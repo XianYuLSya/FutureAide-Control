@@ -1,0 +1,12 @@
+node_modules/
+.runtime/
+*.log
+.env
+.env.*
+!.env.example
+control-config.json
+host-bridge.json
+state/
+.rollback/
+coverage/
+.DS_Store

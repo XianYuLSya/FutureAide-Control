@@ -1,0 +1,16 @@
+{
+  "name": "dsh-control-discovery",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml"
+  ]
+}

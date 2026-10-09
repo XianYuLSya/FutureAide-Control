@@ -1,0 +1,19 @@
+{
+  "name": "futureaide-control",
+  "version": "0.2.0",
+  "description": "Control FutureAide or native DSH through standard MCP with automatic host discovery.",
+  "author": {
+    "name": "FutureAide"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "FutureAide Control · DSH Control",
+    "shortDescription": "通过 MCP 管理 FutureAide 与原版 DSH 对话、项目和模型。",
+    "longDescription": "FutureAide Control，副名 DSH Control。标准 MCP/CLI 桥接，自动发现 FutureAide 或原版 DSH，创建项目对话、选择模型、派单和读取结果。QQ 交流群：259109974。后续计划推出便捷一键安装的个人 DSH 改版 FutureAide。",
+    "developerName": "FutureAide",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": ["检查 FutureAide 当前任务进度", "读取执行母会话并安排后续修复", "验收 FutureAide 的完成报告"]
+  },
+  "mcpServers": "./.mcp.json"
+}

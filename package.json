@@ -1,0 +1,22 @@
+{
+  "name": "futureaide-control",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "FutureAide Control / DSH Control: MCP and CLI bridge for FutureAide and native DeepSeek Harness",
+  "homepage": "https://github.com/XianYuLSya/FutureAide-Control#readme",
+  "repository": { "type": "git", "url": "https://github.com/XianYuLSya/FutureAide-Control.git" },
+  "bugs": { "url": "https://github.com/XianYuLSya/FutureAide-Control/issues" },
+  "keywords": ["mcp", "dsh", "deepseek-harness", "futureaide", "codex", "claude-code"],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/mcp-server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "^4.4.3"
+  }
+}

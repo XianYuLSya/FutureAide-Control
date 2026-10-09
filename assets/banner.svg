@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-labelledby="title desc">
+  <title id="title">FutureAide Control — DSH Control</title>
+  <desc id="desc">Connect your AI workflow to DSH. A standard MCP bridge for project sessions, models, and tasks.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#0b1625"/><stop offset="1" stop-color="#102b32"/></linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#65e7e5"/><stop offset="1" stop-color="#a8f3ba"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#b5e8ed" stroke-opacity=".045"/></pattern>
+  </defs>
+  <rect width="1280" height="420" rx="24" fill="url(#bg)"/>
+  <rect width="1280" height="420" rx="24" fill="url(#grid)"/>
+  <circle cx="1100" cy="92" r="185" fill="none" stroke="#6de3d6" stroke-opacity=".08"/>
+  <circle cx="1100" cy="92" r="225" fill="none" stroke="#6de3d6" stroke-opacity=".05"/>
+  <g font-family="Inter, Segoe UI, Arial, sans-serif">
+    <text x="64" y="67" font-size="13" font-weight="700" letter-spacing="3" fill="#87dcd9">DSH CONTROL / MCP BRIDGE</text>
+    <text x="60" y="139" font-size="56" font-weight="750" letter-spacing="-2" fill="#f0f7ff">FutureAide Control</text>
+    <text x="64" y="185" font-size="23" fill="#b0c3d5">Connect your AI workflow to DSH.</text>
+    <g transform="translate(64 240)">
+      <rect width="270" height="104" rx="14" fill="#162d3c" stroke="#304d5e"/>
+      <text x="22" y="34" font-size="12" letter-spacing="2" fill="#90aaba">YOUR CLIENT</text>
+      <text x="22" y="68" font-size="17" font-weight="600" fill="#edf7ff">Codex / Claude Code / DSH</text>
+      <path d="M286 51H350" stroke="url(#accent)" stroke-width="2"/><path d="m343 46 8 5-8 5" fill="none" stroke="#84ebd6" stroke-width="2"/>
+      <rect x="368" width="270" height="104" rx="14" fill="#163937" stroke="#61d7c5"/>
+      <text x="390" y="34" font-size="12" letter-spacing="2" fill="#9beddf">STANDARD MCP</text>
+      <text x="390" y="68" font-size="23" font-weight="600" fill="#f2fff8">FutureAide Control</text>
+      <path d="M654 51H718" stroke="url(#accent)" stroke-width="2"/><path d="m711 46 8 5-8 5" fill="none" stroke="#a5f0bd" stroke-width="2"/>
+      <rect x="736" width="350" height="104" rx="14" fill="#162d3c" stroke="#304d5e"/>
+      <text x="758" y="34" font-size="12" letter-spacing="2" fill="#90aaba">EXECUTION HOST</text>
+      <text x="758" y="68" font-size="23" font-weight="600" fill="#edf7ff">FutureAide / Native DSH</text>
+    </g>
+    <text x="64" y="387" font-size="13" letter-spacing="1" fill="#7d9dad">PROJECT SESSIONS   /   MODEL SELECTION   /   TASK DISPATCH   /   RESULTS</text>
+  </g>
+</svg>

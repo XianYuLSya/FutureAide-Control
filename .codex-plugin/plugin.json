@@ -1,6 +1,6 @@
 {
   "name": "futureaide-control",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Named DSH subagents for Codex: automatic chat and project binding, direct Q&A, file changes, and one-shot or persistent sessions.",
   "author": {
     "name": "FutureAide"

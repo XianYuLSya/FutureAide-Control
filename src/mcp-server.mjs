@@ -8,10 +8,11 @@ import { createAgents } from './agents.mjs';
 import { createPeers } from './peers.mjs';
 import { CODEX_THREAD_ID } from './codex-target.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
+import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 
 /** Default installed surface: each request is bound to its native calling chat. */
-export function makeScopedServer({ configPath, scopedFactory = createScopedAgents } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.3.0' });
+export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
+  const server = new McpServer({ name: 'futureaide-control', version: '0.3.1' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
@@ -24,13 +25,14 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
     description, inputSchema,
     annotations: { readOnlyHint: readOnly, destructiveHint: destructive, idempotentHint: readOnly, openWorldHint: !readOnly },
   }, async (args, extra) => {
+    const finished = diagnostics?.tool(tool, extra);
     try {
       const result = await action(await service(), args, extra);
       return { content: [{ type: 'text', text: boundedOutput(result) }],
         ...(result?.error || result?.ready === false || result?.created === false || result?.deleted === false ? { isError: true } : {}) };
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
-    }
+    } finally { finished?.(); }
   });
   register('futureaide_status', 'Check this chat context and the local DSH connection. The plugin obtains chat and project automatically.', {}, (s, _a, e) => s.status(e), true);
   register('futureaide_create_agent', 'Create a named DSH subagent in the current project, without running a model. once completes one task then returns its result and removes session data; persistent keeps its context until explicitly deleted.', {
@@ -197,6 +199,9 @@ export function makeServer(control, { configPath, controlFactory = createControl
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const server = process.env.FUTUREAIDE_LEGACY_TOOLS === '1' ? makeServer() : makeScopedServer();
-  await server.connect(new StdioServerTransport());
+  const diagnostics = createMcpDiagnostics();
+  const server = process.env.FUTUREAIDE_LEGACY_TOOLS === '1' ? makeServer() : makeScopedServer({ diagnostics });
+  const transport = new StdioServerTransport();
+  diagnostics?.attach(transport);
+  await server.connect(transport);
 }

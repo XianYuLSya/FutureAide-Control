@@ -45,6 +45,13 @@ export class RosterStore {
     if (!result.changes) throw new Error('This subagent instance has already been removed.');
   }
   setWorker(id, pid) { this.db.prepare("UPDATE agents SET body=json_set(body,'$.workerPid',?) WHERE id=?").run(pid ?? null, id); }
+  setWorkerError(id, holder, error) {
+    // The launcher may have awaited spawn while another call advanced or removed
+    // this record. Update only the error, and only for our still-owned lease.
+    this.db.prepare(`UPDATE agents SET body=json_set(body,'$.error',json(?)) WHERE id=?
+      AND EXISTS (SELECT 1 FROM leases WHERE key=? AND holder=? AND expires>?)`)
+      .run(JSON.stringify(error), id, `worker:${id}`, holder, Date.now());
+  }
   claimLease(key, holder, leaseMs) {
     return this.db.prepare(`INSERT INTO leases(key,holder,expires) VALUES (?,?,?)
       ON CONFLICT(key) DO UPDATE SET holder=excluded.holder,expires=excluded.expires WHERE leases.expires<? OR leases.holder=?`)

@@ -53,14 +53,18 @@ function publicResult(record, { fullResult = false } = {}) {
   };
 }
 
-function workerSpawn(configFile, agentId, lease) {
+export async function workerSpawn(configFile, agentId, lease, spawnProcess = spawn) {
   if (!configFile) throw new Error('The installed plugin has no private configuration path for recovery.');
   const script = fileURLToPath(new URL('./scoped-worker.mjs', import.meta.url));
-  const child = spawn(process.execPath, [script, '--config', configFile, '--agent', agentId, '--lease', lease], {
+  const child = spawnProcess(process.execPath, [script, '--config', configFile, '--agent', agentId, '--lease', lease], {
     detached: true, stdio: 'ignore', windowsHide: true,
   });
-  child.unref();
-  return child.pid;
+  return new Promise((resolve, reject) => {
+    // Spawn failures arrive asynchronously; a surrounding try/catch cannot catch
+    // an unhandled ChildProcess error event. Confirm spawn before saving its PID.
+    child.once('error', reject);
+    child.once('spawn', () => { child.unref(); resolve(child.pid); });
+  });
 }
 
 /** Name-addressed operations; owner and native identifiers never come from tool arguments. */
@@ -123,12 +127,15 @@ export function createScopedAgents(config, {
     return api;
   }
 
-  function ensureWorker(record) {
+  async function ensureWorker(record) {
     if (!ACTIVE.has(record.state)) return;
     const holder = uid('worker');
     if (!store.claimLease(`worker:${record.agentId}`, holder, 30000)) return;
-    try { record.workerPid = startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); }
-    catch (error) { store.releaseLease(`worker:${record.agentId}`, holder); throw error; }
+    try { record.workerPid = await startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); }
+    catch (error) {
+      try { store.setWorkerError(record.agentId, holder, safeError(error)); }
+      finally { store.releaseLease(`worker:${record.agentId}`, holder); }
+    }
   }
 
   async function observe(record) {
@@ -404,7 +411,7 @@ export function createScopedAgents(config, {
           await prepare(record);
           return { ...publicResult(record), created: true, modelRequestsStarted: 0 };
         } catch (error) {
-          record.state = 'reconnecting'; record.error = safeError(error); store.save(record); ensureWorker(record);
+          record.state = 'reconnecting'; record.error = safeError(error); store.save(record); await ensureWorker(record);
           return { ...publicResult(record), created: false };
         }
       });
@@ -427,8 +434,8 @@ export function createScopedAgents(config, {
           try { await beginTask(record); }
           catch (error) { record.state = 'reconnecting'; record.error = safeError(error); store.save(record); }
         }
-        ensureWorker(record);
-        return { ...publicResult(record), accepted: record.task.dispatches.at(-1)?.accepted === true };
+        await ensureWorker(record);
+        return { ...publicResult(store.get(record.agentId) ?? record), accepted: record.task.dispatches.at(-1)?.accepted === true };
       });
     },
     async answer({ name, message }, extra) {
@@ -437,8 +444,8 @@ export function createScopedAgents(config, {
     },
     async list(extra) {
       const owner = await context(extra);
+      for (const record of store.list(owner.ownerId)) await ensureWorker(record);
       const records = store.list(owner.ownerId);
-      for (const record of records) ensureWorker(record);
       return { items: records.map(publicResult), total: records.length };
     },
     async changes({ name, task = 0 }, extra) {
@@ -467,7 +474,7 @@ export function createScopedAgents(config, {
         if (!record.task || !ACTIVE.has(record.state)) return { name, cancelled: false, state: record.state };
         record.task.cancelRequested = true; store.save(record);
         const result = await (await checkHost(record)).managedCancel(hostArgs(record));
-        record.state = 'running'; store.save(record); ensureWorker(record);
+        record.state = 'running'; store.save(record); await ensureWorker(record);
         return { name, cancelled: result.cancelled !== false, state: 'cancelling' };
       });
     },
@@ -500,7 +507,7 @@ export function createScopedAgents(config, {
     async poll(agentId) {
       return store.locked(agentId, async () => { const record = store.get(agentId); return record ? pollLocked(record) : { removed: true }; });
     },
-    async resume() { for (const record of store.list()) ensureWorker(record); },
+    async resume() { for (const record of store.list()) await ensureWorker(record); },
     close() { store.close(); },
   };
 
@@ -515,9 +522,9 @@ export function createScopedAgents(config, {
     if (!existing) record.task.answers.push(answer);
     store.save(record);
     try { await resolveAnswer(record, answer); }
-    catch (error) { record.error = safeError(error); store.save(record); ensureWorker(record); throw error; }
+    catch (error) { record.error = safeError(error); store.save(record); await ensureWorker(record); throw error; }
     record.state = 'running'; record.task.state = 'running'; store.save(record);
-    ensureWorker(record);
+    await ensureWorker(record);
     return { name: record.name, answered: true, state: 'resuming' };
   }
   return service;

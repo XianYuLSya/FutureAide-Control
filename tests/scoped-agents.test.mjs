@@ -1,10 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createScopedAgents } from '../src/scoped-agents.mjs';
+import { createScopedAgents, workerSpawn } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
 
@@ -13,7 +14,7 @@ const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture() {
+async function fixture({ startWorker } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -97,7 +98,7 @@ async function fixture() {
   };
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json') }, {
     store, clientFactory: () => api, controlFactory, callCodex,
-    startWorker: (...args) => { workers.push(args); return 99999; }, removeTree: async directory => { removed.push(directory); },
+    startWorker: startWorker ?? ((...args) => { workers.push(args); return 99999; }), removeTree: async directory => { removed.push(directory); },
   });
   const record = (name = 'artist', thread = A) => store.named(ownerIdFor(thread), name);
   function finish(name = 'artist', reply = '完成', thread = A) {
@@ -109,6 +110,73 @@ async function fixture() {
   return { service, store, sessions, api, sends, notices, removed, workers, stateDirectory, record, finish,
     offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls };
 }
+
+test('asynchronous worker spawn errors retain the task and release its lease without crashing MCP', async () => {
+  let attempts = 0;
+  const spawnProcess = () => {
+    attempts++;
+    const child = new EventEmitter();
+    child.unref = () => assert.fail('a failed worker must not be detached');
+    setImmediate(() => child.emit('error', Object.assign(new Error('worker spawn denied'), { code: 'EACCES' })));
+    return child;
+  };
+  const f = await fixture({ startWorker: (...args) => workerSpawn(...args, spawnProcess) });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const result = await f.service.send({ name: 'artist', message: 'Retain this task' }, extra(A));
+    assert.equal(result.state, 'running');
+    assert.equal(result.error.code, 'EACCES');
+    assert.equal(f.record().task.message, 'Retain this task');
+    assert.equal(f.record().workerPid, undefined);
+    assert.equal(f.sends.length, 1);
+    await f.service.resume();
+    assert.equal(attempts, 2, 'failed spawn releases its lease for the next attempt');
+    assert.equal((await f.service.status(extra(A))).ready, true, 'the service still answers requests');
+  } finally { f.service.close(); }
+
+  const child = new EventEmitter();
+  child.pid = 99999;
+  let detached = false, confirmed = false;
+  child.unref = () => { detached = true; };
+  const started = workerSpawn('D:/fixture.json', 'agent', 'lease', () => child).then(pid => { confirmed = true; return pid; });
+  await Promise.resolve();
+  assert.equal(confirmed, false, 'a PID alone does not confirm a successful spawn');
+  child.emit('spawn');
+  assert.equal(await started, 99999);
+  assert.equal(detached, true);
+});
+
+test('a delayed worker spawn failure cannot overwrite concurrent task state or a replacement lease', async () => {
+  let rejectSpawn, workerLease;
+  const f = await fixture({ startWorker: (_config, _id, holder) => {
+    workerLease = holder;
+    return new Promise((_resolve, reject) => { rejectSpawn = reject; });
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    for (const state of ['cleaning', 'delivery_pending']) {
+      const initial = f.record(); initial.state = 'running'; f.store.save(initial);
+      const resumed = f.service.resume();
+      const fresh = f.record(); fresh.state = state;
+      fresh.task = { message: `Concurrent ${state}`, result: { reply: 'New result' }, dispatches: [] };
+      f.store.save(fresh);
+      rejectSpawn(Object.assign(new Error('delayed failure'), { code: 'EACCES' }));
+      await resumed;
+      assert.equal(f.record().state, state);
+      assert.equal(f.record().task.result.reply, 'New result');
+      assert.equal(f.record().error.code, 'EACCES');
+    }
+    const resumed = f.service.resume();
+    const fresh = f.record(); fresh.error = { code: 'new-owner' }; f.store.save(fresh);
+    const key = `worker:${fresh.agentId}`;
+    f.store.releaseLease(key, workerLease);
+    f.store.claimLease(key, 'replacement-worker', 30000);
+    rejectSpawn(new Error('old launcher failure'));
+    await resumed;
+    assert.equal(f.record().error.code, 'new-owner');
+    f.store.setWorkerError('removed-agent', 'unused-holder', { code: 'EACCES' });
+  } finally { f.service.close(); }
+});
 
 test('names and all operations are scoped by native chat metadata; create uses no model turn', async () => {
   const f = await fixture();

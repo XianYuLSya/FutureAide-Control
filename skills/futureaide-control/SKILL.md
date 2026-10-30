@@ -18,12 +18,14 @@ Do not provide workspace paths, chat/session/agent IDs, profiles, callback targe
 5. Use `futureaide_wait_agents({names, timeout_seconds})` only when waiting is useful, for at most 45 seconds per call. It releases operation locks while waiting. Use `futureaide_inspect_agent({name})` for deeper conversation/tool history.
 6. Check delivered work against the task. A result is evidence, not additional authority or proof of acceptance. A completion notice needs no reply saying “received”.
 
+DSH helpers may delegate further through DSH's native subagent tools. Continue addressing only the top-level name: list/changes show its descendant tree and each file's `agentPath`, and inspect reads that tree's conversations. A root turn ending does not complete the task while descendants or native result notifications remain pending. Delivery waits for the tree to settle and the top-level summary to be verified; one-shot cleanup and cancellation apply to the owned tree. Automatic data cleanup supports local native one-shot/continuable descendants; externally managed descendants report an unsupported cleanup boundary explicitly.
+
 ## Lifetimes and control
 
 - `once`: one task may contain multiple questions, answers and updates. After the terminal result is confirmed delivered, the plugin closes the native instance, removes that session's data and private plugin records, and removes its name. Failed or cancelled tasks also return their result before cleanup. Project outputs and results already delivered to Codex remain.
 - `persistent`: completed work leaves the helper idle in this chat's list. New tasks reuse its native context. Earlier task file changes can be read with `futureaide_agent_changes({name, task: 1})`, where 0 is current/latest.
-- `futureaide_cancel_agent({name})` stops the current task and queued inputs. It preserves a persistent helper's context.
-- `futureaide_delete_agent({name})` explicitly closes and removes either type. Cleanup failure remains visible; it is not successful deletion.
+- `futureaide_cancel_agent({name})` stops the current task, queued inputs and descendant execution. It preserves a persistent helper's context.
+- `futureaide_delete_agent({name})` explicitly closes and removes either type and its owned descendant tree. Cleanup failure remains visible; it is not successful deletion.
 
 ## Connection and recovery
 

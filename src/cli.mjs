@@ -1,10 +1,11 @@
 import { mkdir, readFile, readdir } from 'node:fs/promises';
 import { watch } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { createProfile, listProfiles, loadConfig } from './config.mjs';
 import { boundedOutput, createControl, errorResult } from './control.mjs';
-import { installDesktopHostBridge, installHostBridge } from './host-install.mjs';
+import { installDesktopHostBridge, installHostBridge, maintenanceConfigPath } from './host-install.mjs';
 import { createAgents } from './agents.mjs';
 import { createPeers } from './peers.mjs';
 
@@ -21,7 +22,7 @@ const { values, positionals } = parseArgs({
     event: { type: 'string' }, summary: { type: 'string' }, evidence: { type: 'string' },
     'agent-preset': { type: 'string' }, provider: { type: 'string' }, model: { type: 'string' },
     'reasoning-effort': { type: 'string' }, 'tool-name': { type: 'string' }, 'no-activate': { type: 'boolean' },
-    'host-profile-directory': { type: 'string' }, refresh: { type: 'boolean' },
+    'host-profile-directory': { type: 'string' }, refresh: { type: 'boolean' }, rebind: { type: 'boolean' },
     'agent-id': { type: 'string' }, 'task-name': { type: 'string' },
     'project-workspace': { type: 'string' }, 'project-name': { type: 'string' },
     'peer-id': { type: 'string' }, kind: { type: 'string' }, label: { type: 'string' }, state: { type: 'string' },
@@ -60,7 +61,8 @@ const usage = `futureaide-control <connect|status|sessions|read|send|wait|watch|
                             Background waiter: exits when another peer sends this mailbox new work
   reply-exchange --exchange-id ID --peer-id TARGET_NAME --message-file PATH --request-id ID
                             Reuses existing desktop chats; no new Codex CLI or proxy changes
-  desktop-host-install --host-profile-directory ABSOLUTE_PATH [--refresh]
+  desktop-host-install --host-profile-directory ABSOLUTE_PATH [--refresh] [--rebind]
+  desktop-config            Print the selected DSH data directory for the desktop connector
   --config PATH             Optional local connection configuration
   --profile NAME            Named connection for this call; omission keeps the default
   --session-id ID           Default: configured execution mother session
@@ -89,6 +91,7 @@ if (values.help || !positionals.length) {
 } else {
   try {
     const command = positionals[0];
+    values.config = await maintenanceConfigPath(values.config, path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
     const control = ['profiles', 'profile-create'].includes(command) ? undefined : createControl(await loadConfig(values.config, values.profile));
     const sessionId = values['session-id'];
     const number = name => {
@@ -205,6 +208,7 @@ if (values.help || !positionals.length) {
       case 'cancel-agent': result = await (await agents()).cancel({ agentId: values['agent-id'], requestId: values['request-id'] }); break;
       case 'list-agents': result = await (await agents()).list({ workspace: values.workspace }); break;
       case 'profiles': result = await listProfiles(values.config, values.profile); break;
+      case 'desktop-config': { const config = await loadConfig(values.config, values.profile); result = { dataRoot: config.dshDataRoot }; break; }
       case 'profile-create': result = await createProfile({ profile: values.profile, workspace: values.workspace, futureaideSessionId: values['session-id'], codexThreadId: values['codex-thread-id'] }, values.config); break;
       case 'status': result = await control.status(); break;
       case 'connect': result = await control.connect({ requestId: values['request-id'] }); break;
@@ -226,7 +230,7 @@ if (values.help || !positionals.length) {
       case 'select-model': result = await control.selectModel({ sessionId, provider: values.provider, model: values.model, reasoningEffort: values['reasoning-effort'], requestId: values['request-id'] }); break;
       case 'capabilities': result = await control.capabilities({ sessionId, toolName: values['tool-name'], activate: !values['no-activate'] }); break;
       case 'host-install': result = await installHostBridge(await loadConfig(values.config, values.profile)); break;
-      case 'desktop-host-install': result = await installDesktopHostBridge(await loadConfig(values.config, values.profile), values['host-profile-directory'], { refresh: values.refresh === true }); break;
+      case 'desktop-host-install': result = await installDesktopHostBridge(await loadConfig(values.config, values.profile), values['host-profile-directory'], { refresh: values.refresh === true, rebind: values.rebind === true }); break;
       case 'host-status': result = await control.hostStatus(); break;
       case 'notify': result = await control.notify({ event: values.event, summary: values.summary, evidence: values.evidence }); break;
       case 'codex-status': result = await control.codexStatus(); break;

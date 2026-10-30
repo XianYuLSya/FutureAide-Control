@@ -6,10 +6,11 @@
 
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：DSH 的问题回到原聊天，Codex 按名字回答；完成后自动返回结果和文件变更摘要。
-- **随时监工**：列表显示任务、活动、待答问题和修改路径，需要时再查差异或上下文。
+- **多层分工**：DSH 助手可继续安排下属，Codex 仍只按顶层名字联系；整棵树完成并汇总后回包。
+- **随时监工**：列表显示各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
 - **管理生命周期**：一次性任务回包后自动清除会话；长期代理保留上下文，按名字继续使用。
 
-0.3 的默认入口是 Codex Desktop 插件，无需填写内部 ID 或创建传信 txt。版本变化见 [CHANGELOG](CHANGELOG.md)。
+0.4 的默认入口是 Codex Desktop 插件，无需填写内部 ID 或创建传信 txt。版本变化见 [CHANGELOG](CHANGELOG.md)。
 
 ## 安装
 
@@ -29,15 +30,19 @@ Set-Location D:\Tools\FutureAide-Control
 
 安装器准备依赖、注册并启用 Codex 插件、配置 DSH Host 桥接。它保留其他 Codex/DSH 设置，并为改动文件保存备份。运行入口指向克隆目录，私有配置和状态位于其中的 `.runtime/`，请保留该目录的位置。
 
-安装完成后**重启 Codex Desktop**，在项目聊天中让 Codex 调用：
+安装或升级后，在 Codex 的插件/MCP 设置中**重启或重新加载插件连接**；如果新增插件尚未出现，再重启 Codex Desktop。在项目聊天中让 Codex 调用：
 
 ```text
 futureaide_status({})
 ```
 
-确认工具已加载、聊天上下文已校验、DSH 已连接且 `ready: true`，即可派活。也可以直接说：“检查 FutureAide Control 是否就绪。” 如果工具尚未出现，先检查插件是否启用，再重启客户端。使用时保持 DSH Desktop 运行，模型与网络设置继续由 DSH 管理。
+确认工具已加载、聊天上下文已校验、DSH 已连接且 `treeProtocolReady: true`、`ready: true`，即可派活。也可以直接说：“检查 FutureAide Control 是否就绪。” 如果工具尚未出现，先检查插件是否启用，再重启客户端。使用时保持 DSH Desktop 运行，模型与网络设置继续由 DSH 管理。
 
-使用自定义 DSH 数据目录时，安装可加 `-DshHome 'E:\DSH-data'`；重装会保留已保存的选择。升级可在原目录执行 `git pull`、重新运行 `install.ps1`，然后重启 Codex。
+使用自定义 DSH 数据目录时，安装可加 `-DshHome 'E:\DSH-data'`；重装会保留已保存的选择。升级可在原目录执行 `git pull`、重新运行 `install.ps1`，然后重新加载插件连接。
+
+宿主只支持 DSH。未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；不再发现或连接旧 FutureAide 应用，不读取其 shell、端口或启动日志，也不使用旧应用环境变量覆盖宿主。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
+
+维护 CLI 默认使用此安装目录的 `.runtime/config.json`；`--config` 和配置环境变量可显式选择其他配置。桌面桥接若已绑定不同凭据或托管状态目录，安装会报告冲突并保留原绑定；只有确定要迁移时才使用 `desktop-host-install --rebind` 或 `connect-desktop.ps1 -Rebind`。
 
 ## 单代理：完成一次画图任务
 
@@ -85,6 +90,19 @@ futureaide_send_agent({name: "架构图助手", message: "沿用刚才的架构�
 futureaide_delete_agent({name: "架构图助手"})
 ```
 
+## 让 DSH 团队长继续分配下属
+
+Codex 只创建和联系团队长，由它通过 DSH 原生委派工具组织下属，下属也可以继续向下分工。例如：
+
+```text
+futureaide_create_agent({name: "设计团队长", lifetime: "persistent"})
+futureaide_send_agent({name: "设计团队长", message: "组织下属分别分析架构和模块职责，明确文件分工；需要时继续分配下级，最后汇总结果。"})
+futureaide_list_agents({})
+futureaide_inspect_agent({name: "设计团队长"})
+```
+
+下属通过原生消息联系直接父级，需要 Codex 决定的问题由顶层提出；Codex 继续按顶层名字回答。插件不设固定层数上限，模型与工具权限仍由 DSH 管理。
+
 ## 工具与生命周期
 
 | 工具 | 用途 |
@@ -102,6 +120,8 @@ futureaide_delete_agent({name: "架构图助手"})
 
 列表保持简短，文件全文只在请求详细变更时返回。文件观察优先采用本代理原生文件工具的成功结果；shell 或外部程序写入仍可能只有部分覆盖，工具会明确说明，不把共享项目的全部改动归给某个代理。
 
+DSH 助手可以继续调用其原生子代理，形成多层任务树；Codex 仍只按顶层名字操作。列表和变更会显示下属层级、活动以及文件的 `agentPath` 归属，`inspect_agent` 可深入查看该树的对话。顶层一轮结束不等于整项任务完成：插件等待子孙执行、结果通知和顶层最终汇总全部收齐才回包；一次性助手随后清理整棵受管树。取消或删除顶层名字也作用于它的下属树，不影响其他聊天的代理。
+
 **一次性**完成一项任务，过程中可以多次提问和回答。最终成功、失败或取消结果确认送达后，插件关闭实例、删除该会话数据及私有记录，再移出名单。清理失败仍显示在列表。已回到 Codex 的结果与项目产物保留。
 
 **长期**完成后回到空闲，留在名单中，下一项任务使用原上下文。只有按名字删除时才清除会话数据；停止当前任务不等于删除代理。
@@ -112,7 +132,7 @@ futureaide_delete_agent({name: "架构图助手"})
 
 插件使用本机 MCP 与 DSH 桥接。任务回执、问题、答案及待回包结果持久保存；连接恢复后按原任务继续，不新建代理顶替。发送情况不明时先核对原生证据，回包情况不明时核对原聊天，不盲目发送第二份。
 
-`delivery_pending` 表示工作已完成、结果正在等待交付；此时一次性会话尚未删除。DSH 已完成的缓存结果可以在 DSH 暂时离线时继续回传。插件工具被客户端卸载或尚未加载时，需要重新启用插件并重启 Codex。
+`delivery_pending` 表示工作已完成、结果正在等待交付；此时一次性会话尚未删除。DSH 已完成的缓存结果可以在 DSH 暂时离线时继续回传。插件工具被客户端卸载或尚未加载时，需要重新启用或重新加载插件连接；未恢复时再重启 Codex。
 
 ### 某些聊天提示 `Transport closed`
 
@@ -128,14 +148,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 这项检查不重启应用，也不代表聊天连接已恢复。重新打开后，**在每个受影响的原聊天**调用 `futureaide_status({})` 和 `futureaide_list_agents({})`，核对原名单，再继续原任务。恢复入口不依赖已断开的 MCP 通道；目前不自动重启整个 Codex，也未将此入口宣称为客户端断连根因的修复。
 
-已修复后台 worker 启动失败可能使 MCP 进程退出的一处缺陷。原始多聊天断连仍在排查，不能认为该缺陷已解释全部现场症状。安装配置下，新启动的 MCP 进程会在 `.runtime/diagnostics/` 记录精简生命周期日志，包含进程、工具名和聊天身份，不包含任务正文、结果或凭据。
+本次多聊天断连已通过逐进程审计确认来自外部定时清理器：它将暂时无 CPU/I/O 活动的后台 MCP 误判为残留并终止。MCP 没有窗口、等待请求时不活动，都不表示连接已无用。若运行类似进程清理工具，应保留存活 Codex 进程树内的工具，仅清理能确认失去所属关系的残留；停止误杀后，还需在 Codex 设置重载已关闭的 MCP 连接。该外部清理器不属于本插件，其他 Transport closed 仍应依据各自日志判断。
+
+后台 worker 异步启动失败的修补是另一个独立缺陷。安装配置下，新启动的 MCP 进程会在 `.runtime/diagnostics/` 记录精简生命周期日志，包含进程、工具名和聊天身份，不包含任务正文、结果或凭据。
 
 ## 维护与兼容
 
 默认名字式工具依赖本机 Codex Desktop 的可信聊天上下文和回传通道。其他 MCP 客户端，以及仅有 DSH web/tui profile 的环境，需要相应适配；它们不具备这里描述的默认接入体验。
 
-原生会话清理支持上述 DSH 版本的 JSONL 会话、项目索引和派生缓存；不支持的存储后端会返回清理失败。文件观测会注明覆盖范围；当前派单接口使用文字，图片附件尚不是一等输入参数。
+原生会话清理支持上述 DSH 版本的 JSONL 会话、项目索引和派生缓存；不支持的存储后端会返回清理失败。整树清理支持本机原生 one-shot / continuable 下属；外部托管的下属会明确报告不支持自动清理。文件观测会注明覆盖范围；当前派单接口使用文字，图片附件尚不是一等输入参数。
 
-旧 CLI 仍可用于维护，查看 `node src/cli.mjs --help`。需要旧 MCP 管理面时，在维护环境设置 `FUTUREAIDE_LEGACY_TOOLS=1`；它与默认名字工具面择一启用。详细用法见 [旧版 CLI 与显式接口](skills/futureaide-control/references/legacy-workflows.md)，其中手工指定 ID 等流程属于旧接口。
+显式 ID 的 CLI 仍可用于 DSH 维护，查看 `node src/cli.mjs --help`。需要该 MCP 管理面时，在维护环境设置 `FUTUREAIDE_LEGACY_TOOLS=1`；它与默认名字工具面择一启用。这里的 legacy 指维护接口，不表示仍支持旧 FutureAide 宿主。详细用法见 [旧版 CLI 与显式接口](skills/futureaide-control/references/legacy-workflows.md)。DSH 版本使用的 slash / dot HTTP API 适配均保留，status 中的 `apiDialect: legacy` 只表示 slash 协议。
 
 QQ 交流群：259109974。

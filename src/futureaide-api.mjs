@@ -6,7 +6,6 @@ import { discoveryCandidates, isProcessAlive } from './discovery.mjs';
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_DISCOVERY_BYTES = 32 * 1024;
-const MAX_LOG_BYTES = 512 * 1024;
 const MAX_TEXT_BYTES = 128 * 1024;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 
@@ -42,11 +41,11 @@ function validId(value, field = 'sessionId') {
 
 function parseLocalUrl(raw, launch = false) {
   if (typeof raw !== 'string' || raw.length > 8192 || raw !== raw.trim()) {
-    fail('unsafe-url', 'The FutureAide address must be a loopback HTTP URL.');
+    fail('unsafe-url', 'The DSH address must be a loopback HTTP URL.');
   }
   let url;
   try { url = new URL(raw); } catch {
-    fail('unsafe-url', 'The FutureAide address must be a loopback HTTP URL.');
+    fail('unsafe-url', 'The DSH address must be a loopback HTTP URL.');
   }
   if (!['http:', 'https:'].includes(url.protocol)
       || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
@@ -85,17 +84,16 @@ function samePath(a, b) {
   return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
-async function readBoundedFile(path, maxBytes, { tail = false, optional = false } = {}) {
+async function readBoundedFile(path, maxBytes, { optional = false } = {}) {
   let handle;
   try {
     handle = await open(path, 'r');
     const stats = await handle.stat();
-    if (!stats.isFile() || (!tail && stats.size > maxBytes)) {
+    if (!stats.isFile() || stats.size > maxBytes) {
       fail('invalid-instance', 'A FutureAide discovery file is invalid or too large.');
     }
-    const start = tail ? Math.max(0, stats.size - maxBytes) : 0;
     const buffer = Buffer.alloc(Math.min(stats.size, maxBytes));
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     return buffer.subarray(0, bytesRead).toString('utf8');
   } catch (error) {
     if (optional && error?.code === 'ENOENT') return undefined;
@@ -104,17 +102,6 @@ async function readBoundedFile(path, maxBytes, { tail = false, optional = false 
   } finally {
     await handle?.close();
   }
-}
-
-function numberFile(raw, name, maximum) {
-  if (typeof raw !== 'string' || !/^\s*\d+\s*$/.test(raw)) {
-    fail('invalid-instance', `The FutureAide ${name} file is invalid.`);
-  }
-  const value = Number(raw.trim());
-  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
-    fail('invalid-instance', `The FutureAide ${name} file is invalid.`);
-  }
-  return value;
 }
 
 function sessionCookie(headers) {
@@ -174,31 +161,22 @@ export class FutureAideClient {
   #cookie;
   #dialect;
   #hostBridgeFile;
-  #target;
-  #dshDataHome;
-  #temporaryRoot;
   #selectedCandidate;
   #preferredInstanceFile;
 
-  constructor({ dataHome, dshDataHome, target, temporaryRoot, launchUrl, baseUrl, instanceFile, preferredInstanceFile, hostBridgeFile, fetchImpl, timeoutMs = 15_000 } = {}) {
-    this.#dataHome = resolve(dataHome ?? join(homedir(), '.futureaide'));
-    const launch = launchUrl ?? process.env.FUTUREAIDE_LAUNCH_URL;
-    this.#configuredLaunch = launch === undefined ? undefined : parseLocalUrl(launch, true).href;
+  constructor({ dataHome, dshDataHome, target = 'dsh', launchUrl, baseUrl, instanceFile, preferredInstanceFile, hostBridgeFile, fetchImpl, timeoutMs = 15_000 } = {}) {
+    if (target !== 'dsh') fail('invalid-input', 'Only target=dsh is supported. Select a DSH data directory or an explicit DSH instance.');
+    this.#dataHome = resolve(dshDataHome ?? dataHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'));
+    // Explicit URLs remain useful for DSH maintenance. Old FutureAide environment
+    // overrides and its shell/log/port discovery are intentionally not consulted.
+    this.#configuredLaunch = launchUrl === undefined ? undefined : parseLocalUrl(launchUrl, true).href;
     this.#configuredBase = baseUrl === undefined ? undefined : parseLocalUrl(baseUrl).origin;
     if (this.#configuredLaunch && this.#configuredBase
         && new URL(this.#configuredLaunch).origin !== this.#configuredBase) {
-      fail('instance-mismatch', 'The launch URL and base URL identify different FutureAide instances.');
+      fail('instance-mismatch', 'The launch URL and base URL identify different DSH instances.');
     }
-    const discoveryFile = instanceFile ?? process.env.FUTUREAIDE_INSTANCE_FILE;
-    this.#instanceFile = discoveryFile === undefined ? undefined : resolve(discoveryFile);
-    if (target !== undefined && !['auto', 'futureaide', 'dsh'].includes(target)) fail('invalid-input', 'target must be auto, futureaide, or dsh.');
+    this.#instanceFile = instanceFile === undefined ? undefined : resolve(instanceFile);
     this.#preferredInstanceFile = preferredInstanceFile === undefined ? undefined : resolve(preferredInstanceFile);
-    // Explicit targets always remain pinned; automatic discovery uses its
-    // separate preferredInstanceFile hint, which may disappear after shutdown.
-    this.#target = this.#configuredLaunch || this.#configuredBase || this.#instanceFile ? undefined
-      : target ?? (this.#instanceFile || dataHome !== undefined ? undefined : 'auto');
-    this.#dshDataHome = dshDataHome;
-    this.#temporaryRoot = temporaryRoot;
     this.#hostBridgeFile = hostBridgeFile;
     this.#fetch = fetchImpl ?? globalThis.fetch;
     if (typeof this.#fetch !== 'function' || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) {
@@ -208,169 +186,91 @@ export class FutureAideClient {
   }
 
   async #discover() {
-    if (this.#target) return this.#discoverAutomatic();
     let instance;
-    if (this.#configuredLaunch) {
-      instance = { baseUrl: new URL(this.#configuredLaunch).origin, launchUrl: this.#configuredLaunch, source: 'launch-url' };
-    } else if (this.#instanceFile) {
-      let record;
-      try { record = JSON.parse(await readBoundedFile(this.#instanceFile, MAX_DISCOVERY_BYTES)); } catch (error) {
-        if (error instanceof FutureAideError) throw error;
-        fail('invalid-instance', 'The FutureAide instance file must contain valid JSON.');
-      }
-      if (!record || typeof record !== 'object' || Array.isArray(record)) {
-        fail('invalid-instance', 'The FutureAide instance file must contain an object.');
-      }
-      let launch = record.launchUrl;
-      let base = record.baseUrl ?? record.url;
-      if (launch === undefined && record.authToken !== undefined) {
-        const url = parseLocalUrl(base);
-        if (typeof record.authToken !== 'string') fail('invalid-instance', 'The instance launch token is invalid.');
-        url.searchParams.set('token', record.authToken);
-        launch = url.href;
-      }
-      if (launch !== undefined) {
-        launch = parseLocalUrl(launch, true).href;
-        base ??= new URL(launch).origin;
-      }
-      base = parseLocalUrl(base).origin;
-      if (launch && new URL(launch).origin !== base) {
-        fail('instance-mismatch', 'The instance file contains inconsistent FutureAide addresses.');
-      }
-      if (record.pid !== undefined && (!Number.isInteger(record.pid) || record.pid < 1 || record.pid > 2 ** 31 - 1)) {
-        fail('invalid-instance', 'The instance PID is invalid.');
-      }
-      instance = { baseUrl: base, launchUrl: launch, source: 'instance-file', ...(record.pid === undefined ? {} : { pid: record.pid }) };
-      if (record.application === 'dsh') {
-        if (typeof record.dataRoot !== 'string' || !isAbsolute(record.dataRoot)
-          || typeof record.instanceId !== 'string' || !/^[a-f0-9-]{36}$/i.test(record.instanceId)) fail('invalid-instance', 'Invalid native DSH instance metadata.');
-        Object.assign(instance, { application: 'dsh', dataRoot: resolve(record.dataRoot), instanceId: record.instanceId });
-      }
+    if (this.#instanceFile) {
+      instance = await this.#candidateInstance({ instanceFile: this.#instanceFile }, false);
+      if (!instance) fail('instance-not-found', 'The explicit DSH instance is not running.');
+    } else if (this.#configuredLaunch) {
+      instance = { baseUrl: new URL(this.#configuredLaunch).origin, launchUrl: this.#configuredLaunch,
+        application: 'dsh', dataRoot: this.#dataHome, source: 'launch-url' };
     } else {
-      const runtime = join(this.#dataHome, '.runtime', 'futureaide');
-      const rawPort = await readBoundedFile(join(runtime, 'futureaide-web.port'), 128, { optional: true });
-      const base = this.#configuredBase ?? (rawPort === undefined ? undefined
-        : `http://127.0.0.1:${numberFile(rawPort, 'port', 65535)}`);
-      if (!base) fail('instance-not-found', 'No running FutureAide instance was discovered.');
-      const rawPid = await readBoundedFile(join(runtime, 'futureaide-web.pid'), 128, { optional: true });
-      const pid = this.#configuredBase || rawPid === undefined ? undefined : numberFile(rawPid, 'PID', 2 ** 31 - 1);
-      const log = await readBoundedFile(join(runtime, 'logs', 'futureaide-desktop-service.log'), MAX_LOG_BYTES, { tail: true, optional: true });
-      let launch;
-      // Use the last matching native startup URL. Stale tokens fail the normal exchange.
-      for (const match of log?.matchAll(/\bdsh web:\s*(\S+)/gu) ?? []) {
-        try {
-          const candidate = parseLocalUrl(match[1], true);
-          if (candidate.origin === base) launch = candidate.href;
-        } catch { /* Unrelated or truncated startup lines cannot authorize this instance. */ }
-      }
-      instance = { baseUrl: base, launchUrl: launch, source: this.#configuredBase ? 'base-url' : 'desktop-runtime', ...(pid === undefined ? {} : { pid }) };
+      return this.#discoverAutomatic();
     }
     if (this.#configuredBase && instance.baseUrl !== this.#configuredBase) {
-      fail('instance-mismatch', 'The configured address does not match the discovered FutureAide instance.');
+      fail('instance-mismatch', 'The configured address does not match the DSH instance.');
     }
-    if (this.#instance?.baseUrl !== instance.baseUrl || this.#instance?.pid !== instance.pid) {
+    if (this.#instance && !sameInstance(this.#instance, instance)) {
       this.#cookie = undefined;
-      if (this.#instance) this.#dialect = undefined;
+      this.#dialect = undefined;
     }
     this.#instance = instance;
     return instance;
   }
 
-  async #candidateInstance(candidate) {
-    if (candidate.legacy) {
-      const runtime = join(candidate.dataRoot, '.runtime', 'futureaide');
-      const rawPort = await readBoundedFile(join(runtime, 'futureaide-web.port'), 128, { optional: true });
-      if (rawPort === undefined) return undefined;
-      const baseUrl = `http://127.0.0.1:${numberFile(rawPort, 'port', 65535)}`;
-      const rawPid = await readBoundedFile(join(runtime, 'futureaide-web.pid'), 128, { optional: true });
-      const pid = rawPid === undefined ? undefined : numberFile(rawPid, 'PID', 2 ** 31 - 1);
-      const log = await readBoundedFile(join(runtime, 'logs', 'futureaide-desktop-service.log'), MAX_LOG_BYTES, { optional: true, tail: true });
-      let launchUrl;
-      for (const match of log?.matchAll(/\bdsh web:\s*(\S+)/gu) ?? []) {
-        try { const parsed = parseLocalUrl(match[1], true); if (parsed.origin === baseUrl) launchUrl = parsed.href; } catch { /* Ignore truncated log lines. */ }
-      }
-      if (!launchUrl) return undefined;
-      return { baseUrl, launchUrl, pid, dataRoot: candidate.dataRoot, application: 'futureaide', source: 'desktop-runtime' };
-    }
-    const raw = await readBoundedFile(candidate.instanceFile, MAX_DISCOVERY_BYTES, { optional: true });
+  async #candidateInstance(candidate, optional = true) {
+    const raw = await readBoundedFile(candidate.instanceFile, MAX_DISCOVERY_BYTES, { optional });
     if (raw === undefined) return undefined;
     let record;
-    try { record = JSON.parse(raw); } catch { fail('invalid-instance', 'Invalid local instance discovery record.'); }
-    if (!record || typeof record !== 'object' || Array.isArray(record)) fail('invalid-instance', 'Invalid local instance discovery record.');
-    if (!Number.isInteger(record.pid) || record.pid < 1 || record.pid > 2 ** 31 - 1) fail('invalid-instance', 'Discovery requires a valid host PID.');
-    if (!isProcessAlive(record.pid)) return undefined;
-    if (candidate.registered && (record.version !== 1 || record.application !== 'dsh'
+    try { record = JSON.parse(raw); } catch { fail('invalid-instance', 'Invalid DSH instance discovery record.'); }
+    if (!record || typeof record !== 'object' || Array.isArray(record)
+      || record.version !== 1 || record.application !== 'dsh'
+      || !Number.isInteger(record.pid) || record.pid < 1 || record.pid > 2 ** 31 - 1
       || typeof record.instanceId !== 'string' || !/^[a-f0-9-]{36}$/i.test(record.instanceId)
       || typeof record.dataRoot !== 'string' || !isAbsolute(record.dataRoot)
-      || !samePath(record.dataRoot, candidate.dataRoot))) {
-      fail('invalid-instance', 'The DSH discovery record does not match its data directory.');
+      || (candidate.dataRoot && !samePath(record.dataRoot, candidate.dataRoot))) {
+      fail('invalid-instance', 'The discovery record must identify a native DSH instance and its data directory.');
     }
-    let launchUrl = record.launchUrl;
-    let baseUrl = record.baseUrl ?? record.url;
-    if (launchUrl === undefined && typeof record.authToken === 'string') {
-      const url = parseLocalUrl(baseUrl); url.searchParams.set('token', record.authToken); launchUrl = url.href;
-    }
-    launchUrl = parseLocalUrl(launchUrl, true).href;
-    baseUrl = parseLocalUrl(baseUrl ?? new URL(launchUrl).origin).origin;
-    if (new URL(launchUrl).origin !== baseUrl) fail('instance-mismatch', 'Discovery contains inconsistent local addresses.');
-    return { baseUrl, launchUrl, pid: record.pid, ...(record.instanceId ? { instanceId: record.instanceId } : {}),
-      application: candidate.application, dataRoot: candidate.dataRoot, source: candidate.registered ? 'dsh-plugin-registry' : 'futureaide-shell' };
+    if (!isProcessAlive(record.pid)) return undefined;
+    const launchUrl = parseLocalUrl(record.launchUrl, true).href;
+    const baseUrl = parseLocalUrl(record.baseUrl ?? new URL(launchUrl).origin).origin;
+    if (new URL(launchUrl).origin !== baseUrl) fail('instance-mismatch', 'DSH discovery contains inconsistent local addresses.');
+    return { baseUrl, launchUrl, pid: record.pid, instanceId: record.instanceId,
+      application: 'dsh', dataRoot: resolve(record.dataRoot), source: candidate.registered ? 'dsh-plugin-registry' : 'instance-file' };
   }
 
   async #discoverAutomatic() {
     if (this.#selectedCandidate) {
       const current = await this.#candidateInstance(this.#selectedCandidate);
-      if (!current || !sameInstance(current, this.#instance)) fail('instance-changed', 'The selected host changed; no request was sent to another instance.');
+      if (!current || !sameInstance(current, this.#instance)) fail('instance-changed', 'The selected DSH host changed; no request was sent to another instance.');
       this.#instance = current;
       return current;
     }
-    const candidates = await discoveryCandidates({ target: this.#target, dataHome: this.#dataHome,
-      dshDataHome: this.#dshDataHome, temporaryRoot: this.#temporaryRoot, preferredInstanceFile: this.#preferredInstanceFile });
-    for (const application of ['futureaide', 'dsh']) {
-      const ready = [];
-      const origins = new Set();
-      let authFailure;
-      for (const candidate of candidates.filter(item => item.application === application)) {
-        let instance;
-        try { instance = await this.#candidateInstance(candidate); }
-        catch (error) {
-          if (['discovery-failed', 'invalid-instance', 'unsafe-url', 'invalid-launch-url', 'instance-mismatch'].includes(error.code)) continue;
-          throw error;
-        }
-        if (!instance || (instance.pid !== undefined && !isProcessAlive(instance.pid)) || origins.has(instance.baseUrl)) continue;
-        this.#cookie = undefined;
-        this.#dialect = undefined;
-        try {
-          await this.#listSessionsFor(instance);
-          // Only a host that actually answered claims its origin; a rejected stale
-          // record must not shadow the live host that shares the same address.
-          origins.add(instance.baseUrl);
-          ready.push({ instance, candidate, cookie: this.#cookie, dialect: this.#dialect });
-        } catch (error) {
-          if (['transport-error', 'timeout'].includes(error.code)) continue;
-          // A crashed host leaves its discovery record behind, and the recorded PID
-          // can be reused by an unrelated process that is alive. That record's token
-          // is stale, so a rejected candidate is simply not the host: keep probing and
-          // surface the authentication failure only when no candidate answers.
-          if (['authentication-failed', 'authentication-required', 'bridge-auth-required'].includes(error.code)) {
-            authFailure ??= error;
-            continue;
-          }
-          // Protocol failures are visible; they must never silently reroute a
-          // user's task to a different application.
-          throw error;
-        }
+    const candidates = await discoveryCandidates({ dshDataHome: this.#dataHome, preferredInstanceFile: this.#preferredInstanceFile });
+    const ready = [], origins = new Set();
+    let authFailure;
+    for (const candidate of candidates) {
+      let instance;
+      try { instance = await this.#candidateInstance(candidate); }
+      catch (error) {
+        if (['discovery-failed', 'invalid-instance', 'unsafe-url', 'invalid-launch-url', 'instance-mismatch'].includes(error.code)) continue;
+        throw error;
       }
-      if (ready.length > 1) fail('ambiguous-instance', 'Multiple running hosts match. Configure an explicit instanceFile or baseUrl.');
-      if (ready.length === 1) {
-        const chosen = ready[0];
-        this.#instance = chosen.instance; this.#selectedCandidate = chosen.candidate;
-        this.#cookie = chosen.cookie; this.#dialect = chosen.dialect;
-        return chosen.instance;
+      if (!instance || (this.#configuredBase && instance.baseUrl !== this.#configuredBase) || origins.has(instance.baseUrl)) continue;
+      this.#cookie = undefined;
+      this.#dialect = undefined;
+      try {
+        await this.#listSessionsFor(instance);
+        // Rejected stale records must not shadow a live DSH host at the same origin.
+        origins.add(instance.baseUrl);
+        ready.push({ instance, candidate, cookie: this.#cookie, dialect: this.#dialect });
+      } catch (error) {
+        if (['transport-error', 'timeout'].includes(error.code)) continue;
+        if (['authentication-failed', 'authentication-required', 'bridge-auth-required'].includes(error.code)) {
+          authFailure ??= error;
+          continue;
+        }
+        throw error;
       }
-      if (authFailure) throw authFailure;
     }
-    fail('instance-not-found', 'No running FutureAide or registered DSH Web host was found. Enable the dsh-control-discovery plugin in the native DSH Web profile.');
+    if (ready.length > 1) fail('ambiguous-instance', 'Multiple running DSH hosts match. Configure an explicit instanceFile or baseUrl.');
+    if (ready.length === 1) {
+      const chosen = ready[0];
+      this.#instance = chosen.instance; this.#selectedCandidate = chosen.candidate;
+      this.#cookie = chosen.cookie; this.#dialect = chosen.dialect;
+      return chosen.instance;
+    }
+    if (authFailure) throw authFailure;
+    fail('instance-not-found', 'No registered DSH Web host was found. Enable the dsh-control-discovery plugin in the native DSH Web profile.');
   }
 
   async connectionIdentity() {
@@ -434,6 +334,8 @@ export class FutureAideClient {
     let cookie = this.#cookie?.baseUrl === instance.baseUrl && this.#cookie.pid === instance.pid
       ? this.#cookie.value : await this.#authenticate(instance);
     const rpcId = randomUUID();
+    // Both API shapes are used by DSH releases. 'legacy' describes the slash
+    // wire format, not a fallback to the removed FutureAide application.
     const modern = channel === 'api' && this.#dialect === 'modern';
     const wireEndpoint = modern ? ({ 'session/page': 'session.history', 'session/modelCatalog': 'llm.models' }[endpoint] ?? endpoint.replace('/', '.')) : endpoint;
     let payload = modern ? (args.request ?? args._request ?? args) : { args };
@@ -724,6 +626,12 @@ export class FutureAideClient {
   async managedCreate(input) { return this.#managedCall('managedCreate', input, true); }
   async managedBeginTask(input) { return this.#managedCall('managedBeginTask', input, true); }
   async managedStatus(input) { return this.#managedCall('managedStatus', input, false); }
+  async managedHistory(input) {
+    validId(input?.targetSessionId, 'targetSessionId');
+    const value = await this.#managedCall('managedHistory', input, false);
+    if (!Array.isArray(value?.events)) fail('invalid-response', 'DSH returned invalid managed session history.');
+    return value;
+  }
   async managedAnswer(input) { return this.#managedCall('managedAnswer', input, true); }
   async managedCancel(input) { return this.#managedCall('managedCancel', input, true); }
   async managedDestroy(input) { return this.#managedCall('managedDestroy', input, true); }

@@ -1,9 +1,19 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { access, copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const HOST_PRESET = 'codex-control-bridge';
+
+export async function maintenanceConfigPath(explicit, sourceRoot) {
+  if (explicit) return explicit;
+  if (process.env.DSH_CONTROL_CONFIG || process.env.FUTUREAIDE_CONTROL_CONFIG) return undefined;
+  const installed = path.join(sourceRoot, '.runtime', 'config.json');
+  try { await access(installed); return installed; } catch (error) {
+    if (error.code === 'ENOENT') throw new Error('Installed runtime configuration not found. Install the plugin or provide --config explicitly.');
+    throw error;
+  }
+}
 
 /** Return the module revision embedded in a bootstrap preset without changing local state. */
 export async function hostBridgeRevision() {
@@ -14,7 +24,7 @@ export async function hostBridgeRevision() {
 /** Register the bridge in the current Desktop profile (DSH 0.2 declarations).
  * Its normal profile watcher hot-loads the row; no application restart is needed.
  */
-export async function installDesktopHostBridge(config, profileDirectory, { refresh = false } = {}) {
+export async function installDesktopHostBridge(config, profileDirectory, { refresh = false, rebind = false } = {}) {
   if (!path.isAbsolute(profileDirectory || '')) throw new Error('Desktop profile directory must be absolute.');
   const manifest = JSON.parse(await readFile(path.join(profileDirectory, 'package.json'), 'utf8'));
   if (!manifest.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-web-app')) {
@@ -22,11 +32,7 @@ export async function installDesktopHostBridge(config, profileDirectory, { refre
   }
   const credentialFile = config.hostBridgeFile;
   if (!path.isAbsolute(credentialFile || '')) throw new Error('A host bridge credential path is required.');
-  await mkdir(path.dirname(credentialFile), { recursive: true });
-  await writeFile(credentialFile, JSON.stringify({ version: 1, token: randomBytes(32).toString('hex') }) + '\n',
-    { flag: 'wx', mode: 0o600 }).catch(error => { if (error.code !== 'EEXIST') throw error; });
-  const credential = JSON.parse(await readFile(credentialFile, 'utf8'));
-  if (credential.version !== 1 || !/^[a-f0-9]{64}$/.test(credential.token ?? '')) throw new Error('Existing bridge credential is invalid.');
+  if (config.managedStateDirectory !== undefined && !path.isAbsolute(config.managedStateDirectory)) throw new Error('The managed host state path must be absolute.');
   const filename = path.join(profileDirectory, 'cordis.patch.yml');
   const begin = '# BEGIN futureaide-control host bridge';
   const end = '# END futureaide-control host bridge';
@@ -38,12 +44,37 @@ export async function installDesktopHostBridge(config, profileDirectory, { refre
     if (start < 0 || finish < start || original.indexOf(begin, start + 1) !== -1 || original.indexOf(end, finish + 1) !== -1) {
       throw new Error('The owned bridge patch markers are inconsistent; inspect the profile before installing.');
     }
-    const owned = original.slice(start, finish);
+    // DSH serializes long double-quoted scalars with YAML escaped line breaks.
+    // Remove only an unescaped continuation backslash and its indentation;
+    // retain paired backslashes so JSON decoding preserves Windows paths.
+    const owned = original.slice(start, finish).replace(/((?:^|[^\\])(?:\\\\)*)\\\r?\n[ \t]*/gm, '$1');
+    const readOwnedPath = name => {
+      const line = owned.match(new RegExp(`^\\s+${name}:\\s*("[^\\r\\n]+")\\s*$`, 'm'));
+      if (!line) return undefined;
+      try { return JSON.parse(line[1]); } catch { return undefined; }
+    };
+    const priorCredential = readOwnedPath('credentialFile');
+    const priorState = readOwnedPath('managedStateDirectory');
+    const normalize = value => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+    if (!priorCredential || !path.isAbsolute(priorCredential) || (priorState && !path.isAbsolute(priorState))
+        || (!priorState && /^[ \t]+managedStateDirectory:/m.test(owned))) {
+      throw new Error('The existing bridge binding cannot be verified; inspect it before changing the profile.');
+    }
+    const oldState = priorState ?? path.join(path.dirname(priorCredential), 'managed-host');
+    const newState = config.managedStateDirectory ?? path.join(path.dirname(credentialFile), 'managed-host');
+    if (!rebind && (normalize(priorCredential) !== normalize(credentialFile) || normalize(oldState) !== normalize(newState))) {
+      throw new Error('Desktop bridge binding differs from this configuration. Use explicit rebind only for an intended migration.');
+    }
     const moduleLine = owned.match(/^\s+name:\s*("[^\r\n]+")\s*$/m);
     try { previousModule = moduleLine ? new URL(JSON.parse(moduleLine[1])) : undefined; } catch { /* Rewrite an older owned format. */ }
     before = original.slice(0, start) + original.slice(finish + end.length).replace(/^\r?\n/, '');
   }
   if (/^\s*-\s*id:\s*['"]?codex-control-host-bridge\b/m.test(before)) throw new Error('An unowned host bridge row already exists.');
+  await mkdir(path.dirname(credentialFile), { recursive: true });
+  await writeFile(credentialFile, JSON.stringify({ version: 1, token: randomBytes(32).toString('hex') }) + '\n',
+    { flag: 'wx', mode: 0o600 }).catch(error => { if (error.code !== 'EEXIST') throw error; });
+  const credential = JSON.parse(await readFile(credentialFile, 'utf8'));
+  if (credential.version !== 1 || !/^[a-f0-9]{64}$/.test(credential.token ?? '')) throw new Error('Existing bridge credential is invalid.');
   before = before.replace(/^\s*\[\]\s*$/m, '');
   const revision = await hostBridgeRevision();
   const module = new URL('./host-plugin.mjs', import.meta.url);
@@ -58,8 +89,9 @@ export async function installDesktopHostBridge(config, profileDirectory, { refre
   }
   const discoveryFile = config.instanceFile;
   const discoveryConfig = discoveryFile ? `        discoveryFile: ${JSON.stringify(discoveryFile)}\n        dataRoot: ${JSON.stringify(config.dshDataRoot ?? config.dataRoot)}\n` : '';
-  const registration = createHash('sha256').update(JSON.stringify([module.href, credentialFile, discoveryConfig])).digest('hex').slice(0, 16);
-  const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${registration}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${discoveryConfig}${end}\n`;
+  const stateConfig = config.managedStateDirectory ? `        managedStateDirectory: ${JSON.stringify(config.managedStateDirectory)}\n` : '';
+  const registration = createHash('sha256').update(JSON.stringify(stateConfig ? [module.href, credentialFile, discoveryConfig, stateConfig] : [module.href, credentialFile, discoveryConfig])).digest('hex').slice(0, 16);
+  const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${registration}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${stateConfig}${discoveryConfig}${end}\n`;
   const content = before.trimEnd() + '\n' + patch;
   if (content !== original) {
     const backup = path.join(path.dirname(credentialFile), 'rollback', `desktop-bridge-${Date.now()}`);

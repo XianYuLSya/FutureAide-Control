@@ -1,12 +1,46 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+/** Read the durable descendant catalog; diagnostics never authorize cleanup. */
+export async function readManagedTree(subagents, agents, root, changesBySession = {}) {
+  if (typeof subagents?.listDescendants !== 'function') throw new Error('managed-tree-unavailable');
+  const rows = await subagents.listDescendants(root.id);
+  if (!Array.isArray(rows)) throw new Error('managed-tree-unavailable');
+  const known = new Set([root.id]);
+  const nodes = [{ sessionId: root.id, parentSessionId: null, name: null,
+    status: root.status, activity: root.status, changes: structuredClone(changesBySession[root.id] ?? []),
+    coverage: { complete: false, source: 'agent-file-tool-results' } }];
+  for (const row of rows) {
+    if (row.kind !== 'child' || typeof row.id !== 'string' || !known.has(row.parentId) || known.has(row.id)) throw new Error('managed-tree-unverified');
+    known.add(row.id);
+    const agent = agents.get(row.id);
+    nodes.push({ sessionId: row.id, parentSessionId: row.parentId, name: row.label ?? null, mode: row.mode,
+      status: agent?.status ?? 'unloaded', activity: agent?.status ?? row.activity ?? 'unknown',
+      changes: structuredClone(changesBySession[row.id] ?? []), coverage: { complete: false, source: 'agent-file-tool-results' } });
+  }
+  return nodes;
+}
+
+/** DSH SDK's completion barrier, scoped to the exact live root and task. */
+export async function waitManagedTree(subagents, agents, root, isCurrent) {
+  if (typeof subagents?.waitForChildren !== 'function' || typeof root.whenIdle !== 'function') throw new Error('managed-tree-unavailable');
+  while (isCurrent()) {
+    if (agents.get(root.id) !== root) throw new Error('managed-handle-unavailable');
+    await root.whenIdle();
+    const seq = root.session.seq;
+    const joined = await subagents.waitForChildren(root);
+    if (!isCurrent()) return null;
+    if (agents.get(root.id) !== root) throw new Error('managed-handle-unavailable');
+    if (!joined && root.status === 'idle' && root.session.seq === seq) return seq;
+  }
+  return null;
+}
 
 export const name = 'futureaide-control-host';
 // Tools belong to each Agent's composition; the bridge also mounts at host scope.
 export const inject = ['connection', 'webServer', 'agents', 'sessions'];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
-export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
 
 function managedId(value) {
   if (!ID.test(value ?? '')) reject('invalid-managed-identity');
@@ -45,7 +79,7 @@ function managedFileStore(directory) {
  * adapter below targets the JSONL, workspace and projection services verified in
  * DSH 0.2.1-rc.3; unsupported storage refuses cleanup instead of archiving it.
  */
-export function createManagedHost(ctx, { stateDirectory, store, removeDirectory = rm } = {}) {
+export function createManagedHost(ctx, { stateDirectory, store, removeDirectory = rm, installDelegation: testInstallDelegation } = {}) {
   const root = ctx.root ?? ctx;
   const runtimeKey = Symbol.for('futureaide-control.managed-runtimes');
   const runtimes = root[runtimeKey] ??= new Map();
@@ -58,11 +92,45 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     runtimes.set(directoryKey, runtime);
   }
   const { records, handles, operations, writes, bindings, storage } = runtime;
+  runtime.treeBarriers ??= new Map();
+  runtime.treeInspections ??= new Map();
+  runtime.managedAgents ??= new Map();
   // The Agent factory ties ownership to the caller's fiber. The host root stays
   // alive across bridge reloads; replacing only the RPC fiber must not stop agents.
   const owner = typeof root.get === 'function' ? root : ctx;
   const keyOf = input => createHash('sha256').update(`${managedId(input.ownerId)}\n${managedId(input.agentId)}`).digest('hex');
   const service = name => owner.get(name);
+  async function installDelegation(agentCtx, agent, record) {
+    if (testInstallDelegation) return testInstallDelegation(agentCtx, agent, record);
+    const presets = agentCtx.get('agentPresets');
+    const tree = presets?.generationFor?.(agentCtx)?.mount?.tree;
+    const loader = agentCtx.get('loader');
+    if (typeof tree?.entries !== 'function' || typeof loader?.unwrapExports !== 'function' || typeof agentCtx.plugin !== 'function') reject('managed-delegation-unavailable');
+    const entry = [...tree.entries()].find(item => item.options?.name === '@deepseek-ai/dsh-tool-subagent'
+      && (item.fiber?.config?.toolName ?? 'subagent') === 'subagent');
+    if (!entry?.moduleNamespace || !entry.fiber?.config || typeof entry.fiber.config.provider !== 'string') reject('managed-delegation-unavailable');
+    const config = structuredClone(entry.fiber.config);
+    const fiber = agentCtx.plugin(loader.unwrapExports(entry.moduleNamespace), { ...config, maxDepth: 'provider-managed', toolName: 'managed_subagent' });
+    await fiber.await();
+    agentCtx.get('systemPrompt')?.context?.({ name: 'futureaide:delegation', order: 100,
+      text: 'For delegating work, prefer managed_subagent; use native send_message to communicate with your direct parent and children.' });
+  }
+  runtime.installManagedDescendant = async agent => {
+    if (runtime.managedAgents.has(agent)) return;
+    for (const [parent, record] of runtime.managedAgents) {
+      if (owner.agents.isOwnedBy?.(agent.id, parent)) {
+        await installDelegation(agent.ctx, agent, record);
+        runtime.managedAgents.set(agent, record);
+        agent.ctx.on('tools/result', (exec, result) => runtime.observeManagedDescendant(agent, exec, result));
+        return;
+      }
+    }
+  };
+  if (!runtime.managedAgentListener && typeof owner.on === 'function') {
+    owner.on('agent/created', async ({ agent }) => runtime.installManagedDescendant(agent));
+    owner.on('agent/disposed', ({ agent }) => runtime.managedAgents.delete(agent));
+    runtime.managedAgentListener = true;
+  }
   const persist = record => {
     const key = keyOf(record);
     record.updatedAt = new Date().toISOString();
@@ -74,6 +142,29 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
   };
   const observeWrite = record => {
     void persist(record).catch(() => { record.observationError = 'managed-state-write-failed'; });
+  };
+  runtime.observeManagedDescendant = (agent, exec, result) => {
+    const record = runtime.managedAgents.get(agent);
+    if (!record || exec.agent !== agent || !record.taskId || record.closing || result.isError) return;
+    const changes = record.descendantChanges ??= {};
+    const own = changes[agent.id] ??= [];
+    const values = Array.isArray(result.value?.changes) ? result.value.changes : [result.value];
+    for (const change of values) {
+      if (typeof change?.path !== 'string' || !path.isAbsolute(change.path)
+          || !['create', 'update', 'delete', 'rename'].includes(change.operation)) continue;
+      const item = { path: change.path, operation: change.operation, source: 'agent-file-tool-result', attribution: 'confirmed',
+        ...(typeof change.before === 'string' || change.before === null ? { before: change.before } : {}),
+        ...(typeof change.after === 'string' || change.after === null ? { after: change.after } : {}),
+        ...(typeof change.oldPath === 'string' ? { oldPath: change.oldPath } : {}) };
+      const existing = own.find(value => value.path === item.path);
+      if (existing) {
+        if ('before' in existing) item.before = existing.before;
+        if (existing.operation === 'create' && item.operation === 'update') item.operation = 'create';
+        Object.assign(existing, item);
+      }
+      else own.push(item);
+    }
+    observeWrite(record);
   };
   const serial = (input, operation) => {
     const key = keyOf(input);
@@ -106,6 +197,68 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       ...(record.cancelled ? { cancelled: true } : {}),
     };
   }
+  async function treeSnapshot(record, agent) {
+    const tree = { settled: false, running: agent?.status === 'running', nodes: [], rootSummary: { ready: false } };
+    if (!agent || !record.taskId) return tree;
+    const subagents = service('subagents');
+    try {
+      const changes = { ...(record.descendantChanges ?? {}), [record.sessionId]: record.changes ?? [] };
+      tree.nodes = await readManagedTree(subagents, owner.agents, agent, changes);
+      tree.running ||= tree.nodes.some(node => node.status === 'running');
+      if (record.cancelled && record.cancellationSettled && !tree.running) {
+        tree.settled = true;
+        return tree;
+      }
+      const after = record.taskStartSeq;
+      if (!Number.isSafeInteger(after) || !Number.isSafeInteger(agent.session.seq) || tree.running || agent.session.seq <= after + 1) return tree;
+      const key = keyOf(record);
+      const inspectTask = async () => {
+        let cached = runtime.treeInspections.get(key);
+        if (!cached || cached.taskId !== record.taskId || cached.seq !== agent.session.seq) {
+          const inspectedSeq = agent.session.seq;
+          const inspected = await service('sessionController')?.inspect(record.sessionId);
+          if (!Array.isArray(inspected?.events) || agent.session.seq !== inspectedSeq) throw new Error('managed-tree-unavailable');
+          const taskEvents = inspected.events.filter(event => Number.isSafeInteger(event.seq) && event.seq > after);
+          const end = taskEvents.findLastIndex(event => event.type === 'turn/end');
+          cached = { taskId: record.taskId, seq: inspectedSeq, taskEvents, end,
+            completeTurn: end >= 0 && !taskEvents.slice(end + 1).some(event => event.type === 'turn/start') };
+          runtime.treeInspections.set(key, cached);
+        }
+        return cached;
+      };
+      if (!Number.isSafeInteger(record.taskTurnEndSeq) || record.taskTurnEndSeq <= after) {
+        const recovered = await inspectTask();
+        if (!recovered.completeTurn) return tree;
+        record.taskTurnEndSeq = recovered.taskEvents[recovered.end].seq;
+        await persist(record);
+      }
+      let barrier = runtime.treeBarriers.get(key);
+      if (!barrier || barrier.failed || barrier.taskId !== record.taskId || (barrier.seq !== undefined && barrier.seq !== agent.session.seq)) {
+        barrier = { taskId: record.taskId };
+        runtime.treeBarriers.set(key, barrier);
+        void waitManagedTree(subagents, owner.agents, agent, () => runtime.treeBarriers.get(key) === barrier && record.taskId === barrier.taskId)
+          .then(seq => { if (seq !== null) barrier.seq = seq; })
+          .catch(() => { barrier.failed = true; });
+      }
+      tree.settled = !tree.running && !barrier.failed && barrier.seq !== undefined && barrier.seq === agent.session.seq;
+      if (tree.settled) {
+        const { taskEvents, end, completeTurn } = await inspectTask();
+        if (!completeTurn || barrier.seq !== agent.session.seq) { tree.settled = false; return tree; }
+        const start = taskEvents.findLastIndex((event, index) => index <= end && event.type === 'turn/start');
+        if (start >= 0) {
+          const reply = taskEvents.slice(start, end + 1).filter(event => event.type === 'assistant/message')
+            .map(event => event.data?.message ?? event.data)
+            .map(message => (message?.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('\n'))
+            .filter(Boolean).at(-1);
+          const reason = taskEvents[end].data?.reason;
+          const state = reason?.kind === 'cancelled' || (reason?.kind === 'aborted' && reason?.reason?.kind === 'user')
+            ? 'cancelled' : !reason?.kind || reason.kind === 'completed' ? 'completed' : 'failed';
+          if (reply || state !== 'completed') tree.rootSummary = { ready: true, reply: reply ?? '', state };
+        }
+      }
+    } catch { tree.settled = false; tree.rootSummary = { ready: false }; tree.observationError = 'managed-tree-unavailable'; }
+    return tree;
+  }
   function installTools(agentCtx, agent, record) {
     const tools = agentCtx.get('tools');
     if (!tools?.register || !tools.guard) reject('managed-tools-unavailable');
@@ -114,21 +267,16 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     const fresh = previous?.agent !== agent;
     const binding = fresh ? { agent, record } : previous;
     bindings.set(key, binding);
-    // Codex owns parallel delegation. A managed DSH session must not leave
-    // untracked descendant sessions behind when its single-session owner closes.
-    const delegates = definition => definition?.name === 'subagent'
-      || definition?.description?.includes('This tool starts an independently managed subagent');
-    const view = typeof tools.view === 'function' ? tools.view(agent) : undefined;
-    const inherited = [...(view?.restrictableNames ?? [])].filter(name => delegates(tools.get(name, agent)));
-    if (fresh && inherited.length) tools.restrict({ deny: inherited });
     binding.guard = exec => {
       if (exec.agent !== agent) return undefined;
       if (record.closing || record.cancelled) return 'The controlling agent has stopped this task.';
       if (record.questions.some(question => question.state === 'pending') && exec.name !== 'ask_parent') {
         return 'Wait for the controlling agent to answer before continuing this task.';
       }
-      return delegates(tools.get(exec.name, agent))
-        ? 'Ask the controlling Codex agent to arrange additional agents. This managed session cannot create nested agents.' : undefined;
+      if (record.treeProtocol !== 1 && (exec.name === 'managed_subagent' || exec.name === 'subagent' || exec.name === 'subagent_fork')) {
+        return 'The controlling client must reload and enable managed tree support before delegation.';
+      }
+      return undefined;
     };
     if (fresh) tools.guard(exec => binding.guard(exec));
     binding.questionTool = {
@@ -184,6 +332,8 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     binding.event = (session, event) => {
       if (session.id !== record.sessionId || record.closing) return;
       if (Number.isSafeInteger(event.seq)) record.throughSeq = event.seq;
+      if (event.type === 'turn/end' && record.taskId && Number.isSafeInteger(event.seq)
+          && Number.isSafeInteger(record.taskStartSeq) && event.seq > record.taskStartSeq) record.taskTurnEndSeq = event.seq;
       if (event.type === 'turn/start') record.activity = 'running';
       if (event.type === 'turn/end') record.activity = record.questions.some(question => question.state === 'pending')
         ? 'awaiting-answer' : record.cancelled ? 'cancelled' : 'turn-ended';
@@ -205,6 +355,9 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     const setup = async (agentCtx, agent) => {
       const commit = await composition.setup(agentCtx, agent);
       installTools(agentCtx, agent, record);
+      await installDelegation(agentCtx, agent, record);
+      bindings.get(key).delegationReady = true;
+      runtime.managedAgents.set(agent, record);
       return commit;
     };
     let handle;
@@ -223,7 +376,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     await persist(record);
     return handle.agent;
   }
-  async function removeOwnedDirectory(directory, root, expectedName) {
+  async function validateOwnedDirectory(directory, root, expectedName) {
     if (typeof root !== 'string' || !path.isAbsolute(root) || typeof directory !== 'string' || !path.isAbsolute(directory)
         || path.basename(directory) !== expectedName) reject('managed-cleanup-path-unavailable');
     let entry;
@@ -233,9 +386,13 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     const [actualRoot, actualDirectory] = await Promise.all([realpath(root), realpath(directory)]);
     const relative = path.relative(actualRoot, actualDirectory);
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) reject('managed-cleanup-path-invalid');
-    await removeDirectory(actualDirectory, { recursive: true, force: true });
+    return actualDirectory;
   }
-  async function cleanupPlan(record, agent) {
+  async function removeOwnedDirectory(directory, root, expectedName) {
+    const actualDirectory = await validateOwnedDirectory(directory, root, expectedName);
+    if (actualDirectory) await removeDirectory(actualDirectory, { recursive: true, force: true });
+  }
+  async function cleanupPlan(record, agent, { persistPlan = true } = {}) {
     if (record.cleanup) return record.cleanup;
     const persistence = service('sessionPersistence');
     const registry = service('workspaceRegistry');
@@ -256,7 +413,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     const spillName = `session-${createHash('sha256').update(record.sessionId).digest('hex').slice(0, 12)}`;
     record.cleanup = { sessionRoot: path.resolve(persistence.config.root), sessionDirectory: path.dirname(log),
       ...(typeof spill?.root === 'string' ? { spillRoot: spill.root, spillDirectory: path.join(spill.root, spillName), spillName } : {}) };
-    await persist(record);
+    if (persistPlan) await persist(record);
     return record.cleanup;
   }
   const methods = {
@@ -300,20 +457,52 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     managedBeginTask(input) { return serial(input, async () => {
       managedId(input.taskId);
       const record = await load({ ...input, taskId: undefined });
+      const treeProtocol = input.treeProtocol === 1;
+      if ((!treeProtocol && input.treeProtocol !== undefined) || (!treeProtocol && record.treeProtocol === 1)) reject('managed-tree-protocol-required');
       if (record.closing) reject('managed-agent-closing');
-      const agent = await activate(record);
-      if (record.taskId === input.taskId) return snapshot(record, agent);
+      let agent = await activate(record);
+      if (record.taskId === input.taskId) {
+        if (treeProtocol && record.treeProtocol !== 1) {
+          record.treeProtocol = 1;
+          if (!Number.isSafeInteger(record.taskStartSeq) && Number.isSafeInteger(input.taskStartSeq) && input.taskStartSeq >= -1) record.taskStartSeq = input.taskStartSeq;
+          await persist(record);
+        }
+        return { ...snapshot(record, agent), ...(treeProtocol ? { treeProtocol: 1 } : {}) };
+      }
       if (agent.status === 'running' || record.questions.some(question => question.state === 'pending')) reject('managed-agent-busy');
-      Object.assign(record, { taskId: input.taskId, questions: [], changes: [], cancelled: false,
+      const key = keyOf(record);
+      if (treeProtocol && !bindings.get(key)?.delegationReady) {
+        const handle = handles.get(key);
+        if (!handle) reject('managed-handle-unavailable');
+        await handle.dispose();
+        handles.delete(key); bindings.delete(key); runtime.managedAgents.delete(agent);
+        agent = await activate(record);
+      }
+      runtime.treeBarriers.delete(key); runtime.treeInspections.delete(key);
+      Object.assign(record, { taskId: input.taskId, treeProtocol: treeProtocol ? 1 : undefined, taskStartSeq: sessionCursor(agent.session), taskTurnEndSeq: undefined, questions: [], changes: [], descendantChanges: {}, cancelled: false, cancellationSettled: false,
         activity: 'ready', answers: [], throughSeq: sessionCursor(agent.session) });
       await persist(record);
-      return snapshot(record, agent);
+      return { ...snapshot(record, agent), ...(treeProtocol ? { treeProtocol: 1 } : {}) };
     }); },
     managedStatus(input) { return serial(input, async () => {
       const record = await load(input);
+      if (record.treeProtocol === 1 && input.treeProtocol !== 1) reject('managed-tree-protocol-required');
       const agent = record.closing ? handles.get(keyOf(record))?.agent : await activate(record);
       await (writes.get(keyOf(record)) ?? Promise.resolve());
-      return snapshot(record, agent);
+      return { ...snapshot(record, agent), tree: await treeSnapshot(record, agent) };
+    }); },
+    managedHistory(input) { return serial(input, async () => {
+      const record = await load(input);
+      if (input.treeProtocol !== 1) reject('managed-tree-protocol-required');
+      const target = managedId(input.targetSessionId);
+      const root = handles.get(keyOf(record))?.agent ?? { id: record.sessionId, status: 'unloaded' };
+      let nodes;
+      try { nodes = await readManagedTree(service('subagents'), owner.agents, root, record.descendantChanges); }
+      catch { reject('managed-tree-unverified'); }
+      if (!nodes.some(node => node.sessionId === target)) reject('managed-session-mismatch');
+      const inspected = await service('sessionController')?.inspect(target);
+      if (!Array.isArray(inspected?.events)) reject('managed-history-unavailable');
+      return { events: inspected.events };
     }); },
     managedAnswer(input) { return serial(input, async () => {
       const record = await load(input);
@@ -342,11 +531,23 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       const record = await load(input);
       if (record.closing) reject('managed-agent-closing');
       const agent = await activate(record);
+      const subagents = service('subagents');
+      if (typeof subagents?.drainDescendants !== 'function') reject('managed-tree-unavailable');
+      let nodes;
+      try { nodes = await readManagedTree(subagents, owner.agents, agent, record.descendantChanges); }
+      catch { reject('managed-tree-unverified'); }
       record.cancelled = true;
       for (const question of record.questions) if (question.state === 'pending') question.state = 'cancelled';
       record.activity = 'cancelling';
       await persist(record);
       agent.cancel({ kind: 'user' });
+      await subagents.drainDescendants([agent]);
+      const key = keyOf(record);
+      const handle = handles.get(key);
+      if (!handle) reject('managed-handle-unavailable');
+      await handle.dispose();
+      handles.delete(key); bindings.delete(key); runtime.managedAgents.delete(agent);
+      record.cancellationSettled = true;
       record.activity = agent.status === 'running' ? 'cancelling' : 'cancelled';
       await persist(record);
       return { ...snapshot(record, agent), cancelled: true, cancelRequested: true, pendingInputCleared: true };
@@ -376,44 +577,88 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         });
         return { sessionId: input.sessionId, released: true, dataDeleted: true, destroyed: true, alreadyDestroyed: true };
       }
+      if (record.treeProtocol === 1 && input.treeProtocol !== 1) reject('managed-tree-protocol-required');
       const key = keyOf(record);
       const agent = record.closing ? handles.get(key)?.agent : await activate(record);
-      const cleanup = await cleanupPlan(record, agent);
+      if (!record.cleanupTree) {
+        const subagents = service('subagents');
+        if (typeof subagents?.drainDescendants !== 'function') reject('managed-tree-unavailable');
+        const root = agent ?? { id: record.sessionId, status: 'unloaded' };
+        let nodes;
+        try { nodes = await readManagedTree(subagents, owner.agents, root, record.descendantChanges); }
+        catch { reject('managed-tree-unverified'); }
+        if (nodes.some(node => node.mode === 'external' || (node !== nodes[0] && !['one-shot', 'continuable'].includes(node.mode)))) reject('managed-external-cleanup-unsupported');
+        record.closing = true;
+        record.activity = 'cleaning';
+        await persist(record);
+        if (agent) {
+          agent.cancel({ kind: 'user' });
+          await subagents.drainDescendants([agent]);
+        } else if (nodes.some(node => owner.agents.get(node.sessionId) || owner.sessions.get(node.sessionId))) {
+          reject('managed-release-incomplete');
+        }
+        try { nodes = await readManagedTree(subagents, owner.agents, root, record.descendantChanges); }
+        catch { reject('managed-tree-unverified'); }
+        if (nodes.some(node => node.mode === 'external' || (node !== nodes[0] && !['one-shot', 'continuable'].includes(node.mode)))) reject('managed-external-cleanup-unsupported');
+        if (!agent && nodes.some(node => owner.agents.get(node.sessionId) || owner.sessions.get(node.sessionId))) reject('managed-release-incomplete');
+        const plans = [];
+        for (const node of nodes.slice().reverse()) {
+          const candidate = node.sessionId === record.sessionId ? record : { ...record, sessionId: node.sessionId, cleanup: undefined };
+          if (candidate !== record) {
+            const inspected = await service('sessionController')?.inspect(node.sessionId);
+            const header = inspected?.meta ?? inspected?.header;
+            if (header?.id !== node.sessionId || typeof header.cwd !== 'string') reject('managed-tree-unverified');
+            const relative = path.relative(record.workspace, await realpath(header.cwd));
+            if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) reject('managed-tree-unverified');
+          }
+          const plan = await cleanupPlan(candidate, owner.agents.get(node.sessionId), { persistPlan: false });
+          if (!await validateOwnedDirectory(plan.sessionDirectory, plan.sessionRoot, node.sessionId)) reject('managed-cleanup-path-unavailable');
+          if (plan.spillDirectory) await validateOwnedDirectory(plan.spillDirectory, plan.spillRoot, plan.spillName);
+          plans.push({ sessionId: node.sessionId, ...plan });
+        }
+        record.cleanupTree = plans;
+        await persist(record);
+      }
       record.closing = true;
       record.activity = 'cleaning';
       await persist(record);
       const handle = handles.get(key);
       if (handle) {
         handle.agent.cancel({ kind: 'user' });
+        await service('subagents').drainDescendants([handle.agent]);
         await handle.dispose();
         handles.delete(key);
         bindings.delete(key);
       }
-      if (owner.agents.get(record.sessionId) || owner.sessions.get(record.sessionId)) reject('managed-release-incomplete');
-      await removeOwnedDirectory(cleanup.sessionDirectory, cleanup.sessionRoot, record.sessionId);
-      if (cleanup.spillDirectory) await removeOwnedDirectory(cleanup.spillDirectory, cleanup.spillRoot, cleanup.spillName);
+      for (const cleanup of record.cleanupTree) {
+        if (owner.agents.get(cleanup.sessionId) || owner.sessions.get(cleanup.sessionId)) reject('managed-release-incomplete');
+        await removeOwnedDirectory(cleanup.sessionDirectory, cleanup.sessionRoot, cleanup.sessionId);
+        if (cleanup.spillDirectory) await removeOwnedDirectory(cleanup.spillDirectory, cleanup.spillRoot, cleanup.spillName);
+      }
       const persistence = service('sessionPersistence');
-      persistence.coldLogMemo?.delete(record.sessionId);
+      for (const cleanup of record.cleanupTree) persistence.coldLogMemo?.delete(cleanup.sessionId);
       const projectionCache = service('sessionProjectionCache');
       // Disposal emits a final asynchronous cache write; enqueue our final delete after it.
       if (projectionCache) {
         if (agent) await projectionCache.flushSoft(agent.session, 'managed-delete');
-        await projectionCache.requireTable().delete(record.sessionId);
+        for (const cleanup of record.cleanupTree) await projectionCache.requireTable().delete(cleanup.sessionId);
       }
       const registry = service('workspaceRegistry');
-      await registry.get(record.workspaceId).detachSession(record.sessionId);
-      await registry.unpinSession(record.sessionId);
-      await registry.unarchiveSession(record.sessionId);
-      for (const field of ['headers', 'sessionPaths', 'invalidSessionPaths', 'missingSessionPaths']) registry[field]?.delete(record.sessionId);
+      for (const cleanup of record.cleanupTree) {
+        await registry.get(record.workspaceId).detachSession(cleanup.sessionId);
+        await registry.unpinSession(cleanup.sessionId);
+        await registry.unarchiveSession(cleanup.sessionId);
+        for (const field of ['headers', 'sessionPaths', 'invalidSessionPaths', 'missingSessionPaths']) registry[field]?.delete(cleanup.sessionId);
+      }
       const query = service('sessionQuery');
       if (typeof query?._serialized === 'function' && typeof query?._reconcile === 'function') {
         await query._serialized(undefined, async () => {
-          query._observations.cache.delete(record.sessionId);
+          for (const cleanup of record.cleanupTree) query._observations.cache.delete(cleanup.sessionId);
           await query._ensureReady(undefined);
           await query._reconcile(undefined);
         });
       }
-      if (await persistence.stat(record.sessionId)) reject('managed-cleanup-incomplete');
+      for (const cleanup of record.cleanupTree) if (await persistence.stat(cleanup.sessionId)) reject('managed-cleanup-incomplete');
       await (writes.get(key) ?? Promise.resolve());
       await storage.remove(key);
       records.delete(key);
@@ -562,7 +807,7 @@ export function createHostHandler(ctx, token, options = {}) {
           || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) reject('bridge-auth-required');
       if (managed && MANAGED_METHODS.includes(endpoint)) return { ok: true, value: await managed[endpoint](input) };
       if (!['capabilities', 'historyCursor', 'ping'].includes(endpoint)) reject('unknown-method');
-      if (endpoint === 'ping') return { ok: true, value: { version: 1, revision: options.revision ?? null,
+      if (endpoint === 'ping') return { ok: true, value: { version: 1, revision: options.revision ?? null, ...(managed ? { treeProtocol: 1 } : {}),
         methods: ['capabilities', 'historyCursor', ...(managed ? MANAGED_METHODS : [])], pid: process.pid } };
       if (endpoint === 'historyCursor') return { ok: true, value: await historyCursor(ctx, input.sessionId, input.workspace) };
       const { agent, activated } = await resolveAgent(ctx, input.sessionId, input.workspace, input.activate === true);

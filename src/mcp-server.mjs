@@ -12,7 +12,7 @@ import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.3.1' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.4.0' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
@@ -38,20 +38,20 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
   register('futureaide_create_agent', 'Create a named DSH subagent in the current project, without running a model. once completes one task then returns its result and removes session data; persistent keeps its context until explicitly deleted.', {
     name, lifetime: z.enum(['once', 'persistent']),
   }, (s, a, e) => s.create(a, e));
-  register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. A waiting subagent treats this as its answer. Work runs in DSH while Codex can continue independently; questions and final results return to this chat.', { name, message }, (s, a, e) => s.send(a, e));
+  register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. A waiting subagent treats this as its answer. DSH may delegate further to native descendants. Codex continues independently; questions and the settled tree’s final result return to this chat.', { name, message }, (s, a, e) => s.send(a, e));
   register('futureaide_answer_agent', 'Answer the named subagent’s pending question directly. The plugin continues its original task once; no exchange ID, command, or text file is needed.', { name, message }, (s, a, e) => s.answer(a, e));
-  register('futureaide_list_agents', 'Show only this chat’s subagents, including current task, activity, questions, file changes, delivery and cleanup state. Deep history is unnecessary for ordinary supervision.', {}, (s, _a, e) => s.list(e), true);
+  register('futureaide_list_agents', 'Show only this chat’s subagents, including current task, descendant tree, activity, questions, attributed file changes, delivery and cleanup state. Deep history is unnecessary for ordinary supervision.', {}, (s, _a, e) => s.list(e), true);
   register('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, finish, or need attention. Other work may proceed concurrently; a timeout does not cancel a task.', {
     names: z.array(name).min(1).max(50).optional(), timeout_seconds: z.number().int().min(0).max(45).optional(),
   }, (s, a, e) => s.wait({ names: a.names, timeoutSeconds: a.timeout_seconds ?? 0 }, e), true);
-  register('futureaide_agent_changes', 'Read a named subagent’s observed file changes without reading its conversation. Coverage and uncertain attribution are explicit. task=0 selects the current/latest task; 1 selects the preceding task.', {
+  register('futureaide_agent_changes', 'Read observed file changes across a named subagent’s tree, attributed by agentPath, without reading conversations. Coverage and uncertain attribution are explicit. task=0 selects the current/latest task; 1 selects the preceding task.', {
     name, task: z.number().int().min(0).optional(),
   }, (s, a, e) => s.changes(a, e), true);
-  register('futureaide_inspect_agent', 'Inspect a named subagent’s conversation, tools, and task history when deeper supervision is needed.', {
+  register('futureaide_inspect_agent', 'Inspect a named subagent and its descendants’ conversations, tools, and task history when deeper supervision is needed.', {
     name, max_messages: z.number().int().min(1).max(100).optional(),
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), true);
-  register('futureaide_cancel_agent', 'Stop the named subagent’s current task and queued task inputs. Persistent subagents keep their context. A once subagent reports cancellation before automatic cleanup.', { name }, (s, a, e) => s.cancel(a, e), false, true);
-  register('futureaide_delete_agent', 'Close the named subagent and remove its DSH session data and private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  register('futureaide_cancel_agent', 'Stop the named subagent’s task, descendant execution, and queued inputs across its tree. Persistent subagents keep their context. A once subagent reports cancellation before automatic cleanup.', { name }, (s, a, e) => s.cancel(a, e), false, true);
+  register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing their DSH session data and private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
   return server;
 }
 

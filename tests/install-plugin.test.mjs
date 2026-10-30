@@ -33,7 +33,8 @@ test('installation binds an absolute runtime and preserves unrelated Codex confi
   await mkdir(codexHome, { recursive: true });
   const existing = '# keep this setting\nmodel = "existing"\n\n[mcp_servers.existing]\ncommand = "keep"\n';
   await writeFile(path.join(codexHome, 'config.toml'), existing);
-  await json(path.join(sourceRoot, '.runtime', 'config.json'), { workspace: '/stale-project', codexThreadId: 'stale-chat' });
+  await json(path.join(sourceRoot, '.runtime', 'config.json'), { workspace: '/stale-project', codexThreadId: 'stale-chat',
+    target: 'futureaide', dataRoot: path.join(temp, 'old-host'), launchUrl: 'http://127.0.0.1:12345/?token=stale', preferredInstanceFile: '/old-host-hint' });
   let hostCalls = 0;
   const options = { sourceRoot, codexHome, dshHome, verifyRuntime: async () => {},
     connectHost: async ({ configFile }) => { hostCalls++; assert.match(configFile, /config.json$/); return { ready: true }; } };
@@ -50,6 +51,9 @@ test('installation binds an absolute runtime and preserves unrelated Codex confi
   assert.equal(saved.workspace, undefined);
   assert.equal(saved.codexThreadId, undefined);
   assert.equal(saved.dataRoot, dshHome);
+  assert.equal(saved.target, 'dsh');
+  assert.equal(saved.launchUrl, undefined);
+  assert.equal(saved.preferredInstanceFile, undefined);
   await installPlugin({ ...options, dshHome: undefined });
   assert.equal(await readFile(path.join(codexHome, 'config.toml'), 'utf8'), configured);
   assert.equal(JSON.parse(await readFile(first.configFile, 'utf8')).dshDataRoot, dshHome);

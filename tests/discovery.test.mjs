@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { join, dirname } from 'node:path';
 import { after, test } from 'node:test';
 import { FutureAideClient, FutureAideError } from '../src/futureaide-api.mjs';
 
@@ -68,8 +68,9 @@ function reply(res, body, value) {
 }
 
 async function tempHome(t) {
-  const directory = await mkdtemp(join(tmpdir(), 'discovery-test-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
+  const base = join(dirname(fileURLToPath(import.meta.url)), '..', 'clean', 'dsh-only-tests');
+  await mkdir(base, { recursive: true });
+  const directory = await mkdtemp(join(base, 'discovery-')); // Retain fixtures.
   return directory;
 }
 
@@ -100,15 +101,6 @@ async function writeFutureInstance(t, temporaryRoot, host, options = {}) {
   return file;
 }
 
-function futureClient(t, temporaryRoot, host, options = {}) {
-  return new FutureAideClient({
-    target: 'futureaide',
-    temporaryRoot,
-    hostBridgeFile: options.hostBridgeFile,
-    ...options.extra,
-  });
-}
-
 function failure(code) {
   return error => {
     assert.ok(error instanceof FutureAideError);
@@ -125,7 +117,7 @@ test('discovers only the registered DSH host', async t => {
   const host = await makeHost(t);
   const home = await tempHome(t);
   await writeDshInstance(t, home, host);
-  const client = new FutureAideClient({ target: 'auto', dataHome: await tempHome(t), dshDataHome: home, temporaryRoot: await tempHome(t) });
+  const client = new FutureAideClient({ dshDataHome: home });
   const status = await client.status();
   assert.equal(status.connected, true);
   assert.equal(status.application, 'dsh');
@@ -138,59 +130,65 @@ test('discovers only the registered DSH host', async t => {
   assert.ok(host.state.calls.every(call => call.payload.args._request !== undefined));
 });
 
-test('prefers FutureAide when both hosts are healthy', async t => {
+test('defaults to DSH and ignores old FutureAide discovery and environment overrides', async t => {
   const future = await makeHost(t, { token: 'future-token' });
   const dsh = await makeHost(t, { token: 'dsh-token' });
-  const temporaryRoot = await tempHome(t);
-  await writeFutureInstance(t, temporaryRoot, future);
-  const dshHome = await tempHome(t);
-  await writeDshInstance(t, dshHome, dsh);
-  const client = new FutureAideClient({
-    target: 'auto', temporaryRoot, dataHome: join(dshHome, 'future-data'), dshDataHome: dshHome,
-  });
-  const status = await client.status();
-  assert.equal(status.application, 'futureaide');
-  assert.equal(status.baseUrl, future.baseUrl);
-  assert.equal(status.source, 'futureaide-shell');
-  assert.equal(dsh.state.exchanges, 0);
-  assert.equal(future.state.exchanges, 1);
+  const oldRoot = await tempHome(t);
+  const oldFile = await writeFutureInstance(t, oldRoot, future);
+  const home = await tempHome(t);
+  await writeDshInstance(t, home, dsh);
+  process.env.DSH_HOME = home;
+  process.env.FUTUREAIDE_LAUNCH_URL = future.launchUrl;
+  process.env.FUTUREAIDE_INSTANCE_FILE = oldFile;
+  process.env.FUTUREAIDE_DATA_ROOT = oldRoot;
+  try {
+    const status = await new FutureAideClient().status();
+    assert.equal(status.application, 'dsh');
+    assert.equal(status.baseUrl, dsh.baseUrl);
+    assert.equal(future.state.exchanges, 0);
+  } finally {
+    for (const key of Object.keys(savedEnvironment)) delete process.env[key];
+  }
 });
 
-test('falls back to DSH when the FutureAide host is unreachable', async t => {
-  const future = await makeHost(t, { token: 'future-token', acceptApi: true });
+test('rejects removed auto and FutureAide targets instead of selecting another application', () => {
+  for (const target of ['auto', 'futureaide']) assert.throws(() => new FutureAideClient({ target }), failure('invalid-input'));
+});
+
+test('rejects an explicit old host record without contacting it or falling back', async t => {
+  const future = await makeHost(t);
+  const home = await tempHome(t);
+  const oldFile = await writeFutureInstance(t, home, future);
   const dsh = await makeHost(t, { token: 'dsh-token' });
-  const temporaryRoot = await tempHome(t);
-  await writeFutureInstance(t, temporaryRoot, future, { pid: 999_999_999 });
-  const dshHome = await tempHome(t);
-  await writeDshInstance(t, dshHome, dsh);
-  const client = new FutureAideClient({
-    target: 'auto', temporaryRoot, dataHome: join(dshHome, 'future-data'), dshDataHome: dshHome,
-  });
-  const status = await client.status();
-  assert.equal(status.connected, true);
-  assert.equal(status.application, 'dsh');
-  assert.equal(status.baseUrl, dsh.baseUrl);
+  await writeDshInstance(t, home, dsh);
+  await assert.rejects(new FutureAideClient({ instanceFile: oldFile, dshDataHome: home }).listSessions(), failure('invalid-instance'));
   assert.equal(future.state.exchanges, 0);
-  assert.equal(dsh.state.exchanges, 1);
+  assert.equal(dsh.state.exchanges, 0);
 });
 
-test('FutureAide authentication failure is visible and never falls back to DSH', async t => {
-  const future = await makeHost(t, { token: 'future-token', exchange(_req, res) { res.writeHead(401); res.end(); } });
-  const dsh = await makeHost(t, { token: 'dsh-token' });
-  const temporaryRoot = await tempHome(t);
-  await writeFutureInstance(t, temporaryRoot, future);
-  const dshHome = await tempHome(t);
-  await writeDshInstance(t, dshHome, dsh);
-  const client = new FutureAideClient({
-    target: 'auto', temporaryRoot, dataHome: join(dshHome, 'future-data'), dshDataHome: dshHome,
-  });
-  const status = await client.status();
+test('DSH authentication failure stays visible without contacting an old host', async t => {
+  const future = await makeHost(t, { token: 'future-token' });
+  const dsh = await makeHost(t, { exchange(_req, res) { res.writeHead(401); res.end(); } });
+  const home = await tempHome(t);
+  await writeFutureInstance(t, home, future);
+  await writeDshInstance(t, home, dsh);
+  const status = await new FutureAideClient({ dshDataHome: home }).status();
   assert.equal(status.connected, false);
   assert.equal(status.error.code, 'authentication-failed');
-  await assert.rejects(client.listSessions(), failure('authentication-failed'));
-  assert.equal(dsh.state.exchanges, 0);
-  assert.ok(future.state.exchanges >= 1);
-  assert.ok(future.state.exchanges <= 2);
+  assert.equal(future.state.exchanges, 0);
+});
+
+test('retains the dot API adapter for DSH releases that do not expose slash endpoints', async t => {
+  const host = await makeHost(t, { acceptApi: true, rpc(body, res) {
+    if (body.method === 'session.list') return reply(res, body, { items: [sessionRow] });
+    res.writeHead(404); res.end();
+  } });
+  const home = await tempHome(t);
+  await writeDshInstance(t, home, host);
+  const status = await new FutureAideClient({ dshDataHome: home }).status();
+  assert.equal(status.connected, true);
+  assert.equal(status.application, 'dsh');
+  assert.equal(status.apiDialect, 'modern');
 });
 
 test('reports multiple healthy DSH hosts as ambiguous and skips dead PIDs', async t => {
@@ -208,7 +206,7 @@ test('reports multiple healthy DSH hosts as ambiguous and skips dead PIDs', asyn
   await writeFile(join(registry, `${second.pid + 1}.json`), JSON.stringify({
     version: 1, application: 'dsh', pid: second.pid, instanceId: randomUUID(), dataRoot: home, launchUrl: second.launchUrl,
   }));
-  const client = new FutureAideClient({ target: 'auto', dataHome: await tempHome(t), dshDataHome: home, temporaryRoot: await tempHome(t) });
+  const client = new FutureAideClient({ dshDataHome: home });
   await assert.rejects(client.listSessions(), failure('ambiguous-instance'));
   assert.equal(first.state.exchanges, 1);
   assert.equal(second.state.exchanges, 1);
@@ -223,7 +221,7 @@ test('skips malformed automatic registrations and still finds a healthy DSH host
   await mkdir(registry, { recursive: true });
   await writeFile(join(registry, '999999998.json'), '{bad json');
   await writeDshInstance(t, home, host);
-  const client = new FutureAideClient({ target: 'auto', dataHome: await tempHome(t), dshDataHome: home, temporaryRoot: await tempHome(t) });
+  const client = new FutureAideClient({ dshDataHome: home });
   const status = await client.status();
   assert.equal(status.connected, true);
   assert.equal(status.baseUrl, host.baseUrl);
@@ -231,7 +229,7 @@ test('skips malformed automatic registrations and still finds a healthy DSH host
 
 test('reports disconnected when no instance exists', async t => {
   const home = await tempHome(t);
-  const client = new FutureAideClient({ target: 'auto', dataHome: await tempHome(t), dshDataHome: home, temporaryRoot: await tempHome(t) });
+  const client = new FutureAideClient({ dshDataHome: home });
   const status = await client.status();
   assert.equal(status.connected, false);
   assert.equal(status.error.code, 'instance-not-found');
@@ -244,7 +242,7 @@ test('an explicitly broken instanceFile fails without fallback', async t => {
   await writeFile(badFile, '{not-json');
   const dshHome = await tempHome(t);
   await writeDshInstance(t, dshHome, host);
-  const client = new FutureAideClient({ target: 'auto', instanceFile: badFile, dshDataHome: dshHome, temporaryRoot: await tempHome(t) });
+  const client = new FutureAideClient({ instanceFile: badFile, dshDataHome: dshHome });
   await assert.rejects(client.listSessions(), failure('invalid-instance'));
   assert.equal(host.state.exchanges, 0);
 });
@@ -258,7 +256,7 @@ test('does not send a write when the discovery record changes before the write',
   await writeFile(file, JSON.stringify({
     version: 1, application: 'dsh', pid: host.pid, instanceId: randomUUID(), dataRoot: home, launchUrl: host.launchUrl,
   }));
-  const client = new FutureAideClient({ target: 'auto', dataHome: await tempHome(t), dshDataHome: home, temporaryRoot: await tempHome(t) });
+  const client = new FutureAideClient({ dshDataHome: home });
   await client.listSessions();
   const before = host.state.calls.length;
   await writeFile(file, JSON.stringify({

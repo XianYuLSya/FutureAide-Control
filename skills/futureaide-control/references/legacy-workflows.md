@@ -1,11 +1,11 @@
 ---
 name: futureaide-control
-description: Use FutureAide Control (DSH Control) to discover running FutureAide or native DSH hosts, create project sessions, select models, delegate bounded work, inspect results, exchange work with existing peers through durable mailboxes, and optionally notify Codex.
+description: Use FutureAide Control (DSH Control) to discover running native DSH hosts, create project sessions, select models, delegate bounded work, inspect results, exchange work with existing peers through durable mailboxes, and optionally notify Codex.
 ---
 
 # FutureAide Control · DSH Control
 
-Use the standard MCP tools when available, or the CLI at this plugin's `src/cli.mjs`. The service currently exposes 28 `futureaide_*` tools; README lists all 28, including `futureaide_inbox`. The target FutureAide or DSH Web host must already be running. Other MCP clients can use the same service. Native DSH needs the bundled `dsh-control-discovery` plugin in its Web profile.
+Use the standard MCP tools when available, or the CLI at this plugin's `src/cli.mjs`. The explicit-ID maintenance surface retains the `futureaide_*` tool names, including `futureaide_inbox`, but connects only to an already-running DSH Web host. The legacy label describes this maintenance interface and DSH's slash API, not support for the removed FutureAide application. Other MCP clients can use the same service. Native DSH needs the bundled `dsh-control-discovery` plugin in its Web profile.
 
 ## Prefer the agent facade for new delegated work
 
@@ -63,10 +63,10 @@ CLI: `register-peer`, `list-peers`, `inbox`, `unregister-peer`, `send-peer`, `re
 
 1. Inspect `futureaide_profiles`; verify the project directory and selected session/callback target. Create a unique profile per supervising task using an absolute workspace path. Profile creation does not create a DSH project or start a model.
 2. Pass that profile on every call. Omission uses the default connection; there is no global active profile.
-3. Inspect `futureaide_status` and `futureaide_sessions`. Config `target: "auto"` discovers FutureAide first, then registered native DSH. Explicit `instanceFile`, base URL or launch URL pins the host; `preferredInstanceFile` is only a discovery hint. Resolve multiple healthy matches and authentication errors instead of guessing another host.
+3. Inspect `futureaide_status` and `futureaide_sessions`. The only supported target is `dsh`; omitted target also means DSH. Discovery reads registered native DSH instances in `DSH_HOME` or `~/.dsh`. An explicit `instanceFile` selects a DSH instance record and fails without fallback if that record is invalid or unavailable. `baseUrl` constrains the explicit instance or registered candidates to that loopback origin; it does not provide authentication or discover an unregistered host. `preferredInstanceFile` is only a DSH discovery hint. Resolve multiple healthy matches and authentication errors instead of guessing another host. A `launchUrl` field is not forwarded by the maintenance configuration/control entry point and is not a supported way to select its host.
 4. After a host restart, use `futureaide_connect` with a stable request ID before capability inspection. It may install the owned bridge preset in the selected host's data directory and create an empty bootstrap session. It starts no model and never restarts an application.
 
-Config defaults to `~/.codex/futureaide-control/config.json`; use `DSH_CONTROL_CONFIG`, `FUTUREAIDE_CONTROL_CONFIG` or CLI `--config` for another path. Keep credentials, launch URLs and runtime receipts private.
+CLI maintenance uses the installed plugin's `.runtime/config.json` by default; explicit `--config` or `DSH_CONTROL_CONFIG` / `FUTUREAIDE_CONTROL_CONFIG` overrides it. If no installed configuration exists, it fails instead of silently creating another binding. A desktop bridge already bound to a different credential or managed-state directory is preserved and reported as a conflict; use `desktop-host-install --rebind` (or `connect-desktop.ps1 -Rebind`) only for an intentional migration. Keep credentials, launch URLs and runtime receipts private.
 
 ## Create and supervise a project conversation
 

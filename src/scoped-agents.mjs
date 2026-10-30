@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { lstat, readFile, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createControl, endedState } from './control.mjs';
+import { createControl, endedState, historyMessages } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
@@ -15,7 +15,9 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
 const now = () => new Date().toISOString();
 const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'reconnecting', 'delivery_pending', 'cleaning']);
-const METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+const METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+const TREE_PROTOCOL = 1;
+const treeProtocolError = () => Object.assign(new Error('The DSH bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting DSH is not required.'), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
 
 function assertName(name) {
@@ -31,11 +33,79 @@ function textMessage(message) {
 function stableHost(identity) {
   return { application: identity.application ?? null, dataRoot: path.resolve(identity.dataRoot ?? '') };
 }
-const fileSummary = change => ({ path: change.path, operation: change.operation });
+const fileSummary = change => ({ path: change.path, operation: change.operation,
+  ...(change.agentPath ? { agentPath: change.agentPath } : {}) });
 const compactText = (value, length) => typeof value === 'string' && value.length > length ? value.slice(0, length) + '…' : value;
+
+// Native IDs stay internal. Even a malformed snapshot cannot expose an unrelated
+// session: a node must have an acyclic parent chain to this named agent's root.
+function ownedTree(record, view) {
+  const source = view.tree?.nodes ?? [];
+  const byId = new Map(source.filter(node => typeof node?.sessionId === 'string').map(node => [node.sessionId, node]));
+  const root = byId.get(record.sessionId);
+  const nodes = [];
+  if (root && root.parentSessionId == null) {
+    for (const node of byId.values()) {
+      const names = [], visited = new Set();
+      let current = node;
+      while (current && !visited.has(current.sessionId)) {
+        visited.add(current.sessionId);
+        if (current.sessionId === record.sessionId) {
+          names.unshift(record.name);
+          nodes.push({ node, agentPath: names, depth: names.length - 1 });
+          break;
+        }
+        names.unshift(typeof current.name === 'string' && current.name ? current.name : 'subagent');
+        current = byId.get(current.parentSessionId);
+      }
+    }
+  }
+  nodes.sort((a, b) => a.depth - b.depth);
+  return { nodes, complete: nodes.length > 0 && nodes.length === source.length };
+}
+
+function treeSettled(record, view) {
+  return view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
+}
+
+function rootSummary(view) {
+  const summary = view.tree?.rootSummary;
+  return summary?.ready === true && typeof summary.reply === 'string'
+    && ['completed', 'failed', 'cancelled'].includes(summary.state) ? summary : undefined;
+}
+
+function attributedChanges(record, view) {
+  const tree = ownedTree(record, view);
+  if (!tree.nodes.length) return (view.changes ?? []).map(change => ({ ...change, agentPath: [record.name] }));
+  return tree.nodes.flatMap(({ node, agentPath }) => (node.changes ?? []).map(change => {
+    const { sessionId, parentSessionId, agentId, ...file } = change;
+    return { ...file, agentPath };
+  }));
+}
+
+function publicTree(record, view) {
+  const { nodes, complete } = ownedTree(record, view);
+  const observationError = view.tree?.observationError ?? view.observationError;
+  return { settled: complete && view.tree?.settled === true && view.tree.running === false,
+    running: view.tree?.running ?? view.running ?? false,
+    ...(observationError ? { observationError: safeError(observationError) } : {}),
+    nodes: nodes.map(({ node, agentPath, depth }) => ({ name: agentPath.at(-1),
+      parentName: depth ? agentPath.at(-2) : null, agentPath, depth, status: node.status,
+      activity: node.activity, changes: (node.changes ?? []).slice(0, 12).map(change => fileSummary({ ...change, agentPath })),
+      coverage: node.coverage ?? 'Not observed' })) };
+}
+
+function treeCoverage(record, view) {
+  const { nodes } = ownedTree(record, view);
+  return nodes.length > 1 ? { scope: 'DSH task tree',
+    nodes: nodes.map(({ node, agentPath }) => ({ agentPath, coverage: node.coverage ?? 'Not observed' })) }
+    : view.coverage ?? 'Not observed yet; zero known files is not a complete filesystem audit.';
+}
+
 function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
   const view = record.observation ?? {};
+  const changes = attributedChanges(record, view);
   return {
     name: record.name, lifetime: record.lifetime, state: record.state,
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
@@ -44,10 +114,11 @@ function publicResult(record, { fullResult = false } = {}) {
         ...(fullResult ? { reply: task.result.reply } : { summary: compactText(task.result.reply, 800) }),
         files: (task.result.changes ?? []).map(fileSummary), coverage: task.result.coverage } } : {}) } : null,
     activity: view.activity ?? (record.state === 'idle' ? 'Waiting for a task' : record.state),
-    changes: { count: view.changes?.length ?? 0, files: (view.changes ?? []).slice(0, 12).map(fileSummary),
-      coverage: view.coverage ?? 'Not observed yet; zero known files is not a complete filesystem audit.',
+    changes: { count: changes.length, files: changes.slice(0, 12).map(fileSummary),
+      coverage: treeCoverage(record, view),
       observedAt: view.capturedAt ?? null, stale: Boolean(view.stale) },
     questions: (view.questions ?? []).filter(question => question.state === 'pending').map(question => ({ message: question.message })),
+    tree: publicTree(record, view),
     delivery: task?.delivery?.state ?? null, updatedAt: record.updatedAt,
     ...(record.error ? { error: record.error } : {}),
   };
@@ -88,7 +159,8 @@ export function createScopedAgents(config, {
   };
   const controlFor = record => controlFactory(settings(record), { client: apiFor(record) });
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
-    sessionId: record.sessionId, workspace: record.workspace, ...(record.task ? { taskId: record.task.taskId } : {}) });
+    sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL,
+    ...(record.task ? { taskId: record.task.taskId } : {}) });
 
   async function context(extra) {
     const threadId = callingThread(extra);
@@ -110,18 +182,19 @@ export function createScopedAgents(config, {
     });
   }
 
-  async function checkHost(record, { creation = false } = {}) {
+  async function checkHost(record, { creation = false, taskTree = false } = {}) {
     const api = apiFor(record);
     const identity = await api.connectionIdentity();
     const stable = stableHost(identity);
     if (record.host && JSON.stringify(record.host) !== JSON.stringify(stable)) {
       throw Object.assign(new Error('The original DSH data store is not connected. The task was not sent to another host.'), { code: 'host-ownership-mismatch' });
     }
-    if (creation) {
+    if (creation || taskTree) {
       const status = await api.hostStatus();
       if (!METHODS.every(method => status.methods?.includes(method))) {
         throw Object.assign(new Error('The DSH bridge needs this plugin version installed before subagents can be created.'), { code: 'managed-host-required' });
       }
+      if (status.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
     }
     record.host ??= stable;
     return api;
@@ -144,6 +217,7 @@ export function createScopedAgents(config, {
     if (observed.sessionId !== record.sessionId || (record.task && observed.taskId !== record.task.taskId)) {
       throw new Error('The host returned a different subagent task.');
     }
+    if (record.task?.treeProtocol === TREE_PROTOCOL && !observed.tree) throw treeProtocolError();
     record.observation = { ...observed, capturedAt: now() };
     record.error = undefined;
     return observed;
@@ -236,8 +310,19 @@ export function createScopedAgents(config, {
     record.created = true; record.state = 'idle'; record.error = undefined; store.save(record);
   }
 
+  async function negotiateTree(record, force = false) {
+    if (!force && record.task.treeProtocol === TREE_PROTOCOL) return;
+    const api = await checkHost(record, { taskTree: true });
+    const after = record.task.dispatches[0]?.afterSeq;
+    const started = await api.managedBeginTask({ ...hostArgs(record),
+      ...(Number.isSafeInteger(after) && after >= -1 ? { taskStartSeq: after } : {}) });
+    if (started.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
+    record.task.treeProtocol = TREE_PROTOCOL;
+    store.save(record);
+  }
+
   async function beginTask(record) {
-    await (await checkHost(record)).managedBeginTask(hostArgs(record));
+    await negotiateTree(record, true);
     const selected = await controlFor(record).selectModel({ sessionId: record.sessionId, ...record.model, requestId: `${record.task.taskId}-model` });
     if (selected.accepted === false) throw new Error('DSH did not confirm the default model.');
     await sendDispatch(record, record.task.message);
@@ -285,6 +370,24 @@ export function createScopedAgents(config, {
 
   async function finishDelivery(record) {
     const task = record.task;
+    // Historical completed leaf results predate tree support and may be delivered
+    // offline. New protocol tasks and anything already observed as a tree must
+    // never use that compatibility path.
+    const historicalLeaf = task.treeProtocol === undefined && !task.result.tree && !record.observation?.tree;
+    if (!task.result.treeSettledConfirmed && !historicalLeaf) {
+      // A result persisted by an older worker is not proof that its descendants
+      // and native result notifications have completed.
+      const view = await observe(record);
+      const needsSummary = ownedTree(record, view).nodes.length > 1 && !task.cancelRequested;
+      const summary = rootSummary(view);
+      if (!treeSettled(record, view) || (needsSummary && !summary)) {
+        return waitForTree(record, view, needsSummary && treeSettled(record, view));
+      }
+      if (needsSummary) Object.assign(task.result, { reply: summary.reply, state: summary.state });
+      Object.assign(task.result, { changes: attributedChanges(record, view), coverage: treeCoverage(record, view),
+        tree: publicTree(record, view), treeSettledConfirmed: true });
+      task.state = task.result.state;
+    }
     record.state = 'delivery_pending'; store.save(record);
     const resultText = `DSH 子代理「${record.name}」任务${task.state === 'completed' ? '完成' : task.state === 'cancelled' ? '已取消' : '失败'}。\n\n${task.result.reply}\n\n文件变更：\n${JSON.stringify(task.result.changes.map(fileSummary), null, 2)}\n观测范围：${typeof task.result.coverage === 'string' ? task.result.coverage : JSON.stringify(task.result.coverage)}\n\n这是任务结果，无需回复“收到”。`;
     await deliver(record, task.delivery, resultText);
@@ -292,6 +395,13 @@ export function createScopedAgents(config, {
       if (record.lifetime === 'once') return clearRecord(record);
       record.state = 'idle';
     }
+    store.save(record);
+    return publicResult(record);
+  }
+
+  function waitForTree(record, view, summaryOnly = false) {
+    record.state = record.task.state = 'running';
+    record.observation = { ...view, activity: summaryOnly ? 'Waiting for the top-level DSH summary' : 'Waiting for the DSH task tree and notifications to settle' };
     store.save(record);
     return publicResult(record);
   }
@@ -318,10 +428,11 @@ export function createScopedAgents(config, {
     if (record.closed || record.state === 'cleanup_failed' || record.state === 'idle') return publicResult(record);
     const task = record.task;
     try {
-      if (task?.result) return finishDelivery(record);
+      if (task?.result) return await finishDelivery(record);
       if (!record.created) { await prepare(record); return publicResult(record); }
       if (!task) return publicResult(record);
       if (!task.dispatches.length && !task.cancelRequested) await beginTask(record);
+      else await negotiateTree(record);
       for (const answer of task.answers ?? []) if (!answer.questionIds && !task.cancelRequested) await resolveAnswer(record, answer);
       const view = await observe(record);
       const unanswered = (view.questions ?? []).filter(question => question.state === 'pending');
@@ -344,9 +455,9 @@ export function createScopedAgents(config, {
         }
       }
       const outstanding = task.dispatches.some(dispatch => !['completed', 'cancelled', 'failed'].includes(dispatch.state));
-      if (task.cancelRequested && !view.running) {
+      if (task.cancelRequested && !view.running && treeSettled(record, view)) {
         for (const dispatch of task.dispatches) if (!['completed', 'cancelled', 'failed'].includes(dispatch.state)) dispatch.state = 'cancelled';
-      } else if (outstanding || view.running) {
+      } else if (outstanding || view.running || task.cancelRequested) {
         record.state = unanswered.length ? 'awaiting_input' : 'running';
         task.state = record.state;
         store.save(record);
@@ -362,17 +473,26 @@ export function createScopedAgents(config, {
         await sendDispatch(record, pendingAnswers.map(answer => answer.continuation).join('\n\n'), 'answer', ids);
         return publicResult(record);
       }
+      if (!treeSettled(record, view)) return waitForTree(record, view);
       if (!task.result) {
         const final = task.dispatches.at(-1);
-        task.state = task.cancelRequested ? 'cancelled'
+        let finalState = task.cancelRequested ? 'cancelled'
           : task.dispatches.some(dispatch => dispatch.state === 'failed') ? 'failed'
             : final?.state === 'cancelled' ? 'cancelled' : 'completed';
+        const needsSummary = ownedTree(record, view).nodes.length > 1 && !task.cancelRequested;
+        const summary = rootSummary(view);
+        if (needsSummary && !summary) {
+          return waitForTree(record, view, true);
+        }
+        if (needsSummary) finalState = summary.state;
+        task.state = finalState;
         task.finishedAt = now();
-        task.result = { state: task.state, reply: final?.reply ?? final?.error?.message ?? '',
-          changes: view.changes ?? [], coverage: view.coverage ?? 'Partial observation' };
+        task.result = { state: task.state, reply: needsSummary ? summary.reply : final?.reply ?? final?.error?.message ?? '',
+          changes: attributedChanges(record, view), coverage: treeCoverage(record, view),
+          tree: publicTree(record, view), treeSettledConfirmed: true };
         task.delivery = { state: 'pending' };
       }
-      return finishDelivery(record);
+      return await finishDelivery(record);
     } catch (error) {
       record.state = record.task?.result ? 'delivery_pending' : 'reconnecting';
       record.error = safeError(error); record.observation = { ...record.observation, stale: true };
@@ -393,9 +513,11 @@ export function createScopedAgents(config, {
       try {
         const host = await clientFactory(config).hostStatus();
         status.dshConnected = METHODS.every(method => host.methods?.includes(method));
+        status.treeProtocolReady = host.treeProtocol === TREE_PROTOCOL;
         if (!status.dshConnected) status.hostError = { message: 'Install the current managed DSH bridge.' };
+        else if (!status.treeProtocolReady) status.hostError = safeError(treeProtocolError());
       } catch (error) { status.hostError = safeError(error); }
-      status.ready = status.contextVerified && status.dshConnected;
+      status.ready = status.contextVerified && status.dshConnected && status.treeProtocolReady === true;
       return status;
     },
     async create({ name, lifetime }, extra) {
@@ -424,11 +546,13 @@ export function createScopedAgents(config, {
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
         await checkHost(record);
         if (record.task && ACTIVE.has(record.state)) {
+          await negotiateTree(record);
           const view = await observe(record);
           if ((view.questions ?? []).some(question => question.state === 'pending')) return answerLocked(record, message);
           await sendDispatch(record, message, 'supplement');
         } else {
-          if (record.task) record.history.push({ ...record.task, changes: record.observation?.changes ?? [], coverage: record.observation?.coverage });
+          if (record.task) record.history.push({ ...record.task, changes: attributedChanges(record, record.observation ?? {}),
+            coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) });
           record.task = { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [] };
           record.state = 'running'; record.observation = undefined; store.save(record);
           try { await beginTask(record); }
@@ -453,17 +577,46 @@ export function createScopedAgents(config, {
         if (task !== 0) {
           const historical = record.history.at(-task);
           if (!historical) throw new Error('That earlier task is not available. Use 0 for the current or latest task.');
-          return { name, task, message: historical.message, changes: historical.changes ?? historical.result?.changes ?? [], coverage: historical.coverage };
+          return { name, task, message: historical.message, changes: historical.changes ?? historical.result?.changes ?? [],
+            coverage: historical.coverage, tree: historical.tree ?? historical.result?.tree };
         }
         try { await observe(record); store.save(record); } catch (error) { record.error = safeError(error); }
-        return { name, task: 0, changes: record.observation?.changes ?? [], coverage: record.observation?.coverage ?? 'Unavailable',
+        return { name, task: 0, changes: attributedChanges(record, record.observation ?? {}),
+          tree: publicTree(record, record.observation ?? {}), coverage: treeCoverage(record, record.observation ?? {}),
           stale: Boolean(record.error || record.observation?.stale), ...(record.error ? { error: record.error } : {}) };
       });
     },
     async inspect({ name, maxMessages = 20 }, extra) {
+      if (!Number.isInteger(maxMessages) || maxMessages < 1 || maxMessages > 100) throw new Error('Inspect between 1 and 100 messages per tree node.');
       return withName(extra, name, async record => {
-        const result = await controlFor(record).read({ sessionId: record.sessionId, maxMessages });
-        return { ...publicResult(record), messages: result.messages ?? [], hasMore: result.hasMore,
+        const view = await observe(record);
+        store.save(record);
+        // Newly created and historical idle leaf records need no execution
+        // handshake just to read their own history.
+        const inspectionView = ownedTree(record, view).nodes.length ? view : { ...view,
+          tree: { ...view.tree, settled: false, nodes: [{ sessionId: record.sessionId, parentSessionId: null,
+            status: view.status, activity: view.activity, changes: view.changes, coverage: view.coverage }] } };
+        const tree = publicTree(record, inspectionView);
+        const nodes = ownedTree(record, inspectionView).nodes;
+        let rootHistory, rootError;
+        for (let index = 0; index < nodes.length; index++) {
+          const { node } = nodes[index];
+          try {
+            const raw = await apiFor(record).managedHistory({ ...hostArgs(record), targetSessionId: node.sessionId });
+            if (!Array.isArray(raw?.events)) throw Object.assign(new Error('The DSH bridge returned invalid session history.'), { code: 'invalid-response' });
+            const page = { records: raw.events.map(event => ({ type: 'event', event })), hasMore: false };
+            const history = historyMessages(page, { sessionId: node.sessionId, running: node.status === 'running' });
+            const selected = { messages: history.messages.slice(-maxMessages), hasMore: history.hasMore || history.messages.length > maxMessages,
+              ...(history.note ? { note: history.note } : {}) };
+            Object.assign(tree.nodes[index], selected);
+            if (node.sessionId === record.sessionId) rootHistory = selected;
+          } catch (error) {
+            tree.nodes[index].error = safeError(error);
+            if (node.sessionId === record.sessionId) rootError = safeError(error);
+          }
+        }
+        return { ...publicResult(record), ...(rootHistory ?? {}), ...(rootError ? { error: rootError } : {}),
+          tree, inspectionIncomplete: tree.nodes.some(node => node.error !== undefined),
           historyCount: record.history.length,
           history: record.history.slice(-20).reverse().map((task, index) => ({ task: index + 1, message: compactText(task.message, 240),
             state: task.state, startedAt: task.startedAt, finishedAt: task.finishedAt })) };
@@ -472,6 +625,7 @@ export function createScopedAgents(config, {
     async cancel({ name }, extra) {
       return withName(extra, name, async record => {
         if (!record.task || !ACTIVE.has(record.state)) return { name, cancelled: false, state: record.state };
+        await negotiateTree(record);
         record.task.cancelRequested = true; store.save(record);
         const result = await (await checkHost(record)).managedCancel(hostArgs(record));
         record.state = 'running'; store.save(record); await ensureWorker(record);
@@ -513,6 +667,7 @@ export function createScopedAgents(config, {
 
   async function answerLocked(record, message) {
     if (!record.task || record.closed || record.task.cancelRequested) throw new Error('This subagent has no open task waiting for an answer.');
+    await negotiateTree(record);
     await checkHost(record);
     const view = await observe(record);
     const existing = (record.task.answers ?? []).find(answer => !answer.questionIds && answer.message === message);

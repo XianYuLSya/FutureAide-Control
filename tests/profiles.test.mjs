@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -21,8 +21,9 @@ const alphaThread = '22222222-2222-4222-8222-222222222222';
 const betaThread = '33333333-3333-4333-8333-333333333333';
 
 async function fixture(t, overrides = {}) {
-  const directory = await mkdtemp(path.join(root, '.profile-test-'));
-  t.after(async () => { assert.ok(directory.startsWith(root + path.sep)); await rm(directory, { recursive: true, force: true }); });
+  const base = path.join(root, '..', 'clean', 'dsh-only-tests');
+  await mkdir(base, { recursive: true });
+  const directory = await mkdtemp(path.join(base, 'profiles-')); // Retained; no destructive test cleanup.
   const filename = path.join(directory, 'config.json');
   const workspace = path.join(directory, 'main');
   const original = JSON.stringify({
@@ -51,10 +52,24 @@ test('named profiles inherit only transport fields and leave the default byte-fo
   assert.equal(config.privateField, undefined);
   assert.equal(config.stateDirectory, path.join(f.directory, 'state', 'profiles', 'alpha'));
   const stored = JSON.parse(await readFile(path.join(f.directory, 'profiles', 'alpha.json'), 'utf8'));
-  assert.deepEqual(Object.keys(stored).sort(), ['baseUrl', 'dataRoot', 'instanceFile', 'timeoutMs', 'workspace']);
+  assert.deepEqual(Object.keys(stored).sort(), ['baseUrl', 'dataRoot', 'dshDataRoot', 'instanceFile', 'target', 'timeoutMs', 'workspace']);
   assert.equal(await readFile(f.filename, 'utf8'), f.original);
   assert.equal((await loadConfig(f.filename)).futureaideSessionId, 'main-session');
   assert.equal((await loadConfig(f.filename)).stateDirectory, path.join(f.directory, 'state'));
+});
+
+test('configuration defaults to DSH and rejects the removed host selectors', async t => {
+  const f = await fixture(t);
+  const missing = path.join(f.directory, 'absent-config.json');
+  const defaults = await loadConfig(missing);
+  assert.equal(defaults.target, 'dsh');
+  assert.equal(defaults.dataRoot, defaults.dshDataRoot);
+  assert.ok(!defaults.dataRoot.includes('.futureaide'));
+  for (const target of ['auto', 'futureaide']) {
+    await writeFile(f.filename, JSON.stringify({ target }));
+    await assert.rejects(loadConfig(f.filename), /Only target=dsh/);
+    await assert.rejects(createProfile({ profile: 'blocked-' + target, workspace: f.workspace }, f.filename), /Only target=dsh/);
+  }
 });
 
 test('profile creation rejects traversal, reserved names, relative workspaces, and invalid targets', async t => {
@@ -294,7 +309,7 @@ test('the runnable CLI selects a profile against a local RPC fixture and retains
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
   const instanceFile = path.join(f.directory, 'fixture-instance.json');
-  await writeFile(instanceFile, JSON.stringify({ launchUrl: `${baseUrl}/?token=fixture-token`, pid: process.pid }));
+  await writeFile(instanceFile, JSON.stringify({ version: 1, application: 'dsh', dataRoot: f.directory, instanceId: mainThread, launchUrl: `${baseUrl}/?token=fixture-token`, pid: process.pid }));
   await writeFile(f.filename, JSON.stringify({ ...JSON.parse(f.original), baseUrl, instanceFile }));
   const created = await runCli(f.filename, ['profile-create', '--profile', 'cli-project', '--workspace', workspace]);
   assert.equal(created.code, 0);

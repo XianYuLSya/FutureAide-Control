@@ -128,10 +128,8 @@ try {
   const launchUrl = await waitFor(() => log.match(/dsh web:\s*(http:\/\/\S+)/)?.[1], 'No host launch URL.');
   result.launchUrlRecorded = true;
   const client = new FutureAideClient({
-    target: 'auto',
-    dataHome: path.join(root, 'future-root'),
+    target: 'dsh',
     dshDataHome: home,
-    temporaryRoot: path.join(root, 'temporary'),
     hostBridgeFile: config.hostBridgeFile,
     timeoutMs: 20000,
     fetchImpl: async (url, options) => {
@@ -150,7 +148,7 @@ try {
   assert.equal(discovered.application, 'dsh');
   assert.equal(discovered.source, 'dsh-plugin-registry');
   assert.equal(discovered.dataRoot, home);
-  result.checks.push('auto discovery found the native DSH host via source=dsh-plugin-registry, application=dsh, matched isolated dataRoot');
+  result.checks.push('DSH discovery found the native DSH host via source=dsh-plugin-registry, application=dsh, matched isolated dataRoot');
 
   const control = createControl(config, { client });
   const bootstrap = await control.connect({ requestId: 'dsh-native-bootstrap' });
@@ -231,10 +229,8 @@ try {
   startHost();
   const restartedLaunchUrl = await waitFor(() => log.slice(logOffset).match(/dsh web:\s*(http:\/\/\S+)/)?.[1], 'No restarted host launch URL.');
   const restartedClient = new FutureAideClient({
-    target: 'auto',
-    dataHome: path.join(root, 'future-root'),
+    target: 'dsh',
     dshDataHome: home,
-    temporaryRoot: path.join(root, 'temporary'),
     hostBridgeFile: config.hostBridgeFile,
     timeoutMs: 20000,
   });

@@ -5,10 +5,17 @@ import path from 'node:path';
 export const defaultConfigPath = () => path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'futureaide-control', 'config.json');
 
 const configPath = filename => path.resolve(filename || process.env.DSH_CONTROL_CONFIG || process.env.FUTUREAIDE_CONTROL_CONFIG || defaultConfigPath());
-const transportFields = ['dataRoot', 'dshDataRoot', 'target', 'baseUrl', 'instanceFile', 'preferredInstanceFile', 'timeoutMs', 'hostBridgeFile'];
+const transportFields = ['dataRoot', 'dshDataRoot', 'target', 'baseUrl', 'instanceFile', 'preferredInstanceFile', 'timeoutMs', 'hostBridgeFile', 'managedStateDirectory'];
 const targetFields = ['futureaideSessionId', 'codexThreadId'];
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+function dshConfig(value) {
+  if (value.target !== undefined && value.target !== 'dsh') throw new Error('Only target=dsh is supported. Select the DSH data directory or an explicit DSH instance.');
+  if (value.managedStateDirectory !== undefined && (typeof value.managedStateDirectory !== 'string' || !path.isAbsolute(value.managedStateDirectory))) throw new Error('The managed host state path must be absolute.');
+  const dataRoot = value.dshDataRoot ?? value.dataRoot ?? process.env.DSH_HOME ?? path.join(homedir(), '.dsh');
+  return { ...value, target: 'dsh', dataRoot, dshDataRoot: dataRoot };
+}
 
 function validateProfileName(profile) {
   if (typeof profile !== 'string' || !PROFILE_NAME_PATTERN.test(profile)
@@ -77,7 +84,7 @@ async function profileDirectory(filename, { create = false } = {}) {
 export async function loadConfig(filename, profile) {
   filename = configPath(filename);
   if (profile !== undefined) validateProfileName(profile);
-  const supplied = await readConfiguration(filename, { optional: true });
+  const supplied = dshConfig(await readConfiguration(filename, { optional: true }));
   if (profile !== undefined) {
     const profileFile = path.join(await profileDirectory(filename), `${profile}.json`);
     try {
@@ -85,22 +92,19 @@ export async function loadConfig(filename, profile) {
     } catch (error) {
       if (error.code !== 'ENOENT') throw error;
     }
-    const selected = validateProfile(await readConfiguration(profileFile));
+    const selectedValue = validateProfile(await readConfiguration(profileFile));
+    const selected = dshConfig({ ...selectedValue,
+      dshDataRoot: selectedValue.dshDataRoot ?? selectedValue.dataRoot ?? supplied.dshDataRoot });
     return {
-      dataRoot: path.join(homedir(), '.futureaide', '.dsh'),
-      ...(!supplied.dataRoot && !supplied.instanceFile && !supplied.baseUrl && !selected.dataRoot && !selected.instanceFile && !selected.baseUrl ? { target: 'auto' } : {}),
       hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
       ...pick(supplied, transportFields),
       ...selected,
-      ...(selected.target === undefined && (selected.instanceFile || selected.baseUrl) ? { target: undefined } : {}),
       stateDirectory: path.join(path.dirname(filename), 'state', 'profiles', profile),
       registryDirectory: path.join(path.dirname(filename), 'agents'),
       configFile: filename,
     };
   }
   return {
-    dataRoot: path.join(homedir(), '.futureaide', '.dsh'),
-    ...(!supplied.dataRoot && !supplied.instanceFile && !supplied.baseUrl ? { target: 'auto' } : {}),
     hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
     workspace: process.cwd(),
     ...supplied,
@@ -151,7 +155,7 @@ export async function createProfile({ profile, workspace, futureaideSessionId, c
   validateProfileName(profile);
   filename = configPath(filename);
   const selected = validateProfile({ workspace, futureaideSessionId, codexThreadId });
-  const supplied = await readConfiguration(filename, { optional: true });
+  const supplied = dshConfig(await readConfiguration(filename, { optional: true }));
   const value = { ...pick(supplied, transportFields), ...selected };
   const profileFile = path.join(await profileDirectory(filename, { create: true }), `${profile}.json`);
   try {

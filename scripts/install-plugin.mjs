@@ -107,7 +107,8 @@ export async function installPlugin({
   await lstat(path.join(sourceRoot, 'src', 'mcp-server.mjs'));
   await mkdir(runtime, { recursive: true, mode: 0o700 });
   const saved = JSON.parse(await readOptional(configFile, '{}'));
-  dshHome = path.resolve(dshHome || process.env.DSH_HOME || saved.dshDataRoot || saved.dataRoot || path.join(homedir(), '.dsh'));
+  dshHome = path.resolve(dshHome || process.env.DSH_HOME || saved.dshDataRoot
+    || (saved.target === 'dsh' ? saved.dataRoot : undefined) || path.join(homedir(), '.dsh'));
   const configuration = {
     ...saved, target: 'dsh', dataRoot: dshHome, dshDataRoot: dshHome,
     instanceFile: path.join(runtime, 'instance.json'),
@@ -118,6 +119,8 @@ export async function installPlugin({
   delete configuration.codexThreadId;
   delete configuration.futureaideSessionId;
   delete configuration.baseUrl;
+  delete configuration.launchUrl;
+  delete configuration.preferredInstanceFile;
   await writeJson(configFile, configuration);
   const mcp = { mcpServers: { futureaide: {
     command: process.execPath,

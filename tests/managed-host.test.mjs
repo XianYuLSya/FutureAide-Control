@@ -27,12 +27,13 @@ async function fixture() {
     _reconcile: async () => { for (const id of indexed) if (!stored.has(id)) indexed.delete(id); },
     _requireDb: () => ({ prepare: () => ({ get: id => indexed.has(id) ? { id } : undefined }) }) };
   const services = {
+    subagents: { listDescendants: async () => [], waitForChildren: async () => false, interrupt: () => {}, drainDescendants: async () => {} },
     sessionPersistence: persistence, workspaceRegistry: registry, sessionQuery: query,
     agentDefaultModel: { currentSelection: () => ({ provider: 'provider', model: 'model' }) },
     sessionProjectionCache: { requireTable: () => ({ delete: async id => checkpoints.delete(id), get: id => checkpoints.get(id) }),
       flushSoft: async session => checkpoints.set(session.header.id, { oldContext: true }) },
     sessionController: { agents: { composeAgent: async preset => ({ agentPreset: preset ?? 'default', setup: async () => {} }) },
-      inspect: async id => ({ meta: stored.get(id), events: [] }) },
+      inspect: async id => ({ meta: stored.get(id), events: sessions.get(id)?.events ?? [] }) },
   };
   async function makeAgent(options, resume = false) {
     const id = options.sessionId ?? options.resumeSessionId;
@@ -73,21 +74,64 @@ async function fixture() {
     removed.push(target);
     stored.delete(path.basename(target));
   };
-  return { root, workspace, ctx, store, removeDirectory, live, sessions, stored, records, project, checkpoints, indexed, observed, removed, disposed, cancelled, creations,
+  return { root, workspace, ctx, services, store, removeDirectory, live, sessions, stored, records, project, checkpoints, indexed, observed, removed, disposed, cancelled, creations,
     failNextRemoval: () => { failRemoval = true; },
-    create: (context = ctx) => createManagedHost(context, { stateDirectory: path.join(root, 'managed'), store, removeDirectory }) };
+    create: (context = ctx) => createManagedHost(context, { stateDirectory: path.join(root, 'managed'), store, removeDirectory,
+      installDelegation: async agentCtx => { agentCtx.get('tools').register({name:'managed_subagent'}); } }) };
 }
 
-const identity = workspace => ({ ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a', workspace });
+const identity = workspace => ({ ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a', workspace, treeProtocol: 1 });
 
-test('managed creation spends no model turn, binds project, and restricts nested delegation only in the owned scope', async () => {
+test('tree completion waits for a task turn and descendant result before returning the final root turn', async () => {
+  const f = await fixture(), host = f.create(), input = identity(f.workspace);
+  await host.managedCreate(input);
+  const agent = f.live.get(input.sessionId);
+  agent.session.seq = 0;
+  let release;
+  f.services.subagents.listDescendants = async () => [{kind:'child',id:'child',parentId:input.sessionId,label:'helper',mode:'continuable'}];
+  f.services.subagents.waitForChildren = () => new Promise(resolve => { release = resolve; });
+  await host.managedBeginTask({ ...input, taskId:'task-a' });
+  assert.equal((await host.managedStatus(input)).tree.settled, false);
+  agent.session.events.push({seq:0,type:'turn/start'}, {seq:1,type:'assistant/message',data:{message:{content:[{type:'text',text:'initial'}]}}}, {seq:2,type:'turn/end'});
+  agent.callbacks.get('session/event')[0](agent.session, agent.session.events.at(-1));
+  agent.session.seq = 3;
+  assert.equal((await host.managedStatus(input)).tree.settled, false);
+  await new Promise(resolve => setImmediate(resolve));
+  agent.session.events.push({seq:3,type:'turn/start'}, {seq:4,type:'assistant/message',data:{message:{content:[{type:'text',text:'final summary'}]}}}, {seq:5,type:'turn/end'});
+  agent.callbacks.get('session/event')[0](agent.session, agent.session.events.at(-1));
+  agent.session.seq = 6;
+  release(true);
+  await new Promise(resolve => setImmediate(resolve));
+  release(false);
+  await new Promise(resolve => setImmediate(resolve));
+  const final = await host.managedStatus(input);
+  assert.equal(final.tree.settled, true);
+  assert.deepEqual(final.tree.rootSummary, {ready:true,reply:'final summary',state:'completed'});
+  agent.session.seq = 7;
+  assert.equal((await host.managedStatus(input)).tree.settled, false);
+});
+
+test('legacy tasks remain leaf-only and cannot downgrade an upgraded record', async () => {
+  const f = await fixture(), host = f.create(), input = identity(f.workspace);
+  await host.managedCreate(input);
+  const legacy = { ...input, treeProtocol: undefined, taskId: 'task-a' };
+  assert.equal((await host.managedBeginTask(legacy)).treeProtocol, undefined);
+  const agent = f.live.get(input.sessionId);
+  assert.match(agent.guards[0]({ agent, name: 'managed_subagent' }), /reload/);
+  assert.equal(agent.guards[0]({ agent, name: 'write_file' }), undefined);
+  await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  await assert.rejects(host.managedBeginTask(legacy), error => error.controlCode === 'managed-tree-protocol-required');
+});
+
+test('managed creation spends no model turn, binds project, and exposes delegation in the owned scope', async () => {
   const f = await fixture(), host = f.create(), input = identity(f.workspace);
   const created = await host.managedCreate(input);
   assert.equal(created.modelRequestsStarted, 0);
   assert.deepEqual(f.project.sessionIds, [input.sessionId]);
   const agent = f.live.get(input.sessionId);
   assert.equal(agent.definitions.has('ask_parent'), true);
-  assert.equal(agent.definitions.has('subagent'), false);
+  assert.equal(agent.definitions.has('subagent'), true);
+  assert.equal(agent.definitions.has('managed_subagent'), true);
   assert.equal(agent.definitions.has('write_file'), true);
   assert.deepEqual(agent.session.events, []);
   assert.equal((await host.managedCreate(input)).sessionId, input.sessionId);
@@ -95,10 +139,26 @@ test('managed creation spends no model turn, binds project, and restricts nested
   await assert.rejects(host.managedStatus({ ...input, sessionId: 'another-session' }), error => error.controlCode === 'managed-session-mismatch');
 });
 
+test('managed history reads only an authorized node in the durable tree', async () => {
+  const f = await fixture(), host = f.create(), input = identity(f.workspace);
+  await host.managedCreate(input);
+  assert.deepEqual((await host.managedHistory({ ...input, targetSessionId: input.sessionId })).events, []);
+  assert.equal((await host.managedStatus({ ...input, treeProtocol: undefined })).taskId, null);
+  await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  f.services.subagents.listDescendants = async () => [{ kind: 'child', id: 'child', parentId: input.sessionId, mode: 'continuable' }];
+  f.services.sessionController.inspect = async id => ({ events: [{ seq: 0, type: 'assistant/message', data: { id } }] });
+  assert.equal((await host.managedHistory({ ...input, targetSessionId: 'child' })).events[0].data.id, 'child');
+  await assert.rejects(host.managedHistory({ ...input, targetSessionId: 'other' }), error => error.controlCode === 'managed-session-mismatch');
+  await assert.rejects(host.managedHistory({ ...input, targetSessionId: 'child', treeProtocol: undefined }), error => error.controlCode === 'managed-tree-protocol-required');
+});
+
 test('question and answer carry text directly, conclude the waiting turn, and answer retries do not repeat consumption', async () => {
   const f = await fixture(), host = f.create(), input = identity(f.workspace);
   await host.managedCreate(input);
   await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  await assert.rejects(host.managedStatus({ ...input, treeProtocol: undefined }), error => error.controlCode === 'managed-tree-protocol-required');
+  await assert.rejects(host.managedDestroy({ ...input, treeProtocol: undefined }), error => error.controlCode === 'managed-tree-protocol-required');
+  assert.deepEqual(f.disposed, []);
   const agent = f.live.get(input.sessionId);
   let concluded = 0;
   await agent.definitions.get('ask_parent').execute({ message: '第一行\n是否保留 "中文" 标注？' }, { agent, concludeTurn: () => { concluded++; } });
@@ -161,7 +221,7 @@ test('cancel clears pending input and questions but retains the reusable session
   assert.equal(cancelled.pendingInputCleared, true);
   assert.equal(cancelled.running, true);
   assert.deepEqual(agent.inbox.nextTurn, []);
-  assert.deepEqual(f.disposed, []);
+  assert.deepEqual(f.disposed, [input.sessionId]);
   assert.equal(f.stored.has(input.sessionId), true);
   assert.equal(cancelled.questions[0].state, 'cancelled');
   await assert.rejects(host.managedAnswer({ ...input, message: '继续' }), error => error.controlCode === 'managed-task-closed');
@@ -187,6 +247,18 @@ test('cleanup failure keeps its record, retries release only once, and a lost su
   assert.equal((await host.managedDestroy(input)).alreadyDestroyed, true);
   // The injected deletion adapter records the exact native directory; it does not delete fixture files.
   assert.equal(path.basename(f.removed[0]), input.sessionId);
+});
+
+test('interrupted cleanup rebuilds its plan from the cold durable tree without resuming an agent', async () => {
+  const f = await fixture(), input = identity(f.workspace);
+  await f.create().managedCreate(input);
+  for (const record of f.records.values()) record.closing = true;
+  f.live.clear(); f.sessions.clear();
+  const restartedRoot = { get: f.ctx.get, agents: f.ctx.agents, sessions: f.ctx.sessions };
+  const result = await f.create(restartedRoot).managedDestroy(input);
+  assert.equal(result.destroyed, true);
+  assert.equal(f.creations.length, 1);
+  assert.equal(f.records.size, 0);
 });
 
 test('host restart resumes the same durable agent with its question, without a model turn', async () => {

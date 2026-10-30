@@ -20,28 +20,35 @@ async function fixture({ startWorker } = {}) {
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
   const store = new RosterStore(':memory:');
   const sessions = new Map();
-  const sends = [], notices = [], removed = [], workers = [];
+  const sends = [], notices = [], removed = [], workers = [], reads = [], cancellations = [], beginnings = [], historyRequests = [];
   let offline = false, notificationMode = 'ok', statusCalls = 0;
   const api = {
     async connectionIdentity() { if (offline) throw new Error('DSH offline'); return { application: 'dsh', dataRoot: path.join(stateDirectory, 'native') }; },
-    async hostStatus() { return { methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
+    async hostStatus() { return { treeProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId, { ...input, model: { provider: 'fixture', model: 'test' }, running: false, seq: 0, questions: [], changes: [], turns: new Map() });
       return { ...sessions.get(input.sessionId), modelRequestsStarted: 0 };
     },
     async managedBeginTask(input) {
+      assert.equal(input.treeProtocol, 1);
+      beginnings.push(input);
       const s = sessions.get(input.sessionId);
       if (s.taskId !== input.taskId) Object.assign(s, { taskId: input.taskId, questions: [], changes: [], cancelled: false });
-      return { taskId: s.taskId };
+      return { taskId: s.taskId, treeProtocol: 1 };
     },
     async managedStatus(input) {
+      assert.equal(input.treeProtocol, 1);
       statusCalls++;
       const s = sessions.get(input.sessionId);
       return { sessionId: s.sessionId, taskId: s.taskId, running: s.running, questions: s.questions,
-        changes: s.changes, coverage: 'files written by this agent', activity: s.running ? 'writing' : 'idle', throughSeq: s.seq };
+        changes: s.changes, coverage: 'files written by this agent', activity: s.running ? 'writing' : 'idle', throughSeq: s.seq,
+        tree: { settled: !s.running, running: s.running,
+          nodes: [{ sessionId: s.sessionId, parentSessionId: null, name: 'native root', status: s.running ? 'running' : 'idle',
+            activity: s.running ? 'writing' : 'idle', changes: s.changes, coverage: 'root writes' }, ...(s.descendants ?? [])], ...s.tree } };
     },
     async historyCursor(sessionId) { return { throughSeq: sessions.get(sessionId).seq }; },
     async readSession(sessionId) {
+      reads.push(sessionId);
       const s = sessions.get(sessionId), events = [];
       for (const [requestId, turn] of s.turns) {
         events.push({ seq: turn.afterSeq, type: 'turn/start', data: { turn: requestId } },
@@ -63,11 +70,21 @@ async function fixture({ startWorker } = {}) {
       return result;
     },
     async managedCancel(input) {
+      cancellations.push(input);
       const s = sessions.get(input.sessionId); s.running = false;
       s.questions.forEach(question => { question.state = 'cancelled'; });
       return { cancelled: true };
     },
-    async managedDestroy(input) { sessions.delete(input.sessionId); removed.push(input.sessionId); return { destroyed: true }; },
+    async managedDestroy(input) { assert.equal(input.treeProtocol, 1); sessions.delete(input.sessionId); removed.push(input.sessionId); return { destroyed: true }; },
+  };
+  // Shared native event fixture; managedHistory does not use the ordinary API
+  // method, which a running descendant is allowed to reject as agent-busy.
+  const nativeHistory = api.readSession;
+  api.managedHistory = async input => {
+    assert.equal(input.treeProtocol, 1);
+    historyRequests.push(input);
+    const page = await nativeHistory(input.targetSessionId);
+    return { events: page.records.map(record => record.event) };
   };
   const controlFactory = () => ({
     async models() { return { defaultModel: { provider: 'fixture', model: 'test' } }; },
@@ -107,7 +124,7 @@ async function fixture({ startWorker } = {}) {
     for (const [id, turn] of s.turns) if (turn.state !== 'ended') s.turns.set(id, { ...turn, state: 'ended', endSeq: s.seq,
       completionReason: { kind: 'completed' }, messages: [{ seq: s.seq - 1, role: 'assistant', text: reply }] });
   }
-  return { service, store, sessions, api, sends, notices, removed, workers, stateDirectory, record, finish,
+  return { service, store, sessions, api, sends, notices, removed, workers, reads, cancellations, beginnings, historyRequests, stateDirectory, record, finish,
     offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls };
 }
 
@@ -230,7 +247,7 @@ test('persistent agents reuse one session and retain earlier task changes', asyn
   assert.equal(f.record().state, 'idle');
   await f.service.send({ name: 'artist', message: 'second' }, extra(A));
   assert.equal(f.record().sessionId, id);
-  assert.deepEqual((await f.service.changes({ name: 'artist', task: 1 }, extra(A))).changes, [{ path: 'first.svg', operation: 'write' }]);
+  assert.deepEqual((await f.service.changes({ name: 'artist', task: 1 }, extra(A))).changes, [{ path: 'first.svg', operation: 'write', agentPath: ['artist'] }]);
   assert.equal(f.removed.length, 0);
   f.service.close();
 });
@@ -344,4 +361,221 @@ test('list and automatic result notices include file summaries, never file bodie
   assert.ok(!f.notices.at(-1).prompt.includes('private full file body'));
   assert.equal((await f.service.changes({ name: 'artist' }, extra(A))).changes[0].after, '<svg>private full file body</svg>');
   f.service.close();
+});
+
+
+test('one-shot waits for descendants, result notifications and the final root summary before delivery', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'Delegate a design tree' }, extra(A));
+    const r = f.record(), s = f.sessions.get(r.sessionId);
+    const child = { sessionId: 'native-child', parentSessionId: r.sessionId, name: 'designer', status: 'running',
+      changes: [{ path: 'design.svg', operation: 'write' }], coverage: 'child writes' };
+    s.descendants = [child]; s.tree = { settled: false, running: true, rootSummary: { ready: false } };
+    f.finish('artist', 'Initial root turn, not the final summary');
+    await f.service.poll(r.agentId);
+    assert.equal(f.record().state, 'running');
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.removed.length, 0);
+    child.status = 'idle'; s.tree.running = false;
+    await f.service.poll(r.agentId); // Children idle, but native notifications have not settled.
+    assert.equal(f.notices.length, 0);
+    s.tree.settled = true;
+    await f.service.poll(r.agentId); // Settled tree, but root summary still unverified.
+    assert.equal(f.record().state, 'running');
+    assert.equal(f.notices.length, 0);
+    const summary = '汇总'.repeat(5000) + '完整收尾';
+    s.tree.rootSummary = { ready: true, reply: summary, state: 'completed' };
+    await f.service.poll(r.agentId);
+    assert.equal(f.record(), undefined);
+    assert.ok(f.notices[0].prompt.includes(summary));
+    assert.ok(!f.notices[0].prompt.includes('Initial root turn'));
+    assert.ok(f.notices[0].prompt.includes('designer'));
+    assert.equal(f.removed.filter(item => item === r.sessionId).length, 1);
+  } finally { f.service.close(); }
+});
+
+test('tree inspection and file attribution follow only this root lineage without exposing native IDs', async () => {
+  const f = await fixture();
+  try {
+    for (const thread of [A, B]) await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(thread));
+    await f.service.send({ name: 'artist', message: 'Build a nested tree' }, extra(A));
+    const r = f.record(), s = f.sessions.get(r.sessionId), foreign = f.record('artist', B);
+    s.changes = [{ path: 'root.md', operation: 'write' }];
+    s.descendants = [
+      { sessionId: 'native-child', parentSessionId: r.sessionId, name: 'designer', status: 'running', changes: [{ path: 'design.svg', operation: 'create', after: 'private body' }], coverage: 'child scope' },
+      { sessionId: 'native-grandchild', parentSessionId: 'native-child', name: 'reviewer', status: 'idle', changes: [{ path: 'review.md', operation: 'write' }], coverage: 'grandchild scope' },
+      { sessionId: foreign.sessionId, parentSessionId: null, name: 'foreign chat', status: 'running', changes: [{ path: 'foreign-secret.md', operation: 'write' }] },
+    ];
+    for (const [id, text] of [['native-child', 'Child work'], ['native-grandchild', 'Grandchild review']]) {
+      f.sessions.set(id, { sessionId: id, turns: new Map([['native-turn', { afterSeq: 0, state: 'ended', endSeq: 2,
+        messages: [{ seq: 1, text }] }]]) });
+    }
+    const changes = await f.service.changes({ name: 'artist' }, extra(A));
+    assert.deepEqual(changes.changes.map(item => item.agentPath), [['artist'], ['artist', 'designer'], ['artist', 'designer', 'reviewer']]);
+    const list = await f.service.list(extra(A));
+    assert.deepEqual(list.items[0].tree.nodes.map(node => node.depth), [0, 1, 2]);
+    assert.ok(!JSON.stringify(list).includes('private body'));
+    const inspected = await f.service.inspect({ name: 'artist' }, extra(A));
+    assert.equal(inspected.tree.nodes[1].messages[0].text, 'Child work');
+    assert.equal(inspected.tree.nodes[2].messages[0].text, 'Grandchild review');
+    const visible = JSON.stringify([list, changes, inspected]);
+    for (const hidden of ['native-child', 'native-grandchild', foreign.sessionId, 'foreign-secret.md', 'foreign chat']) assert.ok(!visible.includes(hidden));
+    assert.ok(!f.reads.includes(foreign.sessionId));
+    assert.equal((await f.service.list(extra(B))).items[0].tree.nodes.length, 0);
+  } finally { f.service.close(); }
+});
+
+test('tree cancellation cannot complete or clean up while a descendant is still running', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'Tree to cancel' }, extra(A));
+    const r = f.record(), s = f.sessions.get(r.sessionId);
+    s.descendants = [{ sessionId: 'native-child', parentSessionId: r.sessionId, name: 'child', status: 'running', changes: [] }];
+    s.tree = { settled: false, running: true };
+    await f.service.cancel({ name: 'artist' }, extra(A));
+    await f.service.poll(r.agentId);
+    assert.equal(f.record().state, 'running');
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.removed.length, 0);
+    assert.equal(f.cancellations[0].sessionId, r.sessionId);
+    s.descendants[0].status = 'idle'; s.tree = { settled: true, running: false };
+    await f.service.poll(r.agentId);
+    assert.equal(f.record(), undefined);
+    assert.match(f.notices[0].prompt, /已取消/);
+    assert.equal(f.removed.filter(item => item === r.sessionId).length, 1);
+  } finally { f.service.close(); }
+});
+
+
+test('tree protocol negotiation blocks an old host and a new task cannot lose its tree snapshot', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    const hostStatus = f.api.hostStatus;
+    f.api.hostStatus = async () => { const status = await hostStatus(); delete status.treeProtocol; return status; };
+    const unavailable = await f.service.status(extra(A));
+    assert.equal(unavailable.dshConnected, true);
+    assert.equal(unavailable.ready, false);
+    assert.equal(unavailable.hostError.code, 'tree-protocol-required');
+    const blocked = await f.service.send({ name: 'artist', message: 'Do not start on an old host' }, extra(A));
+    assert.equal(blocked.accepted, false);
+    assert.equal(blocked.error.code, 'tree-protocol-required');
+    assert.equal(f.sends.length, 0);
+    f.api.hostStatus = hostStatus;
+    await f.service.poll(f.record().agentId); // Resume the same saved task after the bridge upgrades.
+    assert.equal(f.record().task.treeProtocol, 1);
+    assert.equal(f.sends.length, 1);
+    const managedStatus = f.api.managedStatus;
+    f.api.managedStatus = async input => { const status = await managedStatus(input); delete status.tree; return status; };
+    f.finish();
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.record().error.code, 'tree-protocol-required');
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.removed.length, 0);
+  } finally { f.service.close(); }
+});
+
+test('a historical completed single-agent result without tree fields remains deliverable offline', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    const r = f.record();
+    r.state = 'delivery_pending';
+    r.task = { taskId: 'historical-task', message: 'Old leaf work', state: 'completed', dispatches: [], answers: [],
+      result: { state: 'completed', reply: 'Historical verified answer', changes: [], coverage: 'old leaf scope' },
+      delivery: { state: 'pending' } };
+    f.store.save(r);
+    // Persistent leaf delivery can complete with DSH unavailable; use persistent
+    // here so native cleanup does not need a live host.
+    r.lifetime = 'persistent'; f.store.save(r);
+    const observed = f.statusCalls();
+    f.offline(true);
+    await f.service.poll(r.agentId);
+    assert.equal(f.record().state, 'idle');
+    assert.equal(f.statusCalls(), observed);
+    assert.ok(f.notices[0].prompt.includes('Historical verified answer'));
+  } finally { f.service.close(); }
+});
+
+
+test('a new caller adopts the exact old in-flight task without resending its prompt', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'Existing in-flight work' }, extra(A));
+    const old = f.record();
+    delete old.task.treeProtocol;
+    f.store.save(old);
+    const requestId = old.task.dispatches[0].requestId;
+    const baseline = old.task.dispatches[0].afterSeq;
+    await f.service.poll(old.agentId);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.beginnings.length, 2);
+    assert.equal(f.beginnings[1].taskId, old.task.taskId);
+    assert.equal(f.beginnings[1].taskStartSeq, baseline);
+    assert.equal(f.beginnings[1].treeProtocol, 1);
+    assert.equal(f.record().task.dispatches[0].requestId, requestId);
+    assert.equal(f.record().task.treeProtocol, 1);
+  } finally { f.service.close(); }
+});
+
+
+test('a failed final summary turn overrides an earlier completed root dispatch', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'Nested task' }, extra(A));
+    const r = f.record(), s = f.sessions.get(r.sessionId);
+    s.descendants = [{ sessionId: 'native-child', parentSessionId: r.sessionId, name: 'child', status: 'idle', changes: [] }];
+    f.finish('artist', 'Initial root completed');
+    s.tree = { settled: true, running: false, rootSummary: { ready: true, reply: '', state: 'failed' } };
+    await f.service.poll(r.agentId);
+    assert.equal(f.record().task.result.state, 'failed');
+    assert.equal(f.record().task.result.reply, '');
+    assert.match(f.notices[0].prompt, /任务失败/);
+    assert.ok(!f.notices[0].prompt.includes('Initial root completed'));
+  } finally { f.service.close(); }
+});
+
+
+test('managed inspection keeps empty history distinct from denial without starting a task or using ordinary history', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const r = f.record(), s = f.sessions.get(r.sessionId);
+    s.tree = { nodes: [], settled: false, running: false };
+    let ordinaryReads = 0;
+    f.api.readSession = async () => { ordinaryReads++; throw Object.assign(new Error('session/agent-busy'), { code: 'session/agent-busy' }); };
+    const empty = await f.service.inspect({ name: 'artist' }, extra(A));
+    assert.deepEqual(empty.messages, []);
+    assert.match(empty.note, /No completed text/);
+    assert.equal(empty.inspectionIncomplete, false);
+    assert.equal(f.historyRequests[0].targetSessionId, r.sessionId);
+    assert.equal(f.beginnings.length, 0);
+    assert.equal(f.sends.length, 0);
+    assert.equal(f.record().task, undefined);
+    delete s.tree;
+    s.descendants = [{ sessionId: 'native-child', parentSessionId: r.sessionId, name: 'child', status: 'running', changes: [] }];
+    f.api.managedHistory = async input => {
+      if (input.targetSessionId !== r.sessionId) throw Object.assign(new Error('The requested history is outside the authorized tree.'), { code: 'managed-history-forbidden' });
+      return { events: [1, 2, 3].map(seq => ({ seq, type: 'assistant/message', data: { content: [{ type: 'text', text: 'message-' + seq }, { type: 'reasoning', text: 'hidden reasoning' }] } })) };
+    };
+    const partial = await f.service.inspect({ name: 'artist', maxMessages: 1 }, extra(A));
+    assert.deepEqual(partial.messages.map(message => message.text), ['message-3']);
+    assert.equal(partial.hasMore, true);
+    assert.equal(partial.inspectionIncomplete, true);
+    assert.equal(partial.tree.nodes[1].error.code, 'managed-history-forbidden');
+    assert.equal(partial.tree.nodes[1].messages, undefined, 'denial is not an empty history');
+    assert.ok(!JSON.stringify(partial).includes('hidden reasoning'));
+    f.api.managedHistory = async () => ({});
+    const malformed = await f.service.inspect({ name: 'artist' }, extra(A));
+    assert.equal(malformed.error.code, 'invalid-response');
+    assert.equal(malformed.messages, undefined);
+    assert.equal(ordinaryReads, 0);
+    assert.equal(f.beginnings.length, 0);
+    assert.equal(f.sends.length, 0);
+  } finally { f.service.close(); }
 });

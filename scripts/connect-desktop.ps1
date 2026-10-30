@@ -2,20 +2,25 @@
 param(
     [string]$DshCli,
     [string]$DataRoot,
-    [string]$Config
+    [string]$Config,
+    [switch]$Rebind
 )
 $ErrorActionPreference = 'Stop'
 $source = Split-Path -Parent $PSScriptRoot
 if (-not $DshCli) { $DshCli = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd' }
 if (-not (Test-Path -LiteralPath $DshCli)) { throw 'Cannot find the desktop DSH CLI. Supply -DshCli with its absolute path.' }
-if (-not $DataRoot) { $DataRoot = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' } }
+$node = (Get-Command node -ErrorAction Stop).Source
+$cli = Join-Path $source 'src\cli.mjs'
+$configArgs = if ($Config) { @('--config', $Config) } else { @() }
+$selected = (& $node $cli desktop-config @configArgs | Out-String | ConvertFrom-Json)
+if ($LASTEXITCODE -ne 0 -or -not $selected.dataRoot) { throw 'Cannot resolve the DSH data directory from the selected configuration.' }
+if ($DataRoot -and [IO.Path]::GetFullPath($DataRoot).TrimEnd('\') -ine [IO.Path]::GetFullPath([string]$selected.dataRoot).TrimEnd('\')) { throw 'DataRoot differs from the selected configuration. Select a matching configuration.' }
+$DataRoot = [string]$selected.dataRoot
 $profileDirectory = Join-Path $DataRoot 'profiles\desktop'
 $manifestFile = Join-Path $profileDirectory 'package.json'
 $manifest = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json
 $plugin = Join-Path $source 'dsh-plugin'
-$node = (Get-Command node -ErrorAction Stop).Source
-$cli = Join-Path $source 'src\cli.mjs'
-$configArgs = if ($Config) { @('--config', $Config) } else { @() }
+$bindArgs = if ($Rebind) { @('--rebind') } else { @() }
 if (-not $manifest.dependencies.'dsh-control-discovery') {
     $controlRoot = if ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME 'futureaide-control' } else { Join-Path $env:USERPROFILE '.codex\futureaide-control' }
     $backup = Join-Path $controlRoot ('rollback\desktop-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
@@ -34,7 +39,7 @@ if (-not $manifest.dependencies.'dsh-control-discovery') {
 $previousControlDshHome = $env:DSH_HOME
 try {
 $env:DSH_HOME = $DataRoot
-& $node $cli desktop-host-install @configArgs --host-profile-directory $profileDirectory
+& $node $cli desktop-host-install @configArgs @bindArgs --host-profile-directory $profileDirectory
 if ($LASTEXITCODE -ne 0) { throw 'Desktop capability bridge installation failed.' }
 # Allow the native profile watcher to reconcile the owned row before connect;
 # otherwise the old compatibility bootstrap would create an unnecessary session.
@@ -47,7 +52,7 @@ for ($attempt = 0; $attempt -lt 10; $attempt++) {
 if (-not $bridgeReady) {
     # A failed Loader fiber with the same identity may survive a normal reinstall.
     # Refresh only our owned row once; this never creates a session or sends a prompt.
-    & $node $cli desktop-host-install @configArgs --host-profile-directory $profileDirectory --refresh
+    & $node $cli desktop-host-install @configArgs @bindArgs --host-profile-directory $profileDirectory --refresh
     if ($LASTEXITCODE -ne 0) { throw 'Desktop capability bridge refresh failed.' }
     for ($attempt = 0; $attempt -lt 10; $attempt++) {
         & $node $cli host-status @configArgs 2>$null | Out-Null

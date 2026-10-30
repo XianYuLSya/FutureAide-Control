@@ -38,6 +38,28 @@ test('duplicate writes reuse the receipt and conflicting contents are rejected',
   await assert.rejects(control.send({ message: 'different', requestId: 'work-1' }), /different content/);
 });
 
+test('only an unsuppressed agent dispatch asks the watcher to auto-archive its session', async t => {
+  const workspace = await mkdtemp(path.join(root, '.auto-archive-args-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const launches = [];
+  const client = {
+    listSessions: async () => ({ items: [{ sessionId: 'parent', cwd: workspace, projections: { asOfSeq: 0 } }] }),
+    sendMessage: async () => ({ accepted: true }),
+  };
+  const control = createControl({ workspace, stateDirectory: path.join(workspace, 'state') }, {
+    client, startWorker: args => { launches.push(args); return { pid: 1 }; },
+  });
+  await control.send({ sessionId: 'parent', message: 'plain', requestId: 'plain', background: true });
+  await control.send({ sessionId: 'parent', message: 'agent', requestId: 'agent', background: true,
+    agentId: 'agent-0123456789abcdef0123456789abcdef', archive: true });
+  await control.send({ sessionId: 'parent', message: 'peer', requestId: 'peer', background: true,
+    agentId: 'agent-0123456789abcdef0123456789abcdef', archive: true, suppressCallback: true });
+  assert.equal(launches.length, 3);
+  assert.ok(!launches[0].includes('--auto-archive'), 'a low-level ordinary send never archives its session');
+  assert.ok(launches[1].includes('--auto-archive'), 'an agent dispatch closes only its own finished session');
+  assert.ok(!launches[2].includes('--auto-archive'), 'a peer-suppressed dispatch leaves finalization to the peer lifecycle');
+});
+
 test('a repeated request cannot be delivered to a different discovered instance', async t => {
   const workspace = await mkdtemp(path.join(root, '.identity-test-'));
   t.after(() => rm(workspace, { recursive: true, force: true }));
@@ -125,8 +147,63 @@ test('wait reports a still-running turn and revalidates its inputs', async t => 
   assert.equal(result.state, 'running');
   assert.equal(result.afterSeq, 3);
   assert.match(result.nextAction, /futureaide_wait/);
+  assert.match(result.nextAction, /running, which is not completion/);
+  assert.match(result.nextAction, /until the state is terminal \(completed, cancelled or failed\) or you are genuinely blocked/);
+  assert.doesNotMatch(result.nextAction, /do NOT block|Monitor|stop waiting/i);
   await assert.rejects(control.wait({ timeoutSeconds: 601 }), /timeout_seconds/);
   await assert.rejects(control.wait({ pollIntervalMs: 10 }), /poll_interval_ms/);
+});
+
+test('send reports whether a chat callback is bound and never promises an automatic wakeup', async t => {
+  const workspace = await mkdtemp(path.join(root, '.send-callback-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const thread = '55555555-5555-4555-8555-555555555555';
+  const clients = [];
+  const client = () => {
+    const stub = {
+      listSessions: async () => ({ items: [{ sessionId: 'parent', cwd: workspace, running: true, projections: { asOfSeq: 5 } }] }),
+      readSession: async () => ({ records: [{ type: 'event', event: { type: 'step/start', seq: 6, time: 0 } }], hasMore: false }),
+      sendMessage: async () => ({ accepted: true }),
+    };
+    clients.push(stub);
+    return stub;
+  };
+  const makeControl = async config => {
+    const spawned = [];
+    const control = createControl({ workspace, stateDirectory: path.join(workspace, 'state'), futureaideSessionId: 'parent', ...config },
+      { client: client(), startWorker: args => { spawned.push(args); return { pid: 4242 }; } });
+    return { control, spawned };
+  };
+
+  const unbound = await makeControl({});
+  const plain = await unbound.control.send({ message: 'work', requestId: 'unbound', background: true });
+  assert.equal(plain.accepted, true);
+  assert.equal(plain.watching, true);
+  assert.equal(plain.watcherPid, 4242);
+  assert.equal(plain.callbackConfigured, false);
+  assert.equal(plain.callbackStatus, 'not_configured');
+  assert.equal(plain.callbackTarget, undefined);
+  assert.equal(plain.reportFile, path.join(workspace, 'state', 'reports', 'parent.unbound.json'));
+  assert.equal(unbound.spawned[0].includes('--codex-thread-id'), false);
+  assert.match(plain.next, /is not a (chat )?notification/);
+  assert.match(plain.next, /45 seconds or less/);
+
+  const bound = await makeControl({ codexThreadId: thread });
+  const targeted = await bound.control.send({ message: 'work', requestId: 'bound', background: true });
+  assert.equal(targeted.callbackConfigured, true);
+  assert.equal(targeted.callbackStatus, 'configured');
+  assert.equal(targeted.callbackTarget, thread);
+  assert.equal(bound.spawned[0][bound.spawned[0].indexOf('--codex-thread-id') + 1], thread);
+
+  // A connection-level target that is not a UUID must not block an authorized send; the watcher
+  // records the failed notice instead of losing the completion.
+  const broken = await makeControl({ codexThreadId: 'not-a-uuid' });
+  const degraded = await broken.control.send({ message: 'work', requestId: 'broken', background: true });
+  assert.equal(degraded.accepted, true);
+  assert.equal(degraded.callbackStatus, 'invalid_target');
+  assert.equal(degraded.callbackConfigured, false);
+  await assert.rejects(broken.control.send({ message: 'work', requestId: 'explicit', background: true, codexThreadId: 'not-a-uuid' }), /Codex task UUID/);
+  assert.equal(broken.spawned.length, 1);
 });
 
 test('watch stores the finished reply without claiming automatic chat delivery', async t => {
@@ -160,7 +237,7 @@ test('the actual MCP transport exposes and calls the scoped read tools', async t
   await client.connect(clientTransport);
   t.after(async () => { await client.close(); await server.close(); });
   const tools = (await client.listTools()).tools;
-  assert.equal(tools.length, 21);
+  assert.equal(tools.length, 29);
   assert.equal(tools.find(tool => tool.name === 'futureaide_connect').annotations.readOnlyHint, false);
   assert.equal(tools.find(tool => tool.name === 'futureaide_wait').annotations.readOnlyHint, true);
   assert.equal(tools.find(tool => tool.name === 'futureaide_watch').annotations.readOnlyHint, true);

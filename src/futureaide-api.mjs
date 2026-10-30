@@ -464,7 +464,8 @@ export class FutureAideClient {
           const rawCode = envelope.result.error?.code;
           const token = instance.launchUrl ? new URL(instance.launchUrl).searchParams.get('token') : undefined;
           const privateValues = [token, cookie, cookie?.slice(cookie.indexOf('=') + 1), channel === 'futureaide-control' ? args.token : undefined].filter(Boolean);
-          const code = typeof rawCode === 'string' && /^[a-z][a-z0-9-]{0,79}$/.test(rawCode)
+          const code = typeof rawCode === 'string' && rawCode.length <= 80
+            && /^[a-z][a-z0-9-]*(?:\/[a-z][a-z0-9-]*)*$/.test(rawCode)
             && !privateValues.some(secret => rawCode.includes(secret)) ? rawCode : 'rpc-error';
           // Remote errors may echo request data. Return the stable code, never that text.
           fail(code, `FutureAide rejected ${endpoint} (${code}).`);
@@ -608,17 +609,76 @@ export class FutureAideClient {
     const workspace = value?.workspace;
     if (!workspace || typeof workspace.workspaceId !== 'string' || typeof workspace.path !== 'string' || !samePath(workspace.path, cwd)
       || !Array.isArray(workspace.sessionIds)) fail('invalid-response', 'The host did not confirm the requested project.', { uncertain: true });
-    return workspace;
+    return { workspace, created: value?.created === true };
   }
 
-  async createProjectSession({ sessionId, cwd, agentPreset }) {
+  /**
+   * Resolve one native Workspace for an existing directory and, only when the caller explicitly
+   * names it, rename that project. The native create already reuses a Workspace registered for the
+   * same canonical path, so a shared project keeps its identity and title unless a name is supplied.
+   * @param {string} cwd Absolute project root.
+   * @param {{projectName?: string}} [options] Explicit user-visible project title.
+   * @returns {Promise<{workspaceId: string, path: string, title: string, created: boolean, renamed: boolean}>}
+   */
+  async ensureProject(cwd, { projectName } = {}) {
+    if (typeof cwd !== 'string' || !isAbsolute(cwd)) fail('invalid-input', 'An absolute project directory is required.');
+    if (projectName !== undefined && (typeof projectName !== 'string' || !projectName.trim() || projectName.length > 200)) {
+      fail('invalid-input', 'projectName must be a nonempty string of at most 200 characters.');
+    }
+    if (this.#dialect === undefined) await this.listSessions();
+    const expectedInstance = this.#instance;
+    const resolved = await this.#workspaceForPath(cwd, expectedInstance);
+    let workspace = resolved.workspace;
+    const created = resolved.created;
+    let renamed = false;
+    if (projectName !== undefined && workspace.title !== projectName.trim()) {
+      const renamedValue = await this.#rpc('workspace/rename', {
+        request: { workspaceId: workspace.workspaceId, title: projectName.trim() },
+      }, { write: true, expectedInstance });
+      const renamedWorkspace = renamedValue.value?.workspace;
+      if (!renamedWorkspace || renamedWorkspace.workspaceId !== workspace.workspaceId
+        || typeof renamedWorkspace.title !== 'string' || renamedWorkspace.title !== projectName.trim()) {
+        fail('invalid-response', 'The host did not confirm the project rename.', { uncertain: true });
+      }
+      workspace = renamedWorkspace;
+      renamed = true;
+    }
+    return { workspaceId: workspace.workspaceId, path: workspace.path, title: workspace.title, created, renamed };
+  }
+
+  async createProjectSession({ sessionId, cwd, agentPreset, projectName }) {
     await this.listSessions();
     const expectedInstance = this.#instance;
-    const workspace = await this.#workspaceForPath(cwd, expectedInstance);
-    const result = await this.createSession({ sessionId, agentPreset, workspaceId: workspace.workspaceId });
-    const confirmed = await this.#workspaceForPath(cwd, expectedInstance);
+    const project = await this.ensureProject(cwd, { projectName });
+    const result = await this.createSession({ sessionId, agentPreset, workspaceId: project.workspaceId });
+    const confirmed = (await this.#workspaceForPath(cwd, expectedInstance)).workspace;
     if (!confirmed.sessionIds.includes(sessionId)) fail('workspace-attach-failed', 'The session exists but was not confirmed in the project list.', { uncertain: true });
-    return { ...result, workspaceId: workspace.workspaceId, workspaceTitle: workspace.title, projectVisible: true };
+    return { ...result, workspaceId: project.workspaceId, workspaceTitle: project.title,
+      projectVisible: true, projectCreated: project.created, projectRenamed: project.renamed };
+  }
+
+  /** Archive exactly one session in native Workspace navigation; never a Workspace or project. */
+  async archiveSession(sessionId) {
+    validId(sessionId);
+    if (this.#dialect === undefined) await this.listSessions();
+    const expectedInstance = this.#instance;
+    const { value } = await this.#rpc('workspace/archiveSession', { request: { sessionId } }, { write: true, expectedInstance });
+    if (!Array.isArray(value?.archivedSessionIds) || !value.archivedSessionIds.includes(sessionId)) {
+      fail('invalid-response', 'The host did not confirm the session archive.', { uncertain: true });
+    }
+    return { accepted: true, sessionId, archived: true, archivedSessionIds: value.archivedSessionIds };
+  }
+
+  /** Restore exactly one archived session so a later followup can run the original conversation. */
+  async unarchiveSession(sessionId) {
+    validId(sessionId);
+    if (this.#dialect === undefined) await this.listSessions();
+    const expectedInstance = this.#instance;
+    const { value } = await this.#rpc('workspace/unarchiveSession', { request: { sessionId } }, { write: true, expectedInstance });
+    if (!Array.isArray(value?.archivedSessionIds) || value.archivedSessionIds.includes(sessionId)) {
+      fail('invalid-response', 'The host did not confirm the session restore.', { uncertain: true });
+    }
+    return { accepted: true, sessionId, archived: false, archivedSessionIds: value.archivedSessionIds };
   }
 
   async attachSessionToWorkspace(sessionId, cwd) {
@@ -628,14 +688,14 @@ export class FutureAideClient {
       fail('workspace-mismatch', 'Only an ordinary session in this exact project can be attached.');
     }
     const expectedInstance = this.#instance;
-    const workspace = await this.#workspaceForPath(cwd, expectedInstance);
+    const workspace = (await this.#workspaceForPath(cwd, expectedInstance)).workspace;
     if (!workspace.sessionIds.includes(sessionId)) {
       // Native create explicitly adopts an existing identity and accounts it
       // to workspaceId. It submits no model prompt and preserves the session.
       const { value } = await this.#rpc('session/create', { request: { sessionId, workspaceId: workspace.workspaceId } }, { write: true, expectedInstance });
       if (value?.sessionId !== sessionId) fail('invalid-response', 'The host did not confirm the attached session.', { uncertain: true });
     }
-    const confirmed = await this.#workspaceForPath(cwd, expectedInstance);
+    const confirmed = (await this.#workspaceForPath(cwd, expectedInstance)).workspace;
     if (!confirmed.sessionIds.includes(sessionId)) fail('workspace-attach-failed', 'The session was not confirmed in the project list.', { uncertain: true });
     return { accepted: true, sessionId, workspaceId: workspace.workspaceId, workspaceTitle: workspace.title, projectVisible: true, modelRequestsStarted: 0 };
   }
@@ -650,6 +710,23 @@ export class FutureAideClient {
   }
 
   async hostStatus() { return this.#hostCall('ping', {}); }
+
+  async #managedCall(method, input, write) {
+    validId(input?.ownerId, 'ownerId');
+    validId(input?.agentId, 'agentId');
+    if (input.sessionId !== undefined) validId(input.sessionId);
+    if (input.taskId !== undefined) validId(input.taskId, 'taskId');
+    const expectedInstance = await this.#discover();
+    return this.#hostCall(method, input, { write, expectedInstance });
+  }
+
+  /** Managed identities are internal to one caller's roster, never model-entered addresses. */
+  async managedCreate(input) { return this.#managedCall('managedCreate', input, true); }
+  async managedBeginTask(input) { return this.#managedCall('managedBeginTask', input, true); }
+  async managedStatus(input) { return this.#managedCall('managedStatus', input, false); }
+  async managedAnswer(input) { return this.#managedCall('managedAnswer', input, true); }
+  async managedCancel(input) { return this.#managedCall('managedCancel', input, true); }
+  async managedDestroy(input) { return this.#managedCall('managedDestroy', input, true); }
 
   async historyCursor(sessionId, workspace) {
     validId(sessionId);

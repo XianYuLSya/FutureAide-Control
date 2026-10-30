@@ -24,7 +24,12 @@ export async function readDispatch(api, sessionId, { workspace, requestId, after
   let boundary = dispatchBoundary(records, afterSeq, requestId);
   while (requestId && (!boundary.matched || !boundary.hasStart) && page.hasMore) {
     const first = records.find(record => Number.isSafeInteger(record.event?.seq))?.event.seq;
-    if (!Number.isSafeInteger(first) || first <= afterSeq + 1) break;
+    if (!Number.isSafeInteger(first) || first < 1) break;
+    // A steer message belongs to a turn that may have started well before the send cursor. Once
+    // its marker is matched, keep paging backwards for that turn's start even below afterSeq; the
+    // baseline floor only protects the still-unmatched case from adopting an unrelated turn.
+    const needsStart = boundary.matched && !boundary.hasStart;
+    if (!needsStart && first <= afterSeq + 1) break;
     page = await api.readSession(sessionId, { workspace, maxMessages, throughSeq: first - 1 });
     const fresh = page.records.filter(record => record.event?.seq < first);
     if (!fresh.length) break;

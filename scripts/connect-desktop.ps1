@@ -44,7 +44,18 @@ for ($attempt = 0; $attempt -lt 10; $attempt++) {
     if ($LASTEXITCODE -eq 0) { $bridgeReady = $true; break }
     Start-Sleep -Seconds 1
 }
-if (-not $bridgeReady) { throw 'The desktop host has not loaded the bridge. Check its plugin panel; no application was restarted.' }
+if (-not $bridgeReady) {
+    # A failed Loader fiber with the same identity may survive a normal reinstall.
+    # Refresh only our owned row once; this never creates a session or sends a prompt.
+    & $node $cli desktop-host-install @configArgs --host-profile-directory $profileDirectory --refresh
+    if ($LASTEXITCODE -ne 0) { throw 'Desktop capability bridge refresh failed.' }
+    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+        & $node $cli host-status @configArgs 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { $bridgeReady = $true; break }
+        Start-Sleep -Seconds 1
+    }
+}
+if (-not $bridgeReady) { throw 'The desktop host has not loaded the bridge after one owned-row refresh. Check its plugin panel; no application was restarted.' }
 & $node $cli connect @configArgs --request-id ('desktop-connect-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 if ($LASTEXITCODE -ne 0) { throw 'The host has not loaded the bridge. Check the DSH plugin panel; no application was restarted.' }
 } finally { $env:DSH_HOME = $previousControlDshHome }

@@ -165,8 +165,8 @@ async function mcpFixture(t) {
 test('MCP exposes optional per-call profiles on every existing tool with preserved read-only annotations', async t => {
   const f = await mcpFixture(t);
   const tools = (await f.client.listTools()).tools;
-  assert.equal(tools.length, 21);
-  for (const tool of tools.filter(tool => !['futureaide_profiles', 'futureaide_profile_create'].includes(tool.name) && !tool.name.endsWith('_agent') && tool.name !== 'futureaide_list_agents')) {
+  assert.equal(tools.length, 29);
+  for (const tool of tools.filter(tool => !['futureaide_profiles', 'futureaide_profile_create'].includes(tool.name) && !tool.name.endsWith('_agent') && tool.name !== 'futureaide_list_agents' && !/_(peer|peers|exchange|inbox)$/.test(tool.name))) {
     assert.ok(tool.inputSchema.properties.profile);
     assert.ok(!tool.inputSchema.required?.includes('profile'));
   }

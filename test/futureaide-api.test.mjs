@@ -23,7 +23,7 @@ const ordinary = {
 };
 
 async function fixture(t, options = {}) {
-  const state = { calls: [], exchanges: 0, token: 'fixture-launch-token', cookie: 'dsh-auth-fixture=fixture-session-cookie', projectSessions: [] };
+  const state = { calls: [], exchanges: 0, token: 'fixture-launch-token', cookie: 'dsh-auth-fixture=fixture-session-cookie', projectSessions: [], archived: [], projectTitle: 'Fixture' };
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://127.0.0.1');
@@ -47,7 +47,25 @@ async function fixture(t, options = {}) {
         case 'session/page': value = { records: [{ type: 'event', event: { type: 'assistant/message', seq: 123, data: { content: [{ type: 'text', text: 'Actual reply' }] } } }], hasMore: true }; break;
         case 'session/prompt': case 'session/cancel': value = { accepted: true }; break;
         case 'session/modelCatalog': value = { default: { provider: 'fixture', model: 'fixture-model' }, groups: [] }; break;
-        case 'workspace/create': value = { created: false, workspace: { workspaceId: 'workspace-fixture', path: ordinary.cwd, title: 'Fixture', sessionIds: state.projectSessions } }; break;
+        case 'workspace/create': value = { created: false, workspace: { workspaceId: 'workspace-fixture', path: ordinary.cwd, title: state.projectTitle, sessionIds: state.projectSessions } }; break;
+        case 'workspace/rename': {
+          const request = body.payload.args.request;
+          state.projectTitle = request.title;
+          value = { workspace: { workspaceId: request.workspaceId, path: ordinary.cwd, title: request.title, sessionIds: state.projectSessions } };
+          break;
+        }
+        case 'workspace/archiveSession': {
+          const request = body.payload.args.request;
+          if (!state.archived.includes(request.sessionId)) state.archived.push(request.sessionId);
+          value = { archivedSessionIds: [...state.archived] };
+          break;
+        }
+        case 'workspace/unarchiveSession': {
+          const request = body.payload.args.request;
+          state.archived = state.archived.filter(id => id !== request.sessionId);
+          value = { archivedSessionIds: [...state.archived] };
+          break;
+        }
         case 'session/create': {
           const request = body.payload.args.request;
           if (request.workspaceId && !options.skipAttach) state.projectSessions.push(request.sessionId);
@@ -126,6 +144,71 @@ test('ordinary project creation uses workspaceId and verifies sidebar membership
   assert.equal(creation.cwd, undefined);
   assert.equal(f.state.calls.filter(call => call.body.method === 'workspace/create').length, 2);
   assert.ok(!f.state.calls.some(call => call.body.method === 'session/prompt'));
+});
+
+test('ensureProject reuses the native workspace for the same path and renames only on an explicit name', async t => {
+  const f = await fixture(t);
+  const reused = await f.client.ensureProject(ordinary.cwd);
+  assert.deepEqual(reused, { workspaceId: 'workspace-fixture', path: ordinary.cwd, title: 'Fixture', created: false, renamed: false });
+  assert.deepEqual(f.state.calls.map(call => call.body.method), ['session/list', 'workspace/create']);
+  assert.ok(!f.state.calls.some(call => call.body.method === 'workspace/rename'));
+
+  const renamed = await f.client.ensureProject(ordinary.cwd, { projectName: 'Shared Project' });
+  assert.equal(renamed.title, 'Shared Project');
+  assert.equal(renamed.renamed, true);
+  const rename = f.state.calls.find(call => call.body.method === 'workspace/rename');
+  assert.deepEqual(rename.body.payload.args.request, { workspaceId: 'workspace-fixture', title: 'Shared Project' });
+  // Repeating the same explicit title is a no-op; a shared project is not renamed again.
+  const calls = f.state.calls.length;
+  const same = await f.client.ensureProject(ordinary.cwd, { projectName: 'Shared Project' });
+  assert.equal(same.renamed, false);
+  assert.equal(f.state.calls.filter(call => call.body.method === 'workspace/rename').length, 1);
+  assert.ok(f.state.calls.length > calls);
+});
+
+test('archive and unarchive address exactly one session id and confirm the native set', async t => {
+  const f = await fixture(t);
+  const archived = await f.client.archiveSession('session-parent');
+  assert.equal(archived.accepted, true);
+  assert.equal(archived.archived, true);
+  assert.deepEqual(archived.archivedSessionIds, ['session-parent']);
+  const archiveCall = f.state.calls.find(call => call.body.method === 'workspace/archiveSession');
+  assert.deepEqual(archiveCall.body.payload.args.request, { sessionId: 'session-parent' });
+  assert.ok(!f.state.calls.some(call => call.body.method === 'workspace/delete'));
+
+  const restored = await f.client.unarchiveSession('session-parent');
+  assert.equal(restored.accepted, true);
+  assert.equal(restored.archived, false);
+  assert.deepEqual(restored.archivedSessionIds, []);
+  const restoreCall = f.state.calls.find(call => call.body.method === 'workspace/unarchiveSession');
+  assert.deepEqual(restoreCall.body.payload.args.request, { sessionId: 'session-parent' });
+});
+
+test('a modern host archive uses the native dotted method and direct request payload', async t => {
+  const f = await fixture(t, { rpc(body, res) {
+    if (body.method === 'session/list') { res.writeHead(404); res.end(); return; }
+    if (body.method === 'session.list') return reply(res, body, { ok: true, value: { items: [ordinary] } });
+    if (body.method === 'workspace.archiveSession') return reply(res, body, { ok: true, value: { archivedSessionIds: [body.payload.sessionId] } });
+    if (body.method === 'workspace.unarchiveSession') return reply(res, body, { ok: true, value: { archivedSessionIds: [] } });
+    throw new Error('Unexpected request');
+  } });
+  const archived = await f.client.archiveSession('session-parent');
+  assert.equal(archived.archived, true);
+  const restored = await f.client.unarchiveSession('session-parent');
+  assert.equal(restored.archived, false);
+  assert.deepEqual(f.state.calls.map(call => call.body.method), ['session/list', 'session.list', 'workspace.archiveSession', 'workspace.unarchiveSession']);
+  assert.deepEqual(f.state.calls[2].body.payload, { sessionId: 'session-parent' });
+  assert.deepEqual(f.state.calls[3].body.payload, { sessionId: 'session-parent' });
+});
+
+test('project creation reuses one workspace and keeps the session cwd equal to the project root', async t => {
+  const f = await fixture(t);
+  const result = await f.client.createProjectSession({ sessionId: 'named-project', cwd: ordinary.cwd, projectName: 'Fixture' });
+  assert.equal(result.workspaceId, 'workspace-fixture');
+  assert.equal(result.projectRenamed, false);
+  const creation = f.state.calls.find(call => call.body.method === 'session/create').body.payload.args.request;
+  assert.deepEqual(creation, { sessionId: 'named-project', workspaceId: 'workspace-fixture' });
+  assert.equal(creation.cwd, undefined, 'session/create(workspaceId) derives cwd from the native project root');
 });
 
 test('existing ordinary sessions are attached with their original identity and never prompted', async t => {
@@ -276,6 +359,30 @@ test('redacts authentication values even when a remote error uses one as its cod
     assert.ok(!JSON.stringify(error).includes(f.state.token));
     return true;
   });
+});
+
+test('preserves namespaced native rejection codes without exposing remote error details', async t => {
+  const f = await fixture(t, { rpc(body, res, state) {
+    if (body.method === 'session/list') return reply(res, body, { ok: true, value: { items: [] } });
+    reply(res, body, { ok: false, error: { code: 'agent-preset/not-found', message: state.token } });
+  } });
+  await assert.rejects(f.client.createSession({ sessionId: 'session-rejected', cwd: ordinary.cwd,
+    agentPreset: 'codex-control-bridge' }), error => {
+    assert.equal(error.code, 'agent-preset/not-found');
+    assert.equal(error.uncertain, false);
+    assert.ok(!String(error).includes(f.state.token));
+    return true;
+  });
+  assert.equal(f.state.calls.filter(call => call.body.method === 'session/create').length, 1);
+});
+
+test('namespaced error codes still redact credentials and reject path-like or oversized values', async t => {
+  for (const code of ['auth/fixture-launch-token', '../private', '/private', 'private//error', 'a/'.repeat(41)]) {
+    const f = await fixture(t, { rpc(body, res) {
+      reply(res, body, { ok: false, error: { code } });
+    } });
+    await assert.rejects(f.client.listSessions(), failure('rpc-error'));
+  }
 });
 
 test('rejects unsafe URLs and credential-bearing URLs without disclosing input', () => {

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { requireWorkspace } from './config.mjs';
+import { isCodexThreadId } from './codex-target.mjs';
 import { discoverCodexBridge, notifyCodex } from './codex-notify.mjs';
 import { HOST_PRESET, hostBridgeRevision, installHostBridge } from './host-install.mjs';
 import { readDispatch } from './dispatch.mjs';
@@ -56,6 +57,18 @@ export function historyMessages(page, row) {
 }
 
 /**
+ * One status mapping for every terminal turn, shared by wait_agent and the saved completion
+ * reports so a finished turn reads the same whether it came from native history or a report.
+ * @param {object} [completionReason] Native `turn/end` reason.
+ * @returns {'completed'|'cancelled'|'failed'} Durable dispatch state.
+ */
+export function endedState(completionReason) {
+  const kind = completionReason?.kind;
+  if (kind === 'cancelled' || (kind === 'aborted' && completionReason?.reason?.kind === 'user')) return 'cancelled';
+  return !kind || kind === 'completed' ? 'completed' : 'failed';
+}
+
+/**
  * A dispatched turn counts as finished only when the newest page ends with a
  * turn/end event newer than the baseline cursor taken before the dispatch.
  * @param {object} page History page returned by the client.
@@ -69,7 +82,18 @@ export function turnEnded(page, afterSeq) {
     && Number.isSafeInteger(last.event.seq) && last.event.seq > afterSeq);
 }
 
-export function createControl(config, { client, notify = notifyCodex, installHost = installHostBridge } = {}) {
+/**
+ * Start the detached completion watcher that outlives this call.
+ * @param {string[]} args Node arguments for watch-worker.mjs.
+ * @returns {{pid: number|undefined}} Handle of the detached process.
+ */
+function startDetachedWorker(args) {
+  const child = spawn(process.execPath, args, { detached: true, stdio: 'ignore', windowsHide: true });
+  child.unref();
+  return { pid: child.pid };
+}
+
+export function createControl(config, { client, notify = notifyCodex, installHost = installHostBridge, startWorker = startDetachedWorker } = {}) {
   const api = client || new FutureAideClient({
     dataHome: config.dataRoot,
     dshDataHome: config.dshDataRoot,
@@ -216,8 +240,8 @@ export function createControl(config, { client, notify = notifyCodex, installHos
     if (!ended) {
       return { ...result, waitedSeconds: timeoutSeconds,
         nextAction: withReport
-          ? 'Still running. The watch call reached its deadline; inspect the report later or use wait with the same request_id.'
-          : 'Still running. Continue independent work and use futureaide_wait with the same request_id when its result is needed.' };
+          ? 'Still running. A watch deadline is not task completion; the report holds what was collected. Call futureaide_wait with the same request_id until the state is terminal (completed, cancelled or failed) or you are genuinely blocked.'
+          : 'Still running, which is not completion. Do independent work, then call futureaide_wait again with the same request_id until the state is terminal (completed, cancelled or failed) or you are genuinely blocked.' };
     }
     if (!withReport) return result;
     const reportFile = path.join(config.stateDirectory, 'reports', `${id}.${requestId ?? baseline}.json`);
@@ -280,8 +304,18 @@ export function createControl(config, { client, notify = notifyCodex, installHos
         ...(throughSeq === undefined ? {} : { throughSeq }) });
       return view === 'events' ? page : historyMessages(page, row);
     },
-    async send({ sessionId, message, requestId, mode = 'queue', background = false }) {
-      const result = await writeOnce('send', sessionId, requestId, { message, mode }, async (id, checkpoint) => {
+    async send({ sessionId, message, requestId, mode = 'queue', background = false, agentId, codexThreadId,
+      suppressCallback = false, archive = false, taskName } = {}) {
+      // The callback target is only what this connection was explicitly given: an agent's own
+      // bound task, or a profile that names one. Nothing is guessed from the environment.
+      const target = codexThreadId === undefined ? config.codexThreadId : codexThreadId;
+      if (codexThreadId !== undefined && !isCodexThreadId(codexThreadId)) {
+        throw new Error('codex_thread_id must be a Codex task UUID. Nothing was sent.');
+      }
+      if (suppressCallback !== true && suppressCallback !== false) throw new Error('suppressCallback must be a boolean.');
+      const owner = agentId === undefined ? config.agentId : agentId;
+      const suppressed = suppressCallback === true;
+      const result = await writeOnce('send', sessionId, requestId, { message, mode, ...(suppressed ? { suppressCallback: true } : {}) }, async (id, checkpoint) => {
         // Attach the pre-dispatch cursor so the watcher knows which turn belongs to this send.
         const afterSeq = await sessionCursor(id);
         await checkpoint({ afterSeq });
@@ -290,13 +324,20 @@ export function createControl(config, { client, notify = notifyCodex, installHos
       if (!background || result.accepted !== true) {
         return { ...result, next: `Use futureaide_wait with session_id ${result.sessionId} and request_id ${requestId} to collect this reply.` };
       }
-      // Dispatch and forget: a detached worker polls in the background and drops the reply
-      // into the report file, so the calling agent is free immediately.
+      const callbackStatus = isCodexThreadId(target) ? 'configured' : target === undefined ? 'not_configured' : 'invalid_target';
+      // Dispatch and forget: a detached worker polls in the background, persists the reply in the
+      // report file and, only for an explicitly bound target, posts one deduplicated notice.
       const reportFile = path.join(config.stateDirectory, 'reports', `${result.sessionId}.${requestId}.json`);
       const worker = fileURLToPath(new URL('./watch-worker.mjs', import.meta.url));
-      const child = spawn(process.execPath, [worker,
+      const args = [worker,
         '--workspace', config.workspace, '--state', config.stateDirectory,
         '--session', result.sessionId, '--request', requestId, '--after-seq', String(result.afterSeq ?? -1),
+        ...(target === undefined ? [] : ['--codex-thread-id', String(target)]),
+        ...(/^[A-Za-z0-9_.-]{1,120}$/.test(owner ?? '') ? ['--agent-id', owner] : []),
+        ...(typeof taskName === 'string' && taskName.trim() ? ['--task-name', taskName] : []),
+        // Only an agent dispatch may close its own finished session, and a peer-suppressed
+        // dispatch never does: the peer lifecycle decides whether that turn was really final.
+        ...(archive === true && !suppressed && /^[A-Za-z0-9_.-]{1,120}$/.test(owner ?? '') ? ['--auto-archive'] : []),
         ...(config.dataRoot ? ['--data-root', config.dataRoot] : []),
         ...(config.dshDataRoot ? ['--dsh-data-root', config.dshDataRoot] : []),
         ...(config.target ? ['--target', config.target] : []),
@@ -305,10 +346,15 @@ export function createControl(config, { client, notify = notifyCodex, installHos
         ...(config.hostBridgeFile ? ['--host-bridge-file', config.hostBridgeFile] : []),
         ...(config.timeoutMs ? ['--timeout-ms', String(config.timeoutMs)] : []),
         ...(config.baseUrl ? ['--base-url', config.baseUrl] : []),
-      ], { detached: true, stdio: 'ignore', windowsHide: true });
-      child.unref();
-      return { ...result, watching: true, watcherPid: child.pid, reportFile,
-        next: `A detached watcher is polling in the background. Keep working - do NOT block. The reply appears in ${reportFile} when the turn ends; read that file (or Monitor it) when you are notified or when you next need it.` };
+      ];
+      const { pid } = startWorker(args);
+      const next = callbackStatus === 'configured'
+        ? `A detached watcher polls this turn and will post one deduplicated notice to the explicitly bound Codex task when it ends. The reply is also written to ${reportFile}; a saved report is not a chat notification. Do independent work, then collect with futureaide_wait_agent / futureaide_wait in bounded waits (45 seconds or less) until the state is terminal (completed, cancelled or failed) or you are genuinely blocked; running is not completion.`
+        : callbackStatus === 'invalid_target'
+          ? `A detached watcher polls this turn and saves the reply to ${reportFile}, but the configured Codex task ID is not a valid UUID, so no chat notice will be posted. Collect the result yourself with futureaide_wait_agent / futureaide_wait in bounded waits (45 seconds or less) until the state is terminal or you are genuinely blocked; running is not completion.`
+          : `A detached watcher polls this turn and saves the reply to ${reportFile}. No callback target is bound, so nothing will post into the chat; a saved report is not a notification. Collect it yourself with futureaide_wait_agent / futureaide_wait in bounded waits (45 seconds or less) until the state is terminal (completed, cancelled or failed) or you are genuinely blocked; running is not completion.`;
+      return { ...result, watching: true, watcherPid: pid, reportFile, callbackConfigured: callbackStatus === 'configured',
+        callbackStatus, ...(target === undefined ? {} : { callbackTarget: target }), next };
     },
     async wait(input = {}) {
       return awaitTurn({ ...input, capSeconds: 600, withReport: false });
@@ -320,12 +366,28 @@ export function createControl(config, { client, notify = notifyCodex, installHos
     async cancel({ sessionId, requestId }) {
       return writeOnce('cancel', sessionId, requestId, {}, id => api.cancelSession(id));
     },
+    /** Archive one finished ordinary session; the native call never archives a project. */
+    async archiveSession({ sessionId, requestId } = {}) {
+      return writeOnce('archive', sessionId, requestId, {}, id => api.archiveSession
+        ? api.archiveSession(id)
+        : Promise.reject(Object.assign(new Error('This host does not expose session archive.'), { code: 'archive-unavailable' })));
+    },
+    /** Restore one archived ordinary session before its next followup. */
+    async unarchiveSession({ sessionId, requestId } = {}) {
+      return writeOnce('unarchive', sessionId, requestId, {}, id => api.unarchiveSession
+        ? api.unarchiveSession(id)
+        : Promise.reject(Object.assign(new Error('This host does not expose session restore.'), { code: 'restore-unavailable' })));
+    },
     async models() { return api.modelCatalog(); },
-    async createSession({ requestId, agentPreset } = {}) {
+    async createSession({ requestId, agentPreset, projectName } = {}) {
       if (typeof requestId !== 'string' || !/^[a-zA-Z0-9_.-]{1,120}$/.test(requestId)) throw new Error('Provide a stable request_id.');
+      if (projectName !== undefined && (typeof projectName !== 'string' || !projectName.trim() || projectName.length > 200)) {
+        throw new Error('project_name must be a nonempty string of at most 200 characters.');
+      }
       const sessionId = 'session-codex-' + createHash('sha256').update(JSON.stringify([config.stateDirectory, config.workspace, requestId])).digest('hex').slice(0, 32);
-      return writeOnce('create', { sessionId }, requestId, { cwd: config.workspace, agentPreset }, id =>
-        (api.createProjectSession ?? api.createSession).call(api, { sessionId: id, cwd: config.workspace, agentPreset }));
+      return writeOnce('create', { sessionId }, requestId, { cwd: config.workspace, agentPreset, ...(projectName === undefined ? {} : { projectName }) }, id =>
+        (api.createProjectSession ?? api.createSession).call(api, { sessionId: id, cwd: config.workspace, agentPreset,
+          ...(projectName === undefined ? {} : { projectName }) }));
     },
     async attachSession({ sessionId, requestId }) {
       return writeOnce('attach-session', sessionId, requestId, { workspace: config.workspace },

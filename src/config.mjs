@@ -95,6 +95,7 @@ export async function loadConfig(filename, profile) {
       ...(selected.target === undefined && (selected.instanceFile || selected.baseUrl) ? { target: undefined } : {}),
       stateDirectory: path.join(path.dirname(filename), 'state', 'profiles', profile),
       registryDirectory: path.join(path.dirname(filename), 'agents'),
+      configFile: filename,
     };
   }
   return {
@@ -105,6 +106,7 @@ export async function loadConfig(filename, profile) {
     ...supplied,
     stateDirectory: path.join(path.dirname(filename), 'state'),
     registryDirectory: path.join(path.dirname(filename), 'agents'),
+    configFile: filename,
   };
 }
 

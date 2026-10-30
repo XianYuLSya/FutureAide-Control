@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAgents } from '../src/agents.mjs';
 import { createControl } from '../src/control.mjs';
 import { readDispatch } from '../src/dispatch.mjs';
+import { runWatchWorker } from '../src/watch-worker.mjs';
 
 const event = (seq, type, data = {}) => ({ type: 'event', event: { seq, type, data } });
+const THREAD = '44444444-4444-4444-8444-444444444444';
 const catalog = { default: { provider: 'wb', model: 'flash', reasoningEffort: 'max' }, routableProviders: ['wb'],
   groups: [{ id: 'wb', models: [{ id: 'flash', reasoning: { efforts: [{ id: 'max' }] } }] }] };
 async function fixture(t) {
@@ -38,9 +40,17 @@ async function fixture(t) {
   };
   const config = { workspace: root, stateDirectory: path.join(root, 'state'), registryDirectory: path.join(root, 'agents') };
   const controlFactory = config => { const control = createControl(config, { client }); return { ...control, send: input => control.send({ ...input, background: false }) }; };
-  return { root, calls, client, config, controlFactory, agents: createAgents(config, { controlFactory }),
+  return { root, calls, client, config, controlFactory, rows, pages, agents: createAgents(config, { controlFactory }),
     failSend: value => { failSend = value; }, hold: value => { hold = value; }, catalog: value => { modelCatalog = value; } };
 }
+
+/** Run the real detached watcher against the fixture host, writing into the agent's private state. */
+const watch = (f, { agentId, sessionId, requestId, notify, codexThreadId, maxMinutes = 0 }) => runWatchWorker({
+  workspace: f.root, stateDirectory: path.join(f.root, 'agents', agentId, 'state'),
+  sessionId, requestId, agentId, codexThreadId, afterSeq: 0, pollMs: 1, maxMinutes,
+}, { client: f.client, notify: notify ?? (async () => ({ delivered: true })) });
+
+const item = async (f, agentId) => (await f.agents.list({})).items.find(entry => entry.agentId === agentId);
 
 test('one-call spawn selects the real default; another client resumes by id and scopes old replies', async t => {
   const f = await fixture(t);
@@ -137,4 +147,64 @@ test('a queued native RPC cannot be satisfied by an earlier turn end', async () 
     event(3, 'turn/end', { turn: 1 })], hasMore: false }) };
   const read = await readDispatch(api, 'session', { requestId: 'queued', afterSeq: 0 });
   assert.equal(read.ended, false); assert.equal(read.boundary.correlation, 'request-id');
+});
+
+test('a turn finished by the background watcher is recovered even though the registry says running', async t => {
+  const f = await fixture(t); f.hold(true);
+  const spawned = await f.agents.spawn({ workspace: f.root, message: 'work', requestId: 'bg' });
+  const cached = await item(f, spawned.agentId);
+  assert.equal(cached.state, 'running');
+  assert.equal(cached.reportState, undefined);
+  const page = f.pages.get(spawned.sessionId);
+  page.push(event(page.at(-1).event.seq + 1, 'turn/end', { turn: 1, reason: { kind: 'completed' } }));
+  f.rows.find(row => row.sessionId === spawned.sessionId).projections.asOfSeq = page.at(-1).event.seq;
+  const report = await watch(f, { agentId: spawned.agentId, sessionId: spawned.sessionId, requestId: 'bg', codexThreadId: THREAD });
+  assert.equal(report.state, 'ended');
+  const recovered = await item(f, spawned.agentId);
+  assert.equal(recovered.state, 'completed');
+  assert.equal(recovered.reportState, 'ended');
+  assert.equal(recovered.notificationStatus, 'delivered');
+  assert.equal(recovered.reportFile, path.join(f.root, 'agents', spawned.agentId, 'state', 'reports', `${spawned.sessionId}.bg.json`));
+  assert.equal(JSON.parse(await readFile(recovered.reportFile, 'utf8')).state, 'ended');
+  assert.equal(recovered.callbackConfigured, false);
+});
+
+test('a cancelled turn is recovered as cancelled, and a passed deadline never becomes failed', async t => {
+  const f = await fixture(t); f.hold(true);
+  const spawned = await f.agents.spawn({ workspace: f.root, message: 'work', requestId: 'bg' });
+  await f.client.cancelSession(spawned.sessionId);
+  const ended = await watch(f, { agentId: spawned.agentId, sessionId: spawned.sessionId, requestId: 'bg', codexThreadId: THREAD });
+  assert.equal(ended.state, 'ended');
+  assert.equal(ended.completionReason.kind, 'aborted');
+  assert.equal((await item(f, spawned.agentId)).state, 'cancelled');
+
+  const retried = await f.agents.spawn({ workspace: f.root, message: 'other', requestId: 'late' });
+  const timedOut = await watch(f, { agentId: retried.agentId, sessionId: retried.sessionId, requestId: 'late', codexThreadId: THREAD,
+    notify: async () => { throw new Error('Notification delivery is unconfirmed.'); } });
+  assert.equal(timedOut.state, 'timeout');
+  const recovered = await item(f, retried.agentId);
+  assert.equal(recovered.state, 'running');
+  assert.equal(recovered.reportState, 'timeout');
+  assert.equal(recovered.notificationStatus, 'unknown');
+  assert.match(recovered.note, /not a task failure/);
+});
+
+test('a completion report is adopted only for the exact same integer cursor', async t => {
+  const f = await fixture(t); f.hold(true);
+  const spawned = await f.agents.spawn({ workspace: f.root, message: 'work', requestId: 'bg' });
+  const file = path.join(f.root, 'agents', spawned.agentId, 'state', 'reports', `${spawned.sessionId}.bg.json`);
+  await mkdir(path.dirname(file), { recursive: true });
+  const base = { state: 'ended', sessionId: spawned.sessionId, requestId: 'bg', completionReason: { kind: 'completed' } };
+  for (const afterSeq of [99, undefined, '0', null, 0.5]) {
+    await writeFile(file, JSON.stringify({ ...base, ...(afterSeq === undefined ? {} : { afterSeq }) }));
+    const cached = await item(f, spawned.agentId);
+    assert.equal(cached.state, 'running', `afterSeq ${String(afterSeq)} must not be adopted`);
+    assert.equal(cached.reportState, undefined);
+    assert.equal(cached.reportFile, undefined);
+  }
+  await writeFile(file, JSON.stringify({ ...base, afterSeq: 0 }));
+  const recovered = await item(f, spawned.agentId);
+  assert.equal(recovered.state, 'completed');
+  assert.equal(recovered.reportState, 'ended');
+  assert.equal(recovered.reportFile, file);
 });

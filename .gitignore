@@ -9,4 +9,5 @@ host-bridge.json
 state/
 .rollback/
 coverage/
+clean/
 .DS_Store

@@ -1,19 +1,19 @@
 {
   "name": "futureaide-control",
-  "version": "0.2.0",
-  "description": "Control FutureAide or native DSH through standard MCP with automatic host discovery.",
+  "version": "0.3.0",
+  "description": "Named DSH subagents for Codex: automatic chat and project binding, direct Q&A, file changes, and one-shot or persistent sessions.",
   "author": {
     "name": "FutureAide"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "FutureAide Control · DSH Control",
-    "shortDescription": "通过 MCP 管理 FutureAide 与原版 DSH 对话、项目和模型。",
-    "longDescription": "FutureAide Control，副名 DSH Control。标准 MCP/CLI 桥接，自动发现 FutureAide 或原版 DSH，创建项目对话、选择模型、派单和读取结果。QQ 交流群：259109974。后续计划推出便捷一键安装的个人 DSH 改版 FutureAide。",
+    "shortDescription": "按名字调用当前项目的 DSH 子代理，直接问答、自动回包、查看文件修改。",
+    "longDescription": "为每个 Codex 聊天建立独立的 DSH 子代理名单，自动使用当前项目路径。创建一次性或长期助手，按名字派活与答疑，查看任务进度和文件变更；结果自动回到原聊天，一次性会话交付后自动清理，长期会话可继续复用。适用于 Windows Codex Desktop 与 DSH Desktop，需 Node.js 24.14 或更高版本。QQ 交流群：259109974。",
     "developerName": "FutureAide",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],
-    "defaultPrompt": ["检查 FutureAide 当前任务进度", "读取执行母会话并安排后续修复", "验收 FutureAide 的完成报告"]
+    "defaultPrompt": ["创建一次性画图助手，为当前项目生成中文架构图", "安排两个 DSH 助手分别制作架构图和模块说明，写入不同文件", "查看当前聊天的 DSH 子代理、任务进度和文件修改"]
   },
   "mcpServers": "./.mcp.json"
 }

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -14,7 +14,7 @@ export async function hostBridgeRevision() {
 /** Register the bridge in the current Desktop profile (DSH 0.2 declarations).
  * Its normal profile watcher hot-loads the row; no application restart is needed.
  */
-export async function installDesktopHostBridge(config, profileDirectory) {
+export async function installDesktopHostBridge(config, profileDirectory, { refresh = false } = {}) {
   if (!path.isAbsolute(profileDirectory || '')) throw new Error('Desktop profile directory must be absolute.');
   const manifest = JSON.parse(await readFile(path.join(profileDirectory, 'package.json'), 'utf8'));
   if (!manifest.dsh?.profile?.bundles?.includes('@deepseek-ai/dsh-web-app')) {
@@ -32,11 +32,15 @@ export async function installDesktopHostBridge(config, profileDirectory) {
   const end = '# END futureaide-control host bridge';
   const original = await readFile(filename, 'utf8');
   let before = original;
+  let previousModule;
   if (original.includes(begin) || original.includes(end)) {
     const start = original.indexOf(begin), finish = original.indexOf(end);
     if (start < 0 || finish < start || original.indexOf(begin, start + 1) !== -1 || original.indexOf(end, finish + 1) !== -1) {
       throw new Error('The owned bridge patch markers are inconsistent; inspect the profile before installing.');
     }
+    const owned = original.slice(start, finish);
+    const moduleLine = owned.match(/^\s+name:\s*("[^\r\n]+")\s*$/m);
+    try { previousModule = moduleLine ? new URL(JSON.parse(moduleLine[1])) : undefined; } catch { /* Rewrite an older owned format. */ }
     before = original.slice(0, start) + original.slice(finish + end.length).replace(/^\r?\n/, '');
   }
   if (/^\s*-\s*id:\s*['"]?codex-control-host-bridge\b/m.test(before)) throw new Error('An unowned host bridge row already exists.');
@@ -44,18 +48,29 @@ export async function installDesktopHostBridge(config, profileDirectory) {
   const revision = await hostBridgeRevision();
   const module = new URL('./host-plugin.mjs', import.meta.url);
   module.searchParams.set('v', revision);
-  const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${revision}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${end}\n`;
+  // Loader identities must change when moving between installed copies, even when
+  // their source bytes match. Retain a successful explicit refresh on later installs.
+  const previousRefresh = previousModule?.searchParams.get('reload');
+  previousModule?.searchParams.delete('reload');
+  if (refresh) module.searchParams.set('reload', randomBytes(8).toString('hex'));
+  else if (previousModule?.href === module.href && /^[a-f0-9]{16}$/.test(previousRefresh ?? '')) {
+    module.searchParams.set('reload', previousRefresh);
+  }
+  const discoveryFile = config.instanceFile;
+  const discoveryConfig = discoveryFile ? `        discoveryFile: ${JSON.stringify(discoveryFile)}\n        dataRoot: ${JSON.stringify(config.dshDataRoot ?? config.dataRoot)}\n` : '';
+  const registration = createHash('sha256').update(JSON.stringify([module.href, credentialFile, discoveryConfig])).digest('hex').slice(0, 16);
+  const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${registration}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${discoveryConfig}${end}\n`;
   const content = before.trimEnd() + '\n' + patch;
   if (content !== original) {
     const backup = path.join(path.dirname(credentialFile), 'rollback', `desktop-bridge-${Date.now()}`);
     await mkdir(backup, { recursive: true });
     await copyFile(filename, path.join(backup, 'cordis.patch.yml'));
-    const temporary = filename + '.futureaide-control.tmp';
-    await writeFile(temporary, content, { flag: 'wx', mode: 0o600 });
-    await rename(temporary, filename);
-    return { installed: true, profileDirectory, revision, backupDirectory: backup, requiresBootstrapSession: false };
+    // Preserve the backup and write in place: this profile may live on a volume
+    // where the user forbids moves and deletion, including rename replacement.
+    await writeFile(filename, content, { mode: 0o600 });
+    return { installed: true, profileDirectory, revision, registration, refreshed: refresh, backupDirectory: backup, requiresBootstrapSession: false };
   }
-  return { installed: true, profileDirectory, revision, unchanged: true, requiresBootstrapSession: false };
+  return { installed: true, profileDirectory, revision, registration, unchanged: true, requiresBootstrapSession: false };
 }
 
 /** Install only the owned bootstrap preset; creation loads it without starting a model. */

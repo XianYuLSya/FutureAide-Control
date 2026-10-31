@@ -40,9 +40,29 @@ export class RosterStore {
   }
   save(record) {
     record.updatedAt = new Date().toISOString();
-    const result = this.db.prepare('UPDATE agents SET body=? WHERE id=? AND owner=? AND name=?')
+    const result = this.db.prepare(`UPDATE agents SET body=CASE
+      WHEN json_extract(body,'$.task.taskId')=json_extract(?1,'$.task.taskId') AND json_extract(body,'$.task.cancelRequested')=1
+      THEN json_set(?1,'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(?1,'$.task.cancelRequested')=1 THEN json_extract(?1,'$.state') ELSE 'running' END) ELSE ?1 END
+      WHERE id=?2 AND owner=?3 AND name=?4`)
       .run(JSON.stringify(record), record.agentId, record.ownerId, record.name);
     if (!result.changes) throw new Error('This subagent instance has already been removed.');
+  }
+  requestCancel(record) {
+    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelRequested',json('true'),'$.state','running')
+      WHERE id=? AND owner=? AND name=? AND json_extract(body,'$.sessionId')=? AND json_extract(body,'$.task.taskId')=?
+      AND coalesce(json_extract(body,'$.closed'),0)=0 AND coalesce(json_extract(body,'$.state'),'') NOT IN ('cleaning','cleanup_failed')`)
+      .run(record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
+  }
+  claimAutoCleanup(record) {
+    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.closed',json('true'),'$.state','cleaning')
+      WHERE id=? AND owner=? AND json_extract(body,'$.task.taskId')=? AND coalesce(json_extract(body,'$.task.cancelRequested'),0)=0
+      AND coalesce(json_extract(body,'$.closed'),0)=0`)
+      .run(record.agentId, record.ownerId, record.task?.taskId).changes === 1;
+  }
+  confirmCancel(record) {
+    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'))
+      WHERE id=? AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.task.cancelRequested')=1`)
+      .run(record.agentId, record.task?.taskId).changes === 1;
   }
   setWorker(id, pid) { this.db.prepare("UPDATE agents SET body=json_set(body,'$.workerPid',?) WHERE id=?").run(pid ?? null, id); }
   setWorkerError(id, holder, error) {

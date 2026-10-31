@@ -11,7 +11,7 @@ const service = createScopedAgents(await loadConfig(values['--config']));
 const lease = values['--lease'];
 if (!/^worker-[a-f\d]{32}$/.test(lease ?? '')) throw new Error('Invalid recovery-worker lease.');
 const stopped = record => !record || (['idle', 'failed', 'cancelled', 'cleanup_failed'].includes(record.state)
-  && !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered'));
+  && (record.callbackBlocked || !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered' && report.delivery.state !== 'blocked')));
 let owned = service.store.renewLease(`worker:${agentId}`, lease, 60000);
 const heartbeat = setInterval(() => { owned = service.store.renewLease(`worker:${agentId}`, lease, 60000); }, 10000);
 heartbeat.unref();

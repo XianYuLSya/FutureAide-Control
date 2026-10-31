@@ -12,7 +12,7 @@ import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.0' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.1' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
@@ -50,7 +50,7 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
   register('futureaide_inspect_agent', 'Inspect a named subagent and its descendants’ conversations, tools, and task history when deeper supervision is needed.', {
     name, max_messages: z.number().int().min(1).max(100).optional(),
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), true);
-  register('futureaide_cancel_agent', 'Stop the named subagent’s task, descendant execution, and queued inputs across its tree. Persistent subagents keep their context. A once subagent reports cancellation before automatic cleanup.', { name }, (s, a, e) => s.cancel(a, e), false, true);
+  register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
   register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing their DSH session data and private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
   return server;
 }

@@ -123,6 +123,7 @@ function publicResult(record, { fullResult = false } = {}) {
     reports: { total: task?.reports?.length ?? 0, pending: (task?.reports ?? []).filter(report => report.delivery.state !== 'delivered').length,
       ...(task?.reports?.length ? { latest: { summary: compactText(task.reports.at(-1).message, 240), final: task.reports.at(-1).final, delivery: task.reports.at(-1).delivery.state } } : {}) },
     delivery: task?.reports?.find(report => report.delivery.state !== 'delivered')?.delivery.state ?? task?.reports?.at(-1)?.delivery.state ?? null, updatedAt: record.updatedAt,
+    ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
     ...(record.error ? { error: record.error } : {}),
   };
 }
@@ -205,7 +206,7 @@ export function createScopedAgents(config, {
   }
 
   async function ensureWorker(record) {
-    if (!ACTIVE.has(record.state) && !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered')) return;
+    if (!ACTIVE.has(record.state) && (record.callbackBlocked || !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered' && report.delivery.state !== 'blocked'))) return;
     const holder = uid('worker');
     if (!store.claimLease(`worker:${record.agentId}`, holder, 30000)) return;
     try { record.workerPid = await startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); }
@@ -239,6 +240,8 @@ export function createScopedAgents(config, {
   }
 
   async function dispatchOnce(record, dispatch) {
+    const current = store.get(record.agentId);
+    if (current?.task?.taskId !== record.task?.taskId || current.task.cancelRequested) return;
     try {
       const sent = await controlFor(record).send({ sessionId: record.sessionId, message: dispatch.message, requestId: dispatch.requestId,
         background: false, suppressCallback: true, mode: 'queue' });
@@ -248,6 +251,18 @@ export function createScopedAgents(config, {
       Object.assign(dispatch, { state: error.uncertain ? 'unknown' : 'failed', afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
     }
     store.save(record);
+    const latest = store.get(record.agentId);
+    if (latest?.task?.taskId === record.task.taskId && latest.task.cancelRequested) {
+      record.task.cancelRequested = true;
+      record.task.cancelVerified = false;
+      store.save(record);
+      const result = await (await checkHost(record)).managedCancel(hostArgs(record));
+      if (result.cancelRequested === true) {
+        store.confirmCancel(record);
+        record.task.cancelVerified = true;
+        store.save(record);
+      }
+    }
   }
 
   async function verifyOwner(owner) {
@@ -262,6 +277,7 @@ export function createScopedAgents(config, {
 
   async function deliver(record, notice, text) {
     if (notice.state === 'delivered') return;
+    if (notice.state === 'blocked') return;
     if (notice.nextAttemptAt && notice.nextAttemptAt > Date.now()) return;
     const owner = store.owner(record.ownerId);
     notice.id ??= uid('notice');
@@ -280,6 +296,9 @@ export function createScopedAgents(config, {
       store.save(record);
       return;
     }
+    // A newly confirmed channel rejection must not rewrite an older ambiguous
+    // delivery: the read-back branch above remains its only recovery path.
+    if (record.callbackBlocked) { notice.state = 'blocked'; store.save(record); return; }
     try { await verifyOwner(owner); }
     catch (error) { Object.assign(notice, { state: 'pending', error: safeError(error) }); store.save(record); return; }
     // A previous attempt may have reached the desktop. Never send a second copy blindly.
@@ -287,7 +306,9 @@ export function createScopedAgents(config, {
     store.save(record);
     try {
       const result = await callCodex(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
-      Object.assign(notice, result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
+      const unavailable = result?.isError && JSON.stringify(result).includes('direct app-server input is not allowed for multi-agent v2 sub-agents');
+      if (unavailable) record.callbackBlocked = true;
+      Object.assign(notice, unavailable ? { state: 'blocked', error: { code: 'native-callback-unavailable' } } : result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
         : { state: 'delivered', deliveredAt: now(), error: undefined });
     } catch (error) { Object.assign(notice, { state: 'unknown', error: safeError(error) }); }
     store.save(record);
@@ -331,8 +352,9 @@ export function createScopedAgents(config, {
     store.save(record);
   }
 
-  async function clearRecord(record) {
-    record.state = 'cleaning'; record.closed = true; store.save(record);
+  async function clearRecord(record, { autoClaimed = false } = {}) {
+    record.state = 'cleaning'; record.closed = true;
+    if (!autoClaimed) store.save(record);
     try {
       if (!record.nativeDestroyed) {
         const result = await (await checkHost(record)).managedDestroy(hostArgs(record));
@@ -374,9 +396,26 @@ export function createScopedAgents(config, {
 
   async function finishDeliveredReport(record) {
     const task = record.task;
+    const current = store.get(record.agentId);
+    if (current?.task?.taskId === task.taskId && current.task.cancelRequested) task.cancelRequested = true;
+    if (task.cancelRequested && (!task.cancelVerified || !task.cancelTreeSettled)) {
+      record.state = task.state = 'running';
+      store.save(record);
+      return publicResult(record);
+    }
     task.state = task.cancelRequested ? 'cancelled' : task.result.state;
     task.finishedAt ??= now();
-    if (record.lifetime === 'once' && task.state === 'completed') return clearRecord(record);
+    if (record.lifetime === 'once' && task.state === 'completed') {
+      if (store.claimAutoCleanup(record)) return clearRecord(record, { autoClaimed: true });
+      const latest = store.get(record.agentId);
+      if (latest?.task?.taskId === task.taskId && latest.task.cancelRequested) {
+        task.cancelRequested = true;
+        record.state = task.state = 'running';
+        store.save(record);
+        return publicResult(record);
+      }
+      else return publicResult(latest ?? record);
+    }
     record.state = task.state === 'completed' ? 'idle' : task.state;
     store.save(record);
     return publicResult(record);
@@ -407,7 +446,8 @@ export function createScopedAgents(config, {
     const delivered = await deliverReports(record);
     if (final && final.treeSettledConfirmed) {
       if (delivered) return finishDeliveredReport(record);
-      record.state = 'delivery_pending';
+      record.state = record.callbackBlocked && ['failed', 'cancelled'].includes(task.result.state)
+        && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled)) ? task.result.state : 'delivery_pending';
     }
     store.save(record);
     return publicResult(record);
@@ -442,6 +482,10 @@ export function createScopedAgents(config, {
     if (record.closed || record.state === 'cleanup_failed' || record.state === 'idle') return publicResult(record);
     const task = record.task;
     try {
+      if (task?.cancelRequested && !task.cancelVerified) {
+        const result = await (await checkHost(record)).managedCancel(hostArgs(record));
+        if (result.cancelRequested === true) { store.confirmCancel(record); task.cancelAccepted = true; task.cancelVerified = true; store.save(record); }
+      }
       // Never migrate an automatic result into an explicit report or cleanup.
       if (task?.result && task.reportProtocol !== REPORT_PROTOCOL) {
         if (['sending', 'unknown'].includes(task.delivery?.state)) await deliver(record, task.delivery, '');
@@ -454,7 +498,8 @@ export function createScopedAgents(config, {
       if (task?.reports?.length) {
         await deliverReports(record);
         const final = task.reports.find(report => report.final && report.treeSettledConfirmed);
-        if (final && task.result && task.reports.every(report => report.delivery.state === 'delivered')) {
+        if (final && task.result && task.reports.every(report => report.delivery.state === 'delivered')
+            && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled))) {
           return finishDeliveredReport(record);
         }
       }
@@ -464,6 +509,10 @@ export function createScopedAgents(config, {
       else await negotiateTree(record);
       for (const answer of task.answers ?? []) if (!answer.questionIds && !task.cancelRequested) await resolveAnswer(record, answer);
       const view = await observe(record);
+      if (task.cancelRequested && task.cancelVerified && !view.running && treeSettled(record, view)) {
+        task.cancelTreeSettled = true;
+        store.save(record);
+      }
       // Persist and deliver explicit reports before inspecting older dispatches:
       // an ordinary history/read failure must not suppress an accepted report.
       const reported = await finishReports(record, view);
@@ -653,14 +702,19 @@ export function createScopedAgents(config, {
       });
     },
     async cancel({ name }, extra) {
-      return withName(extra, name, async record => {
-        if (!record.task || !ACTIVE.has(record.state)) return { name, cancelled: false, state: record.state };
-        await negotiateTree(record);
-        record.task.cancelRequested = true; store.save(record);
-        const result = await (await checkHost(record)).managedCancel(hostArgs(record));
-        record.state = 'running'; store.save(record); await ensureWorker(record);
-        return { name, cancelled: result.cancelled !== false, state: 'cancelling' };
-      });
+      const owner = await context(extra);
+      const record = named(owner, name);
+      if (!record.task || record.closed) return { name, accepted: false, state: record.state };
+      if (!store.requestCancel(record)) return { name, accepted: false, state: store.get(record.agentId)?.state ?? 'removed' };
+      try {
+        const api = await checkHost(record);
+        const result = await api.managedCancel(hostArgs(record));
+        if (result.cancelRequested === true) store.confirmCancel(record);
+        return { name, accepted: result.cancelRequested === true, state: 'cancelling' };
+      } finally {
+        const current = store.get(record.agentId);
+        if (current?.task?.taskId === record.task.taskId) await ensureWorker(current);
+      }
     },
     async delete({ name }, extra) { return withName(extra, name, record => clearRecord(record)); },
     async wait({ names, timeoutSeconds = 0 } = {}, extra) {

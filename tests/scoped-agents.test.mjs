@@ -14,7 +14,7 @@ const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture({ startWorker } = {}) {
+async function fixture({ startWorker, beforeSend, beforeNotice } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -73,7 +73,7 @@ async function fixture({ startWorker } = {}) {
       cancellations.push(input);
       const s = sessions.get(input.sessionId); s.running = false;
       s.questions.forEach(question => { question.state = 'cancelled'; });
-      return { cancelled: true };
+      return { cancelled: true, cancelRequested: true };
     },
     async managedDestroy(input) { assert.equal(input.treeProtocol, 1); assert.equal(input.reportProtocol, 1); sessions.delete(input.sessionId); removed.push(input.sessionId); return { destroyed: true }; },
   };
@@ -90,6 +90,7 @@ async function fixture({ startWorker } = {}) {
     async models() { return { defaultModel: { provider: 'fixture', model: 'test' } }; },
     async selectModel() { return { accepted: true }; },
     async send(input) {
+      if (beforeSend) await beforeSend(input);
       const s = sessions.get(input.sessionId);
       const afterSeq = s.seq;
       s.running = true; s.seq += 1;
@@ -108,6 +109,8 @@ async function fixture({ startWorker } = {}) {
   const callCodex = async (threadId, tool, args) => {
     if (tool === 'read_thread') return { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace },
       turns: args.includeOutputs ? notices.filter(notice => notice.threadId === threadId) : [] };
+    if (beforeNotice) await beforeNotice();
+    if (notificationMode === 'native-rejected') { notices.push({ threadId, prompt: args.prompt }); return { isError: true, content: [{ type: 'text', text: 'direct app-server input is not allowed for multi-agent v2 sub-agents' }] }; }
     if (notificationMode === 'reject') return { isError: true };
     notices.push({ threadId, prompt: args.prompt });
     if (notificationMode === 'unknown') throw new Error('Lost delivery acknowledgement');
@@ -286,6 +289,22 @@ test('failed return does not clear a one-shot session', async () => {
   f.service.close();
 });
 
+test('native v2 callback rejection is visible, never retried, and preserves the report and recipient', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  f.notification('native-rejected'); f.report('keep this', false);
+  await f.service.poll(f.record().agentId);
+  await f.service.poll(f.record().agentId);
+  assert.equal(f.notices.length, 1);
+  assert.equal(f.notices[0].threadId, A);
+  assert.equal(f.record().task.reports[0].message, 'keep this');
+  assert.equal(f.record().task.reports[0].delivery.state, 'blocked');
+  assert.equal((await f.service.list(extra(A))).items[0].callbackError.code, 'native-callback-unavailable');
+  assert.equal(f.removed.length, 0);
+  f.service.close();
+});
+
 test('cancel closes questions without automatic notice or one-shot cleanup', async () => {
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
@@ -296,6 +315,105 @@ test('cancel closes questions without automatic notice or one-shot cleanup', asy
   await f.service.poll(r.agentId);
   assert.equal(f.record().state, 'cancelled');
   assert.equal(f.notices.length, 0);
+  assert.equal(f.removed.length, 0);
+  f.service.close();
+});
+
+test('cancel bypasses the held operation lock and survives an older snapshot', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  const old = f.record(), taskId = old.task.taskId;
+  let release; const held = f.store.locked(old.agentId, () => new Promise(resolve => { release = resolve; }));
+  await new Promise(resolve => setImmediate(resolve));
+  const result = await f.service.cancel({ name: 'artist' }, extra(A));
+  assert.equal(result.accepted, true);
+  assert.equal(f.cancellations[0].taskId, taskId);
+  f.store.save(old);
+  assert.equal(f.record().task.cancelRequested, true);
+  assert.equal(f.record().task.cancelAccepted, true);
+  assert.equal(f.record().task.taskId, taskId);
+  assert.equal(f.removed.length, 0);
+  release(); await held; f.service.close();
+});
+
+test('cancellation and automatic cleanup are decided atomically for the same task', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  const record = f.record();
+  assert.equal(f.store.requestCancel(record), true);
+  assert.equal(f.store.claimAutoCleanup(record), false);
+  await f.service.poll(record.agentId);
+  assert.equal(f.cancellations.length, 1);
+  assert.equal(f.record().task.cancelVerified, true);
+  assert.equal(f.removed.length, 0);
+  f.service.close();
+  const g = await fixture();
+  await g.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+  await g.service.send({ name: 'artist', message: 'task' }, extra(A));
+  const other = g.record();
+  assert.equal(g.store.claimAutoCleanup(other), true);
+  assert.equal(g.store.requestCancel(other), false);
+  assert.equal((await g.service.cancel({ name: 'artist' }, extra(A))).accepted, false);
+  assert.equal(g.cancellations.length, 0);
+  g.service.close();
+});
+
+test('cancel intent cannot attach to a replacement task', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  const old = f.record(), newer = f.record();
+  newer.task.taskId = 'task-replacement'; f.store.save(newer);
+  assert.equal(f.store.requestCancel(old), false);
+  assert.notEqual(f.record().task.cancelRequested, true);
+  assert.equal(f.cancellations.length, 0);
+  f.service.close();
+});
+
+test('a send already in flight is stopped again after it returns', async () => {
+  let release, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const f = await fixture({ beforeSend: async () => { entered(); await gate; } });
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  const sending = f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  await started;
+  const cancel = await f.service.cancel({ name: 'artist' }, extra(A));
+  assert.equal(cancel.accepted, true);
+  assert.equal(f.cancellations.length, 1);
+  release(); await sending;
+  assert.equal(f.cancellations.length, 2);
+  assert.equal(f.record().task.cancelVerified, true);
+  assert.equal(f.sessions.get(f.record().sessionId).running, false);
+  f.service.close();
+});
+
+test('final delivery cannot declare cancellation before the host stop and tree recheck', async () => {
+  let releaseNotice, noticeEntered, releaseStop, stopEntered;
+  const noticeStarted = new Promise(resolve => { noticeEntered = resolve; });
+  const noticeGate = new Promise(resolve => { releaseNotice = resolve; });
+  const stopStarted = new Promise(resolve => { stopEntered = resolve; });
+  const stopGate = new Promise(resolve => { releaseStop = resolve; });
+  const f = await fixture({ beforeNotice: async () => { noticeEntered(); await noticeGate; } });
+  await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  const originalCancel = f.api.managedCancel;
+  f.api.managedCancel = async input => { stopEntered(); await stopGate; return originalCancel(input); };
+  f.finish(); f.report('final', true);
+  const polling = f.service.poll(f.record().agentId);
+  await noticeStarted;
+  const cancellation = f.service.cancel({ name: 'artist' }, extra(A));
+  await stopStarted;
+  releaseNotice(); await polling;
+  assert.equal(f.record().state, 'running');
+  assert.equal(f.record().task.cancelRequested, true);
+  assert.equal(f.removed.length, 0);
+  releaseStop(); await cancellation;
+  await f.service.poll(f.record().agentId);
+  assert.equal(f.record().state, 'cancelled');
+  assert.equal(f.record().task.cancelTreeSettled, true);
   assert.equal(f.removed.length, 0);
   f.service.close();
 });

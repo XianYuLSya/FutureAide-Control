@@ -80,7 +80,28 @@ async function fixture() {
       installDelegation: async agentCtx => { agentCtx.get('tools').register({name:'managed_subagent'}); } }) };
 }
 
-const identity = workspace => ({ ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a', workspace, treeProtocol: 1 });
+const identity = workspace => ({ ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a', workspace, treeProtocol: 1, reportProtocol: 1 });
+
+test('explicit reports persist across reload and final seals reporting', async () => {
+  const f = await fixture(), input = identity(f.workspace), host = f.create();
+  await host.managedCreate(input);
+  await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  const agent = f.live.get(input.sessionId), report = agent.definitions.get('report_parent');
+  let ended = 0;
+  const exec = { agent, concludeTurn: () => { ended++; } };
+  await report.execute({ message: 'progress' }, exec);
+  await report.execute({ message: 'delivery', final: true }, exec);
+  await assert.rejects(report.execute({ message: 'extra' }, exec), error => error.controlCode === 'managed-report-finalized');
+  await assert.rejects(agent.definitions.get('ask_parent').execute({ message: 'late question' }, exec), error => error.controlCode === 'managed-report-finalized');
+  await assert.rejects(report.execute({ message: 'other' }, { ...exec, agent: { id: 'child' } }), error => error.controlCode === 'managed-task-closed');
+  assert.equal(ended, 1);
+  const reloaded = f.create();
+  const reports = (await reloaded.managedStatus({ ...input, taskId: 'task-a' })).reports;
+  assert.deepEqual(reports.map(({ message, final }) => ({ message, final })), [{ message: 'progress', final: false }, { message: 'delivery', final: true }]);
+  assert.equal(new Set(reports.map(item => item.id)).size, 2);
+  await assert.rejects(reloaded.managedStatus({ ...input, reportProtocol: undefined }), error => error.controlCode === 'managed-report-protocol-required');
+  await assert.rejects(reloaded.managedDestroy({ ...input, reportProtocol: undefined }), error => error.controlCode === 'managed-report-protocol-required');
+});
 
 test('tree completion waits for a task turn and descendant result before returning the final root turn', async () => {
   const f = await fixture(), host = f.create(), input = identity(f.workspace);

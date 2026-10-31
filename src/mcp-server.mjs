@@ -12,7 +12,7 @@ import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.4.0' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.0' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
@@ -35,13 +35,13 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
     } finally { finished?.(); }
   });
   register('futureaide_status', 'Check this chat context and the local DSH connection. The plugin obtains chat and project automatically.', {}, (s, _a, e) => s.status(e), true);
-  register('futureaide_create_agent', 'Create a named DSH subagent in the current project, without running a model. once completes one task then returns its result and removes session data; persistent keeps its context until explicitly deleted.', {
+  register('futureaide_create_agent', 'Create a named DSH subagent in the current project, without running a model. once removes session data after an explicitly submitted final report is delivered and the tree settles; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
     name, lifetime: z.enum(['once', 'persistent']),
   }, (s, a, e) => s.create(a, e));
-  register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. A waiting subagent treats this as its answer. DSH may delegate further to native descendants. Codex continues independently; questions and the settled tree’s final result return to this chat.', { name, message }, (s, a, e) => s.send(a, e));
+  register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. A waiting subagent treats this as its answer. DSH may delegate further to native descendants. Codex continues independently. Only explicit ask_parent questions and report_parent reports return to this chat; ordinary replies and idle trees never notify it. awaiting_report keeps the same task for further updates.', { name, message }, (s, a, e) => s.send(a, e));
   register('futureaide_answer_agent', 'Answer the named subagent’s pending question directly. The plugin continues its original task once; no exchange ID, command, or text file is needed.', { name, message }, (s, a, e) => s.answer(a, e));
   register('futureaide_list_agents', 'Show only this chat’s subagents, including current task, descendant tree, activity, questions, attributed file changes, delivery and cleanup state. Deep history is unnecessary for ordinary supervision.', {}, (s, _a, e) => s.list(e), true);
-  register('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, finish, or need attention. Other work may proceed concurrently; a timeout does not cancel a task.', {
+  register('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, submit a report, await a report, or need attention. Other work may proceed concurrently; a timeout does not cancel a task.', {
     names: z.array(name).min(1).max(50).optional(), timeout_seconds: z.number().int().min(0).max(45).optional(),
   }, (s, a, e) => s.wait({ names: a.names, timeoutSeconds: a.timeout_seconds ?? 0 }, e), true);
   register('futureaide_agent_changes', 'Read observed file changes across a named subagent’s tree, attributed by agentPath, without reading conversations. Coverage and uncertain attribution are explicit. task=0 selects the current/latest task; 1 selects the preceding task.', {

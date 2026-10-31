@@ -9,14 +9,15 @@ import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, resolveCallingContext, threadFromResult } from './calling-context.mjs';
 import { RosterStore } from './roster-store.mjs';
-import { readDispatch } from './dispatch.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
 const now = () => new Date().toISOString();
-const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'reconnecting', 'delivery_pending', 'cleaning']);
+const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_report', 'reconnecting', 'delivery_pending', 'cleaning']);
 const METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
 const TREE_PROTOCOL = 1;
+const REPORT_PROTOCOL = 1;
+const reportProtocolError = () => Object.assign(new Error('Update the DSH plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting DSH is not required.'), { code: 'report-protocol-required' });
 const treeProtocolError = () => Object.assign(new Error('The DSH bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting DSH is not required.'), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
 
@@ -119,7 +120,9 @@ function publicResult(record, { fullResult = false } = {}) {
       observedAt: view.capturedAt ?? null, stale: Boolean(view.stale) },
     questions: (view.questions ?? []).filter(question => question.state === 'pending').map(question => ({ message: question.message })),
     tree: publicTree(record, view),
-    delivery: task?.delivery?.state ?? null, updatedAt: record.updatedAt,
+    reports: { total: task?.reports?.length ?? 0, pending: (task?.reports ?? []).filter(report => report.delivery.state !== 'delivered').length,
+      ...(task?.reports?.length ? { latest: { summary: compactText(task.reports.at(-1).message, 240), final: task.reports.at(-1).final, delivery: task.reports.at(-1).delivery.state } } : {}) },
+    delivery: task?.reports?.find(report => report.delivery.state !== 'delivered')?.delivery.state ?? task?.reports?.at(-1)?.delivery.state ?? null, updatedAt: record.updatedAt,
     ...(record.error ? { error: record.error } : {}),
   };
 }
@@ -159,7 +162,7 @@ export function createScopedAgents(config, {
   };
   const controlFor = record => controlFactory(settings(record), { client: apiFor(record) });
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
-    sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL,
+    sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
     ...(record.task ? { taskId: record.task.taskId } : {}) });
 
   async function context(extra) {
@@ -195,13 +198,14 @@ export function createScopedAgents(config, {
         throw Object.assign(new Error('The DSH bridge needs this plugin version installed before subagents can be created.'), { code: 'managed-host-required' });
       }
       if (status.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
+      if (status.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
     }
     record.host ??= stable;
     return api;
   }
 
   async function ensureWorker(record) {
-    if (!ACTIVE.has(record.state)) return;
+    if (!ACTIVE.has(record.state) && !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered')) return;
     const holder = uid('worker');
     if (!store.claimLease(`worker:${record.agentId}`, holder, 30000)) return;
     try { record.workerPid = await startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); }
@@ -289,18 +293,6 @@ export function createScopedAgents(config, {
     store.save(record);
   }
 
-  async function completeReply(record, dispatch, result) {
-    // The ordinary read view intentionally truncates individual messages. Delivery
-    // must use raw, request-correlated events before one-shot data can be removed.
-    const raw = await readDispatch(apiFor(record), record.sessionId, { workspace: record.workspace,
-      requestId: dispatch.requestId, afterSeq: dispatch.afterSeq, maxMessages: 100 });
-    if (!raw.ended || raw.boundary.endSeq !== result.endSeq) throw new Error('The complete native reply could not be verified.');
-    return raw.page.records.filter(item => item.type === 'event' && item.event?.type === 'assistant/message')
-      .map(item => item.event.data?.message ?? item.event.data)
-      .map(message => (message.content ?? []).filter(part => part.type === 'text').map(part => part.text).join('\n'))
-      .filter(Boolean).join('\n\n');
-  }
-
   async function prepare(record) {
     const api = await checkHost(record, { creation: true });
     store.save(record);
@@ -311,13 +303,15 @@ export function createScopedAgents(config, {
   }
 
   async function negotiateTree(record, force = false) {
-    if (!force && record.task.treeProtocol === TREE_PROTOCOL) return;
+    if (!force && record.task.treeProtocol === TREE_PROTOCOL && record.task.reportProtocol === REPORT_PROTOCOL) return;
     const api = await checkHost(record, { taskTree: true });
     const after = record.task.dispatches[0]?.afterSeq;
     const started = await api.managedBeginTask({ ...hostArgs(record),
       ...(Number.isSafeInteger(after) && after >= -1 ? { taskStartSeq: after } : {}) });
     if (started.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
+    if (started.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
     record.task.treeProtocol = TREE_PROTOCOL;
+    record.task.reportProtocol = REPORT_PROTOCOL;
     store.save(record);
   }
 
@@ -368,32 +362,52 @@ export function createScopedAgents(config, {
     }
   }
 
-  async function finishDelivery(record) {
+  // Only persisted report_parent calls may wake the parent chat.
+  async function deliverReports(record) {
+    for (const report of record.task.reports ?? []) {
+      if (report.final && !report.treeSettledConfirmed) continue;
+      await deliver(record, report.delivery, `DSH「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`);
+      if (report.delivery.state !== 'delivered') return false;
+    }
+    return true;
+  }
+
+  async function finishDeliveredReport(record) {
     const task = record.task;
-    // Historical completed leaf results predate tree support and may be delivered
-    // offline. New protocol tasks and anything already observed as a tree must
-    // never use that compatibility path.
-    const historicalLeaf = task.treeProtocol === undefined && !task.result.tree && !record.observation?.tree;
-    if (!task.result.treeSettledConfirmed && !historicalLeaf) {
-      // A result persisted by an older worker is not proof that its descendants
-      // and native result notifications have completed.
-      const view = await observe(record);
-      const needsSummary = ownedTree(record, view).nodes.length > 1 && !task.cancelRequested;
-      const summary = rootSummary(view);
-      if (!treeSettled(record, view) || (needsSummary && !summary)) {
-        return waitForTree(record, view, needsSummary && treeSettled(record, view));
-      }
-      if (needsSummary) Object.assign(task.result, { reply: summary.reply, state: summary.state });
-      Object.assign(task.result, { changes: attributedChanges(record, view), coverage: treeCoverage(record, view),
-        tree: publicTree(record, view), treeSettledConfirmed: true });
+    task.state = task.cancelRequested ? 'cancelled' : task.result.state;
+    task.finishedAt ??= now();
+    if (record.lifetime === 'once' && task.state === 'completed') return clearRecord(record);
+    record.state = task.state === 'completed' ? 'idle' : task.state;
+    store.save(record);
+    return publicResult(record);
+  }
+
+  async function finishReports(record, view) {
+    const task = record.task;
+    task.reports ??= [];
+    for (const incoming of view.reports ?? []) {
+      if (incoming.taskId !== task.taskId || typeof incoming.id !== 'string'
+          || typeof incoming.message !== 'string' || !incoming.message.trim()
+          || typeof incoming.final !== 'boolean') throw new Error('The bridge returned an invalid explicit report.');
+      const previous = task.reports.find(report => report.id === incoming.id);
+      if (previous) {
+        if (previous.message !== incoming.message || previous.final !== incoming.final) throw new Error('A persisted report identity changed.');
+      } else task.reports.push({ id: incoming.id, taskId: incoming.taskId, message: incoming.message,
+        final: incoming.final, createdAt: incoming.createdAt, delivery: { id: 'report-' + incoming.id, state: 'pending' } });
+    }
+    const final = task.reports.find(report => report.final);
+    if (final && treeSettled(record, view) && !(view.questions ?? []).some(question => question.state === 'pending')) final.treeSettledConfirmed = true;
+    if (final && final.treeSettledConfirmed) {
+      task.result = { state: task.cancelRequested || rootSummary(view)?.state === 'cancelled' ? 'cancelled' : task.state === 'failed' || rootSummary(view)?.state === 'failed' ? 'failed' : 'completed',
+        reply: final.message, changes: attributedChanges(record, view), coverage: treeCoverage(record, view), tree: publicTree(record, view) };
       task.state = task.result.state;
     }
-    record.state = 'delivery_pending'; store.save(record);
-    const resultText = `DSH 子代理「${record.name}」任务${task.state === 'completed' ? '完成' : task.state === 'cancelled' ? '已取消' : '失败'}。\n\n${task.result.reply}\n\n文件变更：\n${JSON.stringify(task.result.changes.map(fileSummary), null, 2)}\n观测范围：${typeof task.result.coverage === 'string' ? task.result.coverage : JSON.stringify(task.result.coverage)}\n\n这是任务结果，无需回复“收到”。`;
-    await deliver(record, task.delivery, resultText);
-    if (task.delivery.state === 'delivered') {
-      if (record.lifetime === 'once') return clearRecord(record);
-      record.state = 'idle';
+    // Persist the terminal outcome before delivery can succeed or become ambiguous.
+    store.save(record);
+    const delivered = await deliverReports(record);
+    if (final && final.treeSettledConfirmed) {
+      if (delivered) return finishDeliveredReport(record);
+      record.state = 'delivery_pending';
     }
     store.save(record);
     return publicResult(record);
@@ -428,13 +442,32 @@ export function createScopedAgents(config, {
     if (record.closed || record.state === 'cleanup_failed' || record.state === 'idle') return publicResult(record);
     const task = record.task;
     try {
-      if (task?.result) return await finishDelivery(record);
+      // Never migrate an automatic result into an explicit report or cleanup.
+      if (task?.result && task.reportProtocol !== REPORT_PROTOCOL) {
+        if (['sending', 'unknown'].includes(task.delivery?.state)) await deliver(record, task.delivery, '');
+        task.legacyAutomaticResult = task.result;
+        delete task.result; task.delivery = undefined;
+        record.state = task.state = 'awaiting_report';
+        store.save(record);
+        return publicResult(record);
+      }
+      if (task?.reports?.length) {
+        await deliverReports(record);
+        const final = task.reports.find(report => report.final && report.treeSettledConfirmed);
+        if (final && task.result && task.reports.every(report => report.delivery.state === 'delivered')) {
+          return finishDeliveredReport(record);
+        }
+      }
       if (!record.created) { await prepare(record); return publicResult(record); }
       if (!task) return publicResult(record);
-      if (!task.dispatches.length && !task.cancelRequested) await beginTask(record);
+      if (!task.dispatches.length && !task.cancelRequested && !task.legacyAutomaticResult) await beginTask(record);
       else await negotiateTree(record);
       for (const answer of task.answers ?? []) if (!answer.questionIds && !task.cancelRequested) await resolveAnswer(record, answer);
       const view = await observe(record);
+      // Persist and deliver explicit reports before inspecting older dispatches:
+      // an ordinary history/read failure must not suppress an accepted report.
+      const reported = await finishReports(record, view);
+      if ((task.reports ?? []).some(report => report.final && report.treeSettledConfirmed)) return reported;
       const unanswered = (view.questions ?? []).filter(question => question.state === 'pending');
       for (const question of unanswered) {
         task.questionNotices ??= {};
@@ -451,7 +484,7 @@ export function createScopedAgents(config, {
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
           Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true,
-            reply: await completeReply(record, dispatch, result), endSeq: result.endSeq });
+            endSeq: result.endSeq });
         }
       }
       const outstanding = task.dispatches.some(dispatch => !['completed', 'cancelled', 'failed'].includes(dispatch.state));
@@ -461,10 +494,10 @@ export function createScopedAgents(config, {
         record.state = unanswered.length ? 'awaiting_input' : 'running';
         task.state = record.state;
         store.save(record);
-        return publicResult(record);
+        return await finishReports(record, view);
       }
       if (unanswered.length && !task.cancelRequested) {
-        record.state = task.state = 'awaiting_input'; store.save(record); return publicResult(record);
+        record.state = task.state = 'awaiting_input'; store.save(record); return await finishReports(record, view);
       }
       const pendingAnswers = (task.answers ?? []).filter(answer => !answer.dispatched);
       if (pendingAnswers.length && !task.cancelRequested) {
@@ -473,26 +506,16 @@ export function createScopedAgents(config, {
         await sendDispatch(record, pendingAnswers.map(answer => answer.continuation).join('\n\n'), 'answer', ids);
         return publicResult(record);
       }
-      if (!treeSettled(record, view)) return waitForTree(record, view);
-      if (!task.result) {
-        const final = task.dispatches.at(-1);
-        let finalState = task.cancelRequested ? 'cancelled'
-          : task.dispatches.some(dispatch => dispatch.state === 'failed') ? 'failed'
-            : final?.state === 'cancelled' ? 'cancelled' : 'completed';
-        const needsSummary = ownedTree(record, view).nodes.length > 1 && !task.cancelRequested;
-        const summary = rootSummary(view);
-        if (needsSummary && !summary) {
-          return waitForTree(record, view, true);
-        }
-        if (needsSummary) finalState = summary.state;
-        task.state = finalState;
-        task.finishedAt = now();
-        task.result = { state: task.state, reply: needsSummary ? summary.reply : final?.reply ?? final?.error?.message ?? '',
-          changes: attributedChanges(record, view), coverage: treeCoverage(record, view),
-          tree: publicTree(record, view), treeSettledConfirmed: true };
-        task.delivery = { state: 'pending' };
+      if (!treeSettled(record, view)) {
+        waitForTree(record, view);
+        return await finishReports(record, view);
       }
-      return await finishDelivery(record);
+      const finalDispatch = task.dispatches.at(-1);
+      const terminal = task.cancelRequested || rootSummary(view)?.state === 'cancelled' ? 'cancelled'
+        : rootSummary(view)?.state === 'failed' || finalDispatch?.state === 'failed' ? 'failed'
+          : finalDispatch?.state === 'cancelled' ? 'cancelled' : undefined;
+      record.state = task.state = terminal ?? 'awaiting_report';
+      return await finishReports(record, view);
     } catch (error) {
       record.state = record.task?.result ? 'delivery_pending' : 'reconnecting';
       record.error = safeError(error); record.observation = { ...record.observation, stale: true };
@@ -514,10 +537,11 @@ export function createScopedAgents(config, {
         const host = await clientFactory(config).hostStatus();
         status.dshConnected = METHODS.every(method => host.methods?.includes(method));
         status.treeProtocolReady = host.treeProtocol === TREE_PROTOCOL;
+        status.reportProtocolReady = host.reportProtocol === REPORT_PROTOCOL;
         if (!status.dshConnected) status.hostError = { message: 'Install the current managed DSH bridge.' };
         else if (!status.treeProtocolReady) status.hostError = safeError(treeProtocolError());
       } catch (error) { status.hostError = safeError(error); }
-      status.ready = status.contextVerified && status.dshConnected && status.treeProtocolReady === true;
+      status.ready = status.contextVerified && status.dshConnected && status.treeProtocolReady === true && status.reportProtocolReady === true;
       return status;
     },
     async create({ name, lifetime }, extra) {
@@ -542,12 +566,17 @@ export function createScopedAgents(config, {
       textMessage(message);
       return withName(extra, name, async record => {
         if (record.closed || ['cleaning', 'cleanup_failed', 'creating'].includes(record.state)) throw new Error('This subagent is closing or not yet ready.');
-        if (record.state === 'delivery_pending') throw new Error('The previous result is waiting for delivery. Read it before assigning another task.');
+        if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait before assigning another task.');
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
         await checkHost(record);
+        const stoppedTask = record.task && ['cancelled', 'failed'].includes(record.state);
+        const pendingReports = (record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
+        if (stoppedTask && (record.lifetime === 'once' || pendingReports)) throw new Error('This task stopped; delete the one-shot agent or wait for its submitted reports before reusing a persistent agent.');
+        if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
         if (record.task && ACTIVE.has(record.state)) {
           await negotiateTree(record);
           const view = await observe(record);
+          if ((view.reports ?? []).some(report => report.final)) throw new Error('The agent has already submitted its final report.');
           if ((view.questions ?? []).some(question => question.state === 'pending')) return answerLocked(record, message);
           await sendDispatch(record, message, 'supplement');
         } else {
@@ -616,6 +645,7 @@ export function createScopedAgents(config, {
           }
         }
         return { ...publicResult(record), ...(rootHistory ?? {}), ...(rootError ? { error: rootError } : {}),
+          reports: { ...publicResult(record).reports, items: (record.task?.reports ?? []).map(report => ({ message: report.message, final: report.final, delivery: report.delivery.state })) },
           tree, inspectionIncomplete: tree.nodes.some(node => node.error !== undefined),
           historyCount: record.history.length,
           history: record.history.slice(-20).reverse().map((task, index) => ({ task: index + 1, message: compactText(task.message, 240),
@@ -650,7 +680,7 @@ export function createScopedAgents(config, {
           if (!record) { notListed.add(selected.find(item => item.agentId === id).name); continue; }
           items.push(publicResult(record, { fullResult: true }));
         }
-        if (!selectedIds.length || notListed.size || items.some(item => ['awaiting_input', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
+        if (!selectedIds.length || notListed.size || items.some(item => ['awaiting_input', 'awaiting_report', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
         if (Date.now() >= deadline) break;
         await wait(Math.min(250, deadline - Date.now()));
       } while (true);

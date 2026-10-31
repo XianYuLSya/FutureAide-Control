@@ -1,15 +1,15 @@
 {
   "name": "futureaide-control",
-  "version": "0.4.0",
-  "description": "Named DSH subagent teams for Codex: multi-level delegation, direct Q&A, attributed file changes, and one-shot or persistent sessions.",
+  "version": "0.5.0",
+  "description": "Named DSH teams for Codex with multi-level delegation, agent-controlled reports, direct questions, file attribution, and managed lifetimes.",
   "author": {
     "name": "FutureAide"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "FutureAide Control · DSH Control",
-    "shortDescription": "按名字安排 DSH 团队，多层委派、直接问答、自动回包和整树监工。",
-    "longDescription": "为每个 Codex 聊天建立独立的 DSH 子代理名单，自动使用当前项目路径。按名字派活与答疑，DSH 助手可继续安排多层下属；查看整棵树的任务、文件归属和对话，最终汇总自动回到原聊天。一次性任务交付后清理本机受管树，长期代理保留上下文供复用。适用于 Windows Codex Desktop 与 DSH Desktop，需 Node.js 24.14 或更高版本。QQ 交流群：259109974。",
+    "shortDescription": "按名字安排 DSH 团队，多层委派、主动汇报和整树监工。",
+    "longDescription": "为每个 Codex 聊天建立独立的 DSH 子代理名单，自动使用当前项目路径。按名字派活与答疑，DSH 助手可继续安排多层下属；查看整棵树的任务、文件归属和对话，仅DSH主动提交的汇报、提问和最终交付回到原聊天，普通轮次结束保持安静。一次性任务交付后清理本机受管树，长期代理保留上下文供复用。适用于 Windows Codex Desktop 与 DSH Desktop，需 Node.js 24.14 或更高版本。QQ 交流群：259109974。",
     "developerName": "FutureAide",
     "category": "Productivity",
     "capabilities": [

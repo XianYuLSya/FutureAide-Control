@@ -1,9 +1,9 @@
 {
   "name": "futureaide-control",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
-  "description": "Named DSH subagent teams for Codex with automatic chat and project binding, multi-level delegation, direct Q&A, attributed file changes, and managed lifetimes.",
+  "description": "Named DSH teams for Codex with multi-level delegation, agent-controlled reports, direct questions, file attribution, and managed lifetimes.",
   "homepage": "https://github.com/XianYuLSya/FutureAide-Control#readme",
   "repository": {
     "type": "git",

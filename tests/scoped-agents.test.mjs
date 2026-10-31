@@ -24,23 +24,23 @@ async function fixture({ startWorker } = {}) {
   let offline = false, notificationMode = 'ok', statusCalls = 0;
   const api = {
     async connectionIdentity() { if (offline) throw new Error('DSH offline'); return { application: 'dsh', dataRoot: path.join(stateDirectory, 'native') }; },
-    async hostStatus() { return { treeProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
+    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId, { ...input, model: { provider: 'fixture', model: 'test' }, running: false, seq: 0, questions: [], changes: [], turns: new Map() });
       return { ...sessions.get(input.sessionId), modelRequestsStarted: 0 };
     },
     async managedBeginTask(input) {
-      assert.equal(input.treeProtocol, 1);
+      assert.equal(input.treeProtocol, 1); assert.equal(input.reportProtocol, 1);
       beginnings.push(input);
       const s = sessions.get(input.sessionId);
       if (s.taskId !== input.taskId) Object.assign(s, { taskId: input.taskId, questions: [], changes: [], cancelled: false });
-      return { taskId: s.taskId, treeProtocol: 1 };
+      return { taskId: s.taskId, treeProtocol: 1, reportProtocol: 1 };
     },
     async managedStatus(input) {
-      assert.equal(input.treeProtocol, 1);
+      assert.equal(input.treeProtocol, 1); assert.equal(input.reportProtocol, 1);
       statusCalls++;
       const s = sessions.get(input.sessionId);
-      return { sessionId: s.sessionId, taskId: s.taskId, running: s.running, questions: s.questions,
+      return { sessionId: s.sessionId, taskId: s.taskId, running: s.running, questions: s.questions, reportProtocol: 1, reports: s.reports ?? [],
         changes: s.changes, coverage: 'files written by this agent', activity: s.running ? 'writing' : 'idle', throughSeq: s.seq,
         tree: { settled: !s.running, running: s.running,
           nodes: [{ sessionId: s.sessionId, parentSessionId: null, name: 'native root', status: s.running ? 'running' : 'idle',
@@ -75,13 +75,13 @@ async function fixture({ startWorker } = {}) {
       s.questions.forEach(question => { question.state = 'cancelled'; });
       return { cancelled: true };
     },
-    async managedDestroy(input) { assert.equal(input.treeProtocol, 1); sessions.delete(input.sessionId); removed.push(input.sessionId); return { destroyed: true }; },
+    async managedDestroy(input) { assert.equal(input.treeProtocol, 1); assert.equal(input.reportProtocol, 1); sessions.delete(input.sessionId); removed.push(input.sessionId); return { destroyed: true }; },
   };
   // Shared native event fixture; managedHistory does not use the ordinary API
   // method, which a running descendant is allowed to reject as agent-busy.
   const nativeHistory = api.readSession;
   api.managedHistory = async input => {
-    assert.equal(input.treeProtocol, 1);
+    assert.equal(input.treeProtocol, 1); assert.equal(input.reportProtocol, 1);
     historyRequests.push(input);
     const page = await nativeHistory(input.targetSessionId);
     return { events: page.records.map(record => record.event) };
@@ -124,7 +124,12 @@ async function fixture({ startWorker } = {}) {
     for (const [id, turn] of s.turns) if (turn.state !== 'ended') s.turns.set(id, { ...turn, state: 'ended', endSeq: s.seq,
       completionReason: { kind: 'completed' }, messages: [{ seq: s.seq - 1, role: 'assistant', text: reply }] });
   }
-  return { service, store, sessions, api, sends, notices, removed, workers, reads, cancellations, beginnings, historyRequests, stateDirectory, record, finish,
+  function report(message = '完成', final = true, name = 'artist') {
+    const r = record(name), session = sessions.get(r.sessionId);
+    session.reports ??= [];
+    session.reports.push({ id: 'explicit-' + session.reports.length, taskId: r.task.taskId, message, final, createdAt: new Date().toISOString() });
+  }
+  return { report, service, store, sessions, api, controlFactory, sends, notices, removed, workers, reads, cancellations, beginnings, historyRequests, stateDirectory, record, finish,
     offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls };
 }
 
@@ -228,7 +233,7 @@ test('one-shot asks directly, resumes once, and clears only after confirmed resu
   await f.service.poll(r.agentId);
   assert.equal(f.sends.length, 2);
   s.changes = [{ path: 'art.svg', operation: 'create' }];
-  f.finish('artist', '已画好 art.svg');
+  f.finish('artist', '已画好 art.svg'); f.report('已画好 art.svg');
   await f.service.poll(r.agentId);
   assert.equal(f.record(), undefined);
   assert.equal(f.removed[0], r.sessionId);
@@ -243,7 +248,7 @@ test('persistent agents reuse one session and retain earlier task changes', asyn
   const id = f.record().sessionId;
   await f.service.send({ name: 'artist', message: 'first' }, extra(A));
   f.sessions.get(id).changes = [{ path: 'first.svg', operation: 'write' }];
-  f.finish(); await f.service.poll(f.record().agentId);
+  f.finish(); f.report(); await f.service.poll(f.record().agentId);
   assert.equal(f.record().state, 'idle');
   await f.service.send({ name: 'artist', message: 'second' }, extra(A));
   assert.equal(f.record().sessionId, id);
@@ -256,11 +261,11 @@ test('cached results can return while DSH is offline; ambiguous delivery is read
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'task' }, extra(A));
-  f.finish(); f.notification('unknown');
+  f.finish(); f.report(); f.notification('unknown');
   await f.service.poll(f.record().agentId);
   const r = f.record();
-  assert.equal(r.task.delivery.state, 'unknown');
-  r.task.delivery.nextAttemptAt = 0; f.store.save(r);
+  assert.equal(r.task.reports[0].delivery.state, 'unknown');
+  r.task.reports[0].delivery.nextAttemptAt = 0; f.store.save(r);
   const observed = f.statusCalls();
   f.offline(true);
   await f.service.poll(r.agentId);
@@ -274,14 +279,14 @@ test('failed return does not clear a one-shot session', async () => {
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
   await f.service.send({ name: 'artist', message: 'task' }, extra(A));
-  f.finish(); f.notification('reject');
+  f.finish(); f.report(); f.notification('reject');
   await f.service.poll(f.record().agentId);
   assert.equal(f.record().state, 'delivery_pending');
   assert.equal(f.removed.length, 0);
   f.service.close();
 });
 
-test('cancel closes pending questions and returns cancellation before one-shot cleanup', async () => {
+test('cancel closes questions without automatic notice or one-shot cleanup', async () => {
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
   await f.service.send({ name: 'artist', message: 'task' }, extra(A));
@@ -289,8 +294,9 @@ test('cancel closes pending questions and returns cancellation before one-shot c
   f.sessions.get(r.sessionId).questions = [{ id: 'q', message: 'question', state: 'pending' }];
   await f.service.cancel({ name: 'artist' }, extra(A));
   await f.service.poll(r.agentId);
-  assert.equal(f.record(), undefined);
-  assert.match(f.notices.at(-1).prompt, /已取消/);
+  assert.equal(f.record().state, 'cancelled');
+  assert.equal(f.notices.length, 0);
+  assert.equal(f.removed.length, 0);
   f.service.close();
 });
 
@@ -318,7 +324,7 @@ test('accepted dispatch receipt restores a lost acknowledgement without another 
   await mkdir(directory, { recursive: true });
   await writeFile(path.join(directory, `${key}.json`), JSON.stringify({ status: 'accepted', afterSeq: dispatch.afterSeq }));
   dispatch.accepted = false; dispatch.state = 'sending'; dispatch.afterSeq = undefined; f.store.save(r);
-  f.finish(); await f.service.poll(r.agentId);
+  f.finish(); f.report(); await f.service.poll(r.agentId);
   assert.equal(f.sends.length, 1);
   assert.equal(f.record().state, 'idle');
   f.service.close();
@@ -343,19 +349,19 @@ test('one-shot returns full native text rather than the truncated inspection vie
   await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
   await f.service.send({ name: 'artist', message: 'long answer' }, extra(A));
   const r = f.record(), reply = '中'.repeat(9000) + '完整结尾';
-  f.finish('artist', reply);
+  f.finish('artist', reply); f.report(reply);
   await f.service.poll(r.agentId);
   assert.ok(f.notices.at(-1).prompt.includes(reply));
   assert.equal(f.record(), undefined);
   f.service.close();
 });
 
-test('list and automatic result notices include file summaries, never file bodies', async () => {
+test('list retains file summaries while explicit reports contain only submitted text', async () => {
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'draw a diagram' }, extra(A));
   f.sessions.get(f.record().sessionId).changes = [{ path: 'diagram.svg', operation: 'create', before: '', after: '<svg>private full file body</svg>' }];
-  f.finish('artist', 'Saved diagram.svg'); await f.service.poll(f.record().agentId);
+  f.finish('artist', 'Saved diagram.svg'); f.report('Saved diagram.svg'); await f.service.poll(f.record().agentId);
   const list = await f.service.list(extra(A));
   assert.ok(!JSON.stringify(list).includes('private full file body'));
   assert.ok(!f.notices.at(-1).prompt.includes('private full file body'));
@@ -364,7 +370,7 @@ test('list and automatic result notices include file summaries, never file bodie
 });
 
 
-test('one-shot waits for descendants, result notifications and the final root summary before delivery', async () => {
+test('one-shot requires an explicit final report and settled descendant tree', async () => {
   const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
@@ -383,15 +389,16 @@ test('one-shot waits for descendants, result notifications and the final root su
     assert.equal(f.notices.length, 0);
     s.tree.settled = true;
     await f.service.poll(r.agentId); // Settled tree, but root summary still unverified.
-    assert.equal(f.record().state, 'running');
+    assert.equal(f.record().state, 'awaiting_report');
     assert.equal(f.notices.length, 0);
     const summary = '汇总'.repeat(5000) + '完整收尾';
-    s.tree.rootSummary = { ready: true, reply: summary, state: 'completed' };
+    s.tree.rootSummary = { ready: true, reply: 'Not a report', state: 'completed' };
+    f.report(summary);
     await f.service.poll(r.agentId);
     assert.equal(f.record(), undefined);
     assert.ok(f.notices[0].prompt.includes(summary));
     assert.ok(!f.notices[0].prompt.includes('Initial root turn'));
-    assert.ok(f.notices[0].prompt.includes('designer'));
+    assert.ok(!f.notices[0].prompt.includes('designer'));
     assert.equal(f.removed.filter(item => item === r.sessionId).length, 1);
   } finally { f.service.close(); }
 });
@@ -443,9 +450,9 @@ test('tree cancellation cannot complete or clean up while a descendant is still 
     assert.equal(f.cancellations[0].sessionId, r.sessionId);
     s.descendants[0].status = 'idle'; s.tree = { settled: true, running: false };
     await f.service.poll(r.agentId);
-    assert.equal(f.record(), undefined);
-    assert.match(f.notices[0].prompt, /已取消/);
-    assert.equal(f.removed.filter(item => item === r.sessionId).length, 1);
+    assert.equal(f.record().state, 'cancelled');
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.removed.length, 0);
   } finally { f.service.close(); }
 });
 
@@ -478,7 +485,7 @@ test('tree protocol negotiation blocks an old host and a new task cannot lose it
   } finally { f.service.close(); }
 });
 
-test('a historical completed single-agent result without tree fields remains deliverable offline', async () => {
+test('a historical automatic result remains quarantined without delivery or cleanup', async () => {
   const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
@@ -494,9 +501,15 @@ test('a historical completed single-agent result without tree fields remains del
     const observed = f.statusCalls();
     f.offline(true);
     await f.service.poll(r.agentId);
-    assert.equal(f.record().state, 'idle');
+    assert.equal(f.record().state, 'awaiting_report');
     assert.equal(f.statusCalls(), observed);
-    assert.ok(f.notices[0].prompt.includes('Historical verified answer'));
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.record().task.legacyAutomaticResult.reply, 'Historical verified answer');
+    assert.equal(f.removed.length, 0);
+    f.offline(false);
+    await f.service.poll(r.agentId);
+    assert.equal(f.sends.length, 0, 'old completed work must never be dispatched again');
+    assert.equal(f.notices.length, 0);
   } finally { f.service.close(); }
 });
 
@@ -523,7 +536,7 @@ test('a new caller adopts the exact old in-flight task without resending its pro
 });
 
 
-test('a failed final summary turn overrides an earlier completed root dispatch', async () => {
+test('a native final summary never becomes a report or completion notice', async () => {
   const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
@@ -533,10 +546,9 @@ test('a failed final summary turn overrides an earlier completed root dispatch',
     f.finish('artist', 'Initial root completed');
     s.tree = { settled: true, running: false, rootSummary: { ready: true, reply: '', state: 'failed' } };
     await f.service.poll(r.agentId);
-    assert.equal(f.record().task.result.state, 'failed');
-    assert.equal(f.record().task.result.reply, '');
-    assert.match(f.notices[0].prompt, /任务失败/);
-    assert.ok(!f.notices[0].prompt.includes('Initial root completed'));
+    assert.equal(f.record().state, 'failed');
+    assert.equal(f.record().task.result, undefined);
+    assert.equal(f.notices.length, 0);
   } finally { f.service.close(); }
 });
 
@@ -577,5 +589,150 @@ test('managed inspection keeps empty history distinct from denial without starti
     assert.equal(ordinaryReads, 0);
     assert.equal(f.beginnings.length, 0);
     assert.equal(f.sends.length, 0);
+  } finally { f.service.close(); }
+});
+
+
+test('ordinary turns stay quiet; nonfinal reports preserve the task and exact body across supplements', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    const first = f.record(), taskId = first.task.taskId;
+    f.finish('artist', 'ordinary assistant text');
+    await f.service.poll(first.agentId);
+    assert.equal(f.record().state, 'awaiting_report');
+    assert.equal(f.notices.length, 0); assert.equal(f.removed.length, 0);
+    f.report('Only this progress', false);
+    await f.service.poll(first.agentId);
+    assert.equal(f.record().state, 'awaiting_report');
+    assert.equal(f.notices[0].prompt.split('\n\n<!--')[0], 'DSH「artist」汇报：\nOnly this progress');
+    await f.service.poll(first.agentId);
+    assert.equal(f.notices.length, 1);
+    await f.service.send({ name: 'artist', message: 'continue' }, extra(A));
+    assert.equal(f.record().task.taskId, taskId);
+    assert.equal(f.sends.length, 2);
+    f.report('Explicit final');
+    f.finish('artist', 'Different ordinary ending');
+    await f.service.poll(first.agentId);
+    assert.equal(f.record(), undefined);
+    assert.equal(f.notices.length, 2);
+    assert.equal(f.notices[1].prompt.split('\n\n<!--')[0], 'DSH「artist」交付：\nExplicit final');
+  } finally { f.service.close(); }
+});
+
+test('a submitted final waits for the tree; cancellation retains reports but never cleans automatically', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    const r = f.record(), session = f.sessions.get(r.sessionId);
+    f.report('Final submitted');
+    session.tree = { settled: false, running: true };
+    await f.service.poll(r.agentId);
+    assert.equal(f.notices.length, 0);
+    await assert.rejects(f.service.send({ name: 'artist', message: 'too late' }, extra(A)), /final report/);
+    await f.service.cancel({ name: 'artist' }, extra(A));
+    session.tree = { settled: true, running: false };
+    await f.service.poll(r.agentId);
+    assert.equal(f.record().state, 'cancelled');
+    assert.equal(f.notices.length, 1);
+    assert.equal(f.notices[0].prompt.split('\n\n<!--')[0], 'DSH「artist」交付：\nFinal submitted');
+    assert.equal(f.removed.length, 0);
+  } finally { f.service.close(); }
+});
+
+test('report protocol adoption preserves the dispatch and rejects an old bridge', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'existing task' }, extra(A));
+    const r = f.record(); delete r.task.reportProtocol; f.store.save(r);
+    const status = f.api.hostStatus;
+    f.api.hostStatus = async () => ({ ...await status(), reportProtocol: undefined });
+    await f.service.poll(r.agentId);
+    assert.equal(f.record().error.code, 'report-protocol-required');
+    assert.equal(f.sends.length, 1);
+    f.api.hostStatus = status;
+    await f.service.poll(r.agentId);
+    assert.equal(f.beginnings.at(-1).taskId, r.task.taskId);
+    assert.equal(f.beginnings.at(-1).reportProtocol, 1);
+    assert.equal(f.record().task.reportProtocol, 1);
+    assert.equal(f.sends.length, 1);
+  } finally { f.service.close(); }
+});
+
+
+test('a cancelled persistent agent starts a new task in the same session, while a cancelled one-shot cannot', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'cancel this' }, extra(A));
+    const old = f.record(), oldTask = old.task.taskId;
+    await f.service.cancel({ name: 'artist' }, extra(A));
+    await f.service.poll(old.agentId);
+    assert.equal(f.record().state, 'cancelled');
+    await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
+    assert.equal(f.record().sessionId, old.sessionId);
+    assert.notEqual(f.record().task.taskId, oldTask);
+    assert.equal(f.record().history[0].taskId, oldTask);
+    assert.equal(f.sends.length, 2);
+    await f.service.create({ name: 'once', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'once', message: 'one task' }, extra(A));
+    await f.service.cancel({ name: 'once' }, extra(A));
+    await f.service.poll(f.record('once').agentId);
+    await assert.rejects(f.service.send({ name: 'once', message: 'second task' }, extra(A)), /one-shot/);
+    assert.equal(f.notices.length, 0);
+  } finally { f.service.close(); }
+});
+
+
+test('an accepted progress report is delivered before a broken ordinary dispatch observation', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    const r = f.record();
+    f.report('Persisted progress', false);
+    // A malformed/missing native dispatch causes the fixture wait to reject.
+    f.sessions.get(r.sessionId).turns.delete(r.task.dispatches[0].requestId);
+    await f.service.poll(r.agentId);
+    assert.equal(f.notices.length, 1);
+    assert.equal(f.notices[0].prompt.split('\n\n<!--')[0], 'DSH「artist」汇报：\nPersisted progress');
+    assert.equal(f.record().task.reports[0].delivery.state, 'delivered');
+    assert.equal(f.record().state, 'reconnecting');
+    await f.service.poll(r.agentId);
+    assert.equal(f.notices.length, 1);
+  } finally { f.service.close(); }
+});
+
+
+test('a failed final report delivery retry never automatically cleans a one-shot tree', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    const r = f.record(), session = f.sessions.get(r.sessionId);
+    f.finish(); f.report('Explicit failure report');
+    session.tree = { settled: true, running: false, rootSummary: { ready: true, reply: '', state: 'failed' } };
+    f.notification('reject');
+    await f.service.poll(r.agentId);
+    assert.equal(f.record().state, 'delivery_pending');
+    assert.equal(f.record().task.result.state, 'failed');
+    assert.equal(f.removed.length, 0);
+    const retry = f.record();
+    // The persisted final result remains authoritative even for records whose
+    // task state predates this fix and still says running.
+    retry.task.state = 'running';
+    retry.task.reports[0].delivery.nextAttemptAt = 0;
+    f.store.save(retry);
+    f.notification('ok');
+    await f.service.poll(r.agentId);
+    assert.equal(f.record().state, 'failed');
+    assert.equal(f.record().task.state, 'failed');
+    assert.equal(f.record().task.reports[0].delivery.state, 'delivered');
+    assert.equal(f.notices.length, 1);
+    assert.equal(f.removed.length, 0);
+    assert.ok(f.sessions.has(r.sessionId));
   } finally { f.service.close(); }
 });

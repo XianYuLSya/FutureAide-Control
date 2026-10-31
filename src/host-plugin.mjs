@@ -191,6 +191,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       running: agent?.status === 'running', status: record.closing ? 'cleaning' : agent?.status ?? 'unloaded',
       activity: record.activity ?? 'idle', throughSeq: agent ? sessionCursor(agent.session) : record.throughSeq ?? -1,
       questions: structuredClone(record.questions ?? []), changes: structuredClone(record.changes ?? []),
+      reports: structuredClone((record.reports ?? []).filter(report => report.taskId === record.taskId)),
       coverage: { source: 'agent-file-tool-results', complete: false,
         limitation: 'Only successful file mutations observed in this agent are attributed; shell and external writes are not inferred from the shared workspace.' },
       updatedAt: record.updatedAt, ...(record.observationError ? { observationError: record.observationError } : {}),
@@ -288,6 +289,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       async execute(args, exec) {
         if (exec.agent !== agent || record.closing || record.cancelled) reject('managed-task-closed');
         if (!record.taskId) reject('managed-task-required');
+        if ((record.reports ?? []).some(report => report.taskId === record.taskId && report.final)) reject('managed-report-finalized');
         if (typeof args?.message !== 'string' || !args.message.trim() || args.message.length > 100000) reject('invalid-question');
         record.questions.push({ id: `question-${randomUUID()}`, taskId: record.taskId, message: args.message,
           state: 'pending', createdAt: new Date().toISOString() });
@@ -298,6 +300,31 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       },
     };
     if (fresh) tools.register({ ...binding.questionTool, execute: (args, exec) => binding.questionTool.execute(args, exec) });
+    binding.reportTool = {
+      name: 'report_parent',
+      description: 'Send a message to your controlling Codex agent when useful. Set final to true only for your completed final deliverable; ordinary replies are not automatically sent. Your descendants communicate with you using native messaging.',
+      parameters: { type: 'object', properties: { message: { type: 'string', minLength: 1, maxLength: 100000 }, final: { type: 'boolean', default: false } }, required: ['message'], additionalProperties: false },
+      output: { schema: { type: 'object', properties: { accepted: { type: 'boolean' }, final: { type: 'boolean' } }, required: ['accepted', 'final'], additionalProperties: false },
+        render: () => [{ type: 'text', text: 'Your report was recorded for delivery to the controlling agent.' }] },
+      async execute(args, exec) {
+        if (exec.agent !== agent || record.closing || record.cancelled || record.reportProtocol !== 1) reject('managed-task-closed');
+        if (!record.taskId) reject('managed-task-required');
+        if (typeof args?.message !== 'string' || !args.message.trim() || args.message.length > 100000 || (args.final !== undefined && typeof args.final !== 'boolean')) reject('invalid-report');
+        const reports = record.reports ??= [];
+        if (reports.some(report => report.taskId === record.taskId && report.final)) reject('managed-report-finalized');
+        const report = { id: `report-${randomUUID()}`, taskId: record.taskId, message: args.message, final: args.final === true, createdAt: new Date().toISOString() };
+        reports.push(report);
+        try { await persist(record); } catch (error) { reports.splice(reports.indexOf(report), 1); throw error; }
+        if (report.final) exec.concludeTurn();
+        return { accepted: true, final: report.final };
+      },
+    };
+    if (!binding.reportRegistered) {
+      tools.register({ ...binding.reportTool, execute: (args, exec) => binding.reportTool.execute(args, exec) });
+      binding.reportRegistered = true;
+      agentCtx.get('systemPrompt')?.context?.({ name: 'futureaide:reports', order: 100,
+        text: 'Your ordinary responses are not sent to the controlling Codex agent. Use report_parent for updates and use final: true with your final deliverable. Use ask_parent when you need an answer.' });
+    }
     binding.preExecute = async (exec, next) => {
       if (exec.agent === agent && record.taskId && !record.closing) {
         record.activity = `tool: ${exec.name}`;
@@ -456,18 +483,20 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     }); },
     managedBeginTask(input) { return serial(input, async () => {
       managedId(input.taskId);
+      if (input.reportProtocol !== 1) reject('managed-report-protocol-required');
       const record = await load({ ...input, taskId: undefined });
       const treeProtocol = input.treeProtocol === 1;
       if ((!treeProtocol && input.treeProtocol !== undefined) || (!treeProtocol && record.treeProtocol === 1)) reject('managed-tree-protocol-required');
       if (record.closing) reject('managed-agent-closing');
       let agent = await activate(record);
       if (record.taskId === input.taskId) {
+        record.reportProtocol = 1;
         if (treeProtocol && record.treeProtocol !== 1) {
           record.treeProtocol = 1;
           if (!Number.isSafeInteger(record.taskStartSeq) && Number.isSafeInteger(input.taskStartSeq) && input.taskStartSeq >= -1) record.taskStartSeq = input.taskStartSeq;
-          await persist(record);
         }
-        return { ...snapshot(record, agent), ...(treeProtocol ? { treeProtocol: 1 } : {}) };
+        await persist(record);
+        return { ...snapshot(record, agent), reportProtocol: 1, ...(treeProtocol ? { treeProtocol: 1 } : {}) };
       }
       if (agent.status === 'running' || record.questions.some(question => question.state === 'pending')) reject('managed-agent-busy');
       const key = keyOf(record);
@@ -479,17 +508,18 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         agent = await activate(record);
       }
       runtime.treeBarriers.delete(key); runtime.treeInspections.delete(key);
-      Object.assign(record, { taskId: input.taskId, treeProtocol: treeProtocol ? 1 : undefined, taskStartSeq: sessionCursor(agent.session), taskTurnEndSeq: undefined, questions: [], changes: [], descendantChanges: {}, cancelled: false, cancellationSettled: false,
+      Object.assign(record, { taskId: input.taskId, reportProtocol: 1, reports: [], treeProtocol: treeProtocol ? 1 : undefined, taskStartSeq: sessionCursor(agent.session), taskTurnEndSeq: undefined, questions: [], changes: [], descendantChanges: {}, cancelled: false, cancellationSettled: false,
         activity: 'ready', answers: [], throughSeq: sessionCursor(agent.session) });
       await persist(record);
-      return { ...snapshot(record, agent), ...(treeProtocol ? { treeProtocol: 1 } : {}) };
+      return { ...snapshot(record, agent), reportProtocol: 1, ...(treeProtocol ? { treeProtocol: 1 } : {}) };
     }); },
     managedStatus(input) { return serial(input, async () => {
+      if (input.reportProtocol !== 1) reject('managed-report-protocol-required');
       const record = await load(input);
       if (record.treeProtocol === 1 && input.treeProtocol !== 1) reject('managed-tree-protocol-required');
       const agent = record.closing ? handles.get(keyOf(record))?.agent : await activate(record);
       await (writes.get(keyOf(record)) ?? Promise.resolve());
-      return { ...snapshot(record, agent), tree: await treeSnapshot(record, agent) };
+      return { ...snapshot(record, agent), reportProtocol: 1, tree: await treeSnapshot(record, agent) };
     }); },
     managedHistory(input) { return serial(input, async () => {
       const record = await load(input);
@@ -553,6 +583,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       return { ...snapshot(record, agent), cancelled: true, cancelRequested: true, pendingInputCleared: true };
     }); },
     managedDestroy(input) { return serial(input, async () => {
+      if (input.reportProtocol !== 1) reject('managed-report-protocol-required');
       let record;
       try { record = await load(input); }
       catch (error) {
@@ -807,7 +838,7 @@ export function createHostHandler(ctx, token, options = {}) {
           || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) reject('bridge-auth-required');
       if (managed && MANAGED_METHODS.includes(endpoint)) return { ok: true, value: await managed[endpoint](input) };
       if (!['capabilities', 'historyCursor', 'ping'].includes(endpoint)) reject('unknown-method');
-      if (endpoint === 'ping') return { ok: true, value: { version: 1, revision: options.revision ?? null, ...(managed ? { treeProtocol: 1 } : {}),
+      if (endpoint === 'ping') return { ok: true, value: { version: 1, revision: options.revision ?? null, ...(managed ? { treeProtocol: 1, reportProtocol: 1 } : {}),
         methods: ['capabilities', 'historyCursor', ...(managed ? MANAGED_METHODS : [])], pid: process.pid } };
       if (endpoint === 'historyCursor') return { ok: true, value: await historyCursor(ctx, input.sessionId, input.workspace) };
       const { agent, activated } = await resolveAgent(ctx, input.sessionId, input.workspace, input.activate === true);

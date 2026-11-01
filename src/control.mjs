@@ -68,6 +68,34 @@ export function endedState(completionReason) {
   return !kind || kind === 'completed' ? 'completed' : 'failed';
 }
 
+/** Keep model failures useful without exporting provider payloads or credentials. */
+export function modelTurnError(completionReason) {
+  if (completionReason?.kind !== 'error') return undefined;
+  const native = completionReason.error ?? {};
+  const text = typeof native.message === 'string' ? native.message.slice(0, 1200) : '';
+  const prefix = text.match(/^\s*(?:HTTP\s+)?([45]\d\d)\s*:\s*/i);
+  const httpStatus = prefix ? Number(prefix[1])
+    : Number.isInteger(native.httpStatus) && native.httpStatus >= 400 && native.httpStatus <= 599 ? native.httpStatus : undefined;
+  let body;
+  try { body = JSON.parse(prefix ? text.slice(prefix[0].length) : text); }
+  catch { /* A plain native error still has its category. */ }
+  const stableCode = value => typeof value === 'string' && value.length <= 80
+    && /^[a-z][a-z0-9_.-]*(?:\/[a-z][a-z0-9_.-]*)*$/i.test(value)
+    && !/^(?:sk[-_]|bearer[-_])/i.test(value) ? value : undefined;
+  const code = stableCode(body?.code ?? body?.error?.code)
+    ?? stableCode(native.code) ?? 'model-turn-failed';
+  const descriptions = {
+    no_healthy_account: 'The model gateway has no healthy account available.',
+    insufficient_quota: 'The model provider reports insufficient quota.',
+    rate_limit_exceeded: 'The model provider is rate limiting requests.',
+    invalid_api_key: 'The model provider rejected its API credentials.',
+    model_not_found: 'The model provider did not find the configured model.',
+    context_length_exceeded: 'The model request exceeds the provider context limit.',
+  };
+  return { source: 'model', code, ...(httpStatus ? { httpStatus } : {}),
+    message: Object.hasOwn(descriptions, code) ? descriptions[code] : 'DSH model execution failed.' };
+}
+
 /**
  * A dispatched turn counts as finished only when the newest page ends with a
  * turn/end event newer than the baseline cursor taken before the dispatch.
@@ -241,9 +269,12 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
     const latest = managed ? await checkSession(id) : (await api.listSessions()).items.find(item => item.sessionId === id) ?? row;
     const payload = historyMessages(dispatch.page, latest);
     const messages = (payload.messages ?? []).filter(message => Number.isSafeInteger(message.seq) && message.seq > baseline);
+    const error = ended ? modelTurnError(dispatch.boundary.completionReason) : undefined;
     const result = { state: ended ? 'ended' : 'running', sessionId: id,
       ...(requestId === undefined ? {} : { requestId }), afterSeq: baseline,
-      correlation: dispatch.boundary.correlation, endSeq: dispatch.boundary.endSeq, completionReason: dispatch.boundary.completionReason,
+      correlation: dispatch.boundary.correlation, endSeq: dispatch.boundary.endSeq,
+      completionReason: error ? { kind: 'error', error } : dispatch.boundary.completionReason,
+      ...(error ? { error } : {}),
       session: briefSession(latest), running: Boolean(latest.running), lastEventType: payload.lastEventType, messages,
       ...(payload.hasMore ? { hasMore: true, nextThroughSeq: payload.nextThroughSeq } : {}) };
     if (!ended) {

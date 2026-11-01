@@ -3,7 +3,8 @@ import { spawn } from 'node:child_process';
 import { lstat, readFile, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createControl, endedState, historyMessages } from './control.mjs';
+import { createControl, endedState, historyMessages, modelTurnError } from './control.mjs';
+import { dispatchBoundary } from './dispatch.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
@@ -107,6 +108,8 @@ function treeCoverage(record, view) {
 
 function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
+  const lastDispatch = task?.dispatches?.at(-1);
+  const error = record.error ?? (lastDispatch?.state === 'failed' ? lastDispatch.failure : undefined);
   const view = record.observation ?? {};
   const changes = attributedChanges(record, view);
   return {
@@ -126,7 +129,7 @@ function publicResult(record, { fullResult = false } = {}) {
       ...(task?.reports?.length ? { latest: { summary: compactText(task.reports.at(-1).message, 240), final: task.reports.at(-1).final, delivery: task.reports.at(-1).delivery.state } } : {}) },
     delivery: task?.reports?.find(report => report.delivery.state !== 'delivered')?.delivery.state ?? task?.reports?.at(-1)?.delivery.state ?? null, updatedAt: record.updatedAt,
     ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
-    ...(record.error ? { error: record.error } : {}),
+    ...(error ? { error } : {}),
   };
 }
 
@@ -532,7 +535,8 @@ export function createScopedAgents(config, {
           const observed = await controlFor(record).wait({ sessionId: record.sessionId, requestId: prior.requestId,
             afterSeq: prior.afterSeq, timeoutSeconds: 0, maxMessages: 100 });
           if (observed.state === 'ended' && observed.correlation === 'request-id') Object.assign(prior,
-            { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq });
+            { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq,
+              failure: modelTurnError(observed.completionReason) });
         }
         store.save(record);
         if (prior.accepted) { store.setSupplement(item.requestId, 'accepted'); continue; }
@@ -625,7 +629,7 @@ export function createScopedAgents(config, {
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
           Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true,
-            endSeq: result.endSeq });
+            endSeq: result.endSeq, failure: modelTurnError(result.completionReason) });
         }
       }
       const outstanding = task.dispatches.some(dispatch => !['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state));
@@ -799,6 +803,16 @@ export function createScopedAgents(config, {
             const raw = await apiFor(record).managedHistory({ ...hostArgs(record), targetSessionId: node.sessionId });
             if (!Array.isArray(raw?.events)) throw Object.assign(new Error('The DSH bridge returned invalid session history.'), { code: 'invalid-response' });
             const page = { records: raw.events.map(event => ({ type: 'event', event })), hasMore: false };
+            const dispatch = node.sessionId === record.sessionId ? record.task?.dispatches?.at(-1) : undefined;
+            if (dispatch?.state === 'failed' && !dispatch.failure) {
+              // Upgrade old failed records from this inspection's existing page,
+              // and only when it contains this task's original request.
+              const boundary = dispatchBoundary(page.records, dispatch.afterSeq ?? -1, dispatch.requestId);
+              if (boundary.matched && boundary.endSeq !== undefined) {
+                const failure = modelTurnError(boundary.completionReason);
+                if (failure) { dispatch.failure = failure; store.save(record); }
+              }
+            }
             const history = historyMessages(page, { sessionId: node.sessionId, running: node.status === 'running' });
             const selected = { messages: history.messages.slice(-maxMessages), hasMore: history.hasMore || history.messages.length > maxMessages,
               ...(history.note ? { note: history.note } : {}) };

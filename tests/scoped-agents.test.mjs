@@ -137,6 +137,70 @@ async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, b
     offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls };
 }
 
+test('model failure is visible in list wait and inspect without callbacks or redispatch and clears on the next task', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    f.finish();
+    const r = f.record(), session = f.sessions.get(r.sessionId);
+    Object.assign(session.turns.get(r.task.dispatches[0].requestId), { messages: [],
+      completionReason: { kind: 'error', error: { code: 'SERVER',
+        message: '503: {"code":"no_healthy_account","message":"private upstream detail"}' } } });
+    const failed = await f.service.poll(r.agentId);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.error, { source: 'model', code: 'no_healthy_account', httpStatus: 503,
+      message: 'The model gateway has no healthy account available.' });
+    assert.deepEqual((await f.service.list(extra(A))).items[0].error, failed.error);
+    assert.deepEqual((await f.service.wait({ names: ['artist'] }, extra(A))).items[0].error, failed.error);
+    assert.deepEqual((await f.service.inspect({ name: 'artist' }, extra(A))).error, failed.error);
+    assert.equal(f.record().error, undefined, 'successful observation does not replace model failure with a connection error');
+    assert.doesNotMatch(JSON.stringify(f.record()), /private upstream/);
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.removed.length, 0);
+
+    await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
+    assert.notEqual(f.record().task.taskId, r.task.taskId);
+    assert.equal((await f.service.list(extra(A))).items[0].error, undefined);
+    assert.deepEqual(f.record().history[0].dispatches[0].failure, failed.error);
+    f.finish();
+    const completed = await f.service.poll(r.agentId);
+    assert.equal(completed.state, 'awaiting_report');
+    assert.equal(completed.error, undefined);
+  } finally { f.service.close(); }
+});
+
+test('model failure backfill uses only the inspected original request and does not read history again', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'old task' }, extra(A));
+    f.finish();
+    const r = f.record(), session = f.sessions.get(r.sessionId);
+    Object.assign(session.turns.get(r.task.dispatches[0].requestId), { messages: [],
+      completionReason: { kind: 'error', error: { code: 'SERVER', message: '503: {"code":"no_healthy_account"}' } } });
+    r.state = r.task.state = r.task.dispatches[0].state = 'failed';
+    f.store.save(r);
+    const inspection = await f.service.inspect({ name: 'artist' }, extra(A));
+    assert.equal(inspection.error.code, 'no_healthy_account');
+    assert.equal(f.historyRequests.length, 1);
+    assert.equal(f.reads.length, 1);
+    assert.deepEqual((await f.service.list(extra(A))).items[0].error, inspection.error);
+
+    await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
+    const next = f.record();
+    next.state = next.task.state = next.task.dispatches[0].state = 'failed';
+    f.store.save(next);
+    const unmatched = await f.service.inspect({ name: 'artist' }, extra(A));
+    assert.equal(unmatched.error, undefined, 'an older failed turn cannot supply the new request error');
+    assert.equal(f.historyRequests.length, 2);
+    assert.equal(f.reads.length, 2);
+    assert.equal(f.notices.length, 0);
+    assert.equal(f.sends.length, 2);
+  } finally { f.service.close(); }
+});
+
 test('a proven pre-write read failure resumes the original dispatch; historical failed intents remain stopped', async () => {
   let attempts = 0;
   const f = await fixture({ beforeSend: async () => {

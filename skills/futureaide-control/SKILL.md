@@ -32,6 +32,8 @@ DSH helpers may delegate further through DSH's native subagent tools. Continue a
 
 ## Connection and recovery
 
+Model execution failures appear in list, wait and inspect as a compact `error` with `source: "model"`, a stable code and an HTTP status when available. For example, `no_healthy_account` means the configured gateway has no healthy account available. This does not trigger an automatic report or retry the model task. Inspect can fill the reason for an older failed record from the original request's events already being read. A new task or later successful dispatch clears the current display of the old failure.
+
 `futureaide_status()` reports whether this chat context and DSH bridge are available. Chat verification alone is not a completed return-message test. The plugin reconnects using saved task identities, recovers accepted dispatches and pending answers, and retains undelivered results. Do not create a replacement task merely because a call timed out.
 
 A final report waiting for delivery is `delivery_pending`. Old automatic result caches are not converted into explicit reports or cleanup authorization. An ambiguous delivery is checked against the original chat and is not blindly resent. Until delivery is confirmed, a one-shot session remains available. If the Codex client has unloaded the MCP transport, its plugin tools need to be reloaded; DSH being healthy does not fix that client-side channel.

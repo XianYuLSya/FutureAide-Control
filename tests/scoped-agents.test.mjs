@@ -711,6 +711,48 @@ test('managed inspection keeps empty history distinct from denial without starti
 });
 
 
+test('send returns a compact receipt for a rich active task and preserves errors', async () => {
+  let failure;
+  const f = await fixture({ beforeSend: async () => { if (failure) throw failure; } });
+  try {
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  assert.deepEqual(await f.service.send({ name: 'artist', message: 'private initial task' }, extra(A)),
+    { name: 'artist', accepted: true, state: 'running' });
+  const record = f.record();
+  record.callbackBlocked = true;
+  record.task.reports = [{ id: 'old-report', message: 'private report', final: false, delivery: { state: 'blocked' } }];
+  const session = f.sessions.get(record.sessionId);
+  session.changes = [{ path: 'private file', operation: 'write' }];
+  session.descendants = [
+    { sessionId: 'child', parentSessionId: record.sessionId, name: 'child', status: 'unloaded', changes: [] },
+    { sessionId: 'grandchild', parentSessionId: 'child', name: 'deep child', status: 'unloaded',
+      changes: [{ path: 'private child file', operation: 'write' }], coverage: { complete: false } },
+  ];
+  f.store.save(record);
+  const result = await f.service.send({ name: 'artist', message: 'private supplement' }, extra(A));
+  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'callbackError', 'name', 'state']);
+  assert.equal(result.accepted, true);
+  assert.equal(result.callbackError.code, 'native-callback-unavailable');
+  assert.doesNotMatch(JSON.stringify(result), /private|deep child|coverage/);
+  const listed = (await f.service.list(extra(A))).items[0];
+  assert.equal(listed.tree.nodes.length, 3);
+  assert.equal(listed.changes.count, 2);
+  assert.equal(listed.reports.latest.summary, 'private report');
+  failure = Object.assign(new Error('transport rejected'), { code: 'send-rejected' });
+  const rejected = await f.service.send({ name: 'artist', message: 'retry' }, extra(A));
+  assert.equal(rejected.accepted, false);
+  assert.equal(rejected.error.code, 'send-rejected');
+  assert.equal(rejected.callbackError.code, 'native-callback-unavailable');
+  failure = Object.assign(new Error('delivery unknown'), { code: 'send-unknown', uncertain: true });
+  const unknown = await f.service.send({ name: 'artist', message: 'retry uncertain' }, extra(A));
+  assert.equal(unknown.accepted, false);
+  assert.equal(unknown.error.code, 'send-unknown');
+  failure = undefined;
+  f.sessions.get(f.record().sessionId).questions = [{ id: 'q', message: 'question', state: 'pending' }];
+  assert.deepEqual(await f.service.send({ name: 'artist', message: 'answer' }, extra(A)), { name: 'artist', answered: true, state: 'resuming' });
+  } finally { f.service.close(); }
+});
+
 test('ordinary turns stay quiet; nonfinal reports preserve the task and exact body across supplements', async () => {
   const f = await fixture();
   try {

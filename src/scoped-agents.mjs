@@ -637,7 +637,12 @@ export function createScopedAgents(config, {
           catch (error) { record.state = 'reconnecting'; record.error = safeError(error); store.save(record); }
         }
         await ensureWorker(record);
-        return { ...publicResult(store.get(record.agentId) ?? record), accepted: record.task.dispatches.at(-1)?.accepted === true };
+        const current = store.get(record.agentId) ?? record;
+        const dispatch = record.task.dispatches.at(-1);
+        const error = current.error ?? dispatch?.error;
+        return { name: current.name, accepted: dispatch?.accepted === true, state: current.state,
+          ...(error ? { error } : {}),
+          ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
       });
     },
     async answer({ name, message }, extra) {

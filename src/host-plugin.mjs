@@ -302,7 +302,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     if (fresh) tools.register({ ...binding.questionTool, execute: (args, exec) => binding.questionTool.execute(args, exec) });
     binding.reportTool = {
       name: 'report_parent',
-      description: 'Send a message to your controlling Codex agent when useful. Set final to true only for your completed final deliverable; ordinary replies are not automatically sent. Your descendants communicate with you using native messaging.',
+      description: 'Send a report to your controlling Codex agent. Set final to true for the completed task deliverable. Descendants report to their native parent.',
       parameters: { type: 'object', properties: { message: { type: 'string', minLength: 1, maxLength: 100000 }, final: { type: 'boolean', default: false } }, required: ['message'], additionalProperties: false },
       output: { schema: { type: 'object', properties: { accepted: { type: 'boolean' }, final: { type: 'boolean' } }, required: ['accepted', 'final'], additionalProperties: false },
         render: () => [{ type: 'text', text: 'Your report was recorded for delivery to the controlling agent.' }] },
@@ -323,7 +323,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       tools.register({ ...binding.reportTool, execute: (args, exec) => binding.reportTool.execute(args, exec) });
       binding.reportRegistered = true;
       agentCtx.get('systemPrompt')?.context?.({ name: 'futureaide:reports', order: 100,
-        text: 'Your ordinary responses are not sent to the controlling Codex agent. Use report_parent for updates and use final: true with your final deliverable. Use ask_parent when you need an answer.' });
+        text: 'Keep routine progress in the task record. Use report_parent for agreed milestones, deliverables or issues requiring your controlling agent\'s action, and final: true when the task is complete. Use ask_parent for a decision you need.' });
     }
     binding.preExecute = async (exec, next) => {
       if (exec.agent === agent && record.taskId && !record.closing) {

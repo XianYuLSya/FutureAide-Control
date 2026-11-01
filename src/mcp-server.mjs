@@ -12,11 +12,14 @@ import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.3' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.4' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
     await value.resume?.();
+    await value.ensureIdleMonitor?.();
+    const monitorHealth = setInterval(() => { void value.ensureIdleMonitor?.().catch(() => {}); }, 30000);
+    monitorHealth.unref();
     return value;
   });
   const name = z.string().min(1).max(80).describe('Subagent name in this Codex chat. Names in other chats are unrelated.');
@@ -52,6 +55,8 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), true);
   register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
   register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing their DSH session data and private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  // Restore the shared listener on connection even before the first tool call.
+  void service().catch(() => {});
   return server;
 }
 

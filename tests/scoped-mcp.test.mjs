@@ -6,6 +6,18 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { makeScopedServer } from '../src/mcp-server.mjs';
 
+test('MCP connection restores monitor health before any tool call', async () => {
+  let restored;
+  const done = new Promise(resolve => { restored = resolve; });
+  const service = { async resume() {}, async ensureIdleMonitor() { restored(); } };
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const server = makeScopedServer({ configPath: path.join(root, 'clean', 'scoped-mcp-config-absent.json'), scopedFactory: () => service });
+  const client = new Client({ name: 'scoped-test', version: '1.0.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(b); await client.connect(a);
+  try { await done; } finally { await client.close(); await server.close(); }
+});
+
 test('installed MCP exposes only name-addressed tools and forwards trusted request metadata', async () => {
   const calls = [];
   const service = { async resume() {}, async create(args, extra) { calls.push({ args, meta: extra._meta }); return { created: true, name: args.name }; } };

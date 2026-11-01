@@ -25,6 +25,27 @@ export class RosterStore {
     return saved;
   }
   get(id) { const row = this.db.prepare('SELECT body FROM agents WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
+  lease(key) { return this.db.prepare('SELECT holder,expires FROM leases WHERE key=?').get(key); }
+  wake(id, taskId) {
+    return this.db.prepare("UPDATE agents SET body=json_remove(body,'$.sleep') WHERE id=? AND json_extract(body,'$.sleep.taskId')=? AND json_extract(body,'$.sessionId')=json_extract(body,'$.sleep.sessionId')").run(id, taskId).changes === 1;
+  }
+  markWake(id, taskId) {
+    return this.db.prepare("UPDATE agents SET body=json_set(body,'$.sleep.wakePending',json('true')) WHERE id=? AND json_extract(body,'$.sleep.taskId')=?").run(id, taskId).changes === 1;
+  }
+  sleep(record, signal) {
+    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.sleep',json(?)) WHERE id=? AND owner=?
+      AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.state')=?
+      AND (coalesce(json_extract(body,'$.task.cancelRequested'),0)=0 OR (json_extract(body,'$.task.cancelVerified')=1 AND json_extract(body,'$.task.cancelTreeSettled')=1))
+      AND EXISTS (SELECT 1 FROM leases a JOIN leases b ON a.holder=b.holder WHERE a.key='idle-monitor' AND b.key='idle-monitor:ready' AND a.expires>? AND b.expires>?)
+      AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=? AND status IN ('queued','sending','unknown'))`)
+      .run(JSON.stringify({ taskId: record.task.taskId, sessionId: record.sessionId, signal }), record.agentId, record.ownerId, record.task.taskId, record.state, Date.now(), Date.now(), record.task.taskId).changes === 1;
+  }
+  restoreSleep(record) {
+    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.sleep',json(?))
+      WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=?
+      AND coalesce(json_extract(body,'$.closed'),0)=0`)
+      .run(JSON.stringify(record.sleep), record.agentId, record.ownerId, record.sleep.sessionId).changes === 1;
+  }
   named(owner, name) { const row = this.db.prepare('SELECT body FROM agents WHERE owner=? AND name=?').get(owner, name); return row ? JSON.parse(row.body) : undefined; }
   enqueueSupplement(record, requestId, message) {
     return this.db.prepare(`INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created)
@@ -61,12 +82,15 @@ export class RosterStore {
   }
   save(record) {
     record.updatedAt = new Date().toISOString();
+    // A watcher or sender can wake without the operation lock. Never restore a
+    // sleep marker from an older in-memory poll after that atomic wake.
+    const input = "CASE WHEN json_type(body,'$.sleep') IS NULL THEN json_remove(?1,'$.sleep') WHEN json_extract(body,'$.sleep.wakePending')=1 AND json_extract(body,'$.sleep.taskId')=json_extract(?1,'$.sleep.taskId') THEN json_set(?1,'$.sleep.wakePending',json('true')) ELSE ?1 END";
     const result = this.db.prepare(`UPDATE agents SET body=CASE
-      WHEN json_extract(body,'$.task.taskId')=json_extract(?1,'$.task.taskId') AND json_extract(body,'$.task.cancelRequested')=1
-      THEN json_set(?1,'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(?1,'$.task.cancelRequested')=1 THEN json_extract(?1,'$.state') ELSE 'running' END)
-      WHEN json_extract(?1,'$.state')='idle' AND json_extract(body,'$.task.taskId')=json_extract(?1,'$.task.taskId')
+      WHEN json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId') AND json_extract(body,'$.task.cancelRequested')=1
+      THEN json_set(${input},'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(${input},'$.task.cancelRequested')=1 THEN json_extract(${input},'$.state') ELSE 'running' END)
+      WHEN json_extract(${input},'$.state')='idle' AND json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId')
         AND EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND status IN ('queued','sending','unknown'))
-      THEN json_set(?1,'$.state','running') ELSE ?1 END
+      THEN json_set(${input},'$.state','running') ELSE ${input} END
       WHERE id=?2 AND owner=?3 AND name=?4`)
       .run(JSON.stringify(record), record.agentId, record.ownerId, record.name);
     if (!result.changes) throw new Error('This subagent instance has already been removed.');

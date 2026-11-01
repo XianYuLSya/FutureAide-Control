@@ -9,6 +9,8 @@ import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, resolveCallingContext, threadFromResult } from './calling-context.mjs';
 import { RosterStore } from './roster-store.mjs';
+import { canSleep } from './idle-monitor-eligibility.mjs';
+import { ensureIdleMonitor, idleSignal } from './idle-monitor.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
@@ -151,9 +153,12 @@ export function createScopedAgents(config, {
     baseUrl: settings.baseUrl, timeoutMs: settings.timeoutMs, hostBridgeFile: settings.hostBridgeFile }),
   controlFactory = createControl,
   startWorker = workerSpawn,
+  startIdleMonitor = ensureIdleMonitor,
+  monitorFailureGraceMs = 60000,
   removeTree = rm,
 } = {}) {
   const clients = new Map();
+  let monitorUnavailableSince;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
   const settings = record => ({ ...config, workspace: record.workspace, stateDirectory: agentDirectory(record),
     codexThreadId: undefined, futureaideSessionId: undefined });
@@ -205,15 +210,25 @@ export function createScopedAgents(config, {
     return api;
   }
 
-  async function ensureWorker(record) {
+  async function ensureWorker(record, { wake = false } = {}) {
+    if (!record) return;
+    const previousSleep = wake ? record.sleep : undefined;
+    if (wake && record.sleep && store.lease(`worker:${record.agentId}`)?.expires > Date.now()) {
+      store.markWake(record.agentId, record.sleep.taskId);
+      return true;
+    }
+    if (wake && record.sleep) { store.wake(record.agentId, record.sleep.taskId); record = store.get(record.agentId) ?? record; }
+    if (record.sleep) return;
     const queued = store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
     if (!ACTIVE.has(record.state) && !queued && (record.callbackBlocked || !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered' && report.delivery.state !== 'blocked'))) return;
     const holder = uid('worker');
-    if (!store.claimLease(`worker:${record.agentId}`, holder, 30000)) return;
-    try { record.workerPid = await startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); }
+    if (!store.claimLease(`worker:${record.agentId}`, holder, 30000)) return true;
+    try { record.workerPid = await startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); return true; }
     catch (error) {
       try { store.setWorkerError(record.agentId, holder, safeError(error)); }
       finally { store.releaseLease(`worker:${record.agentId}`, holder); }
+      if (previousSleep) store.restoreSleep({ ...record, sleep: previousSleep });
+      return false;
     }
   }
 
@@ -690,7 +705,7 @@ export function createScopedAgents(config, {
       const enqueue = async record => {
         const requestId = uid('request');
         if (!store.enqueueSupplement(record, requestId, message)) throw Object.assign(new Error('The task changed, stopped or is no longer accepting supplements.'), { code: 'supplement-unavailable' });
-        await ensureWorker(store.get(record.agentId) ?? record);
+        await ensureWorker(store.get(record.agentId) ?? record, { wake: true });
         return { name: record.name, accepted: false, queued: true, state: record.state,
           ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
       };
@@ -719,7 +734,7 @@ export function createScopedAgents(config, {
           try { await beginTask(record); }
           catch (error) { record.state = 'reconnecting'; record.error = safeError(error); store.save(record); }
         }
-        await ensureWorker(record);
+        await ensureWorker(record, { wake: true });
         const current = store.get(record.agentId) ?? record;
         const dispatch = record.task.dispatches.at(-1);
         const error = current.error ?? dispatch?.error;
@@ -741,7 +756,9 @@ export function createScopedAgents(config, {
       const owner = await context(extra);
       for (const record of store.list(owner.ownerId)) await ensureWorker(record);
       const records = store.list(owner.ownerId);
-      return { items: records.map(record => ({ ...publicResult(record), supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
+      return { items: records.map(record => ({ ...publicResult(record),
+        monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping') : (store.lease(`worker:${record.agentId}`)?.expires > Date.now() ? 'running' : 'stopped'),
+        supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
     },
     async changes({ name, task = 0 }, extra) {
       return withName(extra, name, async record => {
@@ -838,7 +855,36 @@ export function createScopedAgents(config, {
     async poll(agentId) {
       return store.locked(agentId, async () => { const record = store.get(agentId); return record ? pollLocked(record) : { removed: true }; });
     },
-    async resume() { for (const record of store.list()) await ensureWorker(record); },
+    async resume() { for (const record of store.list()) await ensureWorker(record, { wake: record.sleep?.wakePending === true }); },
+    async ensureIdleMonitor() {
+      const sleeping = store.list().filter(record => record.sleep);
+      if (!sleeping.length) { monitorUnavailableSince = undefined; return false; }
+      let ready = false;
+      try { ready = await startIdleMonitor(config, store); } catch { /* Fall back to active workers below. */ }
+      if (ready) { monitorUnavailableSince = undefined; return true; }
+      monitorUnavailableSince ??= Date.now();
+      if (Date.now() - monitorUnavailableSince >= monitorFailureGraceMs) {
+        for (const record of sleeping) {
+          await ensureWorker(record, { wake: true });
+        }
+        monitorUnavailableSince = undefined;
+      }
+      return false;
+    },
+    async wake(agentId, taskId) {
+      const record = store.get(agentId);
+      if (!record || record.sleep?.taskId !== taskId || record.sleep.sessionId !== record.sessionId) return false;
+      await ensureWorker(record, { wake: true });
+      return true;
+    },
+    async trySleep(agentId) {
+      return store.locked(agentId, async () => {
+        const record = store.get(agentId);
+        if (!record || !canSleep(record, store.supplements(agentId), treeSettled)) return false;
+        if (!await startIdleMonitor(config, store)) return false;
+        return store.sleep(record, idleSignal({ ...record.observation, taskId: record.task.taskId }));
+      });
+    },
     close() { store.close(); },
   };
 
@@ -856,7 +902,7 @@ export function createScopedAgents(config, {
     try { await resolveAnswer(record, answer); }
     catch (error) { record.error = safeError(error); store.save(record); await ensureWorker(record); throw error; }
     record.state = 'running'; record.task.state = 'running'; store.save(record);
-    await ensureWorker(record);
+    await ensureWorker(record, { wake: true });
     return { name: record.name, answered: true, state: 'resuming' };
   }
   return service;

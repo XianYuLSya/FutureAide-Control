@@ -82,6 +82,18 @@ async function fixture() {
 
 const identity = workspace => ({ ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a', workspace, treeProtocol: 1, reportProtocol: 1 });
 
+test('managed status exposes the live selection instead of its creation snapshot', async () => {
+  const f = await fixture(), input = identity(f.workspace), host = f.create();
+  await host.managedCreate(input);
+  let selection = { provider: 'new-provider', model: 'new-model', reasoningEffort: 'max' };
+  f.services.sessionProjections = { snapshot: () => ({ values: { modelSelection: { next: selection } } }) };
+  const started = await host.managedBeginTask({ ...input, taskId: 'task-model' });
+  assert.deepEqual(started.currentModel, selection);
+  assert.equal(started.model.provider, 'provider', 'creation snapshot remains distinct');
+  selection = { provider: 'third-provider', model: 'third-model' };
+  assert.deepEqual((await host.managedStatus({ ...input, taskId: 'task-model' })).currentModel, selection);
+});
+
 test('explicit reports persist across reload and final seals reporting', async () => {
   const f = await fixture(), input = identity(f.workspace), host = f.create();
   await host.managedCreate(input);

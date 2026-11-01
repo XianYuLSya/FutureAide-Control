@@ -187,7 +187,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     return {
       ownerId: record.ownerId, agentId: record.agentId, sessionId: record.sessionId,
       workspace: record.workspace, workspaceId: record.workspaceId, taskId: record.taskId ?? null,
-      model: record.model, agentPreset: record.agentPreset,
+      model: record.model, currentModel: liveModelSelection(agent), agentPreset: record.agentPreset,
       running: agent?.status === 'running', status: record.closing ? 'cleaning' : agent?.status ?? 'unloaded',
       activity: record.activity ?? 'idle', throughSeq: agent ? sessionCursor(agent.session) : record.throughSeq ?? -1,
       questions: structuredClone(record.questions ?? []), changes: structuredClone(record.changes ?? []),
@@ -779,6 +779,15 @@ async function historyCursor(ctx, sessionId, workspace) {
 }
 
 /** Read registered schemas and effective policy without executing any tool or model. */
+export function liveModelSelection(agent) {
+  if (!agent) return undefined;
+  const session = agent.session;
+  const projections = agent.ctx?.get('sessionProjections')?.snapshot(session)?.values ?? {};
+  const value = projections.modelSelection?.next ?? projections.modelSelection?.lastUsed
+    ?? latest(session.events ?? [], 'model/selection') ?? session.requestHeader?.()?.config ?? agent.options;
+  return value?.provider && value?.model ? modelValue(value) : undefined;
+}
+
 export function capabilitySnapshot(agent, { activated = false } = {}) {
   const ctx = agent.ctx;
   const get = key => ctx.get(key);
@@ -802,11 +811,7 @@ export function capabilitySnapshot(agent, { activated = false } = {}) {
     version: 1, capturedAt: new Date().toISOString(), sessionId: agent.id,
     cwd: session.header.cwd, status: agent.status, activated,
     agentPreset: projections.agentPreset ?? session.header.agentPreset ?? null,
-    model: (() => {
-      const value = projections.modelSelection?.next ?? projections.modelSelection?.lastUsed
-        ?? latest(session.events, 'model/selection') ?? session.requestHeader?.()?.config ?? agent.options;
-      return value?.provider && value?.model ? modelValue(value) : null;
-    })(),
+    model: liveModelSelection(agent) ?? null,
     tools: schemas, totalTools: schemas.length,
     permissions: {
       sandbox: sandbox ? sandbox.resolve({ session }) : { available: false },

@@ -655,7 +655,7 @@ export class FutureAideClient {
     }
     if (this.#dialect === undefined) await this.#modelCatalogFor(this.#instance);
     return { sessionId: view.sessionId, cwd: view.workspace, running: view.running,
-      projections: { asOfSeq: view.throughSeq, values: { modelSelection: { next: view.model } } } };
+      projections: { asOfSeq: view.throughSeq, values: { modelSelection: { next: view.currentModel } } } };
   }
   async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID() } = {}) {
     validId(requestId, 'requestId');

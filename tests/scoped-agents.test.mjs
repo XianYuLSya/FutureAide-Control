@@ -14,14 +14,16 @@ const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, beforeSend, beforeNotice } = {}) {
+async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
   const store = new RosterStore(':memory:');
   const sessions = new Map();
   const sends = [], notices = [], removed = [], workers = [], reads = [], cancellations = [], beginnings = [], historyRequests = [];
-  let offline = false, notificationMode = 'ok', statusCalls = 0;
+  let offline = false, notificationMode = 'ok', statusCalls = 0, catalogCalls = 0, cursorCalls = 0;
+  let defaultModel = { provider: 'fixture', model: 'test' };
+  const selections = [];
   const api = {
     async connectionIdentity() { if (offline) throw new Error('DSH offline'); return { application: 'dsh', dataRoot: path.join(stateDirectory, 'native') }; },
     async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
@@ -34,19 +36,21 @@ async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, b
       beginnings.push(input);
       const s = sessions.get(input.sessionId);
       if (s.taskId !== input.taskId) Object.assign(s, { taskId: input.taskId, questions: [], changes: [], cancelled: false });
-      return { taskId: s.taskId, treeProtocol: 1, reportProtocol: 1 };
+      return { taskId: s.taskId, treeProtocol: 1, reportProtocol: 1, currentModel: s.model, throughSeq: s.seq };
     },
     async managedStatus(input) {
       assert.equal(input.treeProtocol, 1); assert.equal(input.reportProtocol, 1);
       statusCalls++;
       const s = sessions.get(input.sessionId);
-      return { sessionId: s.sessionId, taskId: s.taskId, running: s.running, questions: s.questions, reportProtocol: 1, reports: s.reports ?? [],
+      return { sessionId: s.sessionId, taskId: s.taskId, currentModel: s.model, running: s.running, questions: s.questions, reportProtocol: 1, reports: s.reports ?? [],
         changes: s.changes, coverage: 'files written by this agent', activity: s.running ? 'writing' : 'idle', throughSeq: s.seq,
         tree: { settled: !s.running, running: s.running,
           nodes: [{ sessionId: s.sessionId, parentSessionId: null, name: 'native root', status: s.running ? 'running' : 'idle',
             activity: s.running ? 'writing' : 'idle', changes: s.changes, coverage: 'root writes' }, ...(s.descendants ?? [])], ...s.tree } };
     },
-    async historyCursor(sessionId) { return { throughSeq: sessions.get(sessionId).seq }; },
+    async historyCursor(sessionId) { cursorCalls++; return { throughSeq: sessions.get(sessionId).seq }; },
+    async managedSession(input) { const s = sessions.get(input.sessionId); return {
+      projections: { asOfSeq: s.seq, values: { modelSelection: { next: s.model } } } }; },
     async readSession(sessionId) {
       reads.push(sessionId);
       const s = sessions.get(sessionId), events = [];
@@ -87,8 +91,18 @@ async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, b
     return { events: page.records.map(record => record.event) };
   };
   const controlFactory = () => ({
-    async models() { return { defaultModel: { provider: 'fixture', model: 'test' } }; },
-    async selectModel() { return { accepted: true }; },
+    async models() {
+      catalogCalls++;
+      if (beforeModels) await beforeModels();
+      return { default: { ...defaultModel }, routableProviders: [defaultModel.provider],
+        groups: [{ id: defaultModel.provider, models: [{ id: defaultModel.model, reasoningEfforts: ['off', 'high', 'max'] }] }] };
+    },
+    async selectModel(input) {
+      selections.push(input);
+      sessions.get(input.sessionId).model = Object.fromEntries(['provider', 'model', 'reasoningEffort']
+        .filter(key => input[key] !== undefined).map(key => [key, input[key]]));
+      return { accepted: true };
+    },
     async send(input) {
       if (beforeSend) await beforeSend(input);
       const s = sessions.get(input.sessionId);
@@ -134,8 +148,63 @@ async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, b
     session.reports.push({ id: 'explicit-' + session.reports.length, taskId: r.task.taskId, message, final, createdAt: new Date().toISOString() });
   }
   return { report, service, store, sessions, api, controlFactory, sends, notices, removed, workers, reads, cancellations, beginnings, historyRequests, stateDirectory, record, finish,
-    offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls };
+    offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls,
+    defaultModel: value => { defaultModel = value; }, selections, catalogCalls: () => catalogCalls, cursorCalls: () => cursorCalls };
 }
+
+test('default model follows live host for new tasks, supplements and answers without stale roster selection', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    assert.equal(f.catalogCalls(), 0, 'empty creation does not fetch the model catalog');
+    const newModel = { provider: 'new-route', model: 'new-model', reasoningEffort: 'max' };
+    const record = f.record(); record.model = newModel; f.store.save(record);
+    f.defaultModel(newModel);
+    await f.service.send({ name: 'artist', message: 'first' }, extra(A));
+    assert.equal(f.selections.length, 1, 'migrated roster does not hide the old native model');
+    assert.deepEqual(f.sessions.get(record.sessionId).model, newModel);
+    await f.service.send({ name: 'artist', message: 'same route' }, extra(A));
+    assert.equal(f.selections.length, 1, 'unchanged actual model skips selection');
+    f.defaultModel({ provider: 'fixture', model: 'test' });
+    await f.service.send({ name: 'artist', message: 'switch back' }, extra(A));
+    f.defaultModel(newModel);
+    await f.service.send({ name: 'artist', message: 'switch again' }, extra(A));
+    assert.equal(f.selections.length, 3);
+    assert.equal(new Set(f.selections.map(item => item.requestId)).size, 3, 'each input owns its model receipt');
+    assert.equal(f.catalogCalls(), 4);
+    assert.equal(f.cursorCalls(), 0, 'begin/status observations supply the cursor');
+    f.finish();
+    const session = f.sessions.get(record.sessionId);
+    session.questions.push({ id: 'question-model', message: 'Continue?', state: 'pending' });
+    await f.service.poll(record.agentId);
+    f.defaultModel({ provider: 'fixture', model: 'test' });
+    await f.service.answer({ name: 'artist', message: 'yes' }, extra(A));
+    await f.service.poll(record.agentId);
+    assert.equal(f.selections.length, 4);
+    assert.equal(f.sends.at(-1).message, 'Answer: yes');
+    assert.equal(f.record().task.dispatches.at(-1).kind, 'answer');
+    assert.equal(f.cursorCalls(), 0);
+  } finally { f.service.close(); }
+});
+
+test('default model read failure retries the original saved dispatch before sending any prompt', async () => {
+  let fail = true;
+  const f = await fixture({ beforeModels: () => {
+    if (fail) throw Object.assign(new Error('catalog timed out'), { retryableRead: true });
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'one task' }, extra(A));
+    assert.equal(receipt.retrying, true);
+    assert.equal(f.sends.length, 0);
+    const original = f.record().task.dispatches[0].requestId;
+    fail = false;
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.sends[0].requestId, original);
+    assert.equal(f.record().task.dispatches.length, 1);
+  } finally { f.service.close(); }
+});
 
 test('model failure is visible in list wait and inspect without callbacks or redispatch and clears on the next task', async () => {
   const f = await fixture();

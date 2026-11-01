@@ -33,7 +33,8 @@ async function fixture({ modern = false, changeInstance = false } = {}) {
       const args = body.payload.args;
       if (['ownerId', 'agentId', 'sessionId', 'taskId', 'workspace'].some(key => args[key] !== binding[key])) return reject('managed-task-mismatch');
       if (changeInstance) await writeFile(instanceFile, JSON.stringify({ ...instance, instanceId: randomUUID() }));
-      return reply({ ...binding, running: false, throughSeq: state.seq, model: { provider: 'fixture', model: 'm' } });
+      return reply({ ...binding, running: false, throughSeq: state.seq, model: { provider: 'fixture', model: 'm' },
+        currentModel: state.currentModel });
     }
     if (modern && method.includes('/')) return new Response(null, { status: 404 });
     if (['session/modelCatalog', 'llm.models'].includes(method)) return reply({ defaultModel: { provider: 'fixture', model: 'm' } });
@@ -65,6 +66,14 @@ async function fixture({ modern = false, changeInstance = false } = {}) {
   const control = createControl(config, { client, managed: binding });
   return { binding, state, client, control, config, options };
 }
+
+test('managed session uses live model state and does not mistake an old host snapshot for current selection', async () => {
+  const f = await fixture();
+  assert.equal((await f.client.managedSession(f.binding)).projections.values.modelSelection.next, undefined);
+  f.state.currentModel = { provider: 'new-provider', model: 'new-model', reasoningEffort: 'high' };
+  assert.deepEqual((await f.client.managedSession(f.binding)).projections.values.modelSelection.next, f.state.currentModel);
+  assert.ok(f.state.calls.every(call => !['session/list', 'session.list'].includes(call.method)));
+});
 
 test('managed model selection, dispatch, wait and read never list all sessions', async () => {
   const f = await fixture();

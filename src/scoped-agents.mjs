@@ -247,21 +247,51 @@ export function createScopedAgents(config, {
     return observed;
   }
 
-  async function sendDispatch(record, message, kind = 'task', answerIds = [], requestId = uid('request')) {
+  function sameModel(left, right) {
+    if (!left || !right) return false;
+    return left.provider === right.provider && left.model === right.model
+      && (left.reasoningEffort ?? undefined) === (right.reasoningEffort ?? undefined);
+  }
+
+  async function followHostModel(record, dispatch, observed) {
+    if (dispatch.modelReady) return;
+    const control = controlFor(record);
+    if (!dispatch.model) {
+      dispatch.model = resolveModel(await control.models(), {});
+      store.save(record);
+    }
+    // Only a live host observation proves what the session will use. The roster
+    // model is a display snapshot and may have been migrated while asleep.
+    const current = observed ? observed.currentModel
+      : (await apiFor(record).managedSession(hostArgs(record))).projections?.values?.modelSelection?.next;
+    if (!sameModel(current, dispatch.model)) {
+      const selected = await control.selectModel({ sessionId: record.sessionId, ...dispatch.model,
+        requestId: `${dispatch.requestId}-model` });
+      if (selected.accepted !== true) throw Object.assign(new Error('DSH did not confirm the default model selection.'),
+        { code: 'model-selection-unconfirmed', uncertain: selected.status === 'unknown' });
+    }
+    record.model = dispatch.model;
+    dispatch.modelReady = true;
+    store.save(record);
+  }
+
+  async function sendDispatch(record, message, kind = 'task', answerIds = [], requestId = uid('request'), observed) {
     const task = record.task;
-    const baseline = await apiFor(record).historyCursor(record.sessionId, record.workspace);
+    const baseline = Number.isSafeInteger(observed?.throughSeq)
+      ? observed : await apiFor(record).historyCursor(record.sessionId, record.workspace);
     const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now() };
     task.dispatches.push(dispatch);
     record.state = 'running'; task.state = 'running';
     store.save(record); // The intent survives a caller or worker exiting during the write.
-    await dispatchOnce(record, dispatch);
+    await dispatchOnce(record, dispatch, observed);
     return dispatch;
   }
 
-  async function dispatchOnce(record, dispatch) {
+  async function dispatchOnce(record, dispatch, observed) {
     const current = store.get(record.agentId);
     if (current?.task?.taskId !== record.task?.taskId || current.task.cancelRequested) return;
     try {
+      await followHostModel(record, dispatch, observed);
       const sent = await controlFor(record).send({ sessionId: record.sessionId, message: dispatch.message, requestId: dispatch.requestId,
         background: false, suppressCallback: true, mode: 'queue' });
       Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
@@ -338,7 +368,9 @@ export function createScopedAgents(config, {
     store.save(record);
     const created = await api.managedCreate(hostArgs(record));
     if (created.sessionId !== record.sessionId || created.modelRequestsStarted !== 0) throw new Error('DSH did not confirm the requested empty subagent.');
-    record.model = created.model ?? resolveModel(await controlFor(record).models(), {});
+    // The model is resolved from the live host default when the first input is
+    // sent; creation must not add a second catalog round-trip or pin a stale model.
+    record.model = created.model;
     record.created = true; record.state = 'idle'; record.error = undefined; store.save(record);
   }
 
@@ -353,13 +385,12 @@ export function createScopedAgents(config, {
     record.task.treeProtocol = TREE_PROTOCOL;
     record.task.reportProtocol = REPORT_PROTOCOL;
     store.save(record);
+    return started;
   }
 
   async function beginTask(record) {
-    await negotiateTree(record, true);
-    const selected = await controlFor(record).selectModel({ sessionId: record.sessionId, ...record.model, requestId: `${record.task.taskId}-model` });
-    if (selected.accepted === false) throw new Error('DSH did not confirm the default model.');
-    await sendDispatch(record, record.task.message);
+    const observed = await negotiateTree(record, true);
+    await sendDispatch(record, record.task.message, 'task', [], undefined, observed);
   }
 
   async function resolveAnswer(record, answer) {
@@ -565,7 +596,7 @@ export function createScopedAgents(config, {
         store.setSupplement(item.requestId, 'accepted');
         return;
       } else {
-        const dispatch = await sendDispatch(record, item.message, 'supplement', [], item.requestId);
+        const dispatch = await sendDispatch(record, item.message, 'supplement', [], item.requestId, view);
         store.setSupplement(item.requestId, dispatch.accepted ? 'accepted' : dispatch.state === 'failed' ? 'blocked' : 'unknown', dispatch.accepted ? null : dispatch.error?.code ?? (dispatch.state === 'failed' ? 'send-failed' : 'acceptance-unknown'));
         if (!dispatch.accepted) return;
       }
@@ -648,7 +679,7 @@ export function createScopedAgents(config, {
       if (pendingAnswers.length && !task.cancelRequested) {
         const ids = pendingAnswers.flatMap(answer => answer.questionIds);
         for (const answer of pendingAnswers) answer.dispatched = true;
-        await sendDispatch(record, pendingAnswers.map(answer => answer.continuation).join('\n\n'), 'answer', ids);
+        await sendDispatch(record, pendingAnswers.map(answer => answer.continuation).join('\n\n'), 'answer', ids, undefined, view);
         return publicResult(record);
       }
       if (!treeSettled(record, view)) {
@@ -734,7 +765,7 @@ export function createScopedAgents(config, {
           const view = await observe(record);
           if ((view.reports ?? []).some(report => report.final)) throw new Error('The agent has already submitted its final report.');
           if ((view.questions ?? []).some(question => question.state === 'pending')) return answerLocked(record, message);
-          await sendDispatch(record, message, 'supplement');
+          await sendDispatch(record, message, 'supplement', [], undefined, view);
         } else {
           if (record.task) record.history.push({ ...record.task, changes: attributedChanges(record, record.observation ?? {}),
             coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) });

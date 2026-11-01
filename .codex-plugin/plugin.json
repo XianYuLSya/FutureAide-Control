@@ -1,6 +1,6 @@
 {
   "name": "futureaide-control",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "Named DSH teams for Codex with multi-level delegation, agent-controlled reports, direct questions, file attribution, and managed lifetimes.",
   "author": {
     "name": "FutureAide"

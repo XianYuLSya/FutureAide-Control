@@ -33,7 +33,7 @@ async function makeHost(t, options = {}) {
       res.end();
       return;
     }
-    if (!options.acceptApi && url.pathname !== '/api/session/list') { res.writeHead(404); res.end(); return; }
+    if (!options.acceptApi && !['/api/session/list', '/api/session/modelCatalog'].includes(url.pathname)) { res.writeHead(404); res.end(); return; }
     const chunks = [];
     void (async () => {
       try {
@@ -42,6 +42,7 @@ async function makeHost(t, options = {}) {
         state.calls.push({ method: body.method, payload: body.payload, cookie: req.headers.cookie });
         if (req.headers.cookie !== state.cookie) { res.writeHead(401); res.end(); return; }
         if (options.rpc) return options.rpc(body, res, state);
+        if (url.pathname === '/api/session/modelCatalog') return reply(res, body, { defaultModel: { provider: 'fixture', model: 'm' } });
         if (url.pathname === '/api/session/list') return reply(res, body, { items: [sessionRow] });
         if (url.pathname === '/api/session/create') return reply(res, body, { sessionId: body.payload.args.request.sessionId });
         res.writeHead(404);
@@ -125,9 +126,9 @@ test('discovers only the registered DSH host', async t => {
   assert.equal(status.pid, host.pid);
   assert.equal(status.source, 'dsh-plugin-registry');
   assert.equal(status.sessionCount, 1);
-  assert.ok(host.state.calls.every(call => call.method === 'session/list'));
+  assert.deepEqual(host.state.calls.map(call => call.method), ['session/modelCatalog', 'session/list']);
   assert.equal(host.state.calls.length, 2);
-  assert.ok(host.state.calls.every(call => call.payload.args._request !== undefined));
+  assert.ok(host.state.calls.at(-1).payload.args._request !== undefined);
 });
 
 test('defaults to DSH and ignores old FutureAide discovery and environment overrides', async t => {
@@ -180,6 +181,7 @@ test('DSH authentication failure stays visible without contacting an old host', 
 
 test('retains the dot API adapter for DSH releases that do not expose slash endpoints', async t => {
   const host = await makeHost(t, { acceptApi: true, rpc(body, res) {
+    if (body.method === 'llm.models') return reply(res, body, { defaultModel: { provider: 'fixture', model: 'm' } });
     if (body.method === 'session.list') return reply(res, body, { items: [sessionRow] });
     res.writeHead(404); res.end();
   } });
@@ -210,8 +212,8 @@ test('reports multiple healthy DSH hosts as ambiguous and skips dead PIDs', asyn
   await assert.rejects(client.listSessions(), failure('ambiguous-instance'));
   assert.equal(first.state.exchanges, 1);
   assert.equal(second.state.exchanges, 1);
-  assert.ok(hostCalls(first).every(entry => entry.method === 'session/list'));
-  assert.ok(hostCalls(second).every(entry => entry.method === 'session/list'));
+  assert.ok(hostCalls(first).every(entry => entry.method === 'session/modelCatalog'));
+  assert.ok(hostCalls(second).every(entry => entry.method === 'session/modelCatalog'));
 });
 
 test('skips malformed automatic registrations and still finds a healthy DSH host', async t => {

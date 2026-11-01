@@ -166,7 +166,7 @@ export function createScopedAgents(config, {
     if (!clients.has(record.agentId)) clients.set(record.agentId, clientFactory(settings(record)));
     return clients.get(record.agentId);
   };
-  const controlFor = record => controlFactory(settings(record), { client: apiFor(record) });
+  const controlFor = record => controlFactory(settings(record), { client: apiFor(record), managed: hostArgs(record) });
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
     sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
     ...(record.task ? { taskId: record.task.taskId } : {}) });
@@ -262,9 +262,9 @@ export function createScopedAgents(config, {
       const sent = await controlFor(record).send({ sessionId: record.sessionId, message: dispatch.message, requestId: dispatch.requestId,
         background: false, suppressCallback: true, mode: 'queue' });
       Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
-        afterSeq: sent.afterSeq ?? dispatch.afterSeq });
+        afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined } : {}) });
     } catch (error) {
-      Object.assign(dispatch, { state: error.uncertain ? 'unknown' : 'failed', afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
+      Object.assign(dispatch, { state: error.retryableRead === true ? 'retrying' : error.uncertain ? 'unknown' : 'failed', afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
     }
     store.save(record);
     const latest = store.get(record.agentId);
@@ -482,15 +482,19 @@ export function createScopedAgents(config, {
   }
 
   async function recoverDispatch(record, dispatch, { allowResend = true } = {}) {
-    if (dispatch.accepted || !['sending', 'unknown'].includes(dispatch.state)) return;
+    if (dispatch.accepted || !['sending', 'retrying', 'unknown'].includes(dispatch.state)) return;
     const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, dispatch.requestId])).digest('hex');
     try {
       const receipt = JSON.parse(await readFile(path.join(agentDirectory(record), 'requests', `${key}.json`), 'utf8'));
       dispatch.afterSeq = receipt.result?.afterSeq ?? receipt.afterSeq ?? dispatch.afterSeq;
       if (receipt.status === 'accepted') { dispatch.accepted = true; dispatch.state = 'running'; }
       if (receipt.status === 'rejected') dispatch.state = 'failed';
+      if (receipt.status === 'retryable') {
+        if (!allowResend) return 'not-sent';
+        await dispatchOnce(record, dispatch);
+      }
     } catch (error) {
-      if (error.code === 'ENOENT' && dispatch.state === 'sending') {
+      if (error.code === 'ENOENT' && ['sending', 'retrying'].includes(dispatch.state)) {
         // writeOnce creates its receipt before entering the native send. No receipt
         // means this saved intent never reached that send; keep the exact request ID.
         if (!allowResend) return 'not-sent';
@@ -739,6 +743,7 @@ export function createScopedAgents(config, {
         const dispatch = record.task.dispatches.at(-1);
         const error = current.error ?? dispatch?.error;
         return { name: current.name, accepted: dispatch?.accepted === true, state: current.state,
+          ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
           ...(error ? { error } : {}),
           ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
       }, { waitMs: 0 }); } catch (error) {

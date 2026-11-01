@@ -18,8 +18,8 @@ export function dispatchBoundary(records, afterSeq, requestId) {
     ...(end ? { endSeq: end.seq, completionReason: end.data?.reason } : {}) };
 }
 
-export async function readDispatch(api, sessionId, { workspace, requestId, afterSeq, maxMessages = 100 }) {
-  let page = await api.readSession(sessionId, { workspace, maxMessages });
+export async function readDispatch(api, sessionId, { workspace, requestId, afterSeq, throughSeq, maxMessages = 100 }) {
+  let page = await api.readSession(sessionId, { workspace, maxMessages, ...(throughSeq === undefined ? {} : { throughSeq }) });
   let records = [...page.records];
   let boundary = dispatchBoundary(records, afterSeq, requestId);
   while (requestId && (!boundary.matched || !boundary.hasStart) && page.hasMore) {

@@ -93,7 +93,7 @@ function startDetachedWorker(args) {
   return { pid: child.pid };
 }
 
-export function createControl(config, { client, notify = notifyCodex, installHost = installHostBridge, startWorker = startDetachedWorker } = {}) {
+export function createControl(config, { client, managed, notify = notifyCodex, installHost = installHostBridge, startWorker = startDetachedWorker } = {}) {
   const api = client || new FutureAideClient({
     dataHome: config.dataRoot,
     dshDataHome: config.dshDataRoot,
@@ -112,7 +112,9 @@ export function createControl(config, { client, notify = notifyCodex, installHos
   };
   async function checkSession(id) {
     const sessionId = selected(id);
-    const row = (await api.listSessions()).items.find(item => item.sessionId === sessionId);
+    if (managed && (managed.sessionId !== sessionId || managed.workspace !== config.workspace)) throw new Error('Session does not belong to this managed binding.');
+    const row = managed ? await api.managedSession(managed)
+      : (await api.listSessions()).items.find(item => item.sessionId === sessionId);
     if (!row || !permitted(row)) throw new Error('Session does not belong to the configured project.');
     return row;
   }
@@ -142,17 +144,21 @@ export function createControl(config, { client, notify = notifyCodex, installHos
       if (previous.instance && instance && identity(previous.instance) !== identity(instance)) {
         throw new Error('This request_id belongs to another host instance. Inspect its original receipt; the write was not repeated.');
       }
-      return { ...previous.result, ...(Number.isSafeInteger(previous.afterSeq) ? { afterSeq: previous.afterSeq } : {}), sessionId: session.sessionId, duplicate: true, accepted: previous.status === 'accepted', status: previous.status, requestId, receipt: filename };
+      if (previous.status !== 'retryable' || !managed) return { ...previous.result, ...(Number.isSafeInteger(previous.afterSeq) ? { afterSeq: previous.afterSeq } : {}), sessionId: session.sessionId, duplicate: true, accepted: previous.status === 'accepted', status: previous.status, requestId, receipt: filename };
+      // Only a transport failure on a read can create this receipt state. No
+      // native write was attempted; retry the same durable request identity.
+      await writeFile(filename, JSON.stringify(record), { mode: 0o600 });
     }
     try {
       const result = await operation(session.sessionId, async metadata => {
         Object.assign(record, metadata);
         await writeFile(filename, JSON.stringify(record), { mode: 0o600 });
-      });
+      }, session);
       await writeFile(filename, JSON.stringify({ ...record, status: 'accepted', result }), { mode: 0o600 });
       return { ...result, sessionId: session.sessionId, receipt: filename };
     } catch (error) {
-      const status = error.uncertain ? 'unknown' : 'rejected';
+      const status = managed && ['send', 'select-model'].includes(kind) && error.retryableRead === true
+        ? 'retryable' : error.uncertain ? 'unknown' : 'rejected';
       await writeFile(filename, JSON.stringify({ ...record, status }), { mode: 0o600 });
       Object.assign(error, { receipt: filename, sessionId: session.sessionId, requestId,
         ...(Number.isSafeInteger(record.afterSeq) ? { afterSeq: record.afterSeq } : {}) });
@@ -221,15 +227,18 @@ export function createControl(config, { client, notify = notifyCodex, installHos
     if (baseline === undefined) baseline = Number.isSafeInteger(row.projections?.asOfSeq) ? row.projections.asOfSeq : -1;
     const deadline = Date.now() + timeoutSeconds * 1000;
     const pageSize = Math.max(Math.min(Math.max(maxMessages, 1), 100), 20);
-    let dispatch = await readDispatch(api, id, { maxMessages: pageSize, workspace: config.workspace, requestId, afterSeq: baseline });
+    let current = row;
+    const through = () => managed ? { throughSeq: current.projections.asOfSeq } : {};
+    let dispatch = await readDispatch(api, id, { maxMessages: pageSize, workspace: config.workspace, requestId, afterSeq: baseline, ...through() });
     let ended = dispatch.ended;
     while (!ended && Date.now() < deadline) {
       // Never oversleep past the deadline: a 1s wait must not cost a full poll interval.
       await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.min(pollIntervalMs, deadline - Date.now()))));
-      dispatch = await readDispatch(api, id, { maxMessages: pageSize, workspace: config.workspace, requestId, afterSeq: baseline });
+      if (managed) current = await checkSession(id);
+      dispatch = await readDispatch(api, id, { maxMessages: pageSize, workspace: config.workspace, requestId, afterSeq: baseline, ...through() });
       ended = dispatch.ended;
     }
-    const latest = (await api.listSessions()).items.find(item => item.sessionId === id) ?? row;
+    const latest = managed ? await checkSession(id) : (await api.listSessions()).items.find(item => item.sessionId === id) ?? row;
     const payload = historyMessages(dispatch.page, latest);
     const messages = (payload.messages ?? []).filter(message => Number.isSafeInteger(message.seq) && message.seq > baseline);
     const result = { state: ended ? 'ended' : 'running', sessionId: id,
@@ -301,7 +310,7 @@ export function createControl(config, { client, notify = notifyCodex, installHos
       if (!['messages', 'events'].includes(view)) throw new Error('History view must be messages or events.');
       const row = await checkSession(sessionId);
       const page = await api.readSession(row.sessionId, { maxMessages, workspace: config.workspace,
-        ...(throughSeq === undefined ? {} : { throughSeq }) });
+        ...(throughSeq === undefined ? (managed ? { throughSeq: row.projections.asOfSeq } : {}) : { throughSeq }) });
       return view === 'events' ? page : historyMessages(page, row);
     },
     async send({ sessionId, message, requestId, mode = 'queue', background = false, agentId, codexThreadId,
@@ -315,11 +324,13 @@ export function createControl(config, { client, notify = notifyCodex, installHos
       if (suppressCallback !== true && suppressCallback !== false) throw new Error('suppressCallback must be a boolean.');
       const owner = agentId === undefined ? config.agentId : agentId;
       const suppressed = suppressCallback === true;
-      const result = await writeOnce('send', sessionId, requestId, { message, mode, ...(suppressed ? { suppressCallback: true } : {}) }, async (id, checkpoint) => {
+      const result = await writeOnce('send', sessionId, requestId, { message, mode, ...(suppressed ? { suppressCallback: true } : {}) }, async (id, checkpoint, session) => {
         // Attach the pre-dispatch cursor so the watcher knows which turn belongs to this send.
-        const afterSeq = await sessionCursor(id);
+        const afterSeq = managed ? session.projections.asOfSeq : await sessionCursor(id);
         await checkpoint({ afterSeq });
-        return { ...await api.sendMessage(id, message, { requestId, mode }), afterSeq };
+        const sent = managed ? await api.managedSendMessage(managed, message, { requestId, mode })
+          : await api.sendMessage(id, message, { requestId, mode });
+        return { ...sent, afterSeq };
       });
       if (!background || result.accepted !== true) {
         return { ...result, next: `Use futureaide_wait with session_id ${result.sessionId} and request_id ${requestId} to collect this reply.` };
@@ -396,7 +407,8 @@ export function createControl(config, { client, notify = notifyCodex, installHos
     async selectModel({ sessionId, provider, model, reasoningEffort, requestId }) {
       if (typeof provider !== 'string' || !provider.trim() || typeof model !== 'string' || !model.trim()) throw new Error('Provide both provider and model.');
       const selection = { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) };
-      return writeOnce('select-model', sessionId, requestId, selection, id => api.selectModel(id, selection));
+      return writeOnce('select-model', sessionId, requestId, selection, id => managed
+        ? api.managedSelectModel(managed, selection) : api.selectModel(id, selection));
     },
     async capabilities({ sessionId, toolName, activate = true } = {}) {
       const row = await checkSession(sessionId);

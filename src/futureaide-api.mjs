@@ -10,11 +10,12 @@ const MAX_TEXT_BYTES = 128 * 1024;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 
 export class FutureAideError extends Error {
-  constructor(code, message, { uncertain = false, httpStatus } = {}) {
+  constructor(code, message, { uncertain = false, httpStatus, retryableRead = false } = {}) {
     super(message);
     this.name = 'FutureAideError';
     this.code = code;
     this.uncertain = uncertain;
+    if (retryableRead) this.retryableRead = true;
     if (httpStatus !== undefined) this.httpStatus = httpStatus;
   }
 
@@ -249,7 +250,7 @@ export class FutureAideClient {
       this.#cookie = undefined;
       this.#dialect = undefined;
       try {
-        await this.#listSessionsFor(instance);
+        await this.#modelCatalogFor(instance);
         // Rejected stale records must not shadow a live DSH host at the same origin.
         origins.add(instance.baseUrl);
         ready.push({ instance, candidate, cookie: this.#cookie, dialect: this.#dialect });
@@ -295,7 +296,7 @@ export class FutureAideClient {
       if (error instanceof FutureAideError) throw error;
       fail(abort.signal.aborted ? 'timeout' : 'transport-error',
         uncertain ? 'The FutureAide write outcome is unknown. Inspect the session before retrying.'
-          : 'The FutureAide request could not complete.', { uncertain });
+          : 'The FutureAide request could not complete.', { uncertain, retryableRead: !uncertain });
     } finally {
       clearTimeout(timer);
     }
@@ -464,6 +465,10 @@ export class FutureAideClient {
       fail('invalid-input', 'A nonempty message up to 128 KiB and queue or steer mode are required.');
     }
     const expectedInstance = await this.#ordinarySession(sessionId);
+    return this.#sendPrompt(sessionId, text, { mode, requestId }, expectedInstance);
+  }
+
+  async #sendPrompt(sessionId, text, { mode, requestId }, expectedInstance) {
     const { value } = await this.#rpc('session/prompt', { request: {
       sessionId, requestId, mode, content: [{ type: 'text', text }], clientTimeZone: 'Asia/Shanghai',
     } }, { write: true, expectedInstance });
@@ -479,8 +484,20 @@ export class FutureAideClient {
   }
 
   async modelCatalog() {
-    if (this.#dialect === undefined) await this.listSessions();
-    const { value } = await this.#rpc('session/modelCatalog', {});
+    return this.#modelCatalogFor();
+  }
+
+  async #modelCatalogFor(instanceOverride) {
+    let value;
+    try {
+      ({ value } = await this.#rpc('session/modelCatalog', {}, { instanceOverride }));
+      this.#dialect ??= 'legacy';
+    } catch (error) {
+      if (this.#dialect !== undefined || !(error.httpStatus === 404 || ['unknown-endpoint', 'remote-not-found'].includes(error.code))) throw error;
+      this.#dialect = 'modern';
+      try { ({ value } = await this.#rpc('session/modelCatalog', {}, { instanceOverride })); }
+      catch (modernError) { this.#dialect = undefined; throw modernError; }
+    }
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       fail('invalid-response', 'FutureAide returned an invalid model catalog.');
     }
@@ -626,6 +643,35 @@ export class FutureAideClient {
   async managedCreate(input) { return this.#managedCall('managedCreate', input, true); }
   async managedBeginTask(input) { return this.#managedCall('managedBeginTask', input, true); }
   async managedStatus(input) { return this.#managedCall('managedStatus', input, false); }
+  /** Validate one roster binding and return only its ordinary-session read cursor. */
+  async managedSession(input) {
+    validId(input?.sessionId);
+    if (typeof input?.workspace !== 'string' || !isAbsolute(input.workspace)) fail('invalid-input', 'A managed workspace is required.');
+    const view = await this.managedStatus(input);
+    if (view.ownerId !== input.ownerId || view.agentId !== input.agentId || view.sessionId !== input.sessionId
+        || (input.taskId !== undefined && view.taskId !== input.taskId)
+        || typeof view.workspace !== 'string' || !Number.isSafeInteger(view.throughSeq) || view.throughSeq < -1) {
+      fail('managed-session-mismatch', 'DSH did not confirm the requested managed session.');
+    }
+    if (this.#dialect === undefined) await this.#modelCatalogFor(this.#instance);
+    return { sessionId: view.sessionId, cwd: view.workspace, running: view.running,
+      projections: { asOfSeq: view.throughSeq, values: { modelSelection: { next: view.model } } } };
+  }
+  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID() } = {}) {
+    validId(requestId, 'requestId');
+    if (typeof text !== 'string' || text.trim().length === 0 || Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES
+        || !['queue', 'steer'].includes(mode)) fail('invalid-input', 'A nonempty message up to 128 KiB and queue or steer mode are required.');
+    const row = await this.managedSession(input);
+    const expectedInstance = this.#instance;
+    if (this.#dialect === undefined) await this.modelCatalog();
+    return this.#sendPrompt(row.sessionId, text, { mode, requestId }, expectedInstance);
+  }
+  async managedSelectModel(input, selection) {
+    const row = await this.managedSession(input);
+    const expectedInstance = this.#instance;
+    if (this.#dialect === undefined) await this.modelCatalog();
+    return this.#selectModel(row.sessionId, selection, expectedInstance);
+  }
   async managedHistory(input) {
     validId(input?.targetSessionId, 'targetSessionId');
     const value = await this.#managedCall('managedHistory', input, false);
@@ -658,6 +704,10 @@ export class FutureAideClient {
 
   async selectModel(sessionId, selection) {
     const expectedInstance = await this.#ordinarySession(sessionId);
+    return this.#selectModel(sessionId, selection, expectedInstance);
+  }
+
+  async #selectModel(sessionId, selection, expectedInstance) {
     const { value } = await this.#rpc('session/selectModel', { request: { sessionId, ...selection } }, { write: true, expectedInstance });
     if (!value?.selected || typeof value.selected.provider !== 'string' || typeof value.selected.model !== 'string') {
       fail('invalid-response', 'FutureAide did not confirm model selection.', { uncertain: true });

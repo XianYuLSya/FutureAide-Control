@@ -137,6 +137,31 @@ async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, b
     offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls };
 }
 
+test('a proven pre-write read failure resumes the original dispatch; historical failed intents remain stopped', async () => {
+  let attempts = 0;
+  const f = await fixture({ beforeSend: async () => {
+    attempts++;
+    if (attempts === 1) throw Object.assign(new Error('read timed out'), { code: 'timeout', uncertain: false, retryableRead: true });
+  } });
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  const first = await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+  assert.equal(first.accepted, false);
+  assert.equal(first.retrying, true);
+  const prior = f.record();
+  assert.equal(prior.task.dispatches[0].state, 'retrying');
+  await f.service.poll(prior.agentId);
+  assert.equal(f.record().task.taskId, prior.task.taskId);
+  assert.equal(f.record().task.dispatches[0].requestId, prior.task.dispatches[0].requestId);
+  assert.equal(f.record().task.dispatches[0].accepted, true);
+  assert.equal(f.record().task.dispatches[0].error, undefined);
+  assert.equal(attempts, 2);
+  const saved = f.record(); saved.task.dispatches[0].accepted = false; saved.task.dispatches[0].state = 'failed';
+  f.store.save(saved);
+  await f.service.poll(saved.agentId);
+  assert.equal(attempts, 2);
+  f.store.close();
+});
+
 test('settled awaiting-report monitor sleeps and a supplement wakes the same task', async () => {
   const f = await fixture({ startIdleMonitor: async () => true });
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));

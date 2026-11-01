@@ -10,7 +10,8 @@ if (!/^agent-[a-f\d]{32}$/.test(agentId ?? '') || !values['--config']) throw new
 const service = createScopedAgents(await loadConfig(values['--config']));
 const lease = values['--lease'];
 if (!/^worker-[a-f\d]{32}$/.test(lease ?? '')) throw new Error('Invalid recovery-worker lease.');
-const stopped = record => !record || (['idle', 'failed', 'cancelled', 'cleanup_failed'].includes(record.state)
+const stopped = record => !record || (['idle', 'failed', 'cancelled', 'cleanup_failed', 'supplement_blocked'].includes(record.state)
+  && !service.store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')
   && (record.callbackBlocked || !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered' && report.delivery.state !== 'blocked')));
 let owned = service.store.renewLease(`worker:${agentId}`, lease, 60000);
 const heartbeat = setInterval(() => { owned = service.store.renewLease(`worker:${agentId}`, lease, 60000); }, 10000);

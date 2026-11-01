@@ -711,6 +711,176 @@ test('managed inspection keeps empty history distinct from denial without starti
 });
 
 
+test('busy supplements persist independently and are dispatched in order to the same task', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  const record = f.record(); let release;
+  const held = f.store.locked(record.agentId, () => new Promise(resolve => { release = resolve; }));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(await f.service.send({ name: 'artist', message: 'first' }, extra(A)), { name: 'artist', accepted: false, queued: true, state: 'running' });
+  const flagged = f.record(); flagged.callbackBlocked = true; f.store.save(flagged);
+  const second = await f.service.send({ name: 'artist', message: 'second' }, extra(A));
+  assert.equal(second.queued, true);
+  assert.equal(second.callbackError.code, 'native-callback-unavailable');
+  assert.equal(f.sends.length, 1);
+  f.store.save(record);
+  release(); await held;
+  await f.service.poll(record.agentId);
+  assert.deepEqual(f.sends.map(item => item.message), ['initial', 'first', 'second']);
+  assert.equal(new Set(f.sends.map(item => item.requestId)).size, 3);
+  assert.equal(f.store.supplements(record.agentId).length, 0);
+  f.service.close();
+});
+
+test('busy after entering the operation is not mistaken for a lock timeout', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  f.api.managedStatus = async () => { throw Object.assign(new Error('native busy'), { code: 'agent-busy' }); };
+  await assert.rejects(f.service.send({ name: 'artist', message: 'supplement' }, extra(A)), error => error.message === 'native busy');
+  assert.equal(f.store.supplements(f.record().agentId).length, 0);
+  f.service.close();
+});
+
+test('queued input answers a waiting question and cannot cross cancellation or task replacement', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  const record = f.record(); let release;
+  f.sessions.get(record.sessionId).questions = [{ id: 'q', message: 'question', state: 'pending' }];
+  const held = f.store.locked(record.agentId, () => new Promise(resolve => { release = resolve; }));
+  await new Promise(resolve => setImmediate(resolve));
+  await f.service.send({ name: 'artist', message: 'answer' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'next supplement' }, extra(A));
+  release(); await held; await f.service.poll(record.agentId);
+  assert.equal(f.sessions.get(record.sessionId).questions[0].state, 'answered');
+  assert.equal(f.record().task.answers[0].message, 'answer');
+  assert.equal(f.sends.some(item => item.message === 'next supplement'), false);
+  f.finish();
+  await f.service.poll(record.agentId);
+  await f.service.poll(record.agentId);
+  assert.deepEqual(f.sends.slice(1).map(item => item.message), ['Answer: answer', 'next supplement']);
+  const stale = f.record();
+  assert.equal(f.store.enqueueSupplement(stale, 'request-stale', 'must not send'), true);
+  const newer = f.record(); newer.task.taskId = 'task-new'; f.store.save(newer);
+  await f.service.poll(record.agentId);
+  assert.equal(f.store.supplements(record.agentId)[0].status, 'blocked');
+  assert.equal(f.sends.some(item => item.message === 'must not send'), false);
+  f.service.close();
+});
+
+test('queued dispatch recovers the original accepted receipt without resending', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  const record = f.record(), requestId = 'request-recovery';
+  assert.equal(f.store.enqueueSupplement(record, requestId, 'queued message'), true);
+  record.task.dispatches.push({ requestId, message: 'queued message', state: 'unknown', afterSeq: 0 });
+  f.store.save(record);
+  const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, requestId])).digest('hex');
+  const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
+  await mkdir(directory, { recursive: true });
+  await writeFile(path.join(directory, `${key}.json`), JSON.stringify({ status: 'accepted', afterSeq: 0 }));
+  await f.service.poll(record.agentId);
+  assert.equal(f.sends.length, 1);
+  assert.equal(f.store.supplementSummary(record.agentId, record.task.taskId).latest.status, 'accepted');
+  f.service.close();
+});
+
+test('cached final or cancellation blocks queued input and preserves its reason', async () => {
+  for (const reason of ['final-submitted', 'task-cancelled']) {
+    const f = await fixture();
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+    const record = f.record();
+    assert.equal(f.store.enqueueSupplement(record, 'request-blocked', 'do not send'), true);
+    if (reason === 'task-cancelled') { record.task.cancelRequested = true; record.task.cancelVerified = true; }
+    else record.task.reports = [{ id: 'final', message: 'done', final: true, delivery: { state: 'delivered' }, treeSettledConfirmed: true }];
+    f.store.save(record);
+    await f.service.poll(record.agentId);
+    const summary = f.store.supplementSummary(record.agentId, record.task.taskId);
+    assert.equal(summary.blocked, 1);
+    assert.equal(summary.latest.reason, reason);
+    assert.equal(f.sends.some(item => item.message === 'do not send'), false);
+    if (reason === 'final-submitted') {
+      assert.equal(f.record().state, 'supplement_blocked');
+      await f.service.delete({ name: 'artist' }, extra(A));
+      assert.equal(f.store.supplements(record.agentId).length, 0);
+    }
+    f.service.close();
+  }
+});
+
+test('cancellation resolves an already consumed queued answer despite its unsent continuation', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  const record = f.record();
+  assert.equal(f.store.enqueueSupplement(record, 'request-answer', 'answer'), true);
+  f.store.setSupplement('request-answer', 'sending');
+  record.task.answers = [{ answerId: 'request-answer', message: 'answer', questionIds: ['q'], dispatched: false }];
+  record.task.cancelRequested = true; record.task.cancelVerified = true;
+  f.store.save(record);
+  await f.service.poll(record.agentId);
+  assert.equal(f.store.supplementSummary(record.agentId, record.task.taskId).latest.status, 'accepted');
+  assert.equal(f.sends.length, 1);
+  f.service.close();
+});
+
+test('cached final checks unknown queued dispatch against request-correlated native completion', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  const record = f.record(), requestId = 'request-native-proof';
+  assert.equal(f.store.enqueueSupplement(record, requestId, 'supplement'), true);
+  f.store.setSupplement(requestId, 'unknown');
+  record.task.dispatches.push({ requestId, message: 'supplement', state: 'unknown', afterSeq: 3 });
+  record.task.reports = [{ id: 'final', message: 'done', final: true, delivery: { state: 'delivered' }, treeSettledConfirmed: true }];
+  record.task.result = { state: 'completed', reply: 'done', changes: [] };
+  f.store.save(record);
+  f.sessions.get(record.sessionId).turns.set(requestId, { afterSeq: 3, state: 'ended', endSeq: 8, completionReason: { kind: 'completed' } });
+  await f.service.poll(record.agentId);
+  assert.equal(f.store.supplementSummary(record.agentId, record.task.taskId).latest.status, 'accepted');
+  assert.equal(f.sends.length, 1);
+  f.service.close();
+});
+
+test('a sealed final never resends a queued dispatch with no original receipt', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  const record = f.record(), requestId = 'request-unsent';
+  assert.equal(f.store.enqueueSupplement(record, requestId, 'must not send'), true);
+  f.store.setSupplement(requestId, 'sending');
+  record.task.dispatches.push({ requestId, message: 'must not send', state: 'sending', afterSeq: 0 });
+  record.task.reports = [{ id: 'final', message: 'done', final: true, delivery: { state: 'delivered' }, treeSettledConfirmed: true }];
+  record.task.result = { state: 'completed', reply: 'done', changes: [] };
+  f.store.save(record);
+  await f.service.poll(record.agentId);
+  const summary = f.store.supplementSummary(record.agentId, record.task.taskId);
+  assert.equal(summary.latest.status, 'blocked');
+  assert.equal(summary.latest.reason, 'final-submitted');
+  assert.equal(f.sends.length, 1);
+  f.service.close();
+});
+
+test('an uncached native final blocks recovery before resending an unsent intent', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  const record = f.record(), requestId = 'request-unsent-native-final';
+  assert.equal(f.store.enqueueSupplement(record, requestId, 'must not send'), true);
+  f.store.setSupplement(requestId, 'sending');
+  record.task.dispatches.push({ requestId, message: 'must not send', state: 'sending', afterSeq: 0 });
+  f.store.save(record);
+  f.sessions.get(record.sessionId).reports = [{ id: 'native-final', taskId: record.task.taskId, message: 'done', final: true }];
+  await f.service.poll(record.agentId);
+  assert.equal(f.store.supplementSummary(record.agentId, record.task.taskId).latest.reason, 'final-submitted');
+  assert.equal(f.sends.length, 1);
+  f.service.close();
+});
+
 test('send returns a compact receipt for a rich active task and preserves errors', async () => {
   let failure;
   const f = await fixture({ beforeSend: async () => { if (failure) throw failure; } });

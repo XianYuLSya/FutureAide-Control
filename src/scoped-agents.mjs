@@ -176,14 +176,14 @@ export function createScopedAgents(config, {
     if (!record) throw Object.assign(new Error(`No subagent named “${name}” exists in this chat.`), { code: 'agent-not-found' });
     return record;
   }
-  async function withName(extra, name, action) {
+  async function withName(extra, name, action, options) {
     const owner = await context(extra);
     const record = named(owner, name);
     return store.locked(record.agentId, async () => {
       const fresh = store.get(record.agentId);
       if (!fresh || fresh.ownerId !== owner.ownerId) throw new Error('This subagent instance has already been removed.');
       return action(fresh, owner);
-    });
+    }, options);
   }
 
   async function checkHost(record, { creation = false, taskTree = false } = {}) {
@@ -206,7 +206,8 @@ export function createScopedAgents(config, {
   }
 
   async function ensureWorker(record) {
-    if (!ACTIVE.has(record.state) && (record.callbackBlocked || !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered' && report.delivery.state !== 'blocked'))) return;
+    const queued = store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
+    if (!ACTIVE.has(record.state) && !queued && (record.callbackBlocked || !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered' && report.delivery.state !== 'blocked'))) return;
     const holder = uid('worker');
     if (!store.claimLease(`worker:${record.agentId}`, holder, 30000)) return;
     try { record.workerPid = await startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); }
@@ -228,10 +229,10 @@ export function createScopedAgents(config, {
     return observed;
   }
 
-  async function sendDispatch(record, message, kind = 'task', answerIds = []) {
+  async function sendDispatch(record, message, kind = 'task', answerIds = [], requestId = uid('request')) {
     const task = record.task;
     const baseline = await apiFor(record).historyCursor(record.sessionId, record.workspace);
-    const dispatch = { requestId: uid('request'), message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now() };
+    const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now() };
     task.dispatches.push(dispatch);
     record.state = 'running'; task.state = 'running';
     store.save(record); // The intent survives a caller or worker exiting during the write.
@@ -414,6 +415,11 @@ export function createScopedAgents(config, {
         store.save(record);
         return publicResult(record);
       }
+      if (store.supplementSummary(record.agentId, task.taskId).blocked) {
+        record.state = 'supplement_blocked';
+        store.save(record);
+        return publicResult(record);
+      }
       else return publicResult(latest ?? record);
     }
     record.state = task.state === 'completed' ? 'idle' : task.state;
@@ -460,7 +466,7 @@ export function createScopedAgents(config, {
     return publicResult(record);
   }
 
-  async function recoverDispatch(record, dispatch) {
+  async function recoverDispatch(record, dispatch, { allowResend = true } = {}) {
     if (dispatch.accepted || !['sending', 'unknown'].includes(dispatch.state)) return;
     const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, dispatch.requestId])).digest('hex');
     try {
@@ -472,8 +478,74 @@ export function createScopedAgents(config, {
       if (error.code === 'ENOENT' && dispatch.state === 'sending') {
         // writeOnce creates its receipt before entering the native send. No receipt
         // means this saved intent never reached that send; keep the exact request ID.
+        if (!allowResend) return 'not-sent';
         await dispatchOnce(record, dispatch);
       } else if (error.code !== 'ENOENT') throw error;
+    }
+  }
+
+  async function drainSupplements(record) {
+    if (record.task.cancelRequested) store.blockQueued(record.agentId, record.task.taskId, 'task-cancelled');
+    else if (record.task.reports?.some(report => report.final)) store.blockQueued(record.agentId, record.task.taskId, 'final-submitted');
+    const sealed = record.task.cancelRequested || record.task.reports?.some(report => report.final);
+    if (!sealed && (!(record.task.dispatches?.[0]?.accepted) || (record.task.answers ?? []).some(answer => !answer.dispatched))) return;
+    for (const item of store.supplements(record.agentId)) {
+      if (item.task !== record.task?.taskId) { store.setSupplement(item.requestId, 'blocked', 'task-changed'); continue; }
+      if (item.status === 'blocked') continue;
+      const current = store.get(record.agentId);
+      if (!current || current.ownerId !== item.owner || current.sessionId !== item.session || current.task?.taskId !== item.task) {
+        store.setSupplement(item.requestId, 'blocked', current?.task?.taskId !== item.task ? 'task-changed' : current?.task?.cancelRequested ? 'task-cancelled' : 'task-closed'); return;
+      }
+      const prior = record.task.dispatches.find(dispatch => dispatch.requestId === item.requestId);
+      if (prior) {
+        const recovered = await recoverDispatch(record, prior, { allowResend: false });
+        if (recovered === 'not-sent') {
+          const view = sealed ? undefined : await observe(record);
+          if (sealed || (view.reports ?? []).some(report => report.final)) {
+            store.setSupplement(item.requestId, 'blocked', record.task.cancelRequested ? 'task-cancelled' : 'final-submitted');
+            prior.state = 'blocked';
+            store.save(record);
+            continue;
+          }
+          await dispatchOnce(record, prior);
+        }
+        if (!prior.accepted && prior.state !== 'failed' && Number.isSafeInteger(prior.afterSeq)) {
+          const observed = await controlFor(record).wait({ sessionId: record.sessionId, requestId: prior.requestId,
+            afterSeq: prior.afterSeq, timeoutSeconds: 0, maxMessages: 100 });
+          if (observed.state === 'ended' && observed.correlation === 'request-id') Object.assign(prior,
+            { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq });
+        }
+        store.save(record);
+        if (prior.accepted) { store.setSupplement(item.requestId, 'accepted'); continue; }
+        store.setSupplement(item.requestId, prior.state === 'failed' ? 'blocked' : 'unknown', prior.error?.code ?? (prior.state === 'failed' ? 'send-failed' : 'acceptance-unknown')); return;
+      }
+      const priorAnswer = (record.task.answers ?? []).find(answer => answer.answerId === item.requestId);
+      if (priorAnswer && sealed) {
+        store.setSupplement(item.requestId, priorAnswer.questionIds ? 'accepted' : 'unknown', priorAnswer.questionIds ? null : 'answer-confirmation-unknown');
+        if (!priorAnswer.questionIds) return;
+        continue;
+      }
+      if (current.closed || current.task.cancelRequested || ['cleaning','cleanup_failed','cancelled','failed','idle','delivery_pending'].includes(current.state)) {
+        store.setSupplement(item.requestId, 'blocked', current.task.cancelRequested ? 'task-cancelled' : 'task-closed'); continue;
+      }
+      if (priorAnswer) {
+        if (!priorAnswer.questionIds) await answerLocked(record, item.message, item.requestId);
+        store.setSupplement(item.requestId, 'accepted');
+        if (!priorAnswer.dispatched) return;
+        continue;
+      }
+      const view = await observe(record);
+      if ((view.reports ?? []).some(report => report.final)) { store.blockQueued(record.agentId, record.task.taskId, 'final-submitted'); store.setSupplement(item.requestId, 'blocked', 'final-submitted'); return; }
+      store.setSupplement(item.requestId, 'sending');
+      if ((view.questions ?? []).some(question => question.state === 'pending')) {
+        await answerLocked(record, item.message, item.requestId);
+        store.setSupplement(item.requestId, 'accepted');
+        return;
+      } else {
+        const dispatch = await sendDispatch(record, item.message, 'supplement', [], item.requestId);
+        store.setSupplement(item.requestId, dispatch.accepted ? 'accepted' : dispatch.state === 'failed' ? 'blocked' : 'unknown', dispatch.accepted ? null : dispatch.error?.code ?? (dispatch.state === 'failed' ? 'send-failed' : 'acceptance-unknown'));
+        if (!dispatch.accepted) return;
+      }
     }
   }
 
@@ -486,6 +558,7 @@ export function createScopedAgents(config, {
         const result = await (await checkHost(record)).managedCancel(hostArgs(record));
         if (result.cancelRequested === true) { store.confirmCancel(record); task.cancelAccepted = true; task.cancelVerified = true; store.save(record); }
       }
+      if (task && store.supplements(record.agentId).length) await drainSupplements(record);
       // Never migrate an automatic result into an explicit report or cleanup.
       if (task?.result && task.reportProtocol !== REPORT_PROTOCOL) {
         if (['sending', 'unknown'].includes(task.delivery?.state)) await deliver(record, task.delivery, '');
@@ -525,9 +598,9 @@ export function createScopedAgents(config, {
           `DSH 子代理「${record.name}」等待回答：\n${question.message}\n\n请调用 futureaide_answer_agent，name=${JSON.stringify(record.name)}，message 为回答正文。任务保持等待；无需文件、命令或内部编号。`);
       }
       for (const dispatch of task.dispatches) {
-        if (['completed', 'cancelled', 'failed'].includes(dispatch.state)) continue;
+        if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
         await recoverDispatch(record, dispatch);
-        if (['completed', 'cancelled', 'failed'].includes(dispatch.state)) continue;
+        if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
         const result = await controlFor(record).wait({ sessionId: record.sessionId, requestId: dispatch.requestId,
           ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}), timeoutSeconds: 0, maxMessages: 100 });
         dispatch.afterSeq ??= result.afterSeq;
@@ -536,7 +609,7 @@ export function createScopedAgents(config, {
             endSeq: result.endSeq });
         }
       }
-      const outstanding = task.dispatches.some(dispatch => !['completed', 'cancelled', 'failed'].includes(dispatch.state));
+      const outstanding = task.dispatches.some(dispatch => !['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state));
       if (task.cancelRequested && !view.running && treeSettled(record, view)) {
         for (const dispatch of task.dispatches) if (!['completed', 'cancelled', 'failed'].includes(dispatch.state)) dispatch.state = 'cancelled';
       } else if (outstanding || view.running || task.cancelRequested) {
@@ -613,12 +686,22 @@ export function createScopedAgents(config, {
     },
     async send({ name, message }, extra) {
       textMessage(message);
-      return withName(extra, name, async record => {
-        if (record.closed || ['cleaning', 'cleanup_failed', 'creating'].includes(record.state)) throw new Error('This subagent is closing or not yet ready.');
+      let enteredOperation = false;
+      const enqueue = async record => {
+        const requestId = uid('request');
+        if (!store.enqueueSupplement(record, requestId, message)) throw Object.assign(new Error('The task changed, stopped or is no longer accepting supplements.'), { code: 'supplement-unavailable' });
+        await ensureWorker(store.get(record.agentId) ?? record);
+        return { name: record.name, accepted: false, queued: true, state: record.state,
+          ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
+      };
+      try { return await withName(extra, name, async record => {
+        enteredOperation = true;
+        if (record.closed || ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'].includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
         if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait before assigning another task.');
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
         await checkHost(record);
         const stoppedTask = record.task && ['cancelled', 'failed'].includes(record.state);
+        if (!stoppedTask && store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return enqueue(record);
         const pendingReports = (record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
         if (stoppedTask && (record.lifetime === 'once' || pendingReports)) throw new Error('This task stopped; delete the one-shot agent or wait for its submitted reports before reusing a persistent agent.');
         if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
@@ -643,7 +726,12 @@ export function createScopedAgents(config, {
         return { name: current.name, accepted: dispatch?.accepted === true, state: current.state,
           ...(error ? { error } : {}),
           ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
-      });
+      }, { waitMs: 0 }); } catch (error) {
+        if (enteredOperation || error.code !== 'agent-busy') throw error;
+        const owner = await context(extra);
+        const record = named(owner, name);
+        return enqueue(record);
+      }
     },
     async answer({ name, message }, extra) {
       textMessage(message);
@@ -653,7 +741,7 @@ export function createScopedAgents(config, {
       const owner = await context(extra);
       for (const record of store.list(owner.ownerId)) await ensureWorker(record);
       const records = store.list(owner.ownerId);
-      return { items: records.map(publicResult), total: records.length };
+      return { items: records.map(record => ({ ...publicResult(record), supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
     },
     async changes({ name, task = 0 }, extra) {
       return withName(extra, name, async record => {
@@ -754,15 +842,15 @@ export function createScopedAgents(config, {
     close() { store.close(); },
   };
 
-  async function answerLocked(record, message) {
+  async function answerLocked(record, message, queuedAnswerId) {
     if (!record.task || record.closed || record.task.cancelRequested) throw new Error('This subagent has no open task waiting for an answer.');
     await negotiateTree(record);
     await checkHost(record);
     const view = await observe(record);
-    const existing = (record.task.answers ?? []).find(answer => !answer.questionIds && answer.message === message);
+    const existing = (record.task.answers ?? []).find(answer => queuedAnswerId ? answer.answerId === queuedAnswerId : !answer.questionIds && answer.message === message);
     if (!existing && !(view.questions ?? []).some(question => question.state === 'pending')) throw new Error('This subagent has no unanswered question.');
     record.task.answers ??= [];
-    const answer = existing ?? { answerId: uid('answer'), message, dispatched: false };
+    const answer = existing ?? { answerId: queuedAnswerId ?? uid('answer'), message, dispatched: false };
     if (!existing) record.task.answers.push(answer);
     store.save(record);
     try { await resolveAnswer(record, answer); }

@@ -12,7 +12,7 @@ import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.2' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.3' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
@@ -38,7 +38,7 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
   register('futureaide_create_agent', 'Create a named DSH subagent in the current project, without running a model. once removes session data after an explicitly submitted final report is delivered and the tree settles; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
     name, lifetime: z.enum(['once', 'persistent']),
   }, (s, a, e) => s.create(a, e));
-  register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. Returns a compact receipt; use list, changes or inspect when details are needed. A waiting subagent treats this as its answer. DSH may delegate further to native descendants. Codex continues independently. Only explicit ask_parent questions and report_parent reports return to this chat; ordinary replies and idle trees never notify it. awaiting_report keeps the same task for further updates.', { name, message }, (s, a, e) => s.send(a, e));
+  register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. A compact receipt with queued:true means locally saved; do not resend. accepted:true means DSH accepted, not that work is complete. Use list for queue status or changes/inspect for details. A waiting subagent treats this as its answer. Only explicit questions and reports return to this chat; ordinary replies and idle trees never notify it.', { name, message }, (s, a, e) => s.send(a, e));
   register('futureaide_answer_agent', 'Answer the named subagent’s pending question directly. The plugin continues its original task once; no exchange ID, command, or text file is needed.', { name, message }, (s, a, e) => s.answer(a, e));
   register('futureaide_list_agents', 'Show only this chat’s subagents, including current task, descendant tree, activity, questions, attributed file changes, delivery and cleanup state. Deep history is unnecessary for ordinary supervision.', {}, (s, _a, e) => s.list(e), true);
   register('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, submit a report, await a report, or need attention. Other work may proceed concurrently; a timeout does not cancel a task.', {

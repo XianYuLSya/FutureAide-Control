@@ -672,7 +672,8 @@ export function createScopedAgents(config, {
       const status = { toolsLoaded: true, contextVerified: false, dshConnected: false, returnChannel: 'not-checked' };
       try {
         const owner = await context(extra);
-        Object.assign(status, { contextVerified: true, workspace: owner.workspace, returnChannel: 'chat-verified', agents: store.list(owner.ownerId).length });
+        Object.assign(status, { contextVerified: true, workspace: owner.workspace, returnChannel: 'chat-verified',
+          agents: typeof store.count === 'function' ? store.count(owner.ownerId) : store.list(owner.ownerId).length });
       } catch (error) { status.contextError = safeError(error); }
       try {
         const host = await clientFactory(config).hostStatus();
@@ -860,16 +861,18 @@ export function createScopedAgents(config, {
     async poll(agentId) {
       return store.locked(agentId, async () => { const record = store.get(agentId); return record ? pollLocked(record) : { removed: true }; });
     },
-    async resume() { for (const record of store.list()) await ensureWorker(record, { wake: record.sleep?.wakePending === true }); },
+    async resume() {
+      const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
+      for (const record of records) await ensureWorker(record, { wake: record.sleep?.wakePending === true });
+    },
     async ensureIdleMonitor() {
-      const sleeping = store.list().filter(record => record.sleep);
-      if (!sleeping.length) { monitorUnavailableSince = undefined; return false; }
+      if (!store.hasSleeping()) { monitorUnavailableSince = undefined; return false; }
       let ready = false;
       try { ready = await startIdleMonitor(config, store); } catch { /* Fall back to active workers below. */ }
       if (ready) { monitorUnavailableSince = undefined; return true; }
       monitorUnavailableSince ??= Date.now();
       if (Date.now() - monitorUnavailableSince >= monitorFailureGraceMs) {
-        for (const record of sleeping) {
+        for (const record of store.listSleeping()) {
           await ensureWorker(record, { wake: true });
         }
         monitorUnavailableSince = undefined;

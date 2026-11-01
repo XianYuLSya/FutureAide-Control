@@ -13,11 +13,16 @@ export function idleSignal(value) {
 }
 
 export async function scanSleeping(store, directory, wake, failures = new Map()) {
-  for (const record of store.list().filter(item => item.sleep)) {
+  const sleeping = typeof store.listSleeping === 'function'
+    ? store.listSleeping()
+    : store.list().filter(item => item.sleep);
+  for (const record of sleeping) {
+    const queued = record.hasSupplement ?? store.supplements(record.agentId)
+      .some(item => item.task === record.sleep.taskId && item.status !== 'blocked');
     if (record.sleep.wakePending || record.task?.taskId !== record.sleep.taskId || record.sessionId !== record.sleep.sessionId
         || !['awaiting_report', 'awaiting_input', 'delivery_pending', 'failed', 'cancelled'].includes(record.state)
         || (record.task?.cancelRequested && !(record.task.cancelVerified && record.task.cancelTreeSettled))
-        || store.supplements(record.agentId).some(item => item.task === record.sleep.taskId && item.status !== 'blocked')) {
+        || queued) {
       await wake(record.agentId, record.sleep.taskId);
       continue;
     }
@@ -40,14 +45,16 @@ export async function scanSleeping(store, directory, wake, failures = new Map())
 
 /** Retry existing durable deliveries under the same per-agent lock, with bounded concurrency. */
 export async function pollSleeping(store, poll, wake, ownsLease, concurrency = 2) {
-  const pending = store.list().filter(record => record.sleep && hasPendingDelivery(record));
+  const pending = typeof store.listPendingDeliveries === 'function'
+    ? store.listPendingDeliveries()
+    : store.list().filter(record => record.sleep && hasPendingDelivery(record));
   let next = 0;
   async function run() {
     while (next < pending.length && ownsLease()) {
-      const record = pending[next++];
+      const record = pending[next++], taskId = record.taskId ?? record.sleep?.taskId;
       try { await poll(record.agentId); } catch { /* The next shared scan retries. */ }
       const current = store.get(record.agentId);
-      if (current?.sleep && (current.task?.taskId !== record.sleep.taskId
+      if (current?.sleep && (current.task?.taskId !== taskId
           || !['awaiting_report', 'awaiting_input', 'delivery_pending', 'failed', 'cancelled'].includes(current.state)
           || current.observation?.tree?.running === true || current.observation?.tree?.settled !== true
           || store.supplements(current.agentId).some(item => item.task === current.task?.taskId && item.status !== 'blocked'))) {

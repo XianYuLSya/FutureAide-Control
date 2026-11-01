@@ -44,9 +44,9 @@ try {
       lastPoll = Date.now();
       deliveries.start();
     }
-    if (Date.now() - start > 35000 && !store.list().some(item => item.sleep)) {
+    if (Date.now() - start > 35000 && !store.hasSleeping()) {
       store.releaseLease('idle-monitor:ready', holder);
-      if (!store.list().some(item => item.sleep)) break;
+      if (!store.hasSleeping()) break;
       if (!store.claimLease('idle-monitor:ready', holder, 60000)) break;
     }
     if (signalled) { signalled = false; continue; }

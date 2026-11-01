@@ -73,6 +73,63 @@ export class RosterStore {
       : this.db.prepare('SELECT body FROM agents WHERE owner=? ORDER BY name').all(owner);
     return rows.map(row => JSON.parse(row.body));
   }
+  count(owner) {
+    return this.db.prepare(owner === undefined ? 'SELECT count(*) AS count FROM agents' : 'SELECT count(*) AS count FROM agents WHERE owner=?')
+      .get(...(owner === undefined ? [] : [owner])).count;
+  }
+  // These projections keep periodic checks and shared-monitor scans independent
+  // of task/report/history body size. Full records are loaded only for an agent
+  // whose worker or delivery poll is actually about to run.
+  hasSleeping() {
+    return this.db.prepare("SELECT 1 AS found FROM agents WHERE json_type(body,'$.sleep')='object' LIMIT 1").get() !== undefined;
+  }
+  listSleeping() {
+    return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
+      json_extract(body,'$.state') AS state, json_extract(body,'$.task.taskId') AS taskId,
+      json_extract(body,'$.task.cancelRequested') AS cancelRequested,
+      json_extract(body,'$.task.cancelVerified') AS cancelVerified,
+      json_extract(body,'$.task.cancelTreeSettled') AS cancelTreeSettled,
+      json_extract(body,'$.sleep') AS sleep,
+      EXISTS (SELECT 1 FROM supplements AS queued WHERE queued.agent=agents.id
+        AND queued.task=json_extract(agents.body,'$.task.taskId')
+        AND queued.status IN ('queued','sending','unknown')) AS hasSupplement
+      FROM agents WHERE json_type(body,'$.sleep')='object' ORDER BY name`).all().map(row => ({
+      agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
+      task: row.taskId == null ? undefined : { taskId: row.taskId,
+        ...(row.cancelRequested ? { cancelRequested: true } : {}),
+        ...(row.cancelVerified ? { cancelVerified: true } : {}),
+        ...(row.cancelTreeSettled ? { cancelTreeSettled: true } : {}) },
+      sleep: JSON.parse(row.sleep), hasSupplement: Boolean(row.hasSupplement),
+    }));
+  }
+  listPendingDeliveries() {
+    return this.db.prepare(`SELECT id AS agentId, json_extract(body,'$.sleep.taskId') AS taskId,
+      json_extract(body,'$.sleep.sessionId') AS sessionId
+      FROM agents WHERE json_type(body,'$.sleep')='object'
+        AND coalesce(json_extract(body,'$.callbackBlocked'),0)=0
+        AND (EXISTS (SELECT 1 FROM json_each(agents.body,'$.task.reports') AS report
+              WHERE coalesce(json_extract(report.value,'$.delivery.state'),'') NOT IN ('delivered','blocked'))
+          OR EXISTS (SELECT 1 FROM json_each(agents.body,'$.observation.questions') AS question
+              WHERE json_extract(question.value,'$.state')='pending'
+              AND NOT EXISTS (SELECT 1 FROM json_each(agents.body,'$.task.questionNotices') AS notice
+                WHERE notice.key=CAST(json_extract(question.value,'$.id') AS TEXT)
+                AND json_extract(notice.value,'$.state') IN ('delivered','blocked'))))
+      ORDER BY name`).all().map(row => ({ agentId: row.agentId, taskId: row.taskId, sessionId: row.sessionId }));
+  }
+  listWorkerCandidates() {
+    return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
+      json_extract(body,'$.state') AS state, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
+      json_extract(body,'$.sleep') AS sleep, json_extract(body,'$.task.taskId') AS taskId,
+      (SELECT coalesce(json_group_array(coalesce(json_extract(value,'$.delivery.state'),'')),'[]')
+        FROM json_each(agents.body,'$.task.reports')) AS deliveries
+      FROM agents ORDER BY name`).all().map(row => ({
+      agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
+      ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
+      ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
+      ...(row.taskId == null ? {} : { task: { taskId: row.taskId,
+        reports: JSON.parse(row.deliveries).map(delivery => ({ delivery: { state: delivery } })) } }),
+    }));
+  }
   insert(record) {
     try { this.db.prepare('INSERT INTO agents(id,owner,name,body) VALUES (?,?,?,?)').run(record.agentId, record.ownerId, record.name, JSON.stringify(record)); }
     catch (error) {

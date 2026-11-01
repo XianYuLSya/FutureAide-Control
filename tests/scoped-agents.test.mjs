@@ -594,6 +594,22 @@ test('worker lease expiry restarts monitoring and list does not overwrite task s
   f.service.close();
 });
 
+test('resume and monitor health use projections instead of loading the full roster', async () => {
+  const f = await fixture({ startIdleMonitor: async () => true });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+    const r = f.record(), lease = f.store.lease(`worker:${r.agentId}`);
+    f.store.releaseLease(`worker:${r.agentId}`, lease.holder);
+    const before = f.workers.length;
+    f.store.list = () => { throw new Error('full roster must not be loaded'); };
+    await f.service.resume();
+    assert.equal(f.workers.length, before + 1);
+    assert.equal(await f.service.ensureIdleMonitor(), false);
+    assert.equal((await f.service.status(extra(A))).agents, 1);
+  } finally { f.service.close(); }
+});
+
 test('one-shot returns full native text rather than the truncated inspection view', async () => {
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));

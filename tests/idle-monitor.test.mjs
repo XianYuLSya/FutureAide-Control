@@ -34,6 +34,23 @@ test('shared monitor retries pending or unknown deliveries with at most two conc
   records[0].callbackBlocked = true;
   assert.equal(hasPendingDelivery(records[0]), false);
 });
+test('shared monitor reads sleeping and delivery projections without the full roster', async () => {
+  const value = record();
+  value.sleep = { taskId: 'task-a', sessionId: 'session-a', wakePending: true };
+  let polls = 0, scans = 0, fullListCalls = 0;
+  const store = {
+    list() { fullListCalls++; throw new Error('full roster must not be loaded'); },
+    listSleeping() { return [{ ...value, hasSupplement: false }]; },
+    listPendingDeliveries() { return [{ agentId: 'agent-a', taskId: 'task-a', sessionId: 'session-a' }]; },
+    get() { return value; },
+    supplements() { return []; },
+  };
+  await scanSleeping(store, '.', async () => { scans++; });
+  await pollSleeping(store, async () => { polls++; }, async () => {}, () => true);
+  assert.equal(scans, 1);
+  assert.equal(polls, 1);
+  assert.equal(fullListCalls, 0);
+});
 test('slow delivery does not block event scanning or start overlapping batches', async () => {
   let release, notices = 0, started = false;
   const gate = new Promise(resolve => { release = resolve; });

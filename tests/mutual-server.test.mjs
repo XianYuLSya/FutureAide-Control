@@ -22,3 +22,12 @@ test('a one-shot removed during wait returns immediately instead of waiting out 
     assert.ok(Date.now() - began < 500);
   } finally { service.close(); }
 });
+
+test('Claude dispatch is rejected before reaching an execution adapter', async () => {
+  let created = false;
+  const service = await createMutualService({}, { cliFactory: () => ({ ...fakeCli(), create: async () => { created = true; } }), contextResolver: async () => owner });
+  try {
+    await assert.rejects(service.create({ name: 'desktop', lifetime: 'once', runtime: 'claude' }), { code: 'claude-desktop-required' });
+    assert.equal(created, false);
+  } finally { service.close(); }
+});

@@ -36,8 +36,8 @@ export async function createMutualService(config, { cliFactory = createCliAgents
       const owner = await resolveContext(extra);
       const local = await cli.status(trusted(extra, owner));
       const dshState = permitsDsh(owner) ? await dshService().status(extra) : undefined;
-      return { ...dshState, ...local, agents: (local.agents ?? 0) + (dshState?.agents ?? 0), version: '0.6.0', profileBound: Boolean(owner.profileId),
-        runtimes: { dsh: permitsDsh(owner), claude: true, codex: true }, ...(dshState ? { dsh: dshState } : {}) };
+      return { ...dshState, ...local, agents: (local.agents ?? 0) + (dshState?.agents ?? 0), version: '0.6.2', profileBound: Boolean(owner.profileId),
+        runtimes: { dsh: permitsDsh(owner), claude: false, codex: true }, runtimeErrors: { claude: 'claude-desktop-required' }, ...(dshState ? { dsh: dshState } : {}) };
     },
     async create(args, extra) {
       const owner = await resolveContext(extra);
@@ -45,6 +45,7 @@ export async function createMutualService(config, { cliFactory = createCliAgents
         throw fail('agent-name-exists', 'This subagent name is already in use in this chat.');
       }
       const runtime = args.runtime ?? (permitsDsh(owner) ? 'dsh' : 'codex');
+      if (runtime === 'claude') throw fail('claude-desktop-required', 'Claude CLI execution is disabled. Dispatch through the existing Claude Desktop window is not implemented.');
       if (runtime === 'dsh') {
         if (!permitsDsh(owner)) throw fail('dsh-parent-unsupported', 'DSH currently requires a Codex desktop caller. Use runtime=codex or claude here.');
         return dshService().create(args, extra);
@@ -121,7 +122,7 @@ export function makeMutualServer({ configPath, diagnostics, serviceFactory = cre
     } finally { finished?.(); }
   });
   register('futureaide_status', 'Check the calling chat/project and available runtimes. Uses the bound FaSwitch profile; never asks for login just because a separate CLI is unsigned-in.', {}, (s, _a, e) => s.status(e), true);
-  register('futureaide_create_agent', 'Create a named subagent in this project. runtime defaults to dsh in Codex Desktop and codex in Claude; choose claude for Claude Code. Credentials and proxy come from the bound FaSwitch account. Creation starts no model. once retires session data after its explicit final report is received; persistent is reusable.', {
+  register('futureaide_create_agent', 'Create a named subagent in this project. runtime defaults to dsh in Codex Desktop and codex in Claude; runtime=claude is disabled because existing Claude Desktop dispatch is not implemented; never substitute a CLI. Creation starts no model. once retires session data after its explicit final report is received; persistent is reusable.', {
     name, lifetime: z.enum(['once', 'persistent']), runtime: z.enum(['dsh', 'claude', 'codex']).optional(),
   }, (s, a, e) => s.create(a, e));
   register('futureaide_send_agent', 'Assign work or send an update by name. Running agents queue updates. A short receipt confirms dispatch/queue state. Only explicit reports and questions notify the parent.', { name, message }, (s, a, e) => s.send(a, e));

@@ -20,33 +20,6 @@ const SESSION = '11111111-1111-4111-8111-111111111111';
 const NATIVE = '22222222-2222-4222-8222-222222222222';
 const MCP = String.raw`D:\work\agent\mcp.json`;
 
-test('claude starts a new stream-json session with model, effort, verbose and strict MCP config', () => {
-  const prompt = 'inspect "quoted" input\nsecond line';
-  const invocation = buildCliInvocation({ runtime: 'claude', executable: 'claude.exe', prompt, sessionId: SESSION, mcpConfigPath: MCP, model: 'claude-test', effort: 'high' });
-  assert.equal(invocation.command, 'claude.exe');
-  assert.deepEqual(invocation.args, [
-    '-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json',
-    '--model', 'claude-test', '--effort', 'high',
-    '--session-id', SESSION, '--strict-mcp-config', '--mcp-config', MCP,
-    '--permission-mode', 'acceptEdits', '--allowedTools', 'mcp__futureaide__*',
-  ]);
-  assert.equal(invocation.stdinText, JSON.stringify({
-    type: 'user',
-    message: { role: 'user', content: [{ type: 'text', text: prompt }] },
-  }) + '\n');
-  assert.equal(invocation.stdinText.split('\n').length, 2);
-});
-
-test('claude resumes a native session instead of assigning a new session id', () => {
-  const invocation = buildCliInvocation({ runtime: 'claude', prompt: 'continue', nativeSessionId: NATIVE, sessionId: SESSION, mcpConfigPath: MCP });
-  assert.deepEqual(invocation.args, [
-    '-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json',
-    '--resume', NATIVE, '--strict-mcp-config', '--mcp-config', MCP,
-    '--permission-mode', 'acceptEdits', '--allowedTools', 'mcp__futureaide__*',
-  ]);
-  assert.ok(!invocation.args.includes('--session-id'));
-});
-
 test('codex invokes exec from stdin, registers MCP config, and resumes with its native session', () => {
   const workspace = 'D:\\fixture\\workspace';
   const mcpConfig = {
@@ -72,12 +45,11 @@ test('codex invokes exec from stdin, registers MCP config, and resumes with its 
   assert.equal(resumed.stdinText, 'continue\n');
 });
 
-test('unknown runtimes and missing required invocation values are rejected', () => {
-  assert.throws(() => buildCliInvocation({ runtime: 'other', prompt: 'work', sessionId: SESSION }), /Unsupported CLI runtime/);
-  assert.equal(buildCliInvocation({ runtime: 'claude', prompt: 'work', sessionId: SESSION }).command, 'claude');
-  assert.throws(() => buildCliInvocation({ runtime: 'claude', executable: '', prompt: 'work', sessionId: SESSION }), /executable/);
-  assert.throws(() => buildCliInvocation({ runtime: 'claude', executable: 'claude', sessionId: SESSION }), /prompt/);
-  assert.throws(() => buildCliInvocation({ runtime: 'claude', executable: 'claude', prompt: 'work' }), /sessionId/);
+test('Claude CLI cannot start or resume and Codex arguments remain validated', () => {
+  for (const nativeSessionId of [undefined, NATIVE]) assert.throws(() => buildCliInvocation({ runtime: 'claude', prompt: 'work', nativeSessionId }), { code: 'claude-desktop-required' });
+  assert.throws(() => buildCliInvocation({ runtime: 'other', prompt: 'work' }), /Unsupported CLI runtime/);
+  assert.throws(() => buildCliInvocation({ runtime: 'codex', executable: '', prompt: 'work' }), /executable/);
+  assert.throws(() => buildCliInvocation({ runtime: 'codex', executable: 'codex' }), /prompt/);
 });
 
 test('the MCP config has the exact child-server shape and leaves existing files alone', async () => {

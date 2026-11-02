@@ -1,5 +1,12 @@
 # 更新记录
 
+## 0.6.2 — 2026-11-02 · 停用错误的 Claude CLI 接入
+
+- 停用 runtime=claude，在创建和执行入口明确返回 claude-desktop-required；已有 Claude Desktop 窗口控制尚未实现。
+- 移除 Claude Desktop 登录缓存解密、OAuth 提取、CLI 查找与 Claude 命令行生成路径。保留原生 Claude 作为调用方、DSH 和 Codex 执行路径。
+- 修正文档和工具说明：0.6.0/0.6.1 的独立 CLI 实现不满足用户要求的 Desktop 接入；代理环境设置与抽样 TCP 观测不构成全流量出口证明。
+
+
 ## 0.6.1 — 2026-11-02 · Claude 技能与通用规则
 
 - Claude 子代理每次启动或接续时，继承绑定档案的 skills、rules 和 CLAUDE.md 普通文件；账号设置、凭据及会话保持独立。

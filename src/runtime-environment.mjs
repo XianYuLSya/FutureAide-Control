@@ -1,5 +1,4 @@
-import { createDecipheriv, createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { access, copyFile, cp, lstat, mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -45,84 +44,6 @@ export async function resolveFaSwitchBinding(config = {}, binding = {}) {
   const codeAuthHome = active?.profile_id === profileId ? (owner.roots?.home ?? codexHome) : path.join(root, 'profiles', name);
   return { ...binding, profileId, kind, name, faSwitchRoot: root, desktopData,
     proxy: proxy.href.replace(/\/$/, ''), codexAuthHome: codeAuthHome };
-}
-
-// The DPAPI result stays on this private pipe. Never put it in an exception or log.
-async function unprotectCurrentUser(bytes) {
-  if (process.platform !== 'win32') throw fail('desktop-auth-platform', 'Reusing this Claude Desktop login currently requires Windows.');
-  const executable = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const script = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Security; try { $b=[Convert]::FromBase64String([Console]::In.ReadToEnd()); $p=[Security.Cryptography.ProtectedData]::Unprotect($b,$null,[Security.Cryptography.DataProtectionScope]::CurrentUser); [Console]::Out.Write([Convert]::ToBase64String($p)); [Array]::Clear($p,0,$p.Length) } catch { exit 2 }";
-  return new Promise((resolve, reject) => {
-    const child = spawn(executable, ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
-    let output = '';
-    const timer = setTimeout(() => { child.kill(); reject(fail('desktop-auth-locked', 'The current Windows user could not open this profile login.')); }, 10000);
-    child.stdout.on('data', value => { output += value.toString('ascii'); });
-    child.once('error', () => { clearTimeout(timer); reject(fail('desktop-auth-locked', 'The Windows credential reader could not start.')); });
-    child.once('close', code => {
-      clearTimeout(timer);
-      if (code !== 0 || !output) return reject(fail('desktop-auth-locked', 'The current Windows user could not open this profile login.'));
-      resolve(Buffer.from(output.trim(), 'base64'));
-    });
-    child.stdin.on('error', () => {});
-    child.stdin.end(bytes.toString('base64'));
-  });
-}
-
-/** Read only this profile's current Code authorization. No refresh or new login is attempted. */
-export async function readClaudeDesktopAuthorization(binding, { unprotect = unprotectCurrentUser } = {}) {
-  const settings = await json(path.join(binding.desktopData, 'config.json'));
-  const account = settings.lastKnownAccountUuid;
-  if (!UUID.test(account ?? '')) throw fail('desktop-account-unavailable', 'Claude Desktop has no current account in this FaSwitch profile.');
-  if (binding.claudeAccountId && binding.claudeAccountId !== account) throw fail('profile-account-changed', 'The Claude account in this FaSwitch profile changed.');
-  const encoded = settings['oauth:tokenCacheV2'] ?? settings['oauth:tokenCache'];
-  if (!encoded) throw fail('desktop-code-auth-unavailable', 'Open Code in this already signed-in Claude Desktop profile to initialize its Code authorization.');
-  const blob = Buffer.from(encoded, 'base64');
-  const prefix = blob.subarray(0, 3).toString('ascii');
-  let plaintext;
-  if (['v10', 'v11'].includes(prefix)) {
-    const state = await json(path.join(binding.desktopData, 'Local State'));
-    const wrapped = Buffer.from(state.os_crypt?.encrypted_key ?? '', 'base64');
-    if (wrapped.subarray(0, 5).toString() !== 'DPAPI') throw fail('desktop-auth-format', 'This Desktop credential format is unsupported.');
-    const key = await unprotect(wrapped.subarray(5));
-    try {
-      if (key.length !== 32 || blob.length <= 31) throw new Error('format');
-      const cipher = createDecipheriv('aes-256-gcm', key, blob.subarray(3, 15));
-      cipher.setAuthTag(blob.subarray(-16));
-      plaintext = Buffer.concat([cipher.update(blob.subarray(15, -16)), cipher.final()]);
-    } catch { throw fail('desktop-auth-locked', 'This profile credential could not be opened.'); }
-    finally { key.fill(0); }
-  } else {
-    if (prefix.startsWith('v')) throw fail('desktop-auth-format', 'This Desktop credential format is unsupported.');
-    plaintext = await unprotect(blob);
-  }
-  let cache;
-  try { cache = JSON.parse(plaintext.toString('utf8')); }
-  catch { throw fail('desktop-auth-format', 'This Desktop login cache has an unsupported shape.'); }
-  finally { plaintext.fill(0); }
-  const candidates = Object.entries(cache).flatMap(([key, value]) => {
-    const match = /^acct:([^|]+)\|([^:]+):([^:]+):(https?:\/\/[^:]+(?::\d+)?):(.*)$/.exec(key);
-    if (!match || match[1] !== account || !match[5].split(' ').includes('user:sessions:claude_code') || !value.token) return [];
-    const expiresAt = typeof value.expiresAt === 'number' ? value.expiresAt : Date.parse(value.expiresAt);
-    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now() + 60000) return [];
-    return [{ token: value.token, orgId: match[3], apiHost: match[4], scopes: match[5], expiresAt,
-      subscriptionType: value.subscriptionType, rateLimitTier: value.rateLimitTier }];
-  });
-  const selected = candidates.filter(value => !binding.claudeOrgId || value.orgId === binding.claudeOrgId);
-  if (selected.length !== 1) throw fail('desktop-code-auth-unavailable', 'The current Claude Desktop Code authorization is expired or ambiguous. Open Code in the bound profile to refresh it.');
-  return { ...selected[0], accountId: account };
-}
-
-async function findClaudeExecutable(binding, override) {
-  if (override) { await access(override); return path.resolve(override); }
-  const directory = path.join(binding.desktopData, 'claude-code');
-  const versions = (await readdir(directory, { withFileTypes: true })).filter(v => v.isDirectory() && /^\d+\.\d+\.\d+$/.test(v.name))
-    .map(v => v.name).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
-  for (const version of versions) for (const build of await readdir(path.join(directory, version), { withFileTypes: true })) {
-    if (!build.isDirectory()) continue;
-    const executable = path.join(directory, version, build.name, 'claude.exe');
-    try { await access(executable); return executable; } catch { /* Other package entries are not executables. */ }
-  }
-  throw fail('claude-runtime-unavailable', 'Claude Desktop has not installed its Code runtime yet.');
 }
 
 async function findCodexExecutable(config, binding) {
@@ -171,24 +92,13 @@ export async function copyClaudeUserInstructions(binding, directory) {
 }
 
 export async function resolveRuntimeEnvironment({ runtime, binding = {}, directory, config = {} }) {
+  if (runtime === 'claude') throw fail('claude-desktop-required', 'Claude CLI execution is disabled. The user requires the existing Claude Desktop window; desktop dispatch is not implemented.');
   if (!path.isAbsolute(directory ?? '') || isDriveC(directory)) throw fail('agent-directory-invalid', 'Agent runtime data must have its own absolute path outside drive C.');
   const selected = await resolveFaSwitchBinding(config, binding);
   const env = isolatedRuntimeEnvironment(selected, directory);
   for (const root of [env.HOME, env.APPDATA, env.LOCALAPPDATA, env.TEMP]) await mkdir(root, { recursive: true });
   env.FUTUREAIDE_CONTROL_CONFIG = config.configFile;
-  if (runtime === 'claude') {
-    const auth = await readClaudeDesktopAuthorization(selected);
-    const executable = await findClaudeExecutable(selected, config.claudeExecutable);
-    Object.assign(env, { CLAUDE_CONFIG_DIR: path.join(directory, 'claude-config'),
-      CLAUDE_CODE_OAUTH_TOKEN: auth.token, CLAUDE_CODE_OAUTH_SCOPES: auth.scopes,
-      CLAUDE_CODE_ORGANIZATION_UUID: auth.orgId, CLAUDE_CODE_SUBSCRIPTION_TYPE: auth.subscriptionType ?? '',
-      CLAUDE_CODE_RATE_LIMIT_TIER: auth.rateLimitTier ?? '',
-      ANTHROPIC_BASE_URL: auth.apiHost, DISABLE_AUTOUPDATER: '1' });
-    await copyClaudeUserInstructions(selected, env.CLAUDE_CONFIG_DIR);
-    return { executable, env, binding: { ...selected, claudeAccountId: auth.accountId, claudeOrgId: auth.orgId },
-      model: config.claudeModel ?? 'opus', effort: config.claudeEffort ?? 'medium' };
-  }
-  if (runtime !== 'codex') throw fail('runtime-unsupported', 'Choose claude or codex.');
+  if (runtime !== 'codex') throw fail('runtime-unsupported', 'Only the Codex CLI runtime is enabled.');
   const source = path.join(selected.codexAuthHome, 'auth.json');
   const authText = await readFile(source, 'utf8');
   const auth = JSON.parse(authText);

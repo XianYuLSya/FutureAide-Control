@@ -1,9 +1,9 @@
 {
   "name": "futureaide-control",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
-  "description": "Named DSH, Claude Code and Codex subagents with per-chat isolation, explicit reports and idle process release.",
+  "description": "Named DSH and Codex agents. Claude Desktop can call Codex; dispatch to Claude is disabled pending desktop integration.",
   "homepage": "https://github.com/XianYuLSya/FutureAide-Control#readme",
   "repository": {
     "type": "git",

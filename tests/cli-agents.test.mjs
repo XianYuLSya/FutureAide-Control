@@ -395,22 +395,10 @@ test('send returns a compact receipt and a running supplement is persisted inste
   } finally { f.service.close(); }
 });
 
-test('Claude adapter uses the Desktop Code invocation without a login step', () => {
+test('Claude adapter cannot substitute an independent CLI for Desktop', () => {
   const adapter = createRuntimeAdapter('claude');
-  const invocation = adapter.build({
-    executable: 'claude-desktop.exe',
-    prompt: 'hello',
-    sessionId: '11111111-1111-4111-8111-111111111111',
-    mcpConfigPath: 'D:\\fixture\\mcp.json',
-    model: 'opus',
-    effort: 'medium',
-  });
-  assert.equal(adapter.id, 'claude-desktop-code');
-  assert.equal(invocation.command, 'claude-desktop.exe');
-  assert.ok(invocation.args.includes('--verbose'));
-  assert.ok(invocation.args.includes('--strict-mcp-config'));
-  assert.ok(invocation.args.includes('--mcp-config'));
-  assert.ok(!invocation.args.includes('--bare'));
+  assert.equal(adapter.id, 'claude-disabled');
+  assert.throws(() => adapter.build({ prompt: 'hello' }), { code: 'claude-desktop-required' });
 });
 
 test('poll executes stdin task, collects stdout events, and explicit final returns persistent agent to idle', async () => {

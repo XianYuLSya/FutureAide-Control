@@ -27,25 +27,12 @@ function optionalString(value, name) {
  * @returns {{command: string, args: string[], stdinText: string}}
  */
 export function buildCliInvocation({ runtime, executable, prompt, nativeSessionId, mcpConfigPath, sessionId, workspace, mcpConfig, model, effort } = {}) {
+  if (runtime === 'claude') throw Object.assign(new Error('Claude CLI is disabled; the user requires Claude Desktop.'), { code: 'claude-desktop-required' });
   if (!RUNTIMES.has(runtime)) throw new TypeError(`Unsupported CLI runtime: ${String(runtime)}. Expected 'claude' or 'codex'.`);
   const command = nonEmptyString(executable ?? runtime, 'executable');
   nonEmptyString(prompt, 'prompt');
   const resumeId = optionalString(nativeSessionId, 'nativeSessionId');
   const configPath = optionalString(mcpConfigPath, 'mcpConfigPath');
-  if (runtime === 'claude') {
-    const args = ['-p', '--verbose', '--output-format', 'stream-json', '--input-format', 'stream-json'];
-    if (model) args.push('--model', String(model));
-    if (effort) args.push('--effort', String(effort));
-    if (resumeId) args.push('--resume', resumeId);
-    else args.push('--session-id', nonEmptyString(sessionId, 'sessionId'));
-    if (configPath) args.push('--strict-mcp-config', '--mcp-config', configPath);
-    args.push('--permission-mode', 'acceptEdits', '--allowedTools', 'mcp__futureaide__*');
-    const stdinText = JSON.stringify({
-      type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text: prompt }] },
-    }) + '\n';
-    return { command, args, stdinText };
-  }
   const args = ['exec'];
   if (resumeId) args.push('resume', resumeId, '--json');
   else args.push('--json', '--skip-git-repo-check', '-C', nonEmptyString(workspace, 'workspace'));

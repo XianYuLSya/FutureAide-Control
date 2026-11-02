@@ -1,9 +1,35 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCipheriv, randomBytes } from 'node:crypto';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { isDriveC, isolatedRuntimeEnvironment, readClaudeDesktopAuthorization } from '../src/runtime-environment.mjs';
+import { copyClaudeUserInstructions, isDriveC, isolatedRuntimeEnvironment, readClaudeDesktopAuthorization } from '../src/runtime-environment.mjs';
+
+test('Claude inherits user instructions while its auth and settings remain private', async () => {
+  const parent = path.resolve('.runtime/tests/runtime-environment');
+  await mkdir(parent, { recursive: true });
+  const root = await mkdtemp(path.join(parent, 'instructions-'));
+  const binding = { faSwitchRoot: root, kind: 'account', profileId: 'profile' };
+  const source = path.join(root, 'client-state/claude/account/profile/claude-config');
+  const child = path.join(root, 'child/claude-config');
+  await mkdir(path.join(source, 'skills/shared'), { recursive: true });
+  await mkdir(path.join(source, 'rules'), { recursive: true });
+  await mkdir(child, { recursive: true });
+  await writeFile(path.join(source, 'skills/shared/SKILL.md'), 'shared skill');
+  await writeFile(path.join(source, 'rules/general.md'), 'general rules');
+  await writeFile(path.join(source, 'CLAUDE.md'), 'first rules');
+  await writeFile(path.join(source, 'settings.json'), 'parent settings');
+  await writeFile(path.join(source, '.credentials.json'), 'parent credentials');
+  await writeFile(path.join(child, 'settings.json'), 'private settings');
+  await copyClaudeUserInstructions(binding, child);
+  assert.equal(await readFile(path.join(child, 'skills/shared/SKILL.md'), 'utf8'), 'shared skill');
+  assert.equal(await readFile(path.join(child, 'rules/general.md'), 'utf8'), 'general rules');
+  assert.equal(await readFile(path.join(child, 'settings.json'), 'utf8'), 'private settings');
+  assert.equal((await readdir(child)).includes('.credentials.json'), false);
+  await writeFile(path.join(source, 'CLAUDE.md'), 'updated rules');
+  await copyClaudeUserInstructions(binding, child);
+  assert.equal(await readFile(path.join(child, 'CLAUDE.md'), 'utf8'), 'updated rules');
+});
 
 const account = '11111111-1111-4111-8111-111111111111';
 const other = '22222222-2222-4222-8222-222222222222';

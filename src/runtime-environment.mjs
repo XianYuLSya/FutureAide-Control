@@ -1,6 +1,6 @@
 import { createDecipheriv, createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { access, mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
+import { access, copyFile, cp, lstat, mkdir, readFile, readdir, realpath, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -150,6 +150,26 @@ export function isolatedRuntimeEnvironment(binding, directory, base = process.en
   return env;
 }
 
+/** Copy user instructions only; the child keeps independent settings and auth. */
+export async function copyClaudeUserInstructions(binding, directory) {
+  const source = path.join(binding.faSwitchRoot, 'client-state', 'claude', binding.kind, binding.profileId, 'claude-config');
+  await mkdir(directory, { recursive: true });
+  for (const name of ['skills', 'rules']) {
+    let entries;
+    try { entries = await readdir(path.join(source, name), { withFileTypes: true }); }
+    catch (error) { if (error.code === 'ENOENT') continue; throw error; }
+    for (const entry of entries) {
+      // Ordinary files also work on Windows hosts that reject junction traversal.
+      if (entry.isSymbolicLink()) continue;
+      await cp(path.join(source, name, entry.name), path.join(directory, name, entry.name), {
+        recursive: true, filter: async file => !(await lstat(file)).isSymbolicLink(),
+      });
+    }
+  }
+  try { await copyFile(path.join(source, 'CLAUDE.md'), path.join(directory, 'CLAUDE.md')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
 export async function resolveRuntimeEnvironment({ runtime, binding = {}, directory, config = {} }) {
   if (!path.isAbsolute(directory ?? '') || isDriveC(directory)) throw fail('agent-directory-invalid', 'Agent runtime data must have its own absolute path outside drive C.');
   const selected = await resolveFaSwitchBinding(config, binding);
@@ -164,6 +184,7 @@ export async function resolveRuntimeEnvironment({ runtime, binding = {}, directo
       CLAUDE_CODE_ORGANIZATION_UUID: auth.orgId, CLAUDE_CODE_SUBSCRIPTION_TYPE: auth.subscriptionType ?? '',
       CLAUDE_CODE_RATE_LIMIT_TIER: auth.rateLimitTier ?? '',
       ANTHROPIC_BASE_URL: auth.apiHost, DISABLE_AUTOUPDATER: '1' });
+    await copyClaudeUserInstructions(selected, env.CLAUDE_CONFIG_DIR);
     return { executable, env, binding: { ...selected, claudeAccountId: auth.accountId, claudeOrgId: auth.orgId },
       model: config.claudeModel ?? 'opus', effort: config.claudeEffort ?? 'medium' };
   }

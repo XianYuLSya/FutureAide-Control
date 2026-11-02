@@ -10,7 +10,7 @@
 - **随时监工**：列表显示各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
 - **管理生命周期**：一次性任务显式 final 报告送达且整树收尾后清除会话；长期代理保留上下文，按名字继续使用。
 
-0.6.0 新增 Claude Code 与 Codex 双向调用，复用 FaSwitch 对应档案的现有桌面登录和代理。保留 DSH 的名字式工具、默认模型跟随、定点读取与闲置释放。版本变化见 [CHANGELOG](CHANGELOG.md)。
+0.6.1 让 Claude 子代理继承对应档案的技能和通用规则；0.6.0 已接入 Claude Code 与 Codex 双向调用，复用 FaSwitch 对应档案的现有桌面登录和代理。保留 DSH 的名字式工具、默认模型跟随、定点读取与闲置释放。版本变化见 [CHANGELOG](CHANGELOG.md)。
 
 ## 安装
 
@@ -55,6 +55,8 @@ DSH 宿主适配只连接 DSH 应用。未指定实例时只读取 DSH 的注册
 ```
 
 安装器将 MCP 和 SessionStart 身份钩子写入当前 Claude 档案。Claude Desktop 新开的 Code 会话会自动识别项目与会话；已有 Codex 聊天重载插件后使用新增参数。无需再登录一个独立 CLI，也不用填写内部会话 ID 或代理地址。
+
+Claude 子代理在每次启动或接续时读取该档案 `claude-config` 中普通文件形式的 `skills/`、`rules/` 和 `CLAUDE.md`，保留独立的设置、凭据和会话数据。技能可以通过一个普通 `SKILL.md` 入口引用共享正文与脚本；目录链接不会复制到子代理运行目录。
 
 Codex 调用 Claude：
 

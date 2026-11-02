@@ -1,6 +1,6 @@
 {
   "name": "futureaide-control",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "type": "module",
   "description": "Named DSH, Claude Code and Codex subagents with per-chat isolation, explicit reports and idle process release.",

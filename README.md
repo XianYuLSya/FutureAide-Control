@@ -1,23 +1,16 @@
-![FutureAide Control — Named agents](assets/banner.svg)
+![FutureAide Control — DSH Control](assets/banner.svg)
 
-# FutureAide Control
+# FutureAide Control · DSH Control
 
-0.7.0 可用：在现有 FaSwitch 同一档案窗口里，用 `futureaide_create_agent({name, lifetime, runtime:'claude'|'codex'})` 创建命名下属，再用 `futureaide_send_agent({name, message})` 派任务；`futureaide_wait_agents` 收显式报告和提问。Claude 原生使用 `Agent({description,prompt,subagent_type:'general-purpose'})` 创建、`SendMessage({to:agentId,message,summary})` 复用；Codex 原生使用已登记的 root dispatcher。使用条件是同一 FaSwitch 档案/项目、`futureaide_status` 已就绪、原生宿主已完成 `host_register` 并保持 `host_receive`；Claude/Codex 原生目标沿用该档案原有 FaSwitch 代理，DSH 的供应商联网仍归 DSH 自身管理；不切档案、不直连、不走独立 CLI。每聊天名单隔离，内部票据和回包由插件绑定。
+让 Codex 按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务。每个 Codex 聊天有自己的代理名单，插件自动绑定项目路径、会话身份和回包目标。
 
-- **简单派活**：创建时只选名字、生命周期和 runtime，直接发送任务文字。
+- **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：DSH 的问题回到原聊天，Codex 按名字回答；由助手显式调用 `report_parent` 决定何时回包，正文只转发它提交的内容。
 - **多层分工**：DSH 助手可继续安排下属，Codex 仍只按顶层名字联系；顶层主动提交最终交付后，等待整棵树收尾再回包。
-- **随时监工（DSH）**：列表显示 DSH 各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
-- **管理生命周期（DSH）**：DSH 一次性任务显式 final 报告送达且整树收尾后清除会话；长期代理保留上下文，按名字继续使用。原生 Desktop 目标当前只支持 persistent 和显式报告，once/取消/历史删除/文件归属未打通。
+- **随时监工**：列表显示各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
+- **管理生命周期**：一次性任务显式 final 报告送达且整树收尾后清除会话；长期代理保留上下文，按名字继续使用。
 
-0.7.0 实际验收：Codex → Claude → Codex 双向、ask/answer、分层只报直属上司、persistent 复用和原有 FaSwitch 代理已通过。原生目标需要已有 Desktop 宿主并保持 `host_receive` 常驻；不会自动打开窗口。0.6.0/0.6.1 的独立 CLI 实现已撤回，详见 [CHANGELOG](CHANGELOG.md)。
-
-## 原生桌面调度（0.7.0）
-
-- Claude：创建用 `Agent`/general-purpose，复用用 `SendMessage`；任务会话没有独立 child UUID，dispatcher 把一次性 ticket 作为内部上下文写入首次指令；child 第一次只调用 `host_attach({ticket})`（不带 `agent_context`），attach 成功后后续 FutureAide 工具调用才携带同一 `agent_context`。每个复用任务生成新的 ticket。
-- Codex：dispatcher 由当前 root 聊天注册；managed child 保留真实 child owner，父 owner 单独放在 `reportContext`。
-- 显式 report/question 由 dispatcher 用原生 `followup_task`/`SendMessage` 转发给直属上司，再用 `host_delivery_ack` 确认；普通输出、轮次结束、背景自然完成消息不自动上报。
-- 常驻接收：已有 Desktop 会话先调用一次 `host_register`；进程重启或宿主 binding 变化时用 `host_register({replace:true})` 显式重接（同一 hostKey 的新 session 可省略），不带 replace 的不同 binding 返回 `desktop-host-binding-mismatch`。status 只在注册记录与 profile/workspace/binding 匹配且 `lastSeenAt` 在 5 分钟内（Codex thread 存活回探测）时 ready；不会自行启动窗口或恢复注册，`host_receive` 必须保持 pending。
+0.5 的默认入口是 Codex Desktop 插件，无需填写内部 ID 或创建传信 txt。0.5.7 让托管代理的每次新派单、补充和回答接续跟随 DSH 当前默认供应商、模型与推理档位，不再被创建时的旧配置锁住；实际模型相同就跳过重复选模，并复用本次绑定状态中的会话游标。保留模型失败原因显示、定点读取、闲置释放与原请求恢复。版本变化见 [CHANGELOG](CHANGELOG.md)。
 
 ## 安装
 
@@ -49,25 +42,11 @@ futureaide_status({})
 
 从 0.4 升级到 0.5 前，先让正在运行的任务完成。需要保留在途任务升级时，还须按原任务身份切换后台 `scoped-worker`；仅重新加载 MCP 不会替换已经启动的监工进程，也不要重新派发任务来代替迁移。
 
-DSH 宿主适配只连接 DSH 应用。未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；不再发现或连接旧 FutureAide 应用，不读取其 shell、端口或启动日志，也不使用旧应用环境变量覆盖宿主。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
+宿主只支持 DSH。未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；不再发现或连接旧 FutureAide 应用，不读取其 shell、端口或启动日志，也不使用旧应用环境变量覆盖宿主。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
 
 维护 CLI 默认使用此安装目录的 `.runtime/config.json`；`--config` 和配置环境变量可显式选择其他配置。桌面桥接若已绑定不同凭据或托管状态目录，安装会报告冲突并保留原绑定；只有确定要迁移时才使用 `desktop-host-install --rebind` 或 `connect-desktop.ps1 -Rebind`。
 
-## 支持边界与历史限制
-
-当前实际可用：**Codex Desktop → DSH**，以及已验收的 **Codex → Claude → Codex 原生链路**。原生 Claude/Codex 任务提供命名下属和显式回包；使用前需要已有 Desktop 宿主并保持 `host_receive` 常驻接收。
-
-- `runtime=codex` 使用当前 profile/workspace 已登记的 Codex Desktop dispatcher；应显式指定 runtime，未指定时不要假定会自动切换目标。
-- `runtime=claude` 使用当前 profile/workspace 已登记的 Claude Desktop dispatcher；Claude 原生派单应显式指定 runtime，按 `futureaide_status` 的运行时可用性和当前聊天上下文执行。
-- 0.7.0 新 native 记录按名字正常 `send`/`answer`；旧 0.6.x CLI 记录只保留查看、取消和删除等清理入口，旧记录的 `send`/`answer` 在转发前拒绝，不能与新 native 记录混为不可发送。
-- 插件不会独立启动 Claude/Codex CLI，也不会读取、复制或回写 Desktop/账号凭据。
-- Claude Desktop 原生调用方使用现有 `-Claude` 注册的会话；需要原生下属时显式使用 `runtime:'claude'`，不要依赖省略 runtime 的隐式 fallback。
-
-**网络边界**：桌面 AI/原生子 agent 不是网络代理。Codex/Claude Desktop 目标必须使用对应 FaSwitch 账号档案配置的代理，不得切换档案、直连或经 CLI 回退。0.7.0 已在原有 FaSwitch 代理下完成双向验收；更换窗口或档案后仍需重新确认宿主身份和出口。DSH 路径的网络继续由 DSH 自身配置管理。
-
-0.6.0/0.6.1 的独立 Code CLI 实现不满足“交给 FaSwitch 打开的现有 Desktop 宿主”的要求，已撤回。详细变化见 [CHANGELOG](CHANGELOG.md)。
-
-## 单代理（DSH）：完成一次画图任务
+## 单代理：完成一次画图任务
 
 直接对 Codex 说：“创建一次性画图助手，为当前项目生成中文架构图，保存为 `docs/architecture.svg`。” Codex 的工具调用如下，代码块是 MCP 调用示例，无需在终端执行：
 
@@ -88,7 +67,7 @@ futureaide_answer_agent({name: "画图助手", message: "包含入口、主要�
 
 已加载的旧 MCP 模块在插件/MCP 连接重新加载前仍走旧的前台路径；新的后台 worker 会优先使用绑定会话的定点等待/读取路径。
 
-## 多代理（DSH）：并行分工与长期复用
+## 多代理：并行分工与长期复用
 
 例如让一个长期助手画图，另一个一次性助手整理说明，分别写入不同文件：
 
@@ -130,7 +109,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 
 下属通过原生消息联系直接父级，需要 Codex 决定的问题由顶层提出；Codex 继续按顶层名字回答。插件不设固定层数上限，模型与工具权限仍由 DSH 管理。
 
-## DSH 工具与生命周期（DSH 范围）
+## 工具与生命周期
 
 | 工具 | 用途 |
 |---|---|
@@ -155,7 +134,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 
 DSH 助手可以继续调用其原生子代理，形成多层任务树；Codex 仍只按顶层名字操作。列表和变更会显示下属层级、活动以及文件的 `agentPath` 归属，`inspect_agent` 可深入查看该树的对话。顶层一轮结束不等于整项任务完成：只有顶层助手显式提交 final 报告，插件才在子孙执行与原生通知全部收齐后转发其正文，并为一次性助手清理整棵受管树。下属向其 DSH 父级汇总，不直接报告 Codex。取消或删除顶层名字也作用于它的下属树，不影响其他聊天的代理。
 
-普通 Codex 聊天支持后台回包；受管原生上司的显式报告/问题由 dispatcher 原生转发，root 唤醒或 receive 不算送达。只有真实 unavailable/unknown 错误才回报明确状态，不把普通完成消息自动上报。
+普通 Codex 聊天支持后台回包；当前桌面对原生 multi-agent v2 子代理调用者拒绝后台回包。遇到该明确拒绝时，插件显示 `native-callback-unavailable`、保留未送达报告和原收件人，并停止重复投递。
 
 **一次性**完成一项任务，过程中可以多次提问、回答和显式报告。非 final 报告不会结束任务。成功的 final 报告确认送达且整树收尾后，插件关闭实例、删除该会话数据及私有记录，再移出名单。取消或失败只更新可见状态，不自动发送通知或清理；已提交的报告仍继续交付，代理可由用户按名字删除。清理失败仍显示在列表。已回到 Codex 的结果与项目产物保留。
 
@@ -191,7 +170,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 ## 维护与兼容
 
-名字式工具通过 Codex Desktop 的可信上下文、Claude Code 的 SessionStart 钩子（仅调用方身份）或受管进程身份绑定调用聊天；当前只有 Codex Desktop 调用方能派发 DSH 目标。其他 MCP 客户端和仅有 DSH web/tui profile 的环境仍需适配。
+默认名字式工具依赖本机 Codex Desktop 的可信聊天上下文和回传通道。其他 MCP 客户端，以及仅有 DSH web/tui profile 的环境，需要相应适配；它们不具备这里描述的默认接入体验。
 
 原生会话清理支持上述 DSH 版本的 JSONL 会话、项目索引和派生缓存；不支持的存储后端会返回清理失败。整树清理支持本机原生 one-shot / continuable 下属；外部托管的下属会明确报告不支持自动清理。文件观测会注明覆盖范围；当前派单接口使用文字，图片附件尚不是一等输入参数。
 

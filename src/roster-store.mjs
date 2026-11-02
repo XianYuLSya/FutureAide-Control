@@ -14,8 +14,7 @@ export class RosterStore {
       CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(owner,name));
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS desktop_hosts (hostKey TEXT PRIMARY KEY, body TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);`);
   }
 
   owner(id) { const row = this.db.prepare('SELECT body FROM owners WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
@@ -67,34 +66,6 @@ export class RosterStore {
     for (const row of rows) counts[row.status === 'sending' ? 'unknown' : row.status] = (counts[row.status === 'sending' ? 'unknown' : row.status] ?? 0) + row.count;
     const latest = this.db.prepare('SELECT status,reason FROM supplements WHERE agent=? AND task=? ORDER BY rowid DESC LIMIT 1').get(agentId, taskId);
     return { ...counts, ...(latest ? { latest: { status: latest.status, ...(latest.reason ? { reason: latest.reason } : {}) } } : {}) };
-  }
-  desktopHost(hostKey) {
-    const row = this.db.prepare('SELECT body FROM desktop_hosts WHERE hostKey=?').get(hostKey);
-    return row ? JSON.parse(row.body) : undefined;
-  }
-  registerDesktopHost(host, { replace = false } = {}) {
-    const current = this.desktopHost(host.hostKey);
-    if (current && current.bindingKey !== host.bindingKey && !replace) {
-      throw Object.assign(new Error('A different dispatcher is already registered for this target.'), {
-        code: 'desktop-host-binding-mismatch', fields: ['hostKey'],
-      });
-    }
-    const next = current && current.bindingKey === host.bindingKey
-      ? { ...current, ...host, lastReceiveAt: current.lastReceiveAt }
-      : host;
-    if (current) this.db.prepare('UPDATE desktop_hosts SET body=? WHERE hostKey=?').run(JSON.stringify(next), host.hostKey);
-    else this.db.prepare('INSERT INTO desktop_hosts(hostKey,body) VALUES (?,?)').run(host.hostKey, JSON.stringify(next));
-    return this.desktopHost(host.hostKey);
-  }
-  touchDesktopHost(hostKey, _patch = {}) {
-    const current = this.desktopHost(hostKey);
-    if (!current) return undefined;
-    const at = new Date().toISOString();
-    this.db.prepare(`UPDATE desktop_hosts
-      SET body=json_set(body, '$.lastSeenAt', ?, '$.lastReceiveAt', ?)
-      WHERE hostKey=? AND json_extract(body,'$.bindingKey')=?`)
-      .run(at, at, hostKey, current.bindingKey);
-    return this.desktopHost(hostKey);
   }
   list(owner) {
     const rows = owner === undefined

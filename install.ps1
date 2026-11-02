@@ -2,8 +2,7 @@
 param(
     [string]$CodexHome,
     [string]$DshHome,
-    [switch]$SkipHost,
-    [switch]$Claude
+    [switch]$SkipHost
 )
 $ErrorActionPreference = 'Stop'
 if ([IO.Path]::GetPathRoot($PSScriptRoot).TrimEnd('\') -ieq 'C:') {
@@ -40,7 +39,3 @@ if ($DshHome) { $installerArgs += @('--dsh-home', $DshHome) }
 if ($SkipHost) { $installerArgs += '--skip-host' }
 & $nodePath @installerArgs
 if ($LASTEXITCODE -ne 0) { throw 'FutureAide Control setup is incomplete. See the error above.' }
-if ($Claude) {
-    & $nodePath (Join-Path $PSScriptRoot 'scripts\install-mutual.mjs') --config (Join-Path $PSScriptRoot '.runtime\config.json')
-    if ($LASTEXITCODE -ne 0) { throw 'Claude Code registration is incomplete. See the error above.' }
-}

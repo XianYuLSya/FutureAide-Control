@@ -1,9 +1,9 @@
 {
   "name": "futureaide-control",
-  "version": "0.7.0",
+  "version": "0.5.7",
   "private": true,
   "type": "module",
-  "description": "Named DSH and native Desktop subagents through one futureaide_* interface. Codex Desktop → DSH remains available; native Desktop targets require a verified FaSwitch-bound host and network. Independent CLI, direct connections and credential reuse are prohibited.",
+  "description": "Named DSH teams for Codex with multi-level delegation, agent-controlled reports, direct questions, file attribution, and managed lifetimes.",
   "homepage": "https://github.com/XianYuLSya/FutureAide-Control#readme",
   "repository": {
     "type": "git",

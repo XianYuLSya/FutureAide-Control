@@ -1,47 +1,5 @@
 # 更新记录
 
-## 0.7.0 — 2026-11-02 · 原生 Desktop 子代理接线
-
-- 同一套 futureaide_* 名字接口接入现有 FaSwitch Desktop 宿主：Claude Desktop 原生 Agent/SendMessage 支持创建、同 ID 续起、child 状态调用和显式回包；Codex native 走同一 dispatcher/roster 协议。
-- 增加 native dispatcher、内部 agent_context 层级绑定和 host_register/host_receive/host_attach/host_ack/host_delivery_ack 流程；每层名单独立，外部调用方仍按名字。
-- 增加 agent 列表摘要：保留全部 items，移除重复的完整 result/coverage/tree 载荷，文件与 tree 节点限量并标记截断。
-- 修复 dispatcher 重注册与就绪：同 hostKey 的新 native session 刷新 nativeSessionId，进程重启可显式 replace；status 以 host 记录/profile/workspace/binding + 5 分钟 lastSeenAt 心跳判断，跨调用者可用；host_register/receive/ack/delivery_ack 拒绝 agent_context，managed child 不能抢占 dispatcher。
-- 保留 Codex Desktop → DSH；once 在原生 C 盘清理路径未满足前继续在创建前拒绝。
-- 真实验收：首轮 root→Claude native→Codex native→Claude 汇总→root 及提问答复通过；二轮同组复用通过；late-ack 在 `req_fd…` accepted 后回声校验为 idle/taskcompleted，`BLUE_REUSE_OK` delivered，沿用同一 native handle；`src/cli-agents` 定向 36/36 PASS，summary 2/2 完成。发布候选定向测试 118/118 PASS；独立审查 PASS，已发布并部署，发布提交 `9a62d952dd6d2024000409a295305c1c7e67bbe9`。
-
-## 0.6.3 — 2026-11-02 · 清理 Codex CLI 死代码并明确桌面边界
-
-- 删除 Codex CLI 执行环境：不再查找 `codex.exe`、读取或回写 `auth.json`、复制私有 home 或保留清理回写；`runtime-environment` 只保留 FaSwitch 非敏感档案/代理/路径绑定和 Claude 用户 `skills` / `rules` / `CLAUDE.md` 复制。
-- `runtime=codex` 与 `runtime=claude` 在 CLI 构造、运行环境和统一创建入口全部早拒绝，稳定返回 `codex-desktop-required` / `claude-desktop-required`；`futureaide_status` 的 `runtimes.codex` / `runtimes.claude` 均为 `false`。
-- Codex Desktop 原生子代理与 Claude Desktop 原生 Code 目标都未接通，不新增 adapter 或工具；当前仅 Codex Desktop → DSH 目标可用，Codex Desktop 省略 runtime 仍默认 `dsh`。
-- 统一 facade 对旧 Codex/Claude 名册记录的 `send` / `answer` 也在转发前拒绝；`inspect` / `cancel` / `delete` 保留用于清理，不先产生 accepted 状态。
-- 明确网络边界：桌面 AI/原生子 agent 不是网络代理；Codex/Claude Desktop 目标必须走对应 FaSwitch 账号档案的网络配置，宿主身份或实际出口未核实前拒绝派单，不使用 CLI/直连回退。沿用现有窗口本身不证明所有流量受控；当前仍在核准宿主网络链，未进行模型请求。
-- 撤回 0.6.0/0.6.1 关于独立 CLI 子代理完成的结论；历史 CLI 实现不代表已接入 FaSwitch 打开的现有 Desktop 宿主。
-
-## 0.6.2 — 2026-11-02 · 停用错误的 Claude CLI 接入
-
-- 停用 runtime=claude，在创建和执行入口明确返回 claude-desktop-required；已有 Claude Desktop 窗口控制尚未实现。
-- 移除 Claude Desktop 登录缓存解密、OAuth 提取、CLI 查找与 Claude 命令行生成路径。保留原生 Claude 作为调用方、DSH 和 Codex 执行路径；其中 Codex 路径已在 0.6.3 停用。
-- 修正文档和工具说明：0.6.0/0.6.1 的独立 CLI 实现不满足用户要求的 Desktop 接入；代理环境设置与抽样 TCP 观测不构成全流量出口证明。
-
-
-## 0.6.1 — 2026-11-02 · Claude 技能与通用规则
-
-> 撤回注记（0.6.3）：本版的技能/规则继承依赖已停用的独立 CLI 执行环境；相关文件复制函数仅为未来 Desktop 接入保留，不代表当前派单可用。
-
-- Claude 子代理每次启动或接续时，继承绑定档案的 skills、rules 和 CLAUDE.md 普通文件；账号设置、凭据及会话保持独立。
-- 支持用轻量 SKILL.md 入口引用共享技能正文和脚本，避免复制运行环境；跳过目录链接以兼容 Windows 的链接读取限制。
-
-## 0.6.0 — 2026-11-02 · Claude Code 与 Codex 双向子代理
-
-> 撤回注记（0.6.3）：本版“独立 CLI 子代理完成”的结论不成立，CLI 不满足交给现有 Desktop 宿主的要求；该路径已停用，不能据此认为桌面目标可用。
-
-- 同一套名字工具新增 runtime=claude/codex；各聊天和各层受管代理独立名单，自动使用当前项目。
-- 复用 FaSwitch 对应档案的 Claude Desktop Code 授权、Codex 账号及代理；不启动额外登录。
-- 支持短回执、忙时排队、提问答复、显式报告、长期接续、每轮进程释放和一次性退役。
-- 为原生 Claude Code 安装 SessionStart 身份钩子与 MCP；完整报告由 wait_agents 收取。原生 Claude 空闲聊天的后台唤醒尚不可用。
-- Codex → DSH 保留原服务和状态；运行入口统一，旧维护工具仍由 FUTUREAIDE_LEGACY_TOOLS 显式开启。
-
 ## 0.5.7 — 2026-11-01 · 默认模型跟随与派单去重
 
 - 托管代理每次新任务、补充与回答接续采用 DSH 当前默认供应商、模型和推理档位；旧代理创建时保存的模型不再覆盖当前默认设置。

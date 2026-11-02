@@ -111,8 +111,6 @@ export async function installPlugin({
     || (saved.target === 'dsh' ? saved.dataRoot : undefined) || path.join(homedir(), '.dsh'));
   const configuration = {
     ...saved, target: 'dsh', dataRoot: dshHome, dshDataRoot: dshHome,
-    codexProfileHome: codexHome,
-    codexRuntimeRoot: saved.codexRuntimeRoot ?? path.join(process.env.LOCALAPPDATA ?? '', 'OpenAI', 'Codex', 'bin'),
     instanceFile: path.join(runtime, 'instance.json'),
     hostBridgeFile: path.join(runtime, 'host-bridge.json'),
   };

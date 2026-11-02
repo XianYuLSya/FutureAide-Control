@@ -338,12 +338,18 @@ export function createCliAgents(config, {
     const taskId = newTask ? uid('task') : record.task.taskId;
     const hostKey = desktopHostKeyFor(record, profileId);
     const host = roster.desktopHost(hostKey);
-    const hostLastSeen = Date.parse(host?.lastSeenAt ?? host?.registeredAt ?? '');
-    const hostFresh = Number.isFinite(hostLastSeen) && Date.now() - hostLastSeen <= HOST_STATUS_STALE_MS;
-    const canReuseHandle = Boolean(host && hostFresh
-      && record.desktopHostBindingKey === host.bindingKey
-      && record.desktopHostSessionId === host.nativeSessionId);
-    const resumeHandle = canReuseHandle ? (record.desktopNativeHandle ?? record.desktopNativeAgentId) : undefined;
+    const existingHandle = record.desktopNativeHandle ?? record.desktopNativeAgentId;
+    if (existingHandle) {
+      const sameBinding = host
+        && record.desktopHostBindingKey === host.bindingKey
+        && record.desktopHostSessionId === host.nativeSessionId;
+      if (!sameBinding) {
+        throw Object.assign(new Error('The Desktop host binding or native session changed; the existing native handle was preserved and cannot be resumed here.'), {
+          code: 'desktop-native-resume-host-changed',
+        });
+      }
+    }
+    const resumeHandle = existingHandle || undefined;
     const envelope = createEnvelope({
       ownerId: owner.ownerId,
       agentName: record.name,
@@ -1020,8 +1026,10 @@ export function createCliAgents(config, {
     // A Codex root dispatcher sleeps between app-tools wakeups; its bound thread is
     // the durable host identity. Probe only that thread when the cheap heartbeat is stale.
     if (!live && host?.targetRuntime === 'codex') {
-      try { live = await codexThreadAlive(host) === true; }
-      catch { live = false; }
+      try {
+        live = await codexThreadAlive(host) === true;
+        if (live) roster.touchDesktopHost(hostKey);
+      } catch { live = false; }
     }
     const ready = Boolean(host && host.nativeSessionId && live
       && host.profileId === caller.profileId && sameWorkspace(host.workspace, caller.workspace)

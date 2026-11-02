@@ -17,7 +17,7 @@
 - Claude：创建用 `Agent`/general-purpose，复用用 `SendMessage`；任务会话没有独立 child UUID，dispatcher 把一次性 ticket 作为内部上下文写入首次指令；child 第一次只调用 `host_attach({ticket})`（不带 `agent_context`），attach 成功后后续 FutureAide 工具调用才携带同一 `agent_context`。每个复用任务生成新的 ticket。
 - Codex：dispatcher 由当前 root 聊天注册；managed child 保留真实 child owner，父 owner 单独放在 `reportContext`。
 - 显式 report/question 由 dispatcher 用原生 `followup_task`/`SendMessage` 转发给直属上司，再用 `host_delivery_ack` 确认；普通输出、轮次结束、背景自然完成消息不自动上报。
-- 常驻接收：已有 Desktop 会话先调用一次 `host_register`，保持 `host_receive` pending；没有常驻接收时任务保持 queued，不会自动开窗或自行唤醒。
+- 常驻接收：已有 Desktop 会话先调用一次 `host_register`；进程重启或宿主 binding 变化时用 `host_register({replace:true})` 显式重接（同一 hostKey 的新 session 可省略），不带 replace 的不同 binding 返回 `desktop-host-binding-mismatch`。status 只在注册记录与 profile/workspace/binding 匹配且 `lastSeenAt` 在 5 分钟内（Codex thread 存活回探测）时 ready；不会自行启动窗口或恢复注册，`host_receive` 必须保持 pending。
 
 ## 安装
 

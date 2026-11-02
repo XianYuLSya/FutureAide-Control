@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { copyClaudeUserInstructions, isDriveC, isolatedRuntimeEnvironment, resolveRuntimeEnvironment } from '../src/runtime-environment.mjs';
+import { copyClaudeUserInstructions, resolveRuntimeEnvironment } from '../src/runtime-environment.mjs';
 
 test('Claude inherits user instructions while its auth and settings remain private', async () => {
   const parent = path.resolve('.runtime/tests/runtime-environment');
@@ -30,25 +30,28 @@ test('Claude inherits user instructions while its auth and settings remain priva
   assert.equal(await readFile(path.join(child, 'CLAUDE.md'), 'utf8'), 'updated rules');
 });
 
-const account = '11111111-1111-4111-8111-111111111111';
-test('Windows namespaced paths keep the same drive restriction', { skip: process.platform !== 'win32' }, () => {
-  assert.equal(isDriveC('C:\\private'), true);
-  assert.equal(isDriveC('\\\\?\\C:\\private'), true);
-  assert.equal(isDriveC('D:\\private'), false);
-});
-test('subprocess uses only the selected profile proxy and excludes inherited API credentials', () => {
-  const env = isolatedRuntimeEnvironment({ profileId: account, proxy: 'http://127.0.0.1:17911' }, path.resolve('.runtime/agent'), {
-    PATH: 'runtime-path', SystemRoot: 'C:\\Windows', ANTHROPIC_API_KEY: 'wrong-account', OPENAI_API_KEY: 'wrong-account',
-    CLAUDE_CODE_OAUTH_TOKEN: 'wrong-account', HTTPS_PROXY: 'http://wrong:1', NO_PROXY: '*', CODEX_HOME: 'wrong-home',
-  });
-  assert.equal(env.PATH, 'runtime-path');
-  assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:17911');
-  assert.equal(env.NO_PROXY, 'localhost,127.0.0.1,::1');
-  for (const key of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'CODEX_HOME']) assert.equal(env[key], undefined);
-  assert.ok(env.TEMP.startsWith(path.resolve('.runtime/agent')));
-});
+function guarded(label) {
+  const fail = () => { throw new Error(`${label} must not be read`); };
+  return new Proxy({}, { get: fail, has: fail, ownKeys: fail, getOwnPropertyDescriptor: fail });
+}
 
-test('Claude is blocked before config access, credential reads or process launch', async () => {
-  const config = new Proxy({}, { get() { throw new Error('Config must not be read'); } });
-  await assert.rejects(resolveRuntimeEnvironment({ runtime: 'claude', config }), { code: 'claude-desktop-required' });
+for (const [runtime, code] of [['codex', 'codex-desktop-required'], ['claude', 'claude-desktop-required']]) {
+  test(`${runtime} is refused before config, binding or filesystem access`, async () => {
+    await assert.rejects(
+      resolveRuntimeEnvironment({ runtime, config: guarded('config'), binding: guarded('binding'), directory: 'C:\\private\\agent' }),
+      error => {
+        assert.equal(error.code, code);
+        assert.match(error.message, /native .* Desktop target is not connected/i);
+        assert.match(error.message, /independent .* CLI .* prohibited/i);
+        return true;
+      },
+    );
+  });
+}
+
+test('unknown runtimes are refused before config access with runtime-unsupported', async () => {
+  await assert.rejects(
+    resolveRuntimeEnvironment({ runtime: 'dsh', config: guarded('config') }),
+    { code: 'runtime-unsupported' },
+  );
 });

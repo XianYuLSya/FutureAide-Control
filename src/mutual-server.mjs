@@ -22,10 +22,15 @@ export async function createMutualService(config, { cliFactory = createCliAgents
   const dshService = () => dsh ??= dshFactory(config);
   const trusted = (extra, context) => ({ ...extra, [TRUSTED_CONTEXT]: context });
   const permitsDsh = owner => owner.client === 'codex-desktop';
+  const refuseDesktopTarget = runtime => {
+    if (runtime === 'codex') throw fail('codex-desktop-required', 'Native Desktop target dispatch is not connected for Codex. Independent CLI execution and credential reuse are prohibited.');
+    if (runtime === 'claude') throw fail('claude-desktop-required', 'Native Desktop target dispatch is not connected for Claude. Independent CLI execution and credential reuse are prohibited.');
+  };
 
   async function target(name, extra) {
     const owner = await resolveContext(extra);
-    if (cli.store.named(owner.ownerId, name)) return { service: cli, owner, extra: trusted(extra, owner) };
+    const record = cli.store.named(owner.ownerId, name);
+    if (record) return { service: cli, record, owner, extra: trusted(extra, owner) };
     if (permitsDsh(owner) && dshService().store.named(owner.ownerId, name)) return { service: dshService(), owner, extra };
     throw fail('agent-not-found', `No subagent named “${name}” exists in this chat.`);
   }
@@ -36,8 +41,8 @@ export async function createMutualService(config, { cliFactory = createCliAgents
       const owner = await resolveContext(extra);
       const local = await cli.status(trusted(extra, owner));
       const dshState = permitsDsh(owner) ? await dshService().status(extra) : undefined;
-      return { ...dshState, ...local, agents: (local.agents ?? 0) + (dshState?.agents ?? 0), version: '0.6.2', profileBound: Boolean(owner.profileId),
-        runtimes: { dsh: permitsDsh(owner), claude: false, codex: true }, runtimeErrors: { claude: 'claude-desktop-required' }, ...(dshState ? { dsh: dshState } : {}) };
+      return { ...dshState, ...local, agents: (local.agents ?? 0) + (dshState?.agents ?? 0), version: '0.6.3', profileBound: Boolean(owner.profileId),
+        runtimes: { dsh: permitsDsh(owner), claude: false, codex: false }, runtimeErrors: { claude: 'claude-desktop-required', codex: 'codex-desktop-required' }, ...(dshState ? { dsh: dshState } : {}) };
     },
     async create(args, extra) {
       const owner = await resolveContext(extra);
@@ -45,9 +50,9 @@ export async function createMutualService(config, { cliFactory = createCliAgents
         throw fail('agent-name-exists', 'This subagent name is already in use in this chat.');
       }
       const runtime = args.runtime ?? (permitsDsh(owner) ? 'dsh' : 'codex');
-      if (runtime === 'claude') throw fail('claude-desktop-required', 'Claude CLI execution is disabled. Dispatch through the existing Claude Desktop window is not implemented.');
+      refuseDesktopTarget(runtime);
       if (runtime === 'dsh') {
-        if (!permitsDsh(owner)) throw fail('dsh-parent-unsupported', 'DSH currently requires a Codex desktop caller. Use runtime=codex or claude here.');
+        if (!permitsDsh(owner)) throw fail('dsh-parent-unsupported', 'The DSH target requires a Codex Desktop caller. Claude Desktop cannot dispatch DSH, and native Codex/Claude Desktop targets are not connected.');
         return dshService().create(args, extra);
       }
       return cli.create({ ...args, runtime }, trusted(extra, owner));
@@ -97,13 +102,14 @@ export async function createMutualService(config, { cliFactory = createCliAgents
   };
   for (const method of ['send', 'answer', 'changes', 'inspect', 'cancel', 'delete']) service[method] = async (args, extra) => {
     const selected = await target(args.name, extra);
+    if (method === 'send' || method === 'answer') refuseDesktopTarget(selected.record?.runtime);
     return selected.service[method](args, selected.extra);
   };
   return service;
 }
 
 export function makeMutualServer({ configPath, diagnostics, serviceFactory = createMutualService } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.6.0' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.6.3' });
   let promise;
   const service = () => promise ??= loadConfig(configPath).then(serviceFactory);
   const name = z.string().min(1).max(80).describe('Subagent name in this calling chat.');
@@ -121,8 +127,8 @@ export function makeMutualServer({ configPath, diagnostics, serviceFactory = cre
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
     } finally { finished?.(); }
   });
-  register('futureaide_status', 'Check the calling chat/project and available runtimes. Uses the bound FaSwitch profile; never asks for login just because a separate CLI is unsigned-in.', {}, (s, _a, e) => s.status(e), true);
-  register('futureaide_create_agent', 'Create a named subagent in this project. runtime defaults to dsh in Codex Desktop and codex in Claude; runtime=claude is disabled because existing Claude Desktop dispatch is not implemented; never substitute a CLI. Creation starts no model. once retires session data after its explicit final report is received; persistent is reusable.', {
+  register('futureaide_status', 'Check the calling chat/project and available runtimes. Current target support: Codex Desktop → DSH only. Native Codex Desktop and Claude Desktop target dispatch is not connected; never substitute an independent CLI or reuse Desktop/account credentials.', {}, (s, _a, e) => s.status(e), true);
+  register('futureaide_create_agent', 'Create a named subagent in this project. Current target support: Codex Desktop → DSH only; runtime defaults to dsh in Codex Desktop. Native Codex Desktop and Claude Desktop targets are not connected and are refused; never substitute an independent CLI or reuse Desktop/account credentials. Creation starts no model; once retires session data after its explicit final report is received, persistent is reusable.', {
     name, lifetime: z.enum(['once', 'persistent']), runtime: z.enum(['dsh', 'claude', 'codex']).optional(),
   }, (s, a, e) => s.create(a, e));
   register('futureaide_send_agent', 'Assign work or send an update by name. Running agents queue updates. A short receipt confirms dispatch/queue state. Only explicit reports and questions notify the parent.', { name, message }, (s, a, e) => s.send(a, e));

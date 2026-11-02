@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { buildCliInvocation, createCodexMcpConfig, createMcpConfig, killProcessTree, spawnCliTurn } from '../src/cli-agent-execution.mjs';
+import { buildCliInvocation, createMcpConfig, killProcessTree, spawnCliTurn } from '../src/cli-agent-execution.mjs';
 
 const testRoot = path.dirname(fileURLToPath(import.meta.url));
 const workspaceRoot = path.dirname(testRoot);
@@ -20,36 +20,28 @@ const SESSION = '11111111-1111-4111-8111-111111111111';
 const NATIVE = '22222222-2222-4222-8222-222222222222';
 const MCP = String.raw`D:\work\agent\mcp.json`;
 
-test('codex invokes exec from stdin, registers MCP config, and resumes with its native session', () => {
-  const workspace = 'D:\\fixture\\workspace';
-  const mcpConfig = {
-    serverEntry: 'D:\\fixture\\src\\mutual-server.mjs',
-    configFile: 'D:\\fixture\\config.json',
-    env: { FUTUREAIDE_MANAGED_AGENT: 'agent-test', FUTUREAIDE_MANAGED_TOKEN: 'secret-token' },
+test('Codex and Claude CLI construction is refused before argument validation', () => {
+  const complete = {
+    runtime: 'codex',
+    executable: 'codex.exe',
+    prompt: 'do work',
+    nativeSessionId: NATIVE,
+    mcpConfigPath: MCP,
+    sessionId: SESSION,
+    workspace: 'D:\\fixture\\workspace',
+    mcpConfig: {
+      serverEntry: 'D:\\fixture\\src\\mutual-server.mjs',
+      configFile: 'D:\\fixture\\config.json',
+      env: { FUTUREAIDE_MANAGED_AGENT: 'agent-test', FUTUREAIDE_MANAGED_TOKEN: 'secret-token' },
+    },
+    model: 'gpt-5',
+    effort: 'high',
   };
-  const fresh = buildCliInvocation({ runtime: 'codex', executable: 'codex.exe', prompt: 'do work', workspace, mcpConfig });
-  assert.equal(fresh.command, 'codex.exe');
-  assert.deepEqual(fresh.args.slice(0, 4), ['exec', '--json', '--skip-git-repo-check', '-C']);
-  assert.equal(fresh.args[4], workspace);
-  assert.ok(fresh.args.includes('-c'));
-  assert.ok(fresh.args.some(argument => argument.startsWith('mcp_servers.futureaide.command=')));
-  assert.ok(fresh.args.some(argument => argument.startsWith('mcp_servers.futureaide.args=')));
-  assert.ok(fresh.args.some(argument => argument.startsWith('mcp_servers.futureaide.env.FUTUREAIDE_MANAGED_AGENT=')));
-  assert.equal(fresh.args.at(-1), '-');
-  assert.equal(fresh.stdinText, 'do work\n');
-
-  const resumed = buildCliInvocation({ runtime: 'codex', prompt: 'continue', nativeSessionId: NATIVE, workspace, mcpConfig });
-  assert.deepEqual(resumed.args.slice(0, 4), ['exec', 'resume', NATIVE, '--json']);
-  assert.ok(!resumed.args.includes('-C'));
-  assert.equal(resumed.args.at(-1), '-');
-  assert.equal(resumed.stdinText, 'continue\n');
-});
-
-test('Claude CLI cannot start or resume and Codex arguments remain validated', () => {
-  for (const nativeSessionId of [undefined, NATIVE]) assert.throws(() => buildCliInvocation({ runtime: 'claude', prompt: 'work', nativeSessionId }), { code: 'claude-desktop-required' });
+  assert.throws(() => buildCliInvocation(complete), { code: 'codex-desktop-required' });
+  assert.throws(() => buildCliInvocation({ ...complete, runtime: 'claude' }), { code: 'claude-desktop-required' });
   assert.throws(() => buildCliInvocation({ runtime: 'other', prompt: 'work' }), /Unsupported CLI runtime/);
-  assert.throws(() => buildCliInvocation({ runtime: 'codex', executable: '', prompt: 'work' }), /executable/);
-  assert.throws(() => buildCliInvocation({ runtime: 'codex', executable: 'codex' }), /prompt/);
+  assert.throws(() => buildCliInvocation({ runtime: 'codex', executable: '', prompt: '' }), { code: 'codex-desktop-required' });
+  assert.throws(() => buildCliInvocation({ runtime: 'claude', executable: '', prompt: '' }), { code: 'claude-desktop-required' });
 });
 
 test('the MCP config has the exact child-server shape and leaves existing files alone', async () => {
@@ -84,25 +76,6 @@ test('the MCP config has the exact child-server shape and leaves existing files 
     },
   });
   assert.equal(await readFile(path.join(directory, 'keep.txt'), 'utf8'), 'keep');
-});
-
-test('codex private config registers the child server and preserves existing tables', async () => {
-  const directory = await tempDirectory();
-  const config = path.join(directory, 'config.toml');
-  await writeFile(config, '[model_providers.keep]\nname = "keep"\n', 'utf8');
-  const input = { directory, serverEntry: path.join(workspaceRoot, 'src', 'mutual-server.mjs'),
-    agentId: 'agent-test', taskId: 'task-test', token: 'secret-token' };
-  const filename = await createCodexMcpConfig(input);
-  const first = await readFile(filename, 'utf8');
-  assert.match(first, /\[model_providers\.keep\]/);
-  assert.match(first, /\[mcp_servers\.futureaide\]/);
-  assert.match(first, /FUTUREAIDE_MANAGED_AGENT/);
-  assert.match(first, /FUTUREAIDE_MANAGED_TOKEN/);
-  await createCodexMcpConfig({ ...input, token: 'replacement-token' });
-  const second = await readFile(filename, 'utf8');
-  assert.equal((second.match(/\[mcp_servers\.futureaide\]/g) ?? []).length, 1);
-  assert.match(second, /replacement-token/);
-  assert.match(second, /\[model_providers\.keep\]/);
 });
 
 test('the MCP config rejects a relative directory and an empty token', async () => {

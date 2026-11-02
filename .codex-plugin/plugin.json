@@ -1,15 +1,15 @@
 {
   "name": "futureaide-control",
-  "version": "0.6.2",
-  "description": "Named DSH and Codex agents. Claude Desktop can call Codex; dispatch to Claude is disabled pending desktop integration.",
+  "version": "0.6.3",
+  "description": "Named DSH subagents from Codex Desktop through one futureaide_* interface. Native Codex Desktop and Claude Desktop targets are not connected; independent CLI, direct connections and credential reuse are prohibited. Desktop targets must use the bound FaSwitch profile network, and dispatch is refused until host identity and egress are verified.",
   "author": {
     "name": "FutureAide"
   },
   "skills": "./skills/",
   "interface": {
     "displayName": "FutureAide Control",
-    "shortDescription": "按名字调用 DSH、Codex；Claude 桌面派单待接入。",
-    "longDescription": "按当前聊天和项目组织 DSH、Codex 子代理，支持名字式交流、提问和显式回包。Claude Desktop 原生 Code 可以调用 Codex。向 Claude 的 CLI 派单已停用，现有桌面窗口控制尚未实现；不会提取 Claude 登录凭据启动独立 CLI。",
+    "shortDescription": "按名字调用 DSH 子代理；Codex/Claude 桌面目标未接通、网络未核实不派单。",
+    "longDescription": "同一套 futureaide_* 名字接口面向 DSH、Codex Desktop 和 Claude Desktop，但当前仅 Codex Desktop → DSH 目标可用。Codex Desktop 原生子代理与 Claude Desktop 原生 Code 目标均未接通，创建时分别返回 codex-desktop-required / claude-desktop-required；不会独立启动 Claude/Codex CLI，也不会读取、复制或回写 Desktop/账号凭据。桌面 AI/原生子代理不是网络代理：桌面目标必须使用对应 FaSwitch 档案网络配置，宿主身份或出口未核实前拒绝派单，不使用 CLI/直连回退；沿用窗口不证明所有流量受控。",
     "developerName": "FutureAide",
     "category": "Productivity",
     "capabilities": [
@@ -17,8 +17,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "安排一个 Claude Code 助手检查当前项目",
-      "让 Codex 助手完成当前项目的修改并报告结果",
+      "安排一个 DSH 助手检查当前项目",
+      "让 DSH 助手完成当前项目的修改并报告结果",
       "查看当前聊天的代理任务和文件修改"
     ]
   },

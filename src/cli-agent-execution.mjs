@@ -1,12 +1,11 @@
-// CLI subprocess primitives for the external CLI agent runtimes. This module owns
-// command construction, the per-agent MCP config, one turn's stdio, and process-tree
-// cancellation. It deliberately does not parse runtime output; the worker does that.
+// CLI targets are disabled; native Desktop hosts are not connected yet. This module
+// retains only the per-agent MCP config, one turn's stdio plumbing and process-tree
+// cancellation. It must never construct an independent Claude or Codex command line.
 import { spawn as nodeSpawn } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
-const RUNTIMES = new Set(['claude', 'codex']);
 const STDERR_TAIL_CHARS = 8192;
 
 function nonEmptyString(value, name) {
@@ -14,52 +13,25 @@ function nonEmptyString(value, name) {
   return value;
 }
 
-function optionalString(value, name) {
-  if (value === undefined || value === null || value === '') return undefined;
-  return nonEmptyString(value, name);
-}
-
 /**
- * Build one CLI turn without starting it. Claude gets the stream-json duplex protocol and
- * carries its MCP server in a config file; Codex reads its task from stdin and uses its
- * `exec`/`resume` subcommands. Unknown runtime flags are never invented for either side.
- * @param {object} input Runtime, executable, prompt, native session and MCP config inputs.
- * @returns {{command: string, args: string[], stdinText: string}}
+ * CLI target construction is disabled. Both native Desktop hosts are not connected;
+ * every call is refused before executable or prompt validation and before any argument
+ * construction. Unknown runtimes remain a programming error.
+ * @param {{runtime?: string}} input Runtime selector.
+ * @throws {Error & {code: string}} codex-desktop-required or claude-desktop-required.
  */
-export function buildCliInvocation({ runtime, executable, prompt, nativeSessionId, mcpConfigPath, sessionId, workspace, mcpConfig, model, effort } = {}) {
-  if (runtime === 'claude') throw Object.assign(new Error('Claude CLI is disabled; the user requires Claude Desktop.'), { code: 'claude-desktop-required' });
-  if (!RUNTIMES.has(runtime)) throw new TypeError(`Unsupported CLI runtime: ${String(runtime)}. Expected 'claude' or 'codex'.`);
-  const command = nonEmptyString(executable ?? runtime, 'executable');
-  nonEmptyString(prompt, 'prompt');
-  const resumeId = optionalString(nativeSessionId, 'nativeSessionId');
-  const configPath = optionalString(mcpConfigPath, 'mcpConfigPath');
-  const args = ['exec'];
-  if (resumeId) args.push('resume', resumeId, '--json');
-  else args.push('--json', '--skip-git-repo-check', '-C', nonEmptyString(workspace, 'workspace'));
-  if (model) args.push('--model', String(model));
-  if (effort) args.push('-c', `model_reasoning_effort=${JSON.stringify(String(effort))}`);
-  args.push('-c', 'approval_policy="never"', '-c', 'sandbox_mode="workspace-write"');
-  args.push(...codexMcpArgs(mcpConfig));
-  args.push('-');
-  return { command, args, stdinText: prompt + '\n' };
-}
-
-function codexMcpArgs(mcpConfig) {
-  if (!mcpConfig) return [];
-  const entry = nonEmptyString(mcpConfig.serverEntry, 'mcpConfig.serverEntry');
-  const configFile = nonEmptyString(mcpConfig.configFile, 'mcpConfig.configFile');
-  const env = mcpConfig.env ?? {};
-  const values = [
-    ['mcp_servers.futureaide.command', JSON.stringify(process.execPath)],
-    ['mcp_servers.futureaide.args', JSON.stringify([entry, '--config', configFile])],
-    ['mcp_servers.futureaide.default_tools_approval_mode', '"approve"'],
-    ...Object.entries(env).map(([key, value]) => [`mcp_servers.futureaide.env.${key}`, JSON.stringify(String(value))]),
-  ];
-  return values.flatMap(([key, value]) => ['-c', `${key}=${value}`]);
+export function buildCliInvocation({ runtime } = {}) {
+  if (runtime === 'codex') {
+    throw Object.assign(new Error('Native Codex Desktop target dispatch is not connected. Independent Codex CLI execution and credential reuse are prohibited.'), { code: 'codex-desktop-required' });
+  }
+  if (runtime === 'claude') {
+    throw Object.assign(new Error('Native Claude Desktop target dispatch is not connected. Independent Claude CLI execution and credential reuse are prohibited.'), { code: 'claude-desktop-required' });
+  }
+  throw new TypeError(`Unsupported CLI runtime: ${String(runtime)}. CLI targets are disabled.`);
 }
 
 /**
- * Write the token-bearing MCP config for one CLI agent task and return its absolute path.
+ * Write the per-agent MCP config and return its absolute path.
  * The file is an ordinary write (no temporary rename or cleanup), so an existing directory
  * is only ever added to.
  * @param {object} input Absolute directory, server entry, agent/task identifiers and token.
@@ -96,44 +68,6 @@ export async function createMcpConfig({ directory, serverEntry, agentId, taskId,
   return filename;
 }
 
-/**
- * Register the same child MCP server in a Codex private home's config.toml.
- * Existing user tables are preserved; only the marked managed block is replaced.
- * @param {object} input Absolute Codex home, server entry, agent/task identifiers and token.
- * @returns {Promise<string>} Absolute path of the written config.toml.
- */
-export async function createCodexMcpConfig({ directory, serverEntry, agentId, taskId, token, controlConfig } = {}) {
-  if (typeof directory !== 'string' || !path.isAbsolute(directory)) {
-    throw new TypeError('directory must be an absolute path.');
-  }
-  const entry = nonEmptyString(serverEntry, 'serverEntry');
-  const agent = nonEmptyString(agentId, 'agentId');
-  const task = nonEmptyString(taskId, 'taskId');
-  const secret = nonEmptyString(token, 'token');
-  const absoluteDirectory = path.resolve(directory);
-  await mkdir(absoluteDirectory, { recursive: true });
-  const filename = path.join(absoluteDirectory, 'config.toml');
-  let existing = '';
-  try { existing = await readFile(filename, 'utf8'); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
-  const begin = '# futureaide-cli-agent:begin';
-  const end = '# futureaide-cli-agent:end';
-  const toml = value => JSON.stringify(String(value));
-  const block = [
-    begin,
-    '[mcp_servers.futureaide]',
-    `command = ${toml(process.execPath)}`,
-    `args = [${controlConfig ? `${toml(entry)}, "--config", ${toml(controlConfig)}` : toml(entry)}]`,
-    `env = { FUTUREAIDE_MANAGED_AGENT = ${toml(agent)}, FUTUREAIDE_MANAGED_TOKEN = ${toml(secret)}, FUTUREAIDE_CLI_AGENT_ID = ${toml(agent)}, FUTUREAIDE_CLI_TASK_ID = ${toml(task)}, FUTUREAIDE_CLI_TOKEN = ${toml(secret)}${controlConfig ? `, FUTUREAIDE_CONTROL_CONFIG = ${toml(controlConfig)}` : ''} }`,
-    end,
-    '',
-  ].join('\n');
-  const managed = new RegExp(`${begin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${end.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n?`);
-  const next = managed.test(existing) ? existing.replace(managed, block) : `${existing.trimEnd()}${existing.trim() ? '\n\n' : ''}${block}`;
-  await writeFile(filename, next, { encoding: 'utf8', mode: 0o600 });
-  return filename;
-}
-
 /** Split UTF-8 chunks into complete lines while retaining the final unterminated line. */
 function createLineReader(onLine) {
   const decoder = new StringDecoder('utf8');
@@ -167,8 +101,8 @@ function createLineReader(onLine) {
 }
 
 /**
- * Start one CLI turn, feed its stdin, stream complete stdout/stderr lines to callbacks, and
- * settle only after the child and its pipes have closed. The last partial line is flushed.
+ * Start one managed turn, feed its stdin, stream complete stdout/stderr lines to callbacks,
+ * and settle only after the child and its pipes have closed. The last partial line is flushed.
  * Output is passed through untouched; JSON parsing belongs to the caller.
  * @param {object} input Command line, stdin, working directory, environment and callbacks.
  * @returns {Promise<{exitCode: number|null, signal: string|null, stderrTail: string}>}
@@ -237,7 +171,7 @@ export function spawnCliTurn({
       try { onSpawn(child.pid); } catch (error) { fail(error); return; }
     }
     try {
-      if (!child.stdin) throw new Error('CLI stdin pipe is unavailable.');
+      if (!child.stdin) throw new Error('Child stdin pipe is unavailable.');
       child.stdin.end(stdinText);
     } catch (error) {
       fail(error);
@@ -255,7 +189,7 @@ export function spawnCliTurn({
 }
 
 /**
- * Cancel a CLI process tree. Windows uses taskkill /T; POSIX kills the process group.
+ * Cancel a child process tree. Windows uses taskkill /T; POSIX kills the process group.
  * Invalid identifiers and any kill failure return false without throwing.
  * @param {number} pid Positive process id.
  * @param {object} [options] Test seams for the platform, spawn and kill primitives.

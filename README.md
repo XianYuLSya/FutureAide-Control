@@ -2,7 +2,7 @@
 
 # FutureAide Control
 
-让 Codex、Claude Code 按名字安排子代理，在当前项目中写代码、画图和整理文档。Codex 可以调用 DSH，Claude Desktop 的原生 Code 会话可以调用 Codex；每个聊天有独立名单，项目路径、内部身份和回包目标由插件绑定。
+让 Codex Desktop 按名字安排 DSH 子代理，在当前项目中写代码、画图和整理文档。当前仅 Codex Desktop → DSH 目标可用；Codex Desktop 原生子代理与 Claude Desktop 原生 Code 目标都尚未接通。桌面 AI/原生子代理不等于网络代理：目标必须绑定对应 FaSwitch 档案的网络配置，宿主身份或出口未核实前拒绝派单，不使用 CLI/直连回退。插件不会独立启动 Claude/Codex CLI，也不会读取或复制 Desktop/账号凭据。每个聊天有独立名单，项目路径、内部身份和回包目标由插件绑定。
 
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：DSH 的问题回到原聊天，Codex 按名字回答；由助手显式调用 `report_parent` 决定何时回包，正文只转发它提交的内容。
@@ -10,7 +10,7 @@
 - **随时监工**：列表显示各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
 - **管理生命周期**：一次性任务显式 final 报告送达且整树收尾后清除会话；长期代理保留上下文，按名字继续使用。
 
-0.6.2 已停用向 Claude 的 CLI 派单，并移除 Claude Desktop 凭据提取。此前 0.6.0/0.6.1 使用的是独立 Code CLI，没有实现对现有 Claude Desktop 窗口的控制。桌面派单仍待实现；DSH 和 Codex 路径保留。版本变化见 [CHANGELOG](CHANGELOG.md)。
+0.6.3 完成清理：删除 Codex CLI 的查找、凭据复制和私有 home 执行环境，Codex 与 Claude 两个桌面目标均未接通；`futureaide_status` 将 `runtimes.codex` / `runtimes.claude` 标为 `false`，创建分别返回 `codex-desktop-required` / `claude-desktop-required`。当前仅 Codex Desktop → DSH 目标可用。0.6.0/0.6.1 的独立 CLI 完成结论已撤回，详见 [CHANGELOG](CHANGELOG.md)。
 
 ## 安装
 
@@ -46,25 +46,19 @@ DSH 宿主适配只连接 DSH 应用。未指定实例时只读取 DSH 的注册
 
 维护 CLI 默认使用此安装目录的 `.runtime/config.json`；`--config` 和配置环境变量可显式选择其他配置。桌面桥接若已绑定不同凭据或托管状态目录，安装会报告冲突并保留原绑定；只有确定要迁移时才使用 `desktop-host-install --rebind` 或 `connect-desktop.ps1 -Rebind`。
 
-## Claude Desktop 调用 Codex
+## 支持边界与历史限制
 
-在 FaSwitch 当前档案的 Claude Desktop 原生 Code 会话中使用插件。安装时增加 `-Claude`，安装器注册 MCP、SessionStart 与调用技能，无须另行登录：
+当前唯一可用的目标派单是 **Codex Desktop → DSH**。同一套 `futureaide_*` 名字接口面向 DSH、Codex Desktop 和 Claude Desktop，但另外两个桌面目标都尚未接通：
 
-```powershell
-.\install.ps1 -Claude
-```
+- `runtime=codex` 返回 `codex-desktop-required`：Codex Desktop 原生子代理目标尚未接通。
+- `runtime=claude` 返回 `claude-desktop-required`：Claude Desktop 原生 Code 目标尚未接通。
+- 旧名单中的 codex/claude 记录只保留查看、取消和删除等清理入口；`send`/`answer` 同样在转发前拒绝，不会先产生 accepted 状态。
+- 插件不会独立启动 Claude/Codex CLI，也不会读取、复制或回写 Desktop/账号凭据。
+- Claude Desktop 原生会话仍可通过安装器的 `-Claude` 注册调用方身份与 MCP；省略 runtime 时按既定契约落到 `codex`，会在创建前被拒绝，也不能派发 DSH 目标。
 
-```text
-futureaide_create_agent({"name":"代码助手","lifetime":"persistent","runtime":"codex"})
-futureaide_send_agent({"name":"代码助手","message":"检查这个项目并给出修改建议"})
-futureaide_wait_agents({"names":["代码助手"],"timeout_seconds":45})
-```
+**网络边界**：桌面 AI/原生子 agent 不是网络代理。Codex/Claude Desktop 目标必须使用对应 FaSwitch 账号档案配置的代理，不得切换档案、直连或经 CLI 回退。只有目标窗口的宿主身份和实际出口都核实后才可派单；沿用现有窗口本身不证明所有流量受控。当前仍在核准现有宿主网络链，未进行 Claude/Codex 模型请求，因此两端目标保持 disabled。DSH 路径的网络继续由 DSH 自身配置管理。
 
-原生 Claude 会话在当前轮等待报告和问题；已经结束的原生会话暂时不能由插件自动唤醒。按名字继续派单，保持各层名单和报告归属。
-
-`runtime=claude` 当前返回 `claude-desktop-required`。插件不会读取 Claude Desktop 登录缓存、提取 OAuth 凭据或启动独立 Claude CLI。通过已有桌面窗口派单尚未实现，不能用 CLI 替代。
-
-Codex 子代理目前仍使用 Codex CLI，绑定 FaSwitch 账号和配置中的代理环境。过去抽查到部分连接经过本地代理，未建立全部请求和 DNS 的出口证明；不据此承诺完整网络隔离。DSH 网络继续由 DSH 管理。
+0.6.0/0.6.1 的独立 Code CLI 实现不满足“交给 FaSwitch 打开的现有 Desktop 宿主”的要求，其完成结论已在 0.6.3 撤回。详细变化见 [CHANGELOG](CHANGELOG.md)。
 
 ## 单代理：完成一次画图任务
 
@@ -190,7 +184,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 ## 维护与兼容
 
-名字式工具通过 Codex Desktop 的可信上下文、Claude Code 的 SessionStart 钩子或受管进程身份绑定调用聊天。其他 MCP 客户端和仅有 DSH web/tui profile 的环境仍需适配。
+名字式工具通过 Codex Desktop 的可信上下文、Claude Code 的 SessionStart 钩子（仅调用方身份）或受管进程身份绑定调用聊天；当前只有 Codex Desktop 调用方能派发 DSH 目标。其他 MCP 客户端和仅有 DSH web/tui profile 的环境仍需适配。
 
 原生会话清理支持上述 DSH 版本的 JSONL 会话、项目索引和派生缓存；不支持的存储后端会返回清理失败。整树清理支持本机原生 one-shot / continuable 下属；外部托管的下属会明确报告不支持自动清理。文件观测会注明覆盖范围；当前派单接口使用文字，图片附件尚不是一等输入参数。
 

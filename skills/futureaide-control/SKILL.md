@@ -1,17 +1,17 @@
 ---
 name: futureaide-control
-description: Use named DSH and Codex subagents in the current chat and project. Claude Desktop can call Codex; dispatch to Claude is disabled. Create one-shot or persistent helpers, assign work, answer their questions, inspect progress and file changes, and remove completed sessions.
+description: Use named DSH subagents from Codex Desktop in the current chat and project through the shared futureaide_* interface. Only Codex Desktop → DSH target dispatch works today. Native Codex Desktop and Claude Desktop targets are not connected; never start an independent Claude/Codex CLI or read, copy or reuse Desktop or account credentials. Desktop targets must use the bound FaSwitch profile network; dispatch is refused until host identity and egress are verified, and must never fall back to CLI or direct connections.
 ---
 
 # FutureAide Control
 
-Claude dispatch is disabled in 0.6.2. The user requires the existing Claude Desktop window; independent Claude CLI processes do not satisfy that requirement. Never read/extract Claude Desktop credentials, start a Claude CLI, or substitute a standalone login. runtime="claude" returns claude-desktop-required until actual desktop integration exists.
+0.6.3 status: only Codex Desktop → DSH target dispatch is available. `runtime=codex` returns `codex-desktop-required` and `runtime=claude` returns `claude-desktop-required`; both native Desktop targets remain unconnected. Never read/extract Desktop or account credentials, start a Claude/Codex CLI, or substitute a standalone login. A Claude Desktop caller that omits runtime falls back to `codex` by contract and is refused before creation; it cannot dispatch DSH.
 
-Use the same futureaide_* tools for DSH and Codex helpers. Codex Desktop defaults to DSH; a native Claude Desktop Code caller defaults to Codex. Subsequent calls use only the name. Every caller and managed child has a separate roster in the current project.
+Use the same futureaide_* tools for DSH helpers. Codex Desktop defaults to DSH. Subsequent calls use only the name. Every caller and managed child has a separate roster in the current project.
 
-Native Claude Code callers receive child reports with futureaide_wait_agents and keep waiting while assigned work remains. An ended native Claude chat cannot currently be woken by the plugin; continue that same chat to collect reports. Only explicit report_parent / ask_parent messages reach the immediate parent. Managed Codex parents may resume from queued child reports.
+Only explicit report_parent / ask_parent messages reach the immediate parent. Ordinary assistant replies, turn endings and idle trees never wake Codex. Persistent helpers retain their context; one-shot private data on non-C drives moves to `clean` after final receipt and process/tree settlement. Never delete or move C-drive data.
 
-Codex helpers currently use Codex CLI with the bound FaSwitch account and configured proxy environment. Do not claim that a proxy setting or a sampled connection proves all traffic is covered. Persistent helpers retain their context; one-shot D-drive private data moves to clean after final receipt and process/tree settlement. Never delete or move C-drive data.
+Desktop AI and native subagents are not network proxies. Every Codex/Claude Desktop target must use the proxy configured for its bound FaSwitch account profile. Do not switch profiles, use a direct connection, or fall back to a CLI. Refuse dispatch when the target host identity or its actual egress is not verified; reusing an existing window alone does not prove that all traffic is controlled. The host network chain is still being verified, and this round makes no Claude/Codex model requests. DSH networking remains managed by DSH itself.
 
 The following DSH-specific rules continue to apply when runtime=dsh.
 

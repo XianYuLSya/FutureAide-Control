@@ -7,15 +7,21 @@ import { RosterStore } from './roster-store.mjs';
 import { EventCollector } from './cli-agent-events.mjs';
 import { createMcpConfig, killProcessTree, spawnCliTurn } from './cli-agent-execution.mjs';
 import { createRuntimeAdapter } from './cli-agent-adapters.mjs';
+import { invokeCodexTool } from './codex-notify.mjs';
+import { ownerIdFor, threadFromResult } from './calling-context.mjs';
+import { cancelUnsupportedError, createDispatchState, createEnvelope, dispatcherBindingKey, desktopHostKey, ackRequest, markRequestUnknown, receiveRequest } from './claude-desktop-protocol.mjs';
 
 const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
 const now = () => new Date().toISOString();
 const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_report', 'delivery_pending', 'reconnecting']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled']);
-const WAIT_STATES = new Set(['awaiting_input', 'awaiting_report', 'awaiting_descendants', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed']);
+const WAIT_STATES = new Set(['awaiting_input', 'awaiting_report', 'awaiting_descendants', 'cancelled', 'idle', 'delivery_pending', 'desktop_task_pending', 'cleanup_failed', 'failed']);
 const RUNTIMES = new Set(['claude', 'codex']);
-const DELIVERY_STATES = new Set(['delivered', 'pending', 'blocked', 'unknown']);
+const DELIVERY_STATES = new Set(['delivered', 'pending', 'dispatcher-pending', 'blocked', 'unknown']);
+const UUID = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i;
+const DESKTOP_PENDING = 'desktop_task_pending';
+const HOST_STATUS_STALE_MS = 5 * 60 * 1000;
 
 const safeError = error => ({ code: error?.code ?? 'operation-failed',
   message: String(error?.message ?? error).replace(/((?:token|api[_-]?key|authorization|password)\s*[:=]\s*)[^\s]+/gi, '$1[redacted]').slice(0, 1200) });
@@ -75,6 +81,8 @@ function ownerSnapshot(context, record) {
     workspace: context.workspace,
     client: context.client,
     ...(context.profileId ? { profileId: context.profileId } : {}),
+    ...(context.hostId ? { hostId: context.hostId } : {}),
+    ...(context.parentThreadId ? { parentThreadId: context.parentThreadId } : {}),
     ...(context.parentAgentId ? { parentAgentId: context.parentAgentId } : {}),
     ...(context.parentTaskId ? { parentTaskId: context.parentTaskId } : {}),
     ...(record?.owner ? { saved: record.owner } : {}),
@@ -174,6 +182,17 @@ export function createCliAgents(config, {
   startWorker = (configFile, agentId, lease) => workerSpawn(configFile, agentId, lease),
   runTurn = spawnCliTurn,
   adapterFor = createRuntimeAdapter,
+  wakeCodexDispatcher = async (host, request) => invokeCodexTool(host.nativeThreadId, 'send_message_to_thread', {
+    threadId: host.nativeThreadId,
+    prompt: `FutureAide dispatcher: queued request ${request.requestId} for ${request.agentName}; call host_receive now. Use model Astra for the native followup if the host requires an explicit model. Do not forward ordinary output.`,
+  }),
+  codexThreadAlive = async host => {
+    const thread = threadFromResult(await invokeCodexTool(host.nativeThreadId, 'read_thread', {
+      threadId: host.nativeThreadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 0,
+    }));
+    return Boolean(thread && thread.id?.toLowerCase() === host.nativeThreadId.toLowerCase()
+      && thread.kind === 'codex' && thread.hostId === host.hostId);
+  },
   killTree = killProcessTree,
   moveDirectory = rename,
   cleanDirectory,
@@ -233,6 +252,8 @@ export function createCliAgents(config, {
       workspace: parentOwner?.workspace ?? record.workspace,
       client: 'managed-cli',
       ...(parentOwner?.profileId ? { profileId: parentOwner.profileId } : {}),
+      ...(parentOwner?.hostId ? { hostId: parentOwner.hostId } : {}),
+      ...(parentOwner?.parentThreadId ? { parentThreadId: parentOwner.parentThreadId } : {}),
       parentAgentId: record.agentId, parentTaskId: task.taskId,
     };
     return { ...reportContext, ownerId: subOwnerId, threadId: record.cliSessionId, parentOwnerId: chatOwnerId, reportContext };
@@ -293,6 +314,85 @@ export function createCliAgents(config, {
     return observed;
   }
 
+  function desktopTarget(record) {
+    return record.runtime === 'claude'
+      ? { targetRuntime: 'claude', targetClient: 'claude-code' }
+      : { targetRuntime: 'codex', targetClient: 'codex-desktop' };
+  }
+
+  function desktopHostKeyFor(record, profileId) {
+    return desktopHostKey({
+      ...desktopTarget(record), profileId,
+      workspace: record.workspace,
+    });
+  }
+
+  async function queueDesktopInput(record, owner, message, kindOverride) {
+    const profileId = owner.profileId ?? record.owner?.profileId;
+    if (typeof profileId !== 'string' || !UUID.test(profileId)) {
+      throw Object.assign(new Error('A bound FaSwitch profile is required for Claude Desktop dispatch.'), { code: 'profile-unavailable' });
+    }
+    const kind = kindOverride ?? ((!record.task || record.task.finalSubmitted
+      || ['idle', 'completed', 'failed', 'cancelled'].includes(record.state)) ? 'task' : 'supplement');
+    const newTask = kind === 'task';
+    const taskId = newTask ? uid('task') : record.task.taskId;
+    const hostKey = desktopHostKeyFor(record, profileId);
+    const host = roster.desktopHost(hostKey);
+    const hostLastSeen = Date.parse(host?.lastSeenAt ?? host?.registeredAt ?? '');
+    const hostFresh = Number.isFinite(hostLastSeen) && Date.now() - hostLastSeen <= HOST_STATUS_STALE_MS;
+    const canReuseHandle = Boolean(host && hostFresh
+      && record.desktopHostBindingKey === host.bindingKey
+      && record.desktopHostSessionId === host.nativeSessionId);
+    const resumeHandle = canReuseHandle ? (record.desktopNativeHandle ?? record.desktopNativeAgentId) : undefined;
+    const envelope = createEnvelope({
+      ownerId: owner.ownerId,
+      agentName: record.name,
+      profileId,
+      workspace: record.workspace,
+      kind,
+      message,
+      ...(resumeHandle ? { nativeHandle: resumeHandle } : {}),
+    }, { taskId });
+    const dispatch = { ...createDispatchState(envelope), hostKey, envelope };
+    record.owner = ownerSnapshot(owner);
+    if (newTask) {
+      if (record.task) record.history.push({ ...record.task, changes: record.task.changes,
+        messages: record.task.messages?.slice(-20), result: record.task.result });
+      record.task = {
+        taskId: envelope.taskId, message, state: DESKTOP_PENDING, startedAt: now(),
+        dispatches: [dispatch], answers: [], questions: [], reports: [], changes: [], messages: [], finalSubmitted: false,
+      };
+    } else {
+      record.task.dispatches ??= [];
+      record.task.dispatches.push(dispatch);
+      record.task.state = DESKTOP_PENDING;
+    }
+    record.state = DESKTOP_PENDING;
+    record.error = undefined;
+    roster.save(record);
+    if (record.runtime === 'codex' && host) {
+      try { await wakeCodexDispatcher(host, { requestId: envelope.requestId, agentName: record.name }); }
+      catch { /* The task remains queued if the native wake is unavailable. */ }
+    }
+    return {
+      name: record.name, queued: true, accepted: false, state: record.state,
+      requestId: envelope.requestId, deliveryReceipt: envelope.deliveryReceipt, taskId: envelope.taskId,
+    };
+  }
+
+  async function queueDesktopAnswer(record, owner, message) {
+    const pending = (record.task?.questions ?? []).find(question => question.state === 'pending');
+    if (!pending) throw new Error('This Desktop agent has no unanswered question.');
+    const result = await queueDesktopInput(record, owner, message, 'answer');
+    pending.state = 'answered';
+    pending.answeredAt = now();
+    record.task.answers ??= [];
+    record.task.answers.push({ answerId: uid('answer'), questionId: pending.id, message, dispatched: false, createdAt: now() });
+    record.state = record.task.state = DESKTOP_PENDING;
+    roster.save(record);
+    return result;
+  }
+
   function pendingInput(record) {
     const task = record.task;
     if (!task) return { queued: [], inFlight: [], answers: [] };
@@ -336,6 +436,7 @@ export function createCliAgents(config, {
 
   function activeWork(record) {
     if (!record || record.closed || !record.task) return false;
+    if (record.desktopMode === 'native') return false;
     if (['creating', 'running', 'reconnecting'].includes(record.state)) return true;
     const queued = roster.supplements(record.agentId)
       .some(item => item.task === record.task?.taskId && ['queued', 'sending', 'unknown'].includes(item.status));
@@ -377,7 +478,7 @@ export function createCliAgents(config, {
     if (!parentId) return false;
     return roster.locked(parentId, async () => {
       const parent = roster.get(parentId);
-      if (!parent || owner.ownerId !== managedOwnerIdFor(parentId) || !sameWorkspace(parent.workspace, owner.workspace)) return false;
+      if (!parent || parent.desktopMode === 'native' || owner.ownerId !== managedOwnerIdFor(parentId) || !sameWorkspace(parent.workspace, owner.workspace)) return false;
       if (!parent.task || owner.parentTaskId !== parent.task.taskId || parent.task.cancelRequested) return false;
       // The active model receives through wait; an idle model resumes from its queue.
       if (parent.task.dispatches?.some(item => item.state === 'running')) return false;
@@ -412,6 +513,54 @@ export function createCliAgents(config, {
     return enqueueParentInput(record.owner, record.name, { kind, message, final, id });
   }
 
+  function nativeManagerRoute(record) {
+    const parentId = record.owner?.parentAgentId;
+    if (parentId === record.agentId) return null;
+    let manager = parentId ? roster.get(parentId) : undefined;
+    if (!manager) {
+      // Older child contexts carried the immediate manager thread but not
+      // parentAgentId. Resolve only an exact native session/agent thread; do not
+      // treat an unrelated parentThreadId or a root chat as the manager.
+      const directThreads = new Set([record.owner?.parentThreadId, record.owner?.threadId].filter(Boolean));
+      if (directThreads.size) {
+        manager = roster.list().find(item => item.agentId !== record.agentId
+          && item.desktopMode === 'native'
+          && (directThreads.has(item.desktopSessionId) || directThreads.has(item.desktopNativeAgentId)));
+      }
+    }
+    if (!manager) return parentId ? { error: 'manager-record-missing' } : null;
+    if (manager.desktopMode !== 'native') return null;
+    if (!['codex', 'claude'].includes(manager.runtime)) return { manager, error: 'manager-runtime-invalid' };
+    const targetClient = manager.runtime === 'claude' ? 'claude-code' : 'codex-desktop';
+    const profileId = manager.desktopProfileId ?? manager.owner?.profileId ?? record.owner?.profileId;
+    const workspace = manager.workspace ?? record.owner?.workspace;
+    if (!profileId || !workspace) {
+      return { manager, targetRuntime: manager.runtime, targetClient, error: 'manager-binding-missing' };
+    }
+    const hostKey = desktopHostKey({ targetRuntime: manager.runtime, targetClient, profileId, workspace });
+    const host = roster.desktopHost(hostKey);
+    if (!host) return { manager, targetRuntime: manager.runtime, targetClient, hostKey, error: 'manager-dispatcher-unregistered' };
+    const managerNativeHandle = manager.desktopNativeHandle;
+    if (typeof managerNativeHandle !== 'string' || !managerNativeHandle.trim()) {
+      return { manager, targetRuntime: manager.runtime, targetClient, hostKey, host, error: 'manager-native-handle-missing' };
+    }
+    return { manager, targetRuntime: manager.runtime, targetClient, hostKey, host, managerNativeHandle };
+  }
+
+  function nativeNotificationOwner(record) {
+    if (record.desktopMode !== 'native' || !record.owner?.parentAgentId) return record.owner;
+    const parentThreadId = record.desktopParentThreadId;
+    return {
+      ...(record.owner ?? {}),
+      client: record.runtime === 'codex' ? 'codex-desktop' : 'claude-code',
+      ownerId: record.owner?.ownerId ?? record.ownerId,
+      threadId: record.owner?.threadId ?? record.desktopSessionId ?? parentThreadId,
+      ...(parentThreadId ? { parentThreadId } : {}),
+      profileId: record.desktopProfileId ?? record.owner?.profileId,
+      workspace: record.workspace,
+    };
+  }
+
   async function deliverReports(record) {
     for (const report of record.task?.reports ?? []) {
       if (['delivered', 'blocked'].includes(report.delivery?.state)) continue;
@@ -421,11 +570,41 @@ export function createCliAgents(config, {
         roster.save(record);
         continue;
       }
+      const managerRoute = nativeManagerRoute(record);
+      if (managerRoute) {
+        if (managerRoute.error) {
+          report.delivery = { state: 'blocked', via: 'dispatcher', reason: managerRoute.error, at: now() };
+          roster.save(record);
+          return false;
+        }
+        report.delivery = {
+          ...report.delivery,
+          state: 'dispatcher-pending',
+          via: 'dispatcher',
+          managerNativeHandle: managerRoute.managerNativeHandle,
+          managerAgentId: managerRoute.manager.agentId,
+          at: now(),
+        };
+        roster.save(record);
+        if (managerRoute.targetRuntime === 'codex') {
+          try {
+            await wakeCodexDispatcher(managerRoute.host, { requestId: report.id, agentName: record.name });
+          } catch { /* host_receive can still pick the pending notification */ }
+        }
+        continue;
+      }
       try {
-        const result = await notify({ owner: record.owner, agent: { name: record.name, runtime: record.runtime, lifetime: record.lifetime },
+        const result = await notify({ owner: nativeNotificationOwner(record), agent: { name: record.name, runtime: record.runtime, lifetime: record.lifetime },
           kind: 'report', message: report.message, final: report.final === true, id: report.id }, config);
         const state = normalizeDelivery(result);
-        Object.assign(report.delivery, { state, at: now(), ...(state === 'delivered' ? {} : { note: result?.note ?? result?.error?.message }) });
+        Object.assign(report.delivery, {
+          state,
+          at: now(),
+          ...(result?.managerNativeHandle ? { managerNativeHandle: result.managerNativeHandle } : {}),
+          ...(result?.managerThreadId ? { managerThreadId: result.managerThreadId } : {}),
+          ...(state === 'dispatcher-pending' ? { via: 'dispatcher' } : {}),
+          ...(state === 'delivered' ? {} : { note: result?.note ?? result?.error?.message }),
+        });
       } catch (error) {
         Object.assign(report.delivery, { state: 'unknown', at: now(), error: safeError(error) });
       }
@@ -492,11 +671,13 @@ export function createCliAgents(config, {
       return { name: record.name, deleted: false, state: 'cleanup_failed', error: record.error };
     }
     let archivedTo;
+    const nativeSessionRetained = record.runtime === 'claude' && Boolean(record.desktopSessionId || record.nativeSessionId);
     try {
       archivedTo = await moveToClean(record);
       // The owned directory has already been moved; remove only the active roster row.
       roster.remove(record);
-      return { name: record.name, deleted: true, archivedTo };
+      return { name: record.name, deleted: true, archivedTo,
+        ...(nativeSessionRetained ? { nativeSessionRetained: true, nativeCleanup: 'retained-native-c-drive' } : {}) };
     } catch (error) {
       record.state = 'cleanup_failed';
       record.error = safeError(error);
@@ -610,6 +791,10 @@ export function createCliAgents(config, {
       await roster.locked(agentId, async () => {
         const current = roster.get(agentId);
         if (!current?.task || !sameOwner(current, owner) || current.task.taskId !== snapshot.task?.taskId) return;
+        // Only a managed native parent's child reports are delivered through the
+        // registered dispatcher's host_receive/host_delivery_ack path. An ordinary
+        // Claude owner has no native manager record and must still use wait_agents.
+        if (current.desktopMode === 'native' && nativeManagerRoute(current)) return;
         let changed = false;
         const returned = new Set((snapshot.task.reports ?? []).filter(report => !report.receivedAt).map(report => report.id));
         for (const report of current.task.reports ?? []) {
@@ -629,6 +814,530 @@ export function createCliAgents(config, {
         }
       }, { waitMs: operationWaitMs });
     }
+  }
+
+  async function resolveDesktopContext(caller = {}) {
+    const invalidAgentContext = () => Object.assign(
+      new Error('The supplied agent_context is unknown, expired, or belongs to another host.'),
+      { code: 'desktop-context-invalid' },
+    );
+    const targetRuntime = caller.client === 'claude-code' ? 'claude' : caller.client === 'codex-desktop' ? 'codex' : undefined;
+    if (!targetRuntime) {
+      if (caller.agentContext) throw invalidAgentContext();
+      return undefined;
+    }
+    const sessionId = typeof (caller.sessionId ?? caller.threadId) === 'string' ? (caller.sessionId ?? caller.threadId) : undefined;
+    let candidates = [];
+    if (targetRuntime === 'claude') {
+      if (typeof caller.agentContext !== 'string' || !caller.agentContext) return undefined;
+      const hostKey = desktopHostKey({
+        targetRuntime: 'claude', targetClient: 'claude-code', profileId: caller.profileId, workspace: caller.workspace,
+      });
+      const host = roster.desktopHost(hostKey);
+      const hostMatches = host && host.bindingMode === 'process'
+        ? host.hostPid === caller.hostPid && String(host.hostStarted) === String(caller.hostStarted)
+        : host && sameDesktopHost(host, caller);
+      if (!hostMatches) throw invalidAgentContext();
+      candidates = roster.list().filter(record => record.runtime === 'claude'
+        && record.task?.dispatches?.some(item => item.bindingTicket === caller.agentContext)
+        && (record.desktopAgentContext === caller.agentContext || record.desktopNativeAgentId || record.desktopBindingTicket === caller.agentContext)
+        && sameWorkspace(record.workspace, caller.workspace)
+        && (!caller.profileId || !record.desktopProfileId || record.desktopProfileId === caller.profileId));
+    } else if (targetRuntime === 'codex' && caller.parentThreadId) {
+      const hostKey = desktopHostKey({
+        targetRuntime: 'codex', targetClient: 'codex-desktop', profileId: caller.profileId, workspace: caller.workspace,
+      });
+      const host = roster.desktopHost(hostKey);
+      if (!host || host.nativeThreadId !== caller.parentThreadId) throw invalidAgentContext();
+      const records = roster.list().filter(record => record.runtime === 'codex'
+        && sameWorkspace(record.workspace, caller.workspace)
+        && (!caller.profileId || !record.desktopProfileId || record.desktopProfileId === caller.profileId)
+        && (record.desktopParentThreadId === caller.parentThreadId
+          || (caller.agentContext && record.task?.dispatches?.some(item => item.bindingTicket === caller.agentContext))));
+      if (caller.agentContext) {
+        const ticketRecords = records.filter(record => record.task?.dispatches?.some(item => item.bindingTicket === caller.agentContext));
+        if (ticketRecords.length === 1) {
+          const ticketRecord = ticketRecords[0];
+          await roster.locked(ticketRecord.agentId, () => {
+            const fresh = roster.get(ticketRecord.agentId);
+            const dispatch = fresh?.task?.dispatches?.find(item => item.bindingTicket === caller.agentContext);
+            if (!fresh || !dispatch) return;
+            fresh.desktopSessionId = sessionId;
+            fresh.desktopLocalSessionId = sessionId;
+            fresh.desktopChildThreadId = sessionId;
+            fresh.desktopBindingTicket = caller.agentContext;
+            fresh.desktopAgentContext = caller.agentContext;
+            fresh.desktopParentThreadId = host.nativeThreadId;
+            fresh.desktopProfileId = host.profileId;
+            fresh.desktopWorkspace = host.workspace;
+            fresh.desktopHostPid = host.hostPid;
+            fresh.desktopHostStarted = host.hostStarted;
+            dispatch.attached = true;
+            dispatch.attachedAt = now();
+            roster.save(fresh);
+          }, { waitMs: operationWaitMs });
+          candidates = [roster.get(ticketRecord.agentId)].filter(Boolean);
+        }
+      } else {
+        candidates = records.filter(record => record.desktopSessionId === sessionId || record.desktopLocalSessionId === sessionId);
+      }
+    }
+    if (candidates.length !== 1) {
+      if (caller.agentContext) throw invalidAgentContext();
+      return undefined;
+    }
+    const record = candidates[0];
+    if (!record.task) {
+      if (caller.agentContext) throw invalidAgentContext();
+      return undefined;
+    }
+    const parentOwner = record.owner?.ownerId ? record.owner : undefined;
+    const parentContext = {
+      _resolved: true, agentId: record.agentId, taskId: record.task.taskId,
+      ownerId: parentOwner?.ownerId ?? record.ownerId,
+      threadId: parentOwner?.threadId ?? record.owner.threadId,
+      workspace: parentOwner?.workspace ?? record.workspace,
+      client: caller.client,
+      ...(parentOwner?.profileId ? { profileId: parentOwner.profileId } : {}),
+      ...(parentOwner?.hostId ? { hostId: parentOwner.hostId } : {}),
+      ...(parentOwner?.parentThreadId ? { parentThreadId: parentOwner.parentThreadId } : {}),
+      parentAgentId: record.agentId, parentTaskId: record.task.taskId,
+    };
+    const childThreadId = targetRuntime === 'codex'
+      ? (record.desktopSessionId ?? sessionId)
+      : (record.desktopNativeAgentId ?? record.agentId);
+    const childOwnerId = targetRuntime === 'claude'
+      ? managedOwnerIdFor(record.agentId)
+      : ownerIdFor(childThreadId);
+    const childContext = {
+      ...parentContext,
+      ownerId: childOwnerId,
+      threadId: childThreadId,
+      parentOwnerId: parentContext.ownerId,
+      reportContext: parentContext,
+      ...(targetRuntime === 'claude' ? { agentContext: caller.agentContext } : {}),
+    };
+    return { ...childContext, sessionId: childThreadId, reportContext: parentContext };
+  }
+
+  function desktopDispatch(record, requestId) {
+    return record?.task?.dispatches?.find(item => item.requestId === requestId);
+  }
+
+  function saveDispatch(record, dispatch) {
+    const index = record.task.dispatches.findIndex(item => item.requestId === dispatch.requestId);
+    if (index < 0) throw Object.assign(new Error('The desktop request is not attached to this agent task.'), { code: 'desktop-request-stale' });
+    record.task.dispatches[index] = dispatch;
+    roster.save(record);
+    return dispatch;
+  }
+
+  async function lockedRecord(record, action) {
+    return roster.locked(record.agentId, async () => {
+      const fresh = roster.get(record.agentId);
+      if (!fresh) throw Object.assign(new Error('The Desktop request agent no longer exists.'), { code: 'desktop-request-stale' });
+      return action(fresh);
+    }, { waitMs: operationWaitMs });
+  }
+
+  function sameDesktopHost(host, caller) {
+    if (host?.bindingMode === 'thread') {
+      return Boolean(host.hostId && host.nativeThreadId
+        && host.hostId === caller.hostId && host.nativeThreadId === caller.threadId);
+    }
+    const sessionId = caller?.sessionId ?? caller?.threadId;
+    return Boolean(host && typeof sessionId === 'string' && host.nativeSessionId === sessionId
+      && host.hostPid === caller.hostPid && String(host.hostStarted) === String(caller.hostStarted));
+  }
+
+  async function registerDesktopHost(extra, details = {}) {
+    const caller = await context(extra);
+    if (caller.agentContext || caller.parentAgentId || caller.parentTaskId || caller.parentOwnerId || caller.reportContext) {
+      throw Object.assign(new Error('A managed child cannot register or replace the Desktop dispatcher.'), { code: 'desktop-host-context-required' });
+    }
+    if (typeof caller.profileId !== 'string' || !UUID.test(caller.profileId)) {
+      throw Object.assign(new Error('A FaSwitch profile is required to register a Desktop dispatcher.'), { code: 'profile-unavailable' });
+    }
+    const targetRuntime = details.targetRuntime ?? (caller.client === 'codex-desktop' ? 'codex' : 'claude');
+    const targetClient = details.targetClient ?? (targetRuntime === 'claude' ? 'claude-code' : 'codex-desktop');
+    if (targetRuntime === 'claude' && caller.client !== 'claude-code') {
+      throw Object.assign(new Error('A Claude dispatcher must be registered by the native Claude Code host.'), { code: 'desktop-host-context-required' });
+    }
+    if (targetRuntime === 'codex' && caller.client !== 'codex-desktop') {
+      throw Object.assign(new Error('A Codex dispatcher must be registered by the native Codex Desktop host.'), { code: 'desktop-host-context-required' });
+    }
+    const nativeSessionId = details.nativeSessionId ?? caller.sessionId ?? caller.threadId;
+    if (typeof nativeSessionId !== 'string' || !nativeSessionId.trim()) {
+      throw Object.assign(new Error('A native Desktop session identity is required.'), { code: 'desktop-session-invalid' });
+    }
+    if (details.nativeSessionId && details.nativeSessionId !== (caller.sessionId ?? caller.threadId)) {
+      throw Object.assign(new Error('The registered native session identity does not match this connection.'), { code: 'desktop-session-invalid' });
+    }
+    const hostKey = desktopHostKey({
+      targetRuntime, targetClient, profileId: caller.profileId, workspace: caller.workspace,
+    });
+    let binding;
+    let hostIdentity;
+    if (targetRuntime === 'codex') {
+      if (typeof caller.hostId !== 'string' || !caller.hostId.trim() || typeof caller.threadId !== 'string' || !caller.threadId.trim()) {
+        throw Object.assign(new Error('The Codex dispatcher requires the verified native thread host identity.'), { code: 'desktop-thread-identity-required' });
+      }
+      binding = {
+        targetRuntime, targetClient, profileId: caller.profileId, workspace: caller.workspace,
+        hostId: caller.hostId, threadId: caller.threadId,
+      };
+      hostIdentity = {
+        bindingMode: 'thread', hostId: caller.hostId, nativeThreadId: caller.threadId,
+      };
+    } else {
+      binding = {
+        targetRuntime, targetClient, profileId: caller.profileId, workspace: caller.workspace,
+        hostPid: details.hostPid ?? caller.hostPid,
+        hostStarted: details.hostStarted ?? caller.hostStarted,
+      };
+      hostIdentity = {
+        bindingMode: 'process', hostPid: binding.hostPid, hostStarted: binding.hostStarted,
+      };
+    }
+    const host = {
+      hostKey, targetRuntime, targetClient, profileId: caller.profileId.toLowerCase(),
+      workspace: path.resolve(caller.workspace), nativeSessionId, ...hostIdentity,
+      bindingKey: dispatcherBindingKey(binding), registeredAt: now(), lastSeenAt: now(), state: 'idle',
+    };
+    const saved = roster.registerDesktopHost(host, { replace: details.replace === true });
+    return { registered: true, targetRuntime, targetClient, profileId: saved.profileId, workspace: saved.workspace };
+  }
+
+  async function desktopHostStatus(extra, { targetRuntime, targetClient } = {}) {
+    const caller = await context(extra);
+    targetRuntime ??= caller.client === 'codex-desktop' ? 'codex' : 'claude';
+    targetClient ??= targetRuntime === 'claude' ? 'claude-code' : 'codex-desktop';
+    const hostKey = desktopHostKey({ targetRuntime, targetClient, profileId: caller.profileId, workspace: caller.workspace });
+    const host = roster.desktopHost(hostKey);
+    const lastSeen = Date.parse(host?.lastSeenAt ?? host?.registeredAt ?? '');
+    const fresh = Number.isFinite(lastSeen) && Date.now() - lastSeen <= HOST_STATUS_STALE_MS;
+    let live = fresh;
+    // A Codex root dispatcher sleeps between app-tools wakeups; its bound thread is
+    // the durable host identity. Probe only that thread when the cheap heartbeat is stale.
+    if (!live && host?.targetRuntime === 'codex') {
+      try { live = await codexThreadAlive(host) === true; }
+      catch { live = false; }
+    }
+    const ready = Boolean(host && host.nativeSessionId && live
+      && host.profileId === caller.profileId && sameWorkspace(host.workspace, caller.workspace)
+      && (host.bindingMode === 'thread'
+        ? host.hostId && host.nativeThreadId
+        : host.hostPid > 0 && host.hostStarted));
+    return { ready, targetRuntime, targetClient, ...(ready ? { bindingMode: host.bindingMode } : {}) };
+  }
+
+  function sameNotificationHost(record, host, targetRuntime) {
+    if (record.desktopMode !== 'native') return false;
+    const route = nativeManagerRoute(record);
+    if (!route || route.error || route.targetRuntime !== targetRuntime) return false;
+    if (!route.host || route.host.hostKey !== host.hostKey) return false;
+    if (!sameWorkspace(route.manager.workspace, host.workspace)) return false;
+    return typeof route.managerNativeHandle === 'string' && route.managerNativeHandle.trim() !== '';
+  }
+
+  function desktopNotification(record, host, targetRuntime) {
+    const route = nativeManagerRoute(record);
+    if (!route || route.error) return null;
+    const managerNativeHandle = route.managerNativeHandle;
+    for (const report of record.task?.reports ?? []) {
+      if (!['pending', 'dispatcher-pending'].includes(report.delivery?.state)) continue;
+      return {
+        schema: 'futureaide.host.notification/1',
+        delivery: 'notification',
+        notification_id: report.id,
+        kind: 'report',
+        agent_name: record.name,
+        owner_id: record.ownerId,
+        task_id: record.task.taskId,
+        manager_native_handle: managerNativeHandle,
+        manager_thread_id: managerNativeHandle,
+        message: report.message,
+        final: report.final === true,
+        accepted: false,
+        duplicate: report.delivery.state === 'dispatcher-pending',
+      };
+    }
+    for (const question of record.task?.questions ?? []) {
+      if (question.state !== 'pending') continue;
+      if (!['pending', 'dispatcher-pending', undefined].includes(question.noticeState)) continue;
+      return {
+        schema: 'futureaide.host.notification/1',
+        delivery: 'notification',
+        notification_id: question.id,
+        kind: 'question',
+        agent_name: record.name,
+        owner_id: record.ownerId,
+        task_id: record.task.taskId,
+        manager_native_handle: managerNativeHandle,
+        manager_thread_id: managerNativeHandle,
+        message: question.message,
+        final: false,
+        accepted: false,
+        duplicate: question.noticeState === 'dispatcher-pending',
+      };
+    }
+    return null;
+  }
+
+  function pendingDesktopNotification(host, targetRuntime) {
+    for (const record of roster.list()) {
+      if (!sameNotificationHost(record, host, targetRuntime)) continue;
+      const notification = desktopNotification(record, host, targetRuntime);
+      if (notification) return notification;
+    }
+    return null;
+  }
+
+  async function receiveDesktopRequest(extra, { timeoutMs = 25000, targetRuntime, targetClient } = {}) {
+    const caller = await context(extra);
+    targetRuntime ??= caller.client === 'codex-desktop' ? 'codex' : 'claude';
+    targetClient ??= targetRuntime === 'claude' ? 'claude-code' : 'codex-desktop';
+    if (targetRuntime === 'claude' && caller.client !== 'claude-code') {
+      throw Object.assign(new Error('Only the native Claude Code host may receive Claude dispatcher requests.'), { code: 'desktop-host-context-required' });
+    }
+    if (targetRuntime === 'codex' && caller.client !== 'codex-desktop') {
+      throw Object.assign(new Error('Only the native Codex Desktop host may receive Codex dispatcher requests.'), { code: 'desktop-host-context-required' });
+    }
+    const hostKey = desktopHostKey({ targetRuntime, targetClient, profileId: caller.profileId, workspace: caller.workspace });
+    const host = roster.desktopHost(hostKey);
+    if (!host) throw Object.assign(new Error('This Desktop session is not a registered dispatcher for its profile and workspace.'), { code: 'desktop-dispatcher-unregistered' });
+    if (!sameDesktopHost(host, caller)) {
+      throw Object.assign(new Error('The Desktop dispatcher binding changed; refusing to receive.'), { code: 'desktop-host-binding-mismatch' });
+    }
+    roster.touchDesktopHost(hostKey);
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+    let heartbeatAt = Date.now() + 60000;
+    do {
+      const pending = [];
+      const replay = [];
+      for (const record of roster.list()) {
+        for (const dispatch of record.task?.dispatches ?? []) {
+          if (dispatch.hostKey !== hostKey) continue;
+          if (dispatch.state === 'queued') pending.push({ record, dispatch });
+          else if (dispatch.state === 'received' || dispatch.state === 'unknown') replay.push({ record, dispatch });
+        }
+      }
+      const next = pending[0];
+      if (next) {
+        const claimed = await lockedRecord(next.record, fresh => {
+          const current = desktopDispatch(fresh, next.dispatch.requestId);
+          if (!current || current.state !== 'queued') return null;
+          const received = receiveRequest(current).dispatch;
+          saveDispatch(fresh, received);
+          return { ...current.envelope, agentId: fresh.agentId, delivery: 'received', replay: false, spawnAllowed: true, accepted: false };
+        });
+        if (claimed) return claimed;
+        continue;
+      }
+      const old = replay[0];
+      if (old) {
+        const replayed = await lockedRecord(old.record, fresh => {
+          const current = desktopDispatch(fresh, old.dispatch.requestId);
+          if (!current || (current.state !== 'received' && current.state !== 'unknown')) return null;
+          return { ...current.envelope, agentId: fresh.agentId, delivery: 'received', replay: true, spawnAllowed: false, accepted: Boolean(current.accepted) };
+        });
+        if (replayed) return replayed;
+        continue;
+      }
+      const notification = pendingDesktopNotification(host, targetRuntime);
+      if (notification) return notification;
+      if (Date.now() >= deadline) return { delivery: 'none', accepted: false };
+      if (Date.now() >= heartbeatAt) {
+        roster.touchDesktopHost(hostKey);
+        heartbeatAt = Date.now() + 60000;
+      }
+      await wait(Math.min(250, Math.max(0, deadline - Date.now())));
+    } while (true);
+  }
+
+  async function attachDesktopRequest(extra, ticket) {
+    if (typeof ticket !== 'string' || !/^ticket_[A-Za-z0-9._-]+$/.test(ticket)) {
+      throw Object.assign(new Error('A valid one-time binding ticket is required.'), { code: 'desktop-attach-invalid-ticket' });
+    }
+    const caller = await context(extra);
+    const targetRuntime = caller.client === 'claude-code' ? 'claude' : caller.client === 'codex-desktop' ? 'codex' : undefined;
+    if (!targetRuntime) throw Object.assign(new Error('The native child context is unavailable.'), { code: 'desktop-host-context-required' });
+    const targetClient = targetRuntime === 'claude' ? 'claude-code' : 'codex-desktop';
+    const hostKey = desktopHostKey({ targetRuntime, targetClient, profileId: caller.profileId, workspace: caller.workspace });
+    const host = roster.desktopHost(hostKey);
+    if (!host) throw Object.assign(new Error('The dispatcher is not registered for this profile and workspace.'), { code: 'desktop-dispatcher-unregistered' });
+    if (targetRuntime === 'codex' && host.nativeThreadId !== caller.parentThreadId) {
+      throw Object.assign(new Error('The native child parent does not match the registered dispatcher.'), { code: 'desktop-attach-parent-mismatch' });
+    }
+    const matches = [];
+    for (const record of roster.list()) {
+      for (const dispatch of record.task?.dispatches ?? []) {
+        if (dispatch.bindingTicket === ticket && dispatch.hostKey === hostKey) matches.push({ record, dispatch });
+      }
+    }
+    if (matches.length !== 1) throw Object.assign(new Error('The binding ticket does not identify exactly one request.'), { code: matches.length ? 'desktop-attach-ambiguous' : 'desktop-attach-not-found' });
+    const { record, dispatch: matched } = matches[0];
+    const childThreadId = caller.sessionId ?? caller.threadId;
+    return lockedRecord(record, fresh => {
+      const dispatch = desktopDispatch(fresh, matched.requestId);
+      if (!dispatch) throw Object.assign(new Error('The ticket request is no longer available.'), { code: 'desktop-attach-not-found' });
+      if (dispatch.attached && (targetRuntime === 'claude' ? fresh.desktopBindingTicket === ticket : fresh.desktopSessionId === childThreadId)) {
+        return { attached: true, duplicate: true, requestId: dispatch.requestId,
+          deliveryReceipt: dispatch.deliveryReceipt, taskId: dispatch.taskId };
+      }
+      if (dispatch.attached) throw Object.assign(new Error('This ticket is already bound to another native child.'), { code: 'desktop-attach-already-bound' });
+      if (dispatch.state !== 'received' && dispatch.state !== 'unknown') {
+        throw Object.assign(new Error('The ticket request has not been delivered to the dispatcher.'), { code: 'desktop-attach-before-receive' });
+      }
+      fresh.desktopParentThreadId = host.nativeThreadId;
+      fresh.desktopProfileId = host.profileId;
+      fresh.desktopWorkspace = host.workspace;
+      fresh.desktopHostPid = host.hostPid;
+      fresh.desktopHostStarted = host.hostStarted;
+      fresh.desktopBindingTicket = ticket;
+      fresh.desktopAgentContext = ticket;
+      if (targetRuntime === 'codex') {
+        fresh.desktopSessionId = childThreadId;
+        fresh.desktopLocalSessionId = childThreadId;
+        fresh.desktopChildThreadId = childThreadId;
+      } else {
+        fresh.desktopTicketAttached = true;
+      }
+      dispatch.attached = true;
+      dispatch.attachedAt = now();
+      saveDispatch(fresh, dispatch);
+      return { attached: true, duplicate: false, requestId: dispatch.requestId,
+        deliveryReceipt: dispatch.deliveryReceipt, taskId: dispatch.taskId };
+    });
+  }
+
+  async function ackDesktopRequest(extra, ack = {}, { targetRuntime, targetClient } = {}) {
+    if (!ack.nativeHandle && ack.nativeAgentId) ack = { ...ack, nativeHandle: ack.nativeAgentId };
+    const caller = await context(extra);
+    targetRuntime ??= caller.client === 'codex-desktop' ? 'codex' : 'claude';
+    targetClient ??= targetRuntime === 'claude' ? 'claude-code' : 'codex-desktop';
+    if (targetRuntime === 'claude' && caller.client !== 'claude-code') {
+      throw Object.assign(new Error('Only the native Claude Code host may acknowledge Claude dispatcher requests.'), { code: 'desktop-host-context-required' });
+    }
+    if (targetRuntime === 'codex' && caller.client !== 'codex-desktop') {
+      throw Object.assign(new Error('Only the native Codex Desktop host may acknowledge Codex dispatcher requests.'), { code: 'desktop-host-context-required' });
+    }
+    const hostKey = desktopHostKey({ targetRuntime, targetClient, profileId: caller.profileId, workspace: caller.workspace });
+    const host = roster.desktopHost(hostKey);
+    if (!host) throw Object.assign(new Error('This Desktop session is not a registered dispatcher for its profile and workspace.'), { code: 'desktop-dispatcher-unregistered' });
+    if (!sameDesktopHost(host, caller)) {
+      throw Object.assign(new Error('The Desktop dispatcher binding changed; refusing to acknowledge.'), { code: 'desktop-host-binding-mismatch' });
+    }
+    let found;
+    for (const record of roster.list()) {
+      const dispatch = desktopDispatch(record, ack.requestId);
+      if (dispatch?.hostKey === hostKey) { found = { record, dispatch }; break; }
+    }
+    if (!found) throw Object.assign(new Error('The Desktop request does not belong to this dispatcher.'), { code: 'desktop-request-stale' });
+    return lockedRecord(found.record, fresh => {
+      const dispatch = desktopDispatch(fresh, ack.requestId);
+      if (!dispatch) throw Object.assign(new Error('The Desktop request is no longer available.'), { code: 'desktop-request-stale' });
+      if (dispatch.state !== 'received' && dispatch.state !== 'unknown') {
+        throw Object.assign(new Error('The Desktop request has not been received by this dispatcher.'), { code: 'desktop-ack-before-receive' });
+      }
+      if (!dispatch.attached) {
+        return { requestId: dispatch.requestId, name: fresh.name, accepted: false, state: 'ack-rejected', reason: 'desktop-child-unattached' };
+      }
+      if (ack.status === 'unknown') {
+        if (ack.deliveryReceipt !== dispatch.deliveryReceipt) {
+          throw Object.assign(new Error('The Desktop acknowledgement receipt does not match the delivered request.'), { code: 'desktop-ack-receipt-mismatch' });
+        }
+        const next = markRequestUnknown(dispatch, { nativeHandle: ack.nativeHandle });
+        saveDispatch(fresh, next);
+        return { requestId: dispatch.requestId, name: fresh.name, accepted: false, state: 'unknown', nativeHandle: next.nativeHandle };
+      }
+      if (ack.status === 'accepted' && !ack.nativeAgentId && !ack.nativeHandle) {
+        return { requestId: dispatch.requestId, name: fresh.name, accepted: false, state: 'ack-rejected', reason: 'desktop-native-agent-id-missing' };
+      }
+      const result = ackRequest(dispatch, ack);
+      saveDispatch(fresh, result.dispatch);
+      if (result.accepted) {
+        // desktopNativeHandle is the native operation/session handle, not the
+        // agentId. Keep nativeAgentId separately for identity/cleanup.
+        fresh.desktopNativeHandle = ack.nativeHandle ?? ack.nativeAgentId;
+        fresh.desktopParentThreadId = host.nativeThreadId;
+        fresh.desktopHostKey = hostKey;
+        fresh.desktopHostBindingKey = host.bindingKey;
+        fresh.desktopHostSessionId = host.nativeSessionId;
+        if (ack.nativeAgentId) fresh.desktopNativeAgentId = ack.nativeAgentId;
+        if (dispatch.envelope?.kind === 'answer') {
+          const answer = (fresh.task?.answers ?? []).find(item => !item.dispatched && item.message === dispatch.envelope.message);
+          if (answer) { answer.dispatched = true; answer.dispatchedAt = now(); }
+        }
+        const settled = fresh.task?.finalSubmitted
+          || ['awaiting_input', 'awaiting_report', 'completed', 'delivery_pending', 'idle'].includes(fresh.task?.state)
+          || ['awaiting_input', 'awaiting_report', 'completed', 'delivery_pending', 'idle'].includes(fresh.state);
+        if (!settled) {
+          fresh.state = 'running';
+          if (fresh.task) fresh.task.state = 'running';
+        } else if (fresh.task?.finalSubmitted) {
+          // A late accepted ack must reconcile the existing final state, never
+          // reopen a completed/delivery-pending native task.
+          finishTask(fresh);
+        }
+        roster.save(fresh);
+      }
+      return { requestId: dispatch.requestId, name: fresh.name, accepted: result.accepted,
+        state: result.ackState, nativeHandle: result.dispatch.nativeHandle ?? null };
+    });
+  }
+
+  async function deliveryAck(extra, { notificationId, status } = {}) {
+    if (typeof notificationId !== 'string' || !notificationId.trim()) {
+      throw Object.assign(new Error('A notification id is required.'), { code: 'desktop-notification-id-required' });
+    }
+    if (!['delivered', 'blocked', 'unknown'].includes(status)) {
+      throw Object.assign(new Error('status must be delivered, blocked or unknown.'), { code: 'desktop-notification-status-invalid' });
+    }
+    const caller = await context(extra);
+    const targetRuntime = caller.client === 'codex-desktop' ? 'codex' : caller.client === 'claude-code' ? 'claude' : undefined;
+    if (!targetRuntime) throw Object.assign(new Error('The Desktop dispatcher context is unavailable.'), { code: 'desktop-host-context-required' });
+    const targetClient = targetRuntime === 'claude' ? 'claude-code' : 'codex-desktop';
+    const hostKey = desktopHostKey({ targetRuntime, targetClient, profileId: caller.profileId, workspace: caller.workspace });
+    const host = roster.desktopHost(hostKey);
+    if (!host) throw Object.assign(new Error('This Desktop session is not a registered dispatcher for its profile and workspace.'), { code: 'desktop-dispatcher-unregistered' });
+    if (!sameDesktopHost(host, caller)) {
+      throw Object.assign(new Error('The Desktop dispatcher binding changed; refusing to acknowledge delivery.'), { code: 'desktop-host-binding-mismatch' });
+    }
+    let found;
+    for (const record of roster.list()) {
+      if (!sameNotificationHost(record, host, targetRuntime)) continue;
+      const report = (record.task?.reports ?? []).find(item => item.id === notificationId);
+      const question = (record.task?.questions ?? []).find(item => item.id === notificationId);
+      if (report || question) { found = { record, report, question }; break; }
+    }
+    if (!found) throw Object.assign(new Error('The notification does not belong to this dispatcher.'), { code: 'desktop-notification-stale' });
+    return lockedRecord(found.record, async fresh => {
+      const report = (fresh.task?.reports ?? []).find(item => item.id === notificationId);
+      const question = (fresh.task?.questions ?? []).find(item => item.id === notificationId);
+      if (!report && !question) throw Object.assign(new Error('The notification is no longer available.'), { code: 'desktop-notification-stale' });
+      const previous = report?.delivery?.state ?? question?.noticeState;
+      if (previous === 'delivered') {
+        return { notification_id: notificationId, status: 'delivered', delivered: true, duplicate: true };
+      }
+      if (report) {
+        report.delivery = {
+          ...(report.delivery ?? {}),
+          state: status,
+          via: 'dispatcher',
+          at: now(),
+          ...(status === 'delivered' ? {} : { note: `dispatcher-${status}` }),
+        };
+      } else {
+        question.noticeState = status;
+        question.noticeVia = 'dispatcher';
+        question.noticeAckedAt = now();
+        if (status !== 'delivered') question.noticeError = `dispatcher-${status}`;
+      }
+      roster.save(fresh);
+      if (status === 'delivered' && report?.final === true) finishTask(fresh);
+      return { notification_id: notificationId, status, delivered: status === 'delivered' };
+    });
   }
 
   function managedPrompt(record, dispatch) {
@@ -890,6 +1599,13 @@ export function createCliAgents(config, {
   const service = {
     store: roster,
     resolveManagedContext: managedContext,
+    resolveDesktopContext,
+    registerDesktopHost,
+    desktopHostStatus,
+    receiveDesktopRequest,
+    attachDesktopRequest,
+    ackDesktopRequest,
+    deliveryAck,
     async deliverToParent(owner, notice = {}) {
       if (!owner?.parentAgentId) return { state: 'blocked', reason: 'managed-parent-missing' };
       if (typeof notice.message !== 'string' || !notice.message.trim()) return { state: 'blocked', reason: 'empty-notice' };
@@ -917,6 +1633,11 @@ export function createCliAgents(config, {
       if (runtime === 'dsh') throw Object.assign(new Error('The DSH runtime belongs to the unified facade; route it to the existing DSH service.'), { code: 'dsh-runtime-facade-owned' });
       if (!RUNTIMES.has(runtime)) throw new Error('runtime must be dsh, claude or codex.');
       const owner = await context(extra);
+      if ((runtime === 'claude' || runtime === 'codex') && lifetime === 'once') {
+        throw Object.assign(new Error('Desktop native one-shot cleanup is unsupported until the native session store has an allowed cleanup path.'), {
+          code: 'desktop-once-cleanup-unsupported',
+        });
+      }
       const agentId = uid('agent');
       const directory = path.join(agentsRoot, owner.ownerId, agentId);
       const record = {
@@ -939,6 +1660,16 @@ export function createCliAgents(config, {
         roster.save(record);
         return { name: record.name, runtime: record.runtime, lifetime: record.lifetime, state: record.state, created: true, modelRequestsStarted: 0 };
       } catch (error) {
+        if ((runtime === 'claude' && error?.code === 'claude-desktop-required')
+          || (runtime === 'codex' && error?.code === 'codex-desktop-required')) {
+          record.runtimeAdapter = runtime === 'claude' ? 'claude-desktop' : 'codex-desktop';
+          record.desktopMode = 'native';
+          record.state = 'idle';
+          record.error = undefined;
+          roster.save(record);
+          return { name: record.name, runtime: record.runtime, lifetime: record.lifetime,
+            state: record.state, created: true, modelRequestsStarted: 0, transport: 'desktop-native' };
+        }
         record.state = 'create_failed';
         record.error = safeError(error);
         roster.save(record);
@@ -961,6 +1692,7 @@ export function createCliAgents(config, {
         return await withName(extra, name, async (record, owner) => {
           entered = true;
           if (record.closed || ['cleaning', 'cleanup_failed', 'create_failed'].includes(record.state)) throw new Error('This CLI agent is closing, failed to create, or has blocked cleanup.');
+          if (record.desktopMode === 'native') return queueDesktopInput(record, owner, message);
           if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait or delete the agent before assigning another task.');
           if (record.state === 'awaiting_input' && (record.task?.questions ?? []).some(question => question.state === 'pending')) {
             return answerLocked(record, message);
@@ -1003,7 +1735,9 @@ export function createCliAgents(config, {
     },
     async answer({ name, message }, extra) {
       textMessage(message);
-      return withName(extra, name, record => answerLocked(record, message));
+      return withName(extra, name, (record, owner) => record.desktopMode === 'native'
+        ? queueDesktopAnswer(record, owner, message)
+        : answerLocked(record, message));
     },
     async list(extra) {
       const owner = await context(extra);
@@ -1038,11 +1772,17 @@ export function createCliAgents(config, {
         await wait(Math.min(250, deadline - Date.now()));
       } while (true);
       const reports = snapshots.flatMap(record => (record.task?.reports ?? []).filter(report => !report.receivedAt)
-        .map(report => ({ name: record.name, id: report.id, message: report.message, final: report.final, delivery: report.delivery?.state })));
+        .map(report => ({ name: record.name, id: report.id, message: report.message, final: report.final,
+          delivery: report.delivery?.state, managedNative: Boolean(record.desktopMode === 'native' && nativeManagerRoute(record)) })));
       const questions = items.flatMap(item => (item.questions ?? []).map(question => ({ name: item.name, ...question })));
       await acknowledgeWait(owner, snapshots);
-      for (const report of reports) { report.delivery = 'delivered'; report.received = true; }
-      return { items, ...(reports.length ? { reports } : {}), ...(questions.length ? { questions } : {}), notListed: [...notListed],
+      for (const report of reports) {
+        if (report.managedNative) continue;
+        report.delivery = 'delivered';
+        report.received = true;
+      }
+      const wireReports = reports.map(({ managedNative: _managedNative, ...report }) => report);
+      return { items, ...(wireReports.length ? { reports: wireReports } : {}), ...(questions.length ? { questions } : {}), notListed: [...notListed],
         ...(notListed.size ? { note: 'These names are not in this chat’s current list. Absence alone does not prove completion.' } : {}),
         timedOut: Date.now() >= deadline && items.some(item => item.state === 'running') };
     },
@@ -1074,6 +1814,9 @@ export function createCliAgents(config, {
     async cancel({ name }, extra) {
       const owner = await context(extra);
       const record = named(owner, name);
+      if (record.desktopMode === 'native') {
+        throw cancelUnsupportedError({ name: record.name, requestId: record.task?.dispatches?.at(-1)?.requestId });
+      }
       if (!record.task || record.closed) return { name, accepted: false, state: record.state };
       if (record.task.finalSubmitted || ['delivery_pending', 'idle', 'completed'].includes(record.state)) {
         return { name, accepted: false, state: record.state, reason: 'final-submitted' };
@@ -1136,7 +1879,12 @@ export function createCliAgents(config, {
         if (final) fresh.task.finalSubmitted = true;
         roster.save(fresh);
         await deliverReports(fresh);
-        if (fresh.task.finalSubmitted) await ensureWorker(fresh);
+        if (fresh.task.finalSubmitted) {
+          await ensureWorker(fresh);
+          // Native agents deliberately skip activeWork/ensureWorker, so settle
+          // their final state explicitly instead of leaving them in running.
+          if (fresh.desktopMode === 'native') finishTask(fresh);
+        }
         return { accepted: true, final, delivery: report.delivery.state };
       });
     },
@@ -1165,9 +1913,30 @@ export function createCliAgents(config, {
             question.noticeState = 'delivered';
             question.noticeVia = 'managed-parent';
           } else {
-            const result = await notify({ owner: fresh.owner, agent: { name: fresh.name, runtime: fresh.runtime, lifetime: fresh.lifetime },
-              kind: 'question', message, final: false, id: question.id }, config);
-            question.noticeState = normalizeDelivery(result);
+            const managerRoute = nativeManagerRoute(fresh);
+            if (managerRoute) {
+              if (managerRoute.error) {
+                question.noticeState = 'blocked';
+                question.noticeError = { code: managerRoute.error };
+              } else {
+                question.noticeState = 'dispatcher-pending';
+                question.noticeVia = 'dispatcher';
+                question.managerNativeHandle = managerRoute.managerNativeHandle;
+                question.managerAgentId = managerRoute.manager.agentId;
+                if (managerRoute.targetRuntime === 'codex') {
+                  try {
+                    await wakeCodexDispatcher(managerRoute.host, { requestId: question.id, agentName: fresh.name });
+                  } catch { /* host_receive can still pick the pending notification */ }
+                }
+              }
+            } else {
+              const result = await notify({ owner: nativeNotificationOwner(fresh), agent: { name: fresh.name, runtime: fresh.runtime, lifetime: fresh.lifetime },
+                kind: 'question', message, final: false, id: question.id }, config);
+              question.noticeState = normalizeDelivery(result);
+              if (result?.managerNativeHandle) question.managerNativeHandle = result.managerNativeHandle;
+              if (result?.managerThreadId) question.managerThreadId = result.managerThreadId;
+              if (question.noticeState === 'dispatcher-pending') question.noticeVia = 'dispatcher';
+            }
           }
           question.notifiedAt = now();
         } catch (error) {

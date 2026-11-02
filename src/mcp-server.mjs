@@ -12,7 +12,7 @@ import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.7' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.7.0' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
@@ -67,7 +67,7 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
  * @returns {McpServer} Unconnected MCP server.
  */
 export function makeServer(control, { configPath, controlFactory = createControl, peersFactory = createPeers } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.2.0' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.7.0' });
   const profileName = z.string().regex(PROFILE_NAME_PATTERN).describe('Named project connection. Use the same profile on every call for this task.');
   const profile = profileName.optional().describe('Named project connection. Omit to use the unchanged default connection.');
   const resolveControl = async name => name === undefined && control ? control : controlFactory(await loadConfig(configPath, name));

@@ -44,6 +44,10 @@ export async function installClaudeCaller({ configFile, project, sourceRoot = pa
   if (isOldEntry(nativeConfig.mcpServers['futureaide-control'])) delete nativeConfig.mcpServers['futureaide-control'];
   settings.env ??= {};
   settings.env.FUTUREAIDE_PROFILE_ID = binding.profileId;
+  // Keep a host_receive call pending in the initial model turn. This is a
+  // non-network Claude Code setting; it is applied to the profile settings and
+  // takes effect on the next Code session.
+  settings.env.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS ??= '0';
   settings.permissions ??= {};
   settings.permissions.allow = [...new Set([...(settings.permissions.allow ?? []), 'mcp__futureaide__*'])];
   settings.hooks ??= {};
@@ -69,7 +73,7 @@ export async function installClaudeCaller({ configFile, project, sourceRoot = pa
     }
   }
   return { installed: true, profile: binding.name, mcpFile, settingsFile,
-    nextSession: 'Start a Code session in this existing Claude Desktop window; no additional login is needed.' };
+    nextSession: 'Open or continue the existing Claude Code session once; call host_register, then host_receive. No login and no per-task UI click are needed.' };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

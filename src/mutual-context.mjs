@@ -9,6 +9,7 @@ import { loadConfig } from './config.mjs';
 export const TRUSTED_CONTEXT = Symbol('futureaide-internal-context');
 const UUID = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i;
 const fail = message => Object.assign(new Error(message), { code: 'calling-context-unavailable' });
+const failAgentContext = message => Object.assign(new Error(message), { code: 'desktop-context-invalid' });
 const contextRoot = config => path.join(config.cliStateDirectory ?? config.stateDirectory, 'host-contexts', 'claude');
 const readJson = async file => JSON.parse(await readFile(file, 'utf8'));
 
@@ -83,7 +84,7 @@ async function resolveClaudeHostContext(extra, config) {
     client: 'claude-code', hostPid: record.hostPid, hostStarted: record.hostStarted };
 }
 
-export function createMutualContextResolver(config, { resolveManaged, callCodex } = {}) {
+export function createMutualContextResolver(config, { resolveManaged, resolveDesktop, callCodex } = {}) {
   const known = new Map();
   const claudeHosts = new Map();
   return async extra => {
@@ -93,6 +94,7 @@ export function createMutualContextResolver(config, { resolveManaged, callCodex 
       return resolveManaged(process.env.FUTUREAIDE_CLI_AGENT_ID, process.env.FUTUREAIDE_CLI_TASK_ID, process.env.FUTUREAIDE_CLI_TOKEN);
     }
     const meta = extra?._meta;
+    const suppliedAgentContext = typeof extra?.agent_context === 'string' && extra.agent_context.trim() !== '';
     if (meta?.threadId || meta?.['openai/threadId']) {
       const threadId = callingThread(extra);
       const ownerId = ownerIdFor(threadId);
@@ -103,6 +105,9 @@ export function createMutualContextResolver(config, { resolveManaged, callCodex 
       try { binding = await resolveFaSwitchBinding(config); } catch { /* Checked on account-agent creation. */ }
       const owner = { ...native, client: 'codex-desktop', ...(binding ? { profileId: binding.profileId } : {}) };
       known.set(ownerId, owner);
+      const desktop = resolveDesktop ? await resolveDesktop({ ...owner, client: 'codex-desktop', sessionId: owner.threadId, agentContext: extra?.agent_context }) : undefined;
+      if (desktop?.reportContext) return { ...owner, ...desktop, reportContext: desktop.reportContext };
+      if (suppliedAgentContext) throw failAgentContext('The supplied agent_context is unknown, expired, or belongs to another host.');
       return owner;
     }
     // A stdio MCP connection belongs to one live host. Verify it once instead
@@ -119,6 +124,9 @@ export function createMutualContextResolver(config, { resolveManaged, callCodex 
       const current = await readJson(path.join(contextRoot(config), `pid-${owner.hostPid}.json`));
       if (current.ambiguous || current.sessionId !== owner.threadId) throw fail('This Claude connection changed sessions without a unique request identity. Reconnect this Code session.');
     }
+    const desktop = resolveDesktop ? await resolveDesktop({ ...owner, sessionId: owner.threadId, agentContext: extra?.agent_context }) : undefined;
+    if (desktop?.reportContext) return { ...owner, ...desktop, reportContext: desktop.reportContext };
+    if (suppliedAgentContext) throw failAgentContext('The supplied agent_context is unknown, expired, or belongs to another host.');
     return owner;
   };
 }
@@ -128,6 +136,10 @@ export async function resolveMutualContext(extra) {
   const config = await loadConfig();
   const { createCliAgents } = await import('./cli-agents.mjs');
   const service = createCliAgents(config);
-  try { return await createMutualContextResolver(config, { resolveManaged: (...args) => service.resolveManagedContext(...args) })(extra); }
-  finally { service.close(); }
+  try {
+    return await createMutualContextResolver(config, {
+      resolveManaged: (...args) => service.resolveManagedContext(...args),
+      resolveDesktop: (...args) => service.resolveDesktopContext(...args),
+    })(extra);
+  } finally { service.close(); }
 }

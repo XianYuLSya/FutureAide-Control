@@ -1,9 +1,9 @@
 {
   "name": "futureaide-control",
-  "version": "0.6.3",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
-  "description": "Named DSH subagents from Codex Desktop through one futureaide_* interface. Native Codex Desktop and Claude Desktop targets are not connected; independent CLI, direct connections and credential reuse are prohibited. Desktop targets must use the bound FaSwitch profile network, and dispatch is refused until host identity and egress are verified.",
+  "description": "Named DSH and native Desktop subagents through one futureaide_* interface. Codex Desktop → DSH remains available; native Desktop targets require a verified FaSwitch-bound host and network. Independent CLI, direct connections and credential reuse are prohibited.",
   "homepage": "https://github.com/XianYuLSya/FutureAide-Control#readme",
   "repository": {
     "type": "git",

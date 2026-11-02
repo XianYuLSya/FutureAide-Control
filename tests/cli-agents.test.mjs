@@ -16,13 +16,13 @@ const thread = { A: 'thread-A', B: 'thread-B' };
 const extra = key => ({ key });
 const childExtra = agentId => ({ child: agentId });
 
-async function fixture({ notifyState = 'delivered', turnScript, environmentError = false, realAdapters = false } = {}) {
+async function fixture({ notifyState = 'delivered', turnScript, environmentError = false, realAdapters = false, desktopNative = false } = {}) {
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
   const store = new RosterStore(':memory:');
   const contexts = new Map([
-    [A, { ownerId: A, threadId: thread.A, workspace: root, client: 'codex' }],
-    [B, { ownerId: B, threadId: thread.B, workspace: root, client: 'claude' }],
+    [A, { ownerId: A, threadId: thread.A, workspace: root, client: 'codex', profileId: '11111111-1111-4111-8111-111111111111' }],
+    [B, { ownerId: B, threadId: thread.B, workspace: root, client: 'claude', profileId: '11111111-1111-4111-8111-111111111111' }],
   ]);
   const workers = [];
   const notifications = [];
@@ -33,7 +33,7 @@ async function fixture({ notifyState = 'delivered', turnScript, environmentError
   const service = createCliAgents({
     stateDirectory,
     configFile: path.join(stateDirectory, 'config.json'),
-    binding: { profileId: 'fixture-profile' },
+    binding: { profileId: '11111111-1111-4111-8111-111111111111' },
   }, {
     store,
     resolveContext: async value => {
@@ -48,6 +48,7 @@ async function fixture({ notifyState = 'delivered', turnScript, environmentError
     },
     resolveEnvironment: async ({ binding, directory }) => {
       if (environmentError) throw new Error('fixture environment unavailable');
+      if (desktopNative) throw Object.assign(new Error('desktop required'), { code: 'claude-desktop-required' });
       return {
         executable: process.execPath,
         env: { CODEX_HOME: path.join(directory, 'codex-home') },
@@ -61,9 +62,16 @@ async function fixture({ notifyState = 'delivered', turnScript, environmentError
       return { state };
     },
     startWorker: (...args) => { workers.push(args); return 9000 + workers.length; },
-    adapterFor: realAdapters ? createRuntimeAdapter : runtime => runtime === 'claude'
-      ? { id: 'test-claude', build: input => ({ command: process.execPath, args: ['test-claude'], stdinText: input.prompt + '\n' }) }
-      : createRuntimeAdapter(runtime),
+    adapterFor: realAdapters ? createRuntimeAdapter : runtime => ({
+      id: `test-${runtime}`,
+      build: input => {
+        const args = [`test-${runtime}`];
+        if (input.nativeSessionId) args.push('resume', input.nativeSessionId);
+        else args.push('--skip-git-repo-check', '-C', input.workspace);
+        args.push('-c', 'mcp_servers.futureaide.command="test"', 'mcp_servers.futureaide.args=["test"]');
+        return { command: process.execPath, args, stdinText: input.prompt + '\n' };
+      },
+    }),
     killTree: async pid => { kills.push(pid); return true; },
     runTurn: async input => {
       if (turnScript) return turnScript(input);
@@ -109,6 +117,46 @@ test('final is refused while a descendant created by this agent is still active'
       /descendant/i,
     );
     assert.equal(f.record('parent').task.finalSubmitted, false);
+  } finally { f.service.close(); }
+});
+
+test('native Claude ticket resolves managed context without a child session UUID', async () => {
+  const f = await fixture({ desktopNative: true });
+  try {
+    await f.service.create({ name: 'native-target', lifetime: 'persistent', runtime: 'claude' }, f.extra(A));
+    const record = f.record('native-target');
+    await f.service.send({ name: 'native-target', message: 'native task' }, f.extra(A));
+    await f.service.poll(record.agentId);
+    const fresh = f.record('native-target');
+    assert.ok(fresh.task);
+    const sessionId = '99999999-9999-4999-8999-999999999999';
+    const profileId = '11111111-1111-4111-8111-111111111111';
+    const host = { _resolved: true, ownerId: 'host-owner', threadId: sessionId, sessionId,
+      workspace: root, client: 'claude-code', profileId, hostPid: 4242,
+      hostStarted: '2026-11-02T09:00:00.0000000Z' };
+    await f.service.registerDesktopHost(host, { nativeSessionId: sessionId });
+    const received = await f.service.receiveDesktopRequest(host, { timeoutMs: 20 });
+    assert.equal(received.delivery, 'received');
+    const ticket = fresh.task.dispatches[0].bindingTicket;
+    const attached = await f.service.attachDesktopRequest(host, ticket);
+    assert.equal(attached.attached, true);
+    const acked = await f.service.ackDesktopRequest(host, {
+      requestId: fresh.task.dispatches[0].requestId,
+      deliveryReceipt: fresh.task.dispatches[0].deliveryReceipt,
+      status: 'accepted', nativeAgentId: 'a55840d3c26ec820a',
+    });
+    assert.equal(acked.accepted, true);
+    assert.equal(f.record('native-target').desktopNativeAgentId, 'a55840d3c26ec820a');
+    assert.equal(f.record('native-target').desktopSessionId, undefined);
+    const context = await f.service.resolveDesktopContext({ ...host, agentContext: ticket });
+    assert.ok(context.reportContext, JSON.stringify(context));
+    assert.equal(context.agentId, fresh.agentId);
+    assert.equal(context.parentAgentId, fresh.agentId);
+    assert.equal(context.taskId, fresh.task.taskId);
+    assert.equal(context.reportContext.taskId, fresh.task.taskId);
+    assert.equal(context.ownerId, managedOwnerIdFor(fresh.agentId));
+    const removed = await f.service.delete({ name: 'native-target' }, f.extra(A));
+    assert.equal(removed.deleted, true);
   } finally { f.service.close(); }
 });
 
@@ -216,26 +264,26 @@ test('Claude host wait acknowledges a pending final report and finishes the task
   } finally { f.service.close(); }
 });
 
-test('wait returns complete unseen reports and does not retire a once agent before its process exits', async () => {
+test('wait returns complete unseen reports while a persistent agent remains tracked', async () => {
   let f;
   const longReport = 'full report '.repeat(100);
   f = await fixture({ notifyState: 'pending', turnScript: async input => {
-    const record = f.record('once-report');
+    const record = f.record('wait-report');
     await reportChild(f, record.agentId, 'first checkpoint', false);
     await reportChild(f, record.agentId, longReport, true);
-    const received = await f.service.wait({ names: ['once-report'] }, f.extra(A));
+    const received = await f.service.wait({ names: ['wait-report'] }, f.extra(A));
     assert.deepEqual(received.reports.map(r => r.message), ['first checkpoint', longReport]);
-    assert.ok(f.record('once-report'), 'the process is still executing its final tool response');
-    const again = await f.service.wait({ names: ['once-report'] }, f.extra(A));
+    assert.ok(f.record('wait-report'), 'the process is still executing its final tool response');
+    const again = await f.service.wait({ names: ['wait-report'] }, f.extra(A));
     assert.equal(again.reports, undefined);
     return { exitCode: 0 };
   } });
   try {
-    await f.service.create({ name: 'once-report', lifetime: 'once', runtime: 'codex' }, f.extra(A));
-    const id = f.record('once-report').agentId;
-    await f.service.send({ name: 'once-report', message: 'work' }, f.extra(A));
+    await f.service.create({ name: 'wait-report', lifetime: 'persistent', runtime: 'codex' }, f.extra(A));
+    const id = f.record('wait-report').agentId;
+    await f.service.send({ name: 'wait-report', message: 'work' }, f.extra(A));
     await f.service.poll(id);
-    assert.equal(f.record('once-report'), undefined);
+    assert.ok(f.record('wait-report'));
   } finally { f.service.close(); }
 });
 
@@ -305,7 +353,7 @@ test('final is refused while queued input remains, preventing silent loss', asyn
 test('accepted-only delivery is not treated as delivered', async () => {
   const f = await fixture({ notifyState: 'accepted' });
   try {
-    await f.service.create({ name: 'once-agent', lifetime: 'once', runtime: 'claude' }, f.extra(A));
+    await f.service.create({ name: 'once-agent', lifetime: 'persistent', runtime: 'codex' }, f.extra(A));
     const record = f.record('once-agent');
     await f.service.send({ name: 'once-agent', message: 'work' }, f.extra(A));
     await f.service.poll(record.agentId);
@@ -355,6 +403,17 @@ test('the independent cli-roster.sqlite survives a service reopen', async () => 
   } finally { second.close(); }
 });
 
+test('Claude Desktop once is rejected before create until native cleanup is safe', async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(
+      () => f.service.create({ name: 'once-claude', lifetime: 'once', runtime: 'claude' }, f.extra(A)),
+      error => error.code === 'desktop-once-cleanup-unsupported',
+    );
+    assert.equal(f.record('once-claude'), undefined);
+  } finally { f.service.close(); }
+});
+
 test('create is name-addressed per caller and starts no model turn', async () => {
   const f = await fixture();
   try {
@@ -371,7 +430,7 @@ test('create is name-addressed per caller and starts no model turn', async () =>
       () => f.service.create({ name: 'reviewer', lifetime: 'persistent', runtime: 'codex' }, f.extra(A)),
       /already exists|name/i,
     );
-    const other = await f.service.create({ name: 'reviewer', lifetime: 'once', runtime: 'codex' }, f.extra(B));
+    const other = await f.service.create({ name: 'reviewer', lifetime: 'persistent', runtime: 'codex' }, f.extra(B));
     assert.equal(other.created, true);
     assert.equal(f.store.list(A).length, 1);
     assert.equal(f.store.list(B).length, 1);
@@ -509,29 +568,21 @@ test('ask_parent waits for one answer and the answer resumes the same task once'
   } finally { f.service.close(); }
 });
 
-test('one-shot retires by moving its owned directory to clean, never deleting it', async () => {
+test('Codex native one-shot is rejected before insert', async () => {
   const f = await fixture();
   try {
-    const created = await f.service.create({ name: 'once-agent', lifetime: 'once', runtime: 'claude' }, f.extra(A));
-    assert.equal(created.created, true);
-    const record = f.record('once-agent');
-    await f.service.send({ name: 'once-agent', message: 'finish once' }, f.extra(A));
-    await f.service.poll(record.agentId);
-    await reportChild(f, record.agentId, 'once result', true);
-    const result = await f.service.poll(record.agentId);
-    assert.equal(result.deleted, true);
-    assert.equal(f.store.get(record.agentId), undefined);
-    assert.equal(f.store.list(A).length, 0);
-    const entries = await readdir(path.join(f.stateDirectory, 'clean'));
-    assert.equal(entries.length, 1);
-    assert.equal(entries[0].startsWith(record.agentId), true);
+    await assert.rejects(
+      () => f.service.create({ name: 'once-agent', lifetime: 'once', runtime: 'codex' }, f.extra(A)),
+      error => error.code === 'desktop-once-cleanup-unsupported',
+    );
+    assert.equal(f.record('once-agent'), undefined);
   } finally { f.service.close(); }
 });
 
 test('final delivery not confirmed stays delivery_pending and keeps a one-shot agent', async () => {
   const f = await fixture({ notifyState: 'pending' });
   try {
-    await f.service.create({ name: 'once-agent', lifetime: 'once', runtime: 'codex' }, f.extra(A));
+    await f.service.create({ name: 'once-agent', lifetime: 'persistent', runtime: 'codex' }, f.extra(A));
     const record = f.record('once-agent');
     await f.service.send({ name: 'once-agent', message: 'work' }, f.extra(A));
     await f.service.poll(record.agentId);

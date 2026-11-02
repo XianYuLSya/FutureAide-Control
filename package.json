@@ -1,9 +1,9 @@
 {
   "name": "futureaide-control",
-  "version": "0.5.7",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
-  "description": "Named DSH teams for Codex with multi-level delegation, agent-controlled reports, direct questions, file attribution, and managed lifetimes.",
+  "description": "Named DSH, Claude Code and Codex subagents with per-chat isolation, explicit reports and idle process release.",
   "homepage": "https://github.com/XianYuLSya/FutureAide-Control#readme",
   "repository": {
     "type": "git",

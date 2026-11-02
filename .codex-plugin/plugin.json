@@ -1,15 +1,15 @@
 {
   "name": "futureaide-control",
-  "version": "0.5.7",
-  "description": "Named DSH teams for Codex with multi-level delegation, agent-controlled reports, direct questions, file attribution, and managed lifetimes.",
+  "version": "0.6.0",
+  "description": "Named DSH, Claude Code and Codex subagents with per-chat isolation, explicit reports and idle process release.",
   "author": {
     "name": "FutureAide"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "FutureAide Control · DSH Control",
-    "shortDescription": "按名字安排 DSH 团队，多层委派、主动汇报和整树监工。",
-    "longDescription": "为每个 Codex 聊天建立独立的 DSH 子代理名单，自动使用当前项目路径。按名字派活与答疑，DSH 助手可继续安排多层下属；查看整棵树的任务、文件归属和对话，仅DSH主动提交的汇报、提问和最终交付回到原聊天，普通轮次结束保持安静。一次性任务交付后清理本机受管树，长期代理保留上下文供复用。适用于 Windows Codex Desktop 与 DSH Desktop，需 Node.js 24.14 或更高版本。QQ 交流群：259109974。",
+    "displayName": "FutureAide Control",
+    "shortDescription": "按名字调用 DSH、Claude Code 和 Codex 子代理。",
+    "longDescription": "Codex 与 Claude Code 双向派单，自动绑定当前聊天、项目和 FaSwitch 档案。复用桌面登录与档案代理，按名字交流、答疑、读取文件修改和接收主动报告。长期代理按需恢复，一次性代理交付后退出名单；每轮结束释放执行进程。保留 Codex 调用 DSH 及 DSH 多层委派。需 Windows、Node.js 24.14 或更高版本。",
     "developerName": "FutureAide",
     "category": "Productivity",
     "capabilities": [
@@ -17,9 +17,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "创建一次性画图助手，为当前项目生成中文架构图",
-      "安排一个 DSH 团队长，自行分配下属并汇总当前项目的架构和模块说明",
-      "查看当前聊天的 DSH 团队、下属任务和文件修改"
+      "安排一个 Claude Code 助手检查当前项目",
+      "让 Codex 助手完成当前项目的修改并报告结果",
+      "查看当前聊天的代理任务和文件修改"
     ]
   },
   "mcpServers": "./.mcp.json"

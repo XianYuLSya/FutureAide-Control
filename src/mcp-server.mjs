@@ -205,7 +205,8 @@ export function makeServer(control, { configPath, controlFactory = createControl
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const diagnostics = createMcpDiagnostics();
-  const server = process.env.FUTUREAIDE_LEGACY_TOOLS === '1' ? makeServer() : makeScopedServer({ diagnostics });
+  const server = process.env.FUTUREAIDE_LEGACY_TOOLS === '1' ? makeServer()
+    : (await import('./mutual-server.mjs')).makeMutualServer({ diagnostics });
   const transport = new StdioServerTransport();
   diagnostics?.attach(transport);
   await server.connect(transport);

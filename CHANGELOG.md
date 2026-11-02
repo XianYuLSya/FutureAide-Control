@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.6.0 — 2026-11-02 · Claude Code 与 Codex 双向子代理
+
+- 同一套名字工具新增 runtime=claude/codex；各聊天和各层受管代理独立名单，自动使用当前项目。
+- 复用 FaSwitch 对应档案的 Claude Desktop Code 授权、Codex 账号及代理；不启动额外登录。
+- 支持短回执、忙时排队、提问答复、显式报告、长期接续、每轮进程释放和一次性退役。
+- 为原生 Claude Code 安装 SessionStart 身份钩子与 MCP；完整报告由 wait_agents 收取。原生 Claude 空闲聊天的后台唤醒尚不可用。
+- Codex → DSH 保留原服务和状态；运行入口统一，旧维护工具仍由 FUTUREAIDE_LEGACY_TOOLS 显式开启。
+
 ## 0.5.7 — 2026-11-01 · 默认模型跟随与派单去重
 
 - 托管代理每次新任务、补充与回答接续采用 DSH 当前默认供应商、模型和推理档位；旧代理创建时保存的模型不再覆盖当前默认设置。

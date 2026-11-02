@@ -1,9 +1,19 @@
 ---
 name: futureaide-control
-description: Use named DSH subagents in the current Codex chat and project. Create one-shot or persistent helpers, assign work, answer their questions, inspect progress and file changes, and remove completed sessions.
+description: Use named DSH, Claude Code and Codex subagents in the current calling chat and project. Create one-shot or persistent helpers, assign work, answer their questions, inspect progress and file changes, and remove completed sessions.
 ---
 
 # FutureAide Control
+
+Use the same futureaide_* tools for named DSH, Claude Code and Codex helpers. On create, runtime="claude" selects Claude Code and runtime="codex" selects Codex; omission selects DSH in Codex Desktop and Codex in Claude. Subsequent calls use only the name. Every caller and every managed child has a separate roster in the same project. The plugin reuses the bound FaSwitch profile's existing desktop authorization and proxy; never initiate a separate CLI login or ask the model to supply credentials.
+
+For Claude/Codex helpers, only explicit report_parent / ask_parent messages reach the immediate parent. Ordinary output and turn completion do not finish the task. Before final=true, finish owned children and consume queued input. A managed helper may delegate further and should stay responsible for its subtree.
+
+Native Claude Code callers MUST receive their children's reports with futureaide_wait_agents and continue waiting while assigned work remains. Wait returns complete reports and confirms receipt. Do not end your own turn just because dispatch was accepted. A native Claude chat that has already ended cannot currently be woken by the plugin; resume that same chat to collect reports. Managed parents can resume automatically from queued child reports. Codex desktop parents receive explicit reports through their original chat.
+
+Each CLI turn releases its process. Persistent helpers resume their private session when next addressed. Once helpers retire after final receipt and process/tree settlement: their D-drive data moves to clean, leaving project outputs intact. Never delete or move C-drive data. Use list for current task and observed changes; inspect only for detailed supervision.
+
+The following DSH-specific rules continue to apply when runtime=dsh.
 
 Use this plugin's `futureaide_*` MCP tools for user-authorized delegated work in DSH. The installed service automatically binds the calling Codex chat and its current project. Each chat has its own list; the same name in another chat is unrelated.
 

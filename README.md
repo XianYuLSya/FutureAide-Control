@@ -1,8 +1,8 @@
-![FutureAide Control — DSH Control](assets/banner.svg)
+![FutureAide Control — Named agents](assets/banner.svg)
 
-# FutureAide Control · DSH Control
+# FutureAide Control
 
-让 Codex 按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务。每个 Codex 聊天有自己的代理名单，插件自动绑定项目路径、会话身份和回包目标。
+让 Codex、Claude Code 按名字安排子代理，在当前项目中写代码、画图和整理文档。Codex 可以调用 DSH 或 Claude Code，Claude Code 可以调用 Codex；每个聊天有独立名单，项目路径、内部身份和回包目标由插件绑定。
 
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：DSH 的问题回到原聊天，Codex 按名字回答；由助手显式调用 `report_parent` 决定何时回包，正文只转发它提交的内容。
@@ -10,7 +10,7 @@
 - **随时监工**：列表显示各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
 - **管理生命周期**：一次性任务显式 final 报告送达且整树收尾后清除会话；长期代理保留上下文，按名字继续使用。
 
-0.5 的默认入口是 Codex Desktop 插件，无需填写内部 ID 或创建传信 txt。0.5.7 让托管代理的每次新派单、补充和回答接续跟随 DSH 当前默认供应商、模型与推理档位，不再被创建时的旧配置锁住；实际模型相同就跳过重复选模，并复用本次绑定状态中的会话游标。保留模型失败原因显示、定点读取、闲置释放与原请求恢复。版本变化见 [CHANGELOG](CHANGELOG.md)。
+0.6.0 新增 Claude Code 与 Codex 双向调用，复用 FaSwitch 对应档案的现有桌面登录和代理。保留 DSH 的名字式工具、默认模型跟随、定点读取与闲置释放。版本变化见 [CHANGELOG](CHANGELOG.md)。
 
 ## 安装
 
@@ -42,9 +42,42 @@ futureaide_status({})
 
 从 0.4 升级到 0.5 前，先让正在运行的任务完成。需要保留在途任务升级时，还须按原任务身份切换后台 `scoped-worker`；仅重新加载 MCP 不会替换已经启动的监工进程，也不要重新派发任务来代替迁移。
 
-宿主只支持 DSH。未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；不再发现或连接旧 FutureAide 应用，不读取其 shell、端口或启动日志，也不使用旧应用环境变量覆盖宿主。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
+DSH 宿主适配只连接 DSH 应用。未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；不再发现或连接旧 FutureAide 应用，不读取其 shell、端口或启动日志，也不使用旧应用环境变量覆盖宿主。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
 
 维护 CLI 默认使用此安装目录的 `.runtime/config.json`；`--config` 和配置环境变量可显式选择其他配置。桌面桥接若已绑定不同凭据或托管状态目录，安装会报告冲突并保留原绑定；只有确定要迁移时才使用 `desktop-host-install --rebind` 或 `connect-desktop.ps1 -Rebind`。
+
+## Codex 与 Claude Code 双向调用
+
+在 FaSwitch 的账号档案中打开并登录 Codex 与 Claude Desktop 的 Code。安装时增加 `-Claude`：
+
+```powershell
+.\install.ps1 -Claude
+```
+
+安装器将 MCP 和 SessionStart 身份钩子写入当前 Claude 档案。Claude Desktop 新开的 Code 会话会自动识别项目与会话；已有 Codex 聊天重载插件后使用新增参数。无需再登录一个独立 CLI，也不用填写内部会话 ID 或代理地址。
+
+Codex 调用 Claude：
+
+```text
+futureaide_create_agent({name: "代码助手", lifetime: "persistent", runtime: "claude"})
+futureaide_send_agent({name: "代码助手", message: "检查当前项目的错误处理，给出修改建议。完成后 report_parent，final=true。"})
+```
+
+Claude 调用 Codex：
+
+```text
+futureaide_create_agent({name: "Codex助手", lifetime: "once", runtime: "codex"})
+futureaide_send_agent({name: "Codex助手", message: "阅读当前项目并汇总入口文件；完成后 report_parent，final=true。"})
+futureaide_wait_agents({names: ["Codex助手"], timeout_seconds: 30})
+```
+
+创建时选择运行端，后续只用名字。Codex Desktop 默认创建 DSH；Claude 默认创建 Codex。运行中的补充先排队。受管代理可以继续创建下级，每层名单独立，下级向直属父级报告。
+
+普通输出不回包。Codex 桌面父级收到显式报告时自动续起；原生 Claude Code 父级通过 `wait_agents` 收取完整报告和问题，应在本轮等待子任务完成。原生 Claude 聊天已经结束时，当前版本没有后台唤醒入口，需在该聊天继续一次。插件创建的受管父级可由下级报告排队接续。
+
+每个 CLI 回合结束后释放执行进程。长期代理保存私有会话，下一次按名字恢复；一次性代理在 final 被收取、进程及下级收尾后移出名单，D 盘私有数据移到 `clean/`，项目产物保留。文件变更来自成功的文件工具结果；命令行写入的归属可能不完整。
+
+账号代理固定使用创建时的 FaSwitch 档案。Claude 读取该档案 Desktop 的当前 Code 授权，Codex 从该档案授权建立独立的临时运行目录；每轮结束清空临时授权文件，保留同账号有效的授权刷新。子进程使用档案 HTTP 代理，排除继承的 API 密钥及代理覆盖。账号身份变化会报错，凭据不会进入任务正文、回包或仓库。账号模式当前支持 Windows FaSwitch；DSH 网络仍由 DSH 自己管理。Claude → DSH 暂未接入。
 
 ## 单代理：完成一次画图任务
 
@@ -170,7 +203,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 ## 维护与兼容
 
-默认名字式工具依赖本机 Codex Desktop 的可信聊天上下文和回传通道。其他 MCP 客户端，以及仅有 DSH web/tui profile 的环境，需要相应适配；它们不具备这里描述的默认接入体验。
+名字式工具通过 Codex Desktop 的可信上下文、Claude Code 的 SessionStart 钩子或受管进程身份绑定调用聊天。其他 MCP 客户端和仅有 DSH web/tui profile 的环境仍需适配。
 
 原生会话清理支持上述 DSH 版本的 JSONL 会话、项目索引和派生缓存；不支持的存储后端会返回清理失败。整树清理支持本机原生 one-shot / continuable 下属；外部托管的下属会明确报告不支持自动清理。文件观测会注明覆盖范围；当前派单接口使用文字，图片附件尚不是一等输入参数。
 

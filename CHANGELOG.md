@@ -7,7 +7,7 @@
 - 增加 agent 列表摘要：保留全部 items，移除重复的完整 result/coverage/tree 载荷，文件与 tree 节点限量并标记截断。
 - 修复 dispatcher 重注册与就绪：同 hostKey 的新 native session 刷新 nativeSessionId，进程重启可显式 replace；status 以 host 记录/profile/workspace/binding + 5 分钟 lastSeenAt 心跳判断，跨调用者可用；host_register/receive/ack/delivery_ack 拒绝 agent_context，managed child 不能抢占 dispatcher。
 - 保留 Codex Desktop → DSH；once 在原生 C 盘清理路径未满足前继续在创建前拒绝。
-- 真实验收：首轮 root→Claude native→Codex native→Claude 汇总→root 及提问答复通过；二轮同组复用通过；late-ack 在 `req_fd…` accepted 后回声校验为 idle/taskcompleted，`BLUE_REUSE_OK` delivered，沿用同一 native handle；`src/cli-agents` 定向 36/36 PASS，summary 2/2 完成。发布候选定向测试 118/118 PASS；源码已冻结，等待独立验收后发布。
+- 真实验收：首轮 root→Claude native→Codex native→Claude 汇总→root 及提问答复通过；二轮同组复用通过；late-ack 在 `req_fd…` accepted 后回声校验为 idle/taskcompleted，`BLUE_REUSE_OK` delivered，沿用同一 native handle；`src/cli-agents` 定向 36/36 PASS，summary 2/2 完成。发布候选定向测试 118/118 PASS；独立审查 PASS，已发布并部署，发布提交 `9a62d952dd6d2024000409a295305c1c7e67bbe9`。
 
 ## 0.6.3 — 2026-11-02 · 清理 Codex CLI 死代码并明确桌面边界
 

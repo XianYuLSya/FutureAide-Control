@@ -45,30 +45,47 @@ export async function invokeDesktopTool(contextThreadId, name, args, { discover 
 
 // Python's standard TOML parser handles quoted profile keys and TOML escaping.
 // Only the effective model fields leave this subprocess; credentials never do.
-const CONFIG_SCRIPT = String.raw`import json,sys,pathlib,tomllib
+// Current profile format and layer order:
+// https://learn.chatgpt.com/docs/config-file/config-advanced#profiles
+const CONFIG_SCRIPT = String.raw`import json,sys,pathlib,tomllib,re
 p=json.load(sys.stdin)
 home=pathlib.Path(p['home']); cwd=pathlib.Path(p['workspace']).resolve()
 def read(f):
  return tomllib.loads(f.read_text(encoding='utf-8-sig')) if f.is_file() else {}
 c=read(home/'config.toml'); sources=[str(home/'config.toml')]
-trusted=False
+if c.get('profile'): raise ValueError('Legacy top-level profile selection is unsupported by current Codex')
+matches=[]
 for k,v in c.get('projects',{}).items():
  try:
-  if (cwd==pathlib.Path(k).resolve() or pathlib.Path(k).resolve() in cwd.parents) and v.get('trust_level')=='trusted': trusted=True
+  root=pathlib.Path(k).resolve()
+  if cwd==root or root in cwd.parents: matches.append((len(root.parts),root,v.get('trust_level')))
  except (OSError,ValueError): pass
+match=max(matches,key=lambda x:x[0]) if matches else None
+trusted=match is not None and match[2]=='trusted'
+markers=c.get('project_root_markers',['.git'])
+project_root=next((d for d in [cwd,*cwd.parents] if any((d/m).exists() for m in markers)),match[1] if match else cwd)
+profile=p.get('profile')
+if profile:
+ if re.fullmatch(r'[A-Za-z0-9_-]+',profile) is None: raise ValueError('Invalid Codex profile name')
+ f=home/(profile+'.config.toml')
+ if not f.is_file(): raise ValueError('Selected Codex profile does not exist')
+ c={**c,**read(f)}; sources.append(str(f))
 if trusted:
- for d in reversed([cwd,*cwd.parents]):
+ dirs=[]
+ for d in [cwd,*cwd.parents]:
+  dirs.append(d)
+  if d==project_root: break
+ for d in reversed(dirs):
   f=d/'.codex'/'config.toml'
   if f.is_file() and f.resolve()!=(home/'config.toml').resolve():
-   n=read(f); c={**c,**n,'profiles':{**c.get('profiles',{}),**n.get('profiles',{})}}; sources.append(str(f))
-profile=c.get('profile')
-if profile:
- if profile not in c.get('profiles',{}): raise ValueError('Selected Codex profile does not exist')
- c={**c,**c['profiles'][profile]}
+   n=read(f)
+   for key in ['model','model_reasoning_effort']:
+    if key in n: c[key]=n[key]
+   sources.append(str(f))
 print(json.dumps({'model':c.get('model'),'provider':c.get('model_provider','openai'),'reasoningEffort':c.get('model_reasoning_effort'),'sources':sources,'profile':profile}))
 `;
 
-export async function readDefaultModel({ home, workspace, python, readEffectiveConfig } = {}) {
+export async function readDefaultModel({ home, workspace, python, profile, readEffectiveConfig } = {}) {
   const bundledPython = path.join(homedir(), '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'python', 'python.exe');
   python ??= process.env.FUTUREAIDE_PYTHON ?? (process.platform === 'win32' && existsSync(bundledPython)
     ? bundledPython : process.platform === 'win32' ? 'py' : 'python3');
@@ -77,7 +94,7 @@ export async function readDefaultModel({ home, workspace, python, readEffectiveC
       if (error) return reject(fail('codex-default-model-unresolved', 'Could not parse the current Codex configuration.'));
       try { resolve(JSON.parse(stdout)); } catch (error) { reject(error); }
     });
-    child.stdin.end(JSON.stringify({ home, workspace }));
+    child.stdin.end(JSON.stringify({ home, workspace, profile }));
   });
   if (!value?.model || typeof value.reasoningEffort !== 'string') throw fail('codex-default-model-unresolved',
     'Codex model and reasoning defaults must both be resolved; an effective-config reader is required when either is implicit.');
@@ -181,7 +198,8 @@ export function createCodexHost(options = {}) {
       if (!options.destroyViaUi) missing.push('native-owned-tree-delete');
       return { identity: { application: 'codex-desktop', home }, missing };
     },
-    readDefaultModel: input => readDefaultModel({ home, ...input, readEffectiveConfig: options.readEffectiveConfig, python: options.python }),
+    readDefaultModel: input => readDefaultModel({ home, ...input, readEffectiveConfig: options.readEffectiveConfig,
+      python: options.python, profile: options.profile }),
     readCurrentModel: id => (options.readSessionModel ?? readCodexSessionModel)(id),
     async createFirstTurn(input) {
       const contextThreadId = options.contextThreadId ?? await options.anchorResolver?.({ workspace: input.workspace });

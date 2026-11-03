@@ -27,14 +27,16 @@ test('native transcript cursor admits exact marker, keeps partial line and attri
   assert.equal(next.hasMore, false);
 });
 
-test('real TOML parser resolves trusted project and quoted profile without exposing unrelated config', async () => {
+test('current profile files precede trusted project overrides; project cannot change provider/profile', async () => {
   const dir = directory(), home = path.join(dir, 'home'), workspace = path.join(dir, 'workspace');
   await mkdir(home, { recursive: true }); await mkdir(path.join(workspace, '.codex'), { recursive: true });
-  await writeFile(path.join(home, 'config.toml'), `model = "base"\nprofile = "my.profile"\n[projects.${JSON.stringify(workspace.replaceAll('\\', '/'))}]\ntrust_level = "trusted"\n[profiles."my.profile"]\nmodel = "profile-a"\nmodel_reasoning_effort = "high"\n`);
-  await writeFile(path.join(workspace, '.codex/config.toml'), '[profiles."my.profile"]\nmodel = "project-b"\nmodel_reasoning_effort = "max"\n');
-  const actual = await readDefaultModel({ home, workspace });
+  await writeFile(path.join(home, 'config.toml'), `model = "base"\n[projects.${JSON.stringify(workspace.replaceAll('\\', '/'))}]\ntrust_level = "trusted"\n`);
+  await writeFile(path.join(home, 'review.config.toml'), 'model = "profile-a"\nmodel_reasoning_effort = "high"\n');
+  await writeFile(path.join(workspace, '.codex/config.toml'), 'model = "project-b"\nmodel_reasoning_effort = "max"\nmodel_provider = "ignored"\nprofile = "ignored"\n');
+  const actual = await readDefaultModel({ home, workspace, profile: 'review' });
   assert.equal(actual.model, 'project-b'); assert.equal(actual.reasoningEffort, 'max');
-  assert.equal(actual.sources.length, 2);
+  assert.equal(actual.provider, 'openai'); assert.equal(actual.profile, 'review');
+  assert.equal(actual.sources.length, 3);
 });
 
 test('first native creation uses verified anchor and exact saved workspace, never fork', async () => {

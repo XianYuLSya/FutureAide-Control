@@ -15,12 +15,11 @@
 // process. The loopback tool service lives in this process, so any open managed
 // Claude session keeps it alive; a DSH-only installation still goes to zero
 // background processes.
-import { watch } from 'node:fs';
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
 import { backgroundBatch, pollSleeping, scanSleeping } from './idle-monitor.mjs';
-import { monitorDirectories, MONITOR_LEASE, MONITOR_READY_LEASE } from './shared-monitor.mjs';
+import { createDirectoryWatchers, monitorDirectories, MONITOR_LEASE, MONITOR_READY_LEASE } from './shared-monitor.mjs';
 import { closeReportService, ensureReportService, reportPort, rosterIdentity } from './report-endpoint.mjs';
 
 const MIN_ROUND_MS = 250;      // never poll faster than this
@@ -36,7 +35,7 @@ const config = await loadConfig(values['--config']);
 const hostDirectory = config.managedStateDirectory ?? path.join(path.dirname(config.hostBridgeFile), 'managed-host');
 const service = createScopedAgents(config), store = service.store, holder = values['--lease'];
 
-let watcher, watchedKey = '', wake, heartbeat, running = true, signalled = false, lastDelivery = 0;
+let wake, heartbeat, running = true, signalled = false, lastDelivery = 0;
 let idleSince, lastVersion = store.dataVersion(), rounds = 0;
 // Measurement aid only: FUTUREAIDE_MONITOR_TRACE=1 prints one line per round so a
 // test or a manual run can count rounds without reading the database.
@@ -48,17 +47,9 @@ const deliveries = backgroundBatch(() => pollSleeping(store, agentId => service.
   (agentId, taskId) => service.wake(agentId, taskId), ownsLease), signal);
 function signal() { if (wake) wake(); else signalled = true; }
 
-function attach(directories) {
-  const key = directories.join('|');
-  if (watcher && key === watchedKey) return;
-  watcher?.close();
-  watcher = undefined;
-  watchedKey = key;
-  if (!directories.length) return;
-  try { watcher = watch(directories.length === 1 ? directories[0] : directories, signal); }
-  catch { try { watcher = watch(directories[0], signal); } catch { watcher = undefined; } }
-  watcher?.on('error', () => { watcher?.close(); watcher = undefined; signal(); });
-}
+// fs.watch accepts a single path, so every watched directory owns one watcher.
+const watchers = createDirectoryWatchers(signal);
+function attach(directories) { return watchers.update(directories); }
 
 function sleepUntilSignalled(timeoutMs) {
   if (timeoutMs <= 0) { signalled = false; return Promise.resolve(); }
@@ -120,7 +111,7 @@ try {
     if (busy || external) idleSince = undefined;
     else idleSince ??= Date.now();
     rounds += 1;
-    trace(`round=${rounds} busy=${busy} external=${external} idleMs=${idleSince === undefined ? 0 : Date.now() - idleSince} watched=${watchedKey.split('|').length}`);
+    trace(`round=${rounds} busy=${busy} external=${external} idleMs=${idleSince === undefined ? 0 : Date.now() - idleSince} watched=${watchers.size}`);
     const quiet = !busy && !external && !store.hasSleeping() && !hasManagedClaude();
     if (quiet && Date.now() - idleSince >= IDLE_EXIT_MS) {
       store.releaseLease(MONITOR_READY_LEASE, holder);
@@ -136,7 +127,7 @@ try {
 } finally {
   await deliveries.drain();
   clearInterval(heartbeat);
-  watcher?.close();
+  watchers.close();
   await closeReportService();
   store.releaseLease(MONITOR_READY_LEASE, holder);
   store.releaseLease(MONITOR_LEASE, holder);

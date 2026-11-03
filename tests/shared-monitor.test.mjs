@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { resolve } from 'node:path';
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import path, { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { RosterStore } from '../src/roster-store.mjs';
-import { ensureSharedMonitor, monitorAlive, monitorDirectories, monitorSpawn } from '../src/shared-monitor.mjs';
+import { createDirectoryWatchers, ensureSharedMonitor, monitorAlive, monitorDirectories, monitorSpawn } from '../src/shared-monitor.mjs';
 
 const LEASE = 'monitor-00000000-0000-4000-8000-000000000000';
 const config = configFile => ({ configFile });
@@ -87,6 +89,26 @@ test('the listener reports a pid only after the operating system confirmed the s
   assert.equal(detached, true);
   assert.throws(() => monitorSpawn('D:/fixture.json', 'agent-1', () => child), /Invalid shared monitor lease/);
   assert.throws(() => monitorSpawn(undefined, LEASE, () => child), /private configuration path/);
+});
+
+test('two watched directories each deliver their own event', async () => {
+  const base = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '.runtime', 'tests');
+  await mkdir(base, { recursive: true });
+  const root = await mkdtemp(path.join(base, 'watch-'));
+  const first = path.join(root, 'managed-host');
+  const second = path.join(root, 'claude-sessions');
+  await mkdir(first); await mkdir(second);
+  const seen = [];
+  const watchers = createDirectoryWatchers(directory => seen.push(directory));
+  try {
+    assert.equal(watchers.update([first, second]), 2, 'one watcher per directory');
+    await writeFile(path.join(first, 'a.json'), '{}');
+    await writeFile(path.join(second, 'b.json'), '{}');
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert.ok(seen.includes(first), `first directory delivered: ${seen.join(',')}`);
+    assert.ok(seen.includes(second), `second directory delivered: ${seen.join(',')}`);
+    assert.equal(watchers.update([first]), 1, 'a directory no longer wanted is closed');
+  } finally { watchers.close(); }
 });
 
 test('the watch set covers the DSH host, the Claude registry and every binding', () => {

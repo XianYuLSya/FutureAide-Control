@@ -7,13 +7,49 @@
 // reads them directly: 'idle-monitor' is the shared monitor, not a per-agent one.
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { statSync } from 'node:fs';
+import { statSync, watch } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const MONITOR_LEASE = 'idle-monitor';
 export const MONITOR_READY_LEASE = 'idle-monitor:ready';
+
+/**
+ * One watcher per directory. fs.watch does not accept an array of paths, so each
+ * directory gets its own watch and the set is kept in step with what the listener
+ * currently cares about: new directories are watched, dropped ones are closed,
+ * and close() releases everything. Watchers are non-persistent, so they never keep
+ * the process alive on their own.
+ */
+export function createDirectoryWatchers(onEvent, { watchImpl = watch } = {}) {
+  const watchers = new Map();
+  return {
+    update(directories) {
+      const wanted = new Set(directories);
+      for (const [directory, watcher] of watchers) {
+        if (wanted.has(directory)) continue;
+        watcher.close();
+        watchers.delete(directory);
+      }
+      for (const directory of wanted) {
+        if (watchers.has(directory)) continue;
+        try {
+          // The listener is told which directory changed, not the raw event type.
+          const watcher = watchImpl(directory, { persistent: false }, () => onEvent(directory));
+          watcher.on('error', () => { watcher.close(); watchers.delete(directory); onEvent(directory); });
+          watchers.set(directory, watcher);
+        } catch { /* A directory that cannot be watched is simply skipped. */ }
+      }
+      return watchers.size;
+    },
+    get size() { return watchers.size; },
+    close() {
+      for (const watcher of watchers.values()) watcher.close();
+      watchers.clear();
+    },
+  };
+}
 
 /**
  * Directories whose file events are worth waking for. Every one of them belongs

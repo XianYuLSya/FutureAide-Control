@@ -1065,7 +1065,9 @@ export async function probeClaudeHost({ env = process.env, driver = createNullDr
       destroy: ui.available ? 'verified-surface' : 'unavailable',
       resume: { live: 'verified-surface', closed: ui.available ? 'unverified' : 'unavailable' },
       readDefaultModel: model.verified ? 'verified-surface' : 'unavailable',
-      selectModel: ui.available ? 'verified-surface' : 'unavailable',
+      // The control is read back, but the option list inside it has not been
+      // exercised against a live app, so the capability is not claimed yet.
+      selectModel: ui.available ? 'unverified' : 'unavailable',
       nativeInbox: 'separate-module',
     },
     deepLinks: {

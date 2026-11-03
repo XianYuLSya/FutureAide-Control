@@ -539,7 +539,7 @@ test('the probe states what is really available', async () => {
     assert.equal(withUi.sessions.live, 1);
     assert.equal(withUi.capabilities.createFirstTurn, 'verified-surface');
     assert.equal(withUi.capabilities.readDefaultModel, 'verified-surface');
-    assert.equal(withUi.capabilities.selectModel, 'verified-surface');
+    assert.equal(withUi.capabilities.selectModel, 'unverified', 'a control that was never exercised on a live app is not claimed');
     assert.equal(withUi.capabilities.destroy, 'verified-surface');
     assert.equal(withUi.deepLinks.newSession, 'prefill-only');
 

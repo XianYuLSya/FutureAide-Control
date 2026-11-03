@@ -434,23 +434,41 @@ try {
     'reveal' {
       $revealed = $false
       $method = $null
+      $attempted = @()
+      $title = [string]$payload.title
+      function Test-OnTitle([string]$wanted) {
+        if (-not $wanted) { return $true }
+        $signature = Get-PageSignature $window
+        return $signature.documentName.StartsWith($wanted)
+      }
       $hostSessionId = [string]$payload.hostSessionId
       if ($payload.allowDeepLink -and $hostSessionId -match '^local_[A-Za-z0-9-]{1,64}$') {
         $url = 'claude://code/continue?session=' + [uri]::EscapeDataString($hostSessionId)
         $via = Open-DeepLink $url ([string]$payload.launchVia) $window.Pid $window.Path
-        $method = 'deep-link-continue-' + $via
         Start-Sleep -Milliseconds 1800
-        $revealed = $true
-      } elseif ($payload.title) {
-        $titlePattern = '^' + (Unescape-Pattern ([string]$payload.title))
-        $titles = Find-Elements $web.Element $titlePattern 'Button'
-        if ($titles.Count -eq 0) { throw "session-entry-not-found:$($payload.title)" }
-        Invoke-Element $titles[0] | Out-Null
-        $method = 'sidebar-entry'
-        $revealed = $true
+        $attempted += ('deep-link-continue-' + $via)
+        if (Test-OnTitle $title) { $revealed = $true; $method = 'deep-link-continue-' + $via }
       }
-      if (-not $revealed) { throw 'no-reveal-strategy' }
-      Write-Result @{ ok = $true; value = @{ revealed = $true; method = $method } }
+      if (-not $revealed -and $title) {
+        # The sidebar entry is the reliable path when the link is not consumed.
+        $titlePattern = '^' + (Unescape-Pattern $title) + '($|\s)'
+        $entries = @(Find-Elements $web.Element $titlePattern 'Button' |
+          Where-Object { $_.Current.Name -notmatch ('\s*' + [char]0x7684 + [char]0x66F4 + [char]0x591A + [char]0x9009 + [char]0x9879 + '$') })
+        if ($entries.Count -eq 0) { throw "session-entry-not-found:$title" }
+        Focus-Window $window.Element
+        $null = Invoke-ElementByMouse $entries[0]
+        Start-Sleep -Milliseconds 1200
+        $attempted += 'sidebar-entry'
+        if (Test-OnTitle $title) { $revealed = $true; $method = 'sidebar-entry' }
+      }
+      if (-not $revealed) {
+        Write-Result @{ ok = $false; code = 'reveal-not-confirmed'
+          message = ('the window did not reach ' + $title + '; attempts: ' + ($attempted -join ', '))
+          value = @{ attempts = $attempted; documentName = (Get-PageSignature $window).documentName } }
+        break
+      }
+      Write-Result @{ ok = $true; value = @{ revealed = $true; method = $method; attempts = $attempted
+        documentName = (Get-PageSignature $window).documentName } }
     }
     'click-button' {
       $pattern = [string]$payload.namePattern
@@ -557,32 +575,53 @@ try {
           if ($matched.Count -ge 1) { $anchors = $matched; break }
         }
       }
+      $attempted = @()
+      # 1) the app's own sidebar action for this folder, with a real click: this
+      #    control does not answer the automation Invoke pattern.
+      $opened = $false
       if ($anchors.Count -eq 1) {
-        Invoke-Element $anchors[0] | Out-Null
-        Start-Sleep -Milliseconds 1200
-        $strategy = 'sidebar-folder-new-session'
-      } elseif ($payload.allowDeepLink) {
+        Focus-Window $window.Element
+        $null = Invoke-ElementByMouse $anchors[0]
+        Start-Sleep -Milliseconds 1800
+        $attempted += 'sidebar-folder-new-session'
+        $probeSidebar = Get-PageSignature $window
+        $opened = ($probeSidebar.hasComposer -and $probeSidebar.messages -eq 0)
+        if ($opened) { $strategy = 'sidebar-folder-new-session' }
+      }
+      # 2) the renderer's own code-new link (prefill only), protocol first and the
+      #    context-verified executable as the second attempt.
+      if (-not $opened -and $payload.allowDeepLink) {
         $query = 'claude://code/new?src=external&folder=' + [uri]::EscapeDataString($workspace)
         $prefillViaLink = $(if ($null -ne $payload.prefill) { [bool]$payload.prefill } else { [bool]$prompt })
         if ($prefillViaLink -and $prompt) { $query += '&q=' + [uri]::EscapeDataString($prompt) }
         $via = Open-DeepLink $query ([string]$payload.launchVia) $window.Pid $window.Path
         Start-Sleep -Milliseconds 2200
-        $strategy = 'deep-link-code-new-' + $via
+        $attempted += ('deep-link-code-new-' + $via)
         $probeAfter = Get-PageSignature $window
-        if (-not $probeAfter.hasComposer -and $payload.allowExecutable) {
+        $opened = ($probeAfter.hasComposer -and $probeAfter.messages -eq 0)
+        if ($opened) { $strategy = 'deep-link-code-new-' + $via }
+        if (-not $opened -and $payload.allowExecutable) {
           try {
             $via2 = Open-DeepLink $query 'executable' $window.Pid $window.Path
             Start-Sleep -Milliseconds 2200
-            $strategy = $strategy + '+executable'
-          } catch { }
+            $attempted += ('deep-link-code-new-' + $via2)
+            $probeExec = Get-PageSignature $window
+            $opened = ($probeExec.hasComposer -and $probeExec.messages -eq 0)
+            if ($opened) { $strategy = $strategy + '+executable' }
+          } catch { $attempted += 'executable-refused' }
         }
-      } else {
+      }
+      # 3) last resort: the global new-session control.
+      if (-not $opened -and -not $payload.allowDeepLink) {
         $fallback = Find-Elements $web.Element $newPattern 'Button'
         if ($fallback.Count -eq 0) { throw 'new-session-control-not-found' }
-        Invoke-Element $fallback[0] | Out-Null
-        Start-Sleep -Milliseconds 1000
+        Focus-Window $window.Element
+        $null = Invoke-ElementByMouse $fallback[0]
+        Start-Sleep -Milliseconds 1500
+        $attempted += 'sidebar-new-session'
         $strategy = 'sidebar-new-session'
       }
+      $strategy = $(if ($strategy) { $strategy } else { 'none' })
       $after = Get-PageSignature $window
       if ($after.trustPrompt -and $payload.trustWorkspace) {
         # A fresh Claude Code page asks the app's own workspace-trust question.
@@ -600,6 +639,7 @@ try {
       $navigated = ($after.hasComposer -and $after.messages -eq 0 -and -not $after.trustPrompt)
       Write-Result @{ ok = $true; value = @{
         strategy = $strategy
+        attempted = $attempted
         workspace = $workspace
         folderLabel = $folderLabel
         navigated = $navigated

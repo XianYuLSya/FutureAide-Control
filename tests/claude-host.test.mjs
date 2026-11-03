@@ -202,8 +202,8 @@ test('a session counts as created only when a new record registers and the marke
 test('a new record with the wrong or duplicated marker is never reported as created', async () => {
   for (const [label, lines, reason] of [
     ['missing marker', [userLine('something else')], 'transcript-marker-count-0'],
-    ['duplicated marker', [userLine(markerLine('request-abc', 'fa-life-20261103-1630')),
-      userLine(markerLine('request-abc', 'fa-life-20261103-1630'))], 'transcript-marker-count-2'],
+    ['duplicated marker', [enqueueLine(`first\n\n${markerLine('request-abc', 'fa-life-20261103-1630')}`),
+      userLine(`a different second copy\n\n${markerLine('request-abc', 'fa-life-20261103-1630')}`)], 'transcript-marker-count-2'],
   ]) {
     const host1 = await host({ sessions: [] });
     const driver = uiDriver({ openNewSession: async () => { await host1.write(record(), lines); return { strategy: 'deep-link-code-new', prefilled: true }; } });
@@ -851,6 +851,7 @@ function pageDriver(initial, transitions) {
     },
     async revealSession(input) {
       calls.push(['revealSession', input]);
+      assert.ok(input.title, 'the restore names the session it wants back');
       state = { ...state, ...(transitions.reveal ?? {}) };
       return { revealed: true, method: 'deep-link-continue-protocol' };
     },
@@ -1040,5 +1041,90 @@ test('a stop states its scope instead of implying a tree wide cancel', async () 
     assert.equal(result.scope, 'session-turn');
     assert.equal(result.childrenMayContinue, true);
     assert.match(result.scopeNote, /background child/);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+
+test('one submission recorded twice (enqueue plus user echo) counts once', async () => {
+  const host1 = await host({ sessions: [] });
+  try {
+    const marker = markerLine('request-echo', 'fa-echo-20261104');
+    const body = `task text\n\n${marker}`;
+    // this is the real shape the host writes: the enqueue record and the user
+    // message it turns into carry the same text
+    await host1.write(record(), [enqueueLine(body), userLine(body)]);
+    const found = await findCreatedSession({ workspace: CWD, requestId: 'request-echo', bindingNonce: 'fa-echo-20261104' },
+      { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(found.nativeSessionId, SESSION);
+    assert.equal(found.submittedBy, 'enqueue');
+    const binding = await firstTurnBinding({ env: host1.env,
+      record: await resolveNativeSession(SESSION, { env: host1.env, isAlive: host1.isAlive }), marker });
+    assert.equal(binding.markerCount, 1, 'one submission');
+    assert.equal(binding.markerRecords, 2, 'two records for it');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+// ---------------------------------- first input ownership, not record counting
+
+test('the queue mirror grants ownership once and later renders never add to it', async () => {
+  const host1 = await host({ sessions: [] });
+  try {
+    const marker = markerLine('request-mirror', 'fa-mirror-20261104');
+    const body = `\n\n<pasted_content id="c4c3">\ntask\n\n${marker}\n</pasted_content>\n`;
+    await host1.write(record(), [
+      enqueueLine(body),
+      { type: 'queue-operation', operation: 'dequeue', timestamp: new Date().toISOString() },
+      userLine(body),
+      // the app later re-renders the same text inside a request blob
+      { type: 'api-request-blob', timestamp: new Date(Date.now() + 9000).toISOString(),
+        message: { role: 'user', content: [{ type: 'text', text: `<system-reminder>\n...${marker}` }] } },
+    ]);
+    const native = await resolveNativeSession(SESSION, { env: host1.env, isAlive: host1.isAlive });
+    const binding = await firstTurnBinding({ env: host1.env, record: native, marker });
+    assert.equal(binding.firstInput.kind, 'enqueue');
+    assert.equal(binding.firstInput.markerOccurrences, 1);
+    assert.equal(binding.firstInput.owned, true);
+    assert.equal(binding.mirrorFound, true, 'the user record is the same input, not a second one');
+    assert.equal(binding.markerCount, 1, 'one submission');
+    assert.equal(binding.laterMentions, 1, 'the request blob only mentions it');
+    const found = await findCreatedSession({ workspace: CWD, requestId: 'request-mirror', bindingNonce: 'fa-mirror-20261104' },
+      { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(found.nativeSessionId, SESSION);
+    assert.equal(found.submittedBy, 'enqueue');
+    assert.ok(found.submittedAt, 'the submission time comes from the opener record');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a marker that only appears later never grants first-turn ownership', async () => {
+  const host1 = await host({ sessions: [] });
+  try {
+    const marker = markerLine('request-late', 'fa-late-20261104');
+    await host1.write(record(), [
+      enqueueLine('the real first message without any marker'),
+      userLine('the real first message without any marker'),
+      userLine(`a later message that quotes ${marker}`),
+    ]);
+    const native = await resolveNativeSession(SESSION, { env: host1.env, isAlive: host1.isAlive });
+    const binding = await firstTurnBinding({ env: host1.env, record: native, marker });
+    assert.equal(binding.firstInput.hasMarker, false);
+    assert.equal(binding.firstInput.owned, false);
+    const found = await findCreatedSession({ workspace: CWD, requestId: 'request-late', bindingNonce: 'fa-late-20261104' },
+      { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(found, undefined, 'a later reference is not this session taking the request');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a marker twice inside the first input is not a clean ownership proof', async () => {
+  const host1 = await host({ sessions: [] });
+  try {
+    const marker = markerLine('request-twice', 'fa-twice-20261104');
+    await host1.write(record(), [enqueueLine(`odd payload\n\n${marker}\n\n${marker}`)]);
+    const native = await resolveNativeSession(SESSION, { env: host1.env, isAlive: host1.isAlive });
+    const binding = await firstTurnBinding({ env: host1.env, record: native, marker });
+    assert.equal(binding.firstInput.markerOccurrences, 2);
+    assert.equal(binding.firstInput.owned, false);
+    const found = await findCreatedSession({ workspace: CWD, requestId: 'request-twice', bindingNonce: 'fa-twice-20261104' },
+      { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(found, undefined);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

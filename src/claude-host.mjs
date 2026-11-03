@@ -306,10 +306,12 @@ export async function readTranscriptHead(file, { initialBytes = HEAD_INITIAL_BYT
 /**
  * Whether this session's first turn is the request this caller is looking for.
  *
- * The opener is matched against the exact request+binding marker, so a native
- * enqueue that already carries it counts as the first turn having been
- * submitted — which is what lets a binding be persisted before the assistant
- * has answered anything.
+ * Ownership is decided by the *first complete input* alone: the marker must
+ * appear exactly once inside it. The host records that same input twice — the
+ * queue-operation that carried it and the user message it becomes — and it also
+ * re-renders it later inside request blobs; neither is a second submission and
+ * neither can grant ownership on its own. The session id is the identity: this
+ * transcript belongs to exactly one native session.
  */
 export async function firstTurnBinding({ env = process.env, record, marker, deep = false }) {
   const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
@@ -320,7 +322,23 @@ export async function firstTurnBinding({ env = process.env, record, marker, deep
     .filter(event => event.type === 'user' || event.type === 'queue-operation')
     .map(event => event.enqueueText ?? event.text ?? '')
     .filter(text => text.length > 0);
-  const markerCount = inputs.filter(text => text.includes(marker)).length;
+  // The host records one submission twice: the queue-operation that carries the
+  // text and the user message it becomes. Those are the same submission, so the
+  // count is of distinct texts, while the raw record count stays for evidence.
+  const normalize = value => value.replace(/\s+/g, ' ').trim();
+  const markerTexts = inputs.filter(text => text.includes(marker));
+  const markerCount = new Set(markerTexts.map(normalize)).size;
+  const markerRecords = markerTexts.length;
+  // Ownership proof: the marker's occurrences inside the first input itself.
+  const openerText = head.firstInput?.text ?? '';
+  const openerOccurrences = openerText ? (openerText.split(marker).length - 1) : 0;
+  // The same input can appear as the queue record and the user message it becomes.
+  const openerNormalized = openerText ? normalize(openerText) : '';
+  const openerRecords = openerNormalized ? inputs.filter(value => normalize(value) === openerNormalized).length : 0;
+  const mirrorFound = openerRecords > 1;
+  const laterMentions = head.events
+    .filter(event => event.type !== 'user' && event.type !== 'queue-operation')
+    .filter(event => (event.enqueueText ?? event.text ?? '').includes(marker)).length;
   let deepCount;
   if (deep) {
     const { events } = await readTranscriptEvents(file);
@@ -330,12 +348,23 @@ export async function firstTurnBinding({ env = process.env, record, marker, deep
       .filter(text => text.includes(marker)).length;
   }
   const firstInput = head.firstInput
-    ? { ...head.firstInput, length: head.firstInput.text.length, hasMarker: head.firstInput.text.includes(marker) }
+    ? {
+      kind: head.firstInput.kind,
+      index: head.firstInput.index,
+      timestamp: head.firstInput.timestamp,
+      length: head.firstInput.text.length,
+      hasMarker: openerOccurrences > 0,
+      markerOccurrences: openerOccurrences,
+      owned: openerOccurrences === 1,
+    }
     : undefined;
   return {
     file,
     firstInput,
     markerCount,
+    markerRecords,
+    mirrorFound,
+    laterMentions,
     complete: !head.truncated,
     ...(deep ? { deepCount } : {}),
   };
@@ -619,7 +648,7 @@ export async function findCreatedSession({ workspace, requestId, bindingNonce },
   const matches = [];
   for (const record of candidates) {
     const binding = await firstTurnBinding({ env, record, marker });
-    if (binding.firstInput?.hasMarker) matches.push({ record, binding });
+    if (binding.firstInput?.owned) matches.push({ record, binding });
   }
   if (matches.length > 1) {
     throw fail('ambiguous-created-session',
@@ -628,10 +657,12 @@ export async function findCreatedSession({ workspace, requestId, bindingNonce },
   }
   if (!matches.length) return undefined;
   const [{ record, binding }] = matches;
+  // A genuinely repeated delivery shows up as a second distinct input carrying
+  // the marker; the queue mirror and later request blobs do not count.
   if (binding.markerCount !== 1) {
     throw fail('marker-not-unique',
-      `The request marker appears ${binding.markerCount} times in the opening of session ${record.nativeSessionId}.`,
-      { nativeSessionId: record.nativeSessionId, firstInput: binding.firstInput });
+      `The request marker appears in ${binding.markerCount} distinct inputs of session ${record.nativeSessionId}.`,
+      { nativeSessionId: record.nativeSessionId, firstInput: binding.firstInput, markerRecords: binding.markerRecords });
   }
   return {
     ...bindingOf(record),
@@ -640,6 +671,7 @@ export async function findCreatedSession({ workspace, requestId, bindingNonce },
     transcriptFile: binding.file,
     submittedBy: binding.firstInput?.kind,
     firstInput: binding.firstInput,
+    submittedAt: binding.firstInput?.timestamp,
     verifiedBy: ['first-input-marker-once'],
   };
 }
@@ -748,7 +780,7 @@ export async function createFirstTurn({
       const count = binding.markerCount;
       const file = binding.file;
       observed = { record, file, count, binding };
-      if (binding.firstInput?.hasMarker && count === 1) {
+      if (binding.firstInput?.owned && count === 1) {
         if (!bound && typeof onBound === 'function') {
           bound = true;
           try { await onBound(bindingOf(record)); }
@@ -1280,9 +1312,13 @@ export async function resolveAppAsar({ driver, env = process.env } = {}) {
     const probe = await driver.probe().catch(() => undefined);
     const executable = probe?.window?.executable;
     if (typeof executable === 'string' && executable.toLowerCase().endsWith('claude.exe')) {
-      const candidate = path.join(path.dirname(executable), '..', 'resources', 'app.asar');
-      const info = await stat(candidate).catch(() => null);
-      if (info?.isFile()) return { asar: path.resolve(candidate), source: 'running-app' };
+      // The executable lives in <app>/ and the archive in <app>/resources/, but a
+      // packaged build can also put resources one level up; both are checked.
+      for (const candidate of [path.join(path.dirname(executable), 'resources', 'app.asar'),
+        path.join(path.dirname(executable), '..', 'resources', 'app.asar')]) {
+        const info = await stat(candidate).catch(() => null);
+        if (info?.isFile()) return { asar: path.resolve(candidate), source: 'running-app' };
+      }
     }
   }
   return { asar: undefined, source: 'unavailable' };
@@ -1649,7 +1685,9 @@ export async function readDefaultModel({
     const draftView = await readViewStable(ui);
     const restore = async () => {
       if (!previous?.hostSessionId) return 'none';
-      const revealed = await ui.revealSession({ hostSessionId: previous.hostSessionId, allowDeepLink: true })
+      // The title is what the reveal verifies itself against; without it the
+      // sidebar fallback never runs and a swallowed deep link looks like success.
+      const revealed = await ui.revealSession({ hostSessionId: previous.hostSessionId, title: previous.name, allowDeepLink: true })
         .catch(() => undefined);
       const back = await readViewStable(ui);
       const marker = await sessionContentMarker({ env, record: previous });

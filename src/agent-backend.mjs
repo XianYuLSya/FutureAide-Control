@@ -10,11 +10,18 @@
 //                      logical session with zero model turns; a native session may
 //                      be established by the first deliver and mapped internally.
 //   beginTask(input)   {treeProtocol: 1, reportProtocol: 1, throughSeq?, currentModel?}
+//                      currentModel here is the real control read at task start.
 //   observe()          {sessionId, taskId, running, throughSeq, currentModel,
-//                      changes, coverage, questions[{id,state,message}],
+//                      modelSelectionObserved?, changes, coverage,
+//                      questions[{id,state,message}],
 //                      reports[{id,taskId,message,final}], tree{settled,running,nodes}}
 //                      Questions and reports carry the target's stable ids; the
 //                      shared layer owns delivery, backoff and cleanup thresholds.
+//                      currentModel counts as the next input's model only when the
+//                      backend observed the live selection (DSH: omit the flag). A
+//                      backend that reads it back from history sets
+//                      modelSelectionObserved:false, and the shared layer then calls
+//                      model() for the real control instead of trusting it.
 //   history(input)     {messages, hasMore, note?, failure?} — already normalized,
 //                      at most maxMessages; the target's own event format never
 //                      leaves the adapter.

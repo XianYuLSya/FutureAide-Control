@@ -362,8 +362,14 @@ export function createScopedAgents(config, {
       store.save(record);
     }
     // Only a live host observation proves what the session will use. The roster
-    // model is a display snapshot and may have been migrated while asleep.
-    const current = observed ? observed.currentModel : await backend.model();
+    // model is a display snapshot and may have been migrated while asleep. An
+    // observation that reports modelSelectionObserved:false carries a historical
+    // value (read back from a transcript), which is stale exactly when the user
+    // changed the model in the UI without sending a turn — then the real
+    // next-turn control is read instead of trusting that value.
+    const current = observed && observed.modelSelectionObserved !== false
+      ? observed.currentModel
+      : await backend.model();
     if (!sameModel(current, dispatch.model)) {
       const selected = await backend.selectModel({ ...dispatch.model, requestId: `${dispatch.requestId}-model` });
       if (selected.accepted !== true) throw Object.assign(new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the default model selection.`),

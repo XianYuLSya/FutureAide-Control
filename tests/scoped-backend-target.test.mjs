@@ -265,6 +265,59 @@ test('status reads tool-service readiness without starting it', async () => {
   } finally { f.service.close(); }
 });
 
+test('a historical currentModel is not trusted: the real control decides the follow', async () => {
+  // The observation replays the assistant transcript (historical). The user picked
+  // a different model in the UI without sending a turn, so the historical value
+  // still looks like the default while the real control has moved.
+  const selections = [];
+  const factory = (record, deps) => {
+    const backend = claudeAdapter([]);
+    backend.record = record;
+    backend.deps = deps;
+    backend.observe = async () => ({ sessionId: record.sessionId, taskId: record.task?.taskId, running: true,
+      questions: [], reports: [], changes: [], throughSeq: 5, currentModel: { ...CLAUDE_MODEL },
+      modelSelectionObserved: false, tree: { settled: false, running: true, nodes: [] } });
+    backend.model = async () => ({ provider: 'anthropic', model: 'claude-opus-5-6' });
+    const select = backend.selectModel;
+    backend.selectModel = async input => { selections.push(input); return select(input); };
+    return backend;
+  };
+  const f = await fixture({ adapters: { 'claude-desktop': factory } });
+  try {
+    await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A));
+    await f.service.send({ name: 'partner', message: 'first' }, extra(A));
+    selections.length = 0;
+    // A busy supplement goes through observe(); the stale value equals the default,
+    // so only the real control can reveal the mismatch.
+    await f.service.send({ name: 'partner', message: 'continue while busy' }, extra(A));
+    assert.equal(selections.length, 1, 'the default was re-selected from the real next-turn control');
+    assert.deepEqual(selections[0].model, CLAUDE_MODEL.model);
+  } finally { f.service.close(); }
+});
+
+test('an observed live selection is used as-is, without another control round-trip', async () => {
+  const selections = [];
+  const factory = record => {
+    const backend = claudeAdapter([]);
+    backend.record = record;
+    backend.observe = async () => ({ sessionId: record.sessionId, taskId: record.task?.taskId, running: true,
+      questions: [], reports: [], changes: [], throughSeq: 5, currentModel: { ...CLAUDE_MODEL },
+      tree: { settled: false, running: true, nodes: [] } });
+    backend.model = async () => { throw new Error('the live observation already answers this'); };
+    const select = backend.selectModel;
+    backend.selectModel = async input => { selections.push(input); return select(input); };
+    return backend;
+  };
+  const f = await fixture({ adapters: { 'claude-desktop': factory } });
+  try {
+    await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A));
+    await f.service.send({ name: 'partner', message: 'first' }, extra(A));
+    selections.length = 0;
+    await f.service.send({ name: 'partner', message: 'continue while busy' }, extra(A));
+    assert.deepEqual(selections, [], 'the session already runs the default; nothing is re-selected');
+  } finally { f.service.close(); }
+});
+
 test('an unknown target is rejected before any backend is resolved', async () => {
   const f = await fixture();
   try {

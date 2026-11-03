@@ -16,7 +16,7 @@ const parse = result => JSON.parse(result.content[0].text);
 function ownership({ accept = true, reportError } = {}) {
   const calls = [];
   const owned = {
-    agentName: '绘图副手', taskId: 7,
+    agentId: 'agent-test', agentName: '绘图副手', taskId: 7,
     async ask(input) { calls.push({ kind: 'ask', ...input }); return accept ? { accepted: true } : { accepted: false, code: 'task-busy' }; },
     async report(input) {
       calls.push({ kind: 'report', ...input });
@@ -96,19 +96,19 @@ test('a caller that cannot be identified is refused instead of defaulting to som
 test('results carry the task id and the acceptance id so a late result is attributable', async () => {
   const finals = [];
   const owned = {
-    agentName: '绘图副手', taskId: 7,
-    async ask() { return { accepted: true, submissionId: 'accept-ask' }; },
-    async report({ final }) { finals.push(final); return { accepted: true, submissionId: final ? 'accept-final' : 'accept-progress' }; },
+    agentId: 'agent-test', agentName: '绘图副手', taskId: 7,
+    async ask() { return { accepted: true, receiptId: 'accept-ask' }; },
+    async report({ final }) { finals.push(final); return { accepted: true, receiptId: final ? 'accept-final' : 'accept-progress' }; },
   };
   const { client, close } = await inMemory(async () => owned);
   try {
     const progress = parse(await client.callTool({ name: 'report_parent', arguments: { message: 'half way' } }));
-    assert.deepEqual([progress.accepted, progress.taskId, progress.final, progress.submissionId],
-      [true, 7, false, 'accept-progress']);
+    assert.deepEqual([progress.accepted, progress.taskId, progress.agentId, progress.final, progress.receiptId],
+      [true, 7, 'agent-test', false, 'accept-progress']);
     const final = parse(await client.callTool({ name: 'report_parent', arguments: { message: 'delivered', final: true } }));
-    assert.deepEqual([final.accepted, final.taskId, final.final, final.submissionId], [true, 7, true, 'accept-final']);
+    assert.deepEqual([final.accepted, final.taskId, final.final, final.receiptId], [true, 7, true, 'accept-final']);
     const asked = parse(await client.callTool({ name: 'ask_parent', arguments: { message: 'which model?' } }));
-    assert.deepEqual([asked.kind, asked.taskId, asked.submissionId], ['question', 7, 'accept-ask']);
+    assert.deepEqual([asked.kind, asked.taskId, asked.agentId, asked.receiptId], ['question', 7, 'agent-test', 'accept-ask']);
     assert.deepEqual(finals, [false, true]);
   } finally { await close(); }
 });

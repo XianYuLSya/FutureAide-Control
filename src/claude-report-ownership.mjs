@@ -5,7 +5,8 @@
 // recorded": the caller's native session is bound to a live claude-desktop name,
 // that name is not closed, and its current task is still open (not cancelled, not
 // terminal, and without a final report already). It then answers `accepted` with
-// the agent id, the task id and a stable submission id.
+// the agent id, the task id and a stable receipt id — the fields the observer
+// already reads from a successful native `tool_result`.
 //
 // It deliberately does not deliver anything and does not create a second notice
 // path: the observer projects native `tool_use` + successful `tool_result` into
@@ -23,7 +24,7 @@ const TERMINAL_TASK_STATES = Object.freeze(['completed', 'cancelled', 'failed'])
  * a repeated submission returns the same id, and a late result from an older task
  * is distinguishable by the task id it carries.
  */
-export function submissionIdFor(agentId, taskId, kind, final = false) {
+export function receiptIdFor(agentId, taskId, kind, final = false) {
   const digest = createHash('sha256').update(JSON.stringify([agentId, taskId, kind, final === true])).digest('hex');
   return `accept-${digest.slice(0, 16)}`;
 }
@@ -65,7 +66,7 @@ export function createReportOwnership({ store } = {}) {
     }
     const { agentId, name } = record;
     const { taskId } = task;
-    const accept = (kind, final) => ({ accepted: true, agentId, taskId, submissionId: submissionIdFor(agentId, taskId, kind, final) });
+    const accept = (kind, final) => ({ accepted: true, agentId, taskId, receiptId: receiptIdFor(agentId, taskId, kind, final) });
     return {
       agentId, agentName: name, taskId,
       async ask() { return accept('ask', false); },

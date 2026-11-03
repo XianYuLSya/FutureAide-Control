@@ -7,7 +7,8 @@ import { randomUUID } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { RosterStore } from '../src/roster-store.mjs';
-import { createReportOwnership, submissionIdFor } from '../src/claude-report-ownership.mjs';
+import { reportReceipt } from '../src/claude-inbox.mjs';
+import { createReportOwnership, receiptIdFor } from '../src/claude-report-ownership.mjs';
 import { startHttpService } from '../src/claude-report-server.mjs';
 
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
@@ -33,11 +34,11 @@ test('an owned session with an open task is accepted with agent, task and a stab
   assert.equal(owned.agentName, '绘图副手');
   const progress = await owned.report({ message: 'half way', final: false });
   assert.deepEqual(progress, { accepted: true, agentId, taskId: 7,
-    submissionId: submissionIdFor(agentId, 7, 'report', false) });
+    receiptId: receiptIdFor(agentId, 7, 'report', false) });
   const repeat = await owned.report({ message: 'half way again', final: false });
-  assert.equal(repeat.submissionId, progress.submissionId);
+  assert.equal(repeat.receiptId, progress.receiptId);
   const final = await owned.report({ message: 'delivered', final: true });
-  assert.notEqual(final.submissionId, progress.submissionId);
+  assert.notEqual(final.receiptId, progress.receiptId);
   const ask = await owned.ask({ message: 'which model?' });
   assert.equal(ask.taskId, 7);
   assert.equal(ask.accepted, true);
@@ -94,7 +95,7 @@ test('ownership needs the shared store, not a stand-in object', () => {
 });
 
 test('the HTTP service with real ownership answers the owned session and lists nothing for others', async () => {
-  const { store } = fixture();
+  const { store, agentId } = fixture();
   const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', via: 'pid' };
   const service = await startHttpService({ port: 0, resolveOwned: createReportOwnership({ store }),
     resolveCaller: async () => caller });
@@ -114,8 +115,14 @@ test('the HTTP service with real ownership answers the owned session and lists n
     const payload = JSON.parse(result.content[0].text);
     assert.equal(payload.accepted, true);
     assert.equal(payload.taskId, 7);
+    assert.equal(payload.agentId, agentId);
     assert.equal(payload.final, true);
-    assert.match(payload.submissionId, /^accept-[0-9a-f]{16}$/);
+    assert.equal(payload.kind, 'report');
+    assert.match(payload.receiptId, /^accept-[0-9a-f]{16}$/);
+    // The observer reads its receipt with exactly this parser, so the surface is
+    // checked against the real contract rather than a copy of it.
+    assert.deepEqual(reportReceipt(result), { accepted: true, taskId: 7, agentId,
+      kind: 'report', final: true, questionId: undefined, receiptId: payload.receiptId });
     await client.close();
 
     const stranger = await open(outsider.url);

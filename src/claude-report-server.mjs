@@ -104,8 +104,9 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
       accepted: true,
       kind: kind === 'ask' ? 'question' : 'report',
       taskId: owned.taskId,
+      ...(owned.agentId ? { agentId: owned.agentId } : {}),
       ...(owned.agentName ? { agent: owned.agentName } : {}),
-      ...(result.submissionId ? { submissionId: result.submissionId } : {}),
+      ...(result.receiptId ? { receiptId: result.receiptId } : {}),
       ...(kind === 'report' ? { final } : {}),
       note: kind === 'ask'
         ? 'Accepted for delivery. End your turn; the answer arrives as a new message in this session.'

@@ -532,6 +532,21 @@ export function claudeTreeFiles(treeState) {
 }
 
 /**
+ * What a whole-tree cancel still has to stop: one entry per node that is not
+ * finished, with the native task id the host's per-task stop takes (the same id
+ * as its `<session>/tasks/<agentId>.output` file). This function stops nothing.
+ */
+export function claudeTreeStopTargets(tree) {
+  return (tree?.nodes ?? []).filter(node => node.status !== 'ended')
+    .map(node => ({ sessionId: node.sessionId, name: node.name ?? null, depth: node.depth ?? 0,
+      status: node.status, evidence: node.evidence ?? null,
+      // The root is stopped by the session interrupt; a child by its task id.
+      ...(node.parentSessionId
+        ? (typeof node.nativeAgentId === 'string' ? { taskId: node.nativeAgentId } : {})
+        : { root: true }) }));
+}
+
+/**
  * Whole-tree cancellation check. This function cancels nothing by itself and
  * never touches the app: the adapter performs the root interrupt (host.interrupt)
  * and then calls this with `afterSeq` = the root cursor at the moment it asked.

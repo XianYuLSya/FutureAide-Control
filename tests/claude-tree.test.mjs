@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { emptyClaudeProjection, observeClaudeTranscript } from '../src/claude-observer.mjs';
 import { readClaudeEvents } from '../src/claude-inbox.mjs';
 import { cancelClaudeTree, claudeNodeId, claudeTreeNodeMessages, claudeTreeStopEvidence,
-  emptyClaudeTreeState, observeClaudeTree, TREE_PROTOCOL } from '../src/claude-tree.mjs';
+  claudeTreeStopTargets, emptyClaudeTreeState, observeClaudeTree, TREE_PROTOCOL } from '../src/claude-tree.mjs';
 
 const line = value => `${JSON.stringify(value)}\n`;
 const assistant = (sessionId, content, { stopReason, sidechain = false, agentId } = {}) => line({
@@ -447,6 +447,22 @@ test('a finished child from an earlier task never enters a new task tree', async
   assert.deepEqual(Object.keys(histories), [claudeNodeId('a1')]);
   assert.deepEqual(tree.unpaired, ['old1'], 'the unpaired meta is reported, never attached');
   assert.equal(tree.settled, true);
+});
+
+test('stop targets name the native task id of every unfinished node', async t => {
+  const f = await fixture(t);
+  await writeFile(f.subagent('b1'), assistant(f.sessionId, [toolUse('toolu_b', 'Bash', { command: 'sleep' })],
+    { sidechain: true, agentId: 'b1' }));
+  await f.writeRoot([...launched('toolu_a', 'still running', { agentId: 'b1' }),
+    reply(f.sessionId, 'launched', { stopReason: 'end_turn' })]);
+  const projection = await rootProjection(f);
+  const { tree } = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'busy' }));
+  assert.deepEqual(claudeTreeStopTargets(tree), [
+    { sessionId: 'logical-1', name: 'root-agent', depth: 0, status: 'running', evidence: null, root: true },
+    { sessionId: claudeNodeId('b1'), name: 'still running', depth: 1, status: 'running',
+      evidence: 'pending-tool', taskId: 'b1' }]);
+  const settledTree = { nodes: tree.nodes.map(node => ({ ...node, status: 'ended' })) };
+  assert.deepEqual(claudeTreeStopTargets(settledTree), []);
 });
 
 test('an unbound root is refused instead of producing an empty tree', async () => {

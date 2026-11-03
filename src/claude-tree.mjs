@@ -478,6 +478,7 @@ export async function observeClaudeTree(binding, rootProjection, {
   return { tree: { version: CLAUDE_TREE_VERSION, settled, running, nodes,
     ...(unverified.length ? { unverified: unverified.map(node => node.sessionId), limitation: CLAUDE_TREE_LIMITATION } : {}),
     ...(unpaired.length ? { unpaired } : {}),
+    ...(unpairedRunning.length ? { unpairedRunning } : {}),
     ...(unindexed.length ? { unindexed } : {}),
     ...(truncated ? { truncated } : {}) }, state: treeState, histories };
 }
@@ -518,7 +519,7 @@ export function claudeTreeStopEvidence(tree, { afterSeq = 0 } = {}) {
     endSeq: node.endSeq ?? node.lastSeq ?? 0,
     endedAfterCancel: node.status === 'ended' && Number(node.endSeq ?? node.lastSeq ?? 0) >= afterSeq }));
   const stopped = tree?.running === false && (tree?.unverified ?? []).length === 0
-    && (tree?.unpaired ?? []).length === 0
+    && (tree?.unpairedRunning ?? []).length === 0
     && nodes.every(node => node.status === 'ended')
     && evidence.every(item => item.endedAfterCancel) && descendantPending.length === 0;
   return { stopped, afterSeq, pendingAgentTools, ...(descendantPending.length ? { descendantPending } : {}),

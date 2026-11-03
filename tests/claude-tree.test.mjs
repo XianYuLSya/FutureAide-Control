@@ -465,6 +465,29 @@ test('stop targets name the native task id of every unfinished node', async t =>
   assert.deepEqual(claudeTreeStopTargets(settledTree), []);
 });
 
+test('a finished unpaired meta does not block a stop verdict, an unfinished one does', async t => {
+  const f = await fixture(t);
+  await writeFile(f.subagent('a1'), reply(f.sessionId, 'reply', { stopReason: 'end_turn', sidechain: true, agentId: 'a1' }));
+  await writeFile(f.meta('a1'), JSON.stringify({ toolUseId: 'toolu_a', spawnDepth: 1, finished: true }));
+  // Older task leftovers in the same session directory.
+  await writeFile(f.subagent('old1'), reply(f.sessionId, 'old', { stopReason: 'end_turn', sidechain: true, agentId: 'old1' }));
+  await writeFile(f.meta('old1'), JSON.stringify({ toolUseId: 'toolu_old', spawnDepth: 1, finished: true }));
+  await f.writeRoot([...launched('toolu_a', 'current', { agentId: 'a1', background: false }),
+    reply(f.sessionId, 'done', { stopReason: 'end_turn' })]);
+  let projection = await rootProjection(f);
+  let tree = (await observeClaudeTree(f.binding, projection, treeOptions(f))).tree;
+  assert.deepEqual(tree.unpaired, ['old1']);
+  assert.equal(tree.unpairedRunning, undefined);
+  assert.equal(claudeTreeStopEvidence(tree, { afterSeq: 0 }).stopped, true);
+
+  await writeFile(f.meta('old1'), JSON.stringify({ toolUseId: 'toolu_old', spawnDepth: 1, finished: false }));
+  projection = await rootProjection(f);
+  tree = (await observeClaudeTree(f.binding, projection, treeOptions(f))).tree;
+  assert.deepEqual(tree.unpairedRunning, ['old1']);
+  assert.equal(tree.settled, false);
+  assert.equal(claudeTreeStopEvidence(tree, { afterSeq: 0 }).stopped, false);
+});
+
 test('an unbound root is refused instead of producing an empty tree', async () => {
   await assert.rejects(observeClaudeTree({}, emptyClaudeProjection('task-1'), { logicalSessionId: 'logical-1' }),
     /transcript file/i);

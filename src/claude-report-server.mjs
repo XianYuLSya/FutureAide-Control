@@ -15,11 +15,18 @@
 //           so no Node process is started per session. The service is bound to
 //           127.0.0.1 and identifies each caller from its TCP peer (see
 //           claude-caller-identity.mjs); it is never reachable from another host.
+//
+// A session that is not plugin-owned keeps its normal chat: the service answers
+// it with a surface that lists no tools at all (no approval noise, no failing
+// server icon), and every submission is refused by code even if it races an
+// ownership change. The same gate is what makes a workspace-level registration
+// safe: the user's own chats in that project see nothing to approve.
 import http from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { resolveSocketCaller, resolveStdioCaller } from './claude-caller-identity.mjs';
 
@@ -142,12 +149,31 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
   return server;
 }
 
+/** The surface for a session this plugin does not own: connected, zero tools. */
+export function createUnavailableReportServer({ version = SERVER_VERSION } = {}) {
+  const server = new McpServer({ name: SERVER_NAME, version });
+  // Answer tools/list with an empty list instead of a protocol error: clients that
+  // list unconditionally must see "no tools", not a broken server. No instructions
+  // ride along: an unowned session is told nothing about reporting.
+  server.server.registerCapabilities({ tools: {} });
+  server.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+  return server;
+}
+
 /** Run the stdio transport: one process per Claude Desktop session. */
-export async function runStdioService({ resolveOwned, resolveCaller, instructions, identity = {} } = {}) {
-  const server = createClaudeReportServer({
-    resolveOwned, instructions,
-    resolveCaller: resolveCaller ?? (() => resolveStdioCaller(identity)),
-  });
+export async function runStdioService({ resolveOwned, resolveCaller, instructions, identity = {}, log = () => {} } = {}) {
+  const resolve = resolveCaller ?? (() => resolveStdioCaller(identity));
+  let server;
+  try {
+    const caller = await resolve();
+    const owned = typeof resolveOwned === 'function' ? await resolveOwned(caller, { tool: 'list' }) : null;
+    server = owned ? createClaudeReportServer({ resolveOwned, instructions, resolveCaller: async () => caller })
+      : createUnavailableReportServer();
+    if (!owned) log('this session is not plugin-owned; the report surface lists no tools');
+  } catch (error) {
+    server = createUnavailableReportServer();
+    log(`no verified caller (${error?.code ?? 'caller-unresolved'}); the report surface lists no tools`);
+  }
   await server.connect(new StdioServerTransport());
   return server;
 }
@@ -181,7 +207,7 @@ async function readBody(req, limitBytes = 1024 * 1024) {
 export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1', resolveOwned,
   resolveCaller, instructions, identity = {}, log = () => {} } = {}) {
   const startedAt = new Date().toISOString();
-  const stats = { requests: 0, refused: 0, served: 0 };
+  const stats = { requests: 0, owned: 0, unowned: 0, served: 0 };
   let boundPort = port;
 
   const server = http.createServer(async (req, res) => {
@@ -199,25 +225,28 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
       return;
     }
     stats.requests += 1;
-    let caller;
+    // Identity and ownership decide which surface answers: the owned one, or a
+    // connected surface with no tools. Neither path tells the caller who it is
+    // thought to be, and a refusal never becomes a working tool.
+    let caller = null;
+    let owned = null;
     try {
       // The default resolver reads the request socket; an injected resolver gets
       // the same context so it can be verified or replaced without a second path.
       caller = await (resolveCaller ?? (() => resolveSocketCaller(req.socket, { serverPort: boundPort, ...identity })))(
         { req, socket: req.socket, serverPort: boundPort });
+      if (caller && typeof resolveOwned === 'function') owned = await resolveOwned(caller, { tool: 'list' });
     } catch (error) {
-      stats.refused += 1;
-      log(`refused ${error?.code ?? 'caller-unresolved'}: ${String(error?.message ?? error).slice(0, 200)}`);
-      sendJson(res, 403, { error: { code: error?.code ?? 'caller-unresolved',
-        message: 'This connection is not a FutureAide-owned Claude Desktop session; no tool is available to it.' } });
-      return;
+      log(`not an owned session (${error?.code ?? 'caller-unresolved'}): ${String(error?.message ?? error).slice(0, 200)}`);
     }
+    if (owned) stats.owned += 1; else stats.unowned += 1;
     let body;
     try { body = await readBody(req); }
-    catch (error) { stats.refused += 1; sendJson(res, 400, { error: { code: error.code ?? 'invalid-request', message: error.message } }); return; }
+    catch (error) { sendJson(res, 400, { error: { code: error.code ?? 'invalid-request', message: error.message } }); return; }
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-    const mcp = createClaudeReportServer({ resolveCaller: async () => caller,
-      resolveOwned: resolveOwned ?? (() => null), instructions });
+    const mcp = owned
+      ? createClaudeReportServer({ resolveCaller: async () => caller, resolveOwned, instructions })
+      : createUnavailableReportServer();
     const close = () => { void transport.close().catch(() => {}); void mcp.close().catch(() => {}); };
     res.once('close', close);
     try {
@@ -244,6 +273,22 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
   };
 }
 
+/**
+ * Development-only ownership stub for a UI or transport test before the shared
+ * roster integration exists: accept exactly the pinned native session ids and
+ * record what was submitted. It never widens identity — the caller is still
+ * resolved from the connection — and it writes no state of its own.
+ */
+export function developmentOwnership(sessions, { log = () => {} } = {}) {
+  const pinned = new Set(sessions.map(value => String(value).toLowerCase()));
+  log(`DEVELOPMENT stub: only these native sessions are accepted (${[...pinned].join(', ')}); nothing is delivered.`);
+  return async caller => (pinned.has(String(caller?.sessionId ?? '').toLowerCase()) ? {
+    agentName: 'development-stub', taskId: 1,
+    async ask({ message }) { log(`stub ask (${message.length} chars): ${message.slice(0, 120)}`); return { accepted: true }; },
+    async report({ message, final }) { log(`stub report final=${final} (${message.length} chars): ${message.slice(0, 120)}`); return { accepted: true }; },
+  } : null);
+}
+
 function argument(argv, name) {
   const index = argv.indexOf(name);
   return index === -1 ? undefined : argv[index + 1];
@@ -251,20 +296,23 @@ function argument(argv, name) {
 
 async function main(argv = process.argv.slice(2)) {
   const ownershipPath = argument(argv, '--ownership');
+  const accept = argument(argv, '--accept-session');
+  const log = message => process.stderr.write(`[futureaide-report] ${message}\n`);
   // No ownership integration is bundled here on purpose: without a resolver the
   // service refuses every call, so a mistakenly started service exposes nothing.
-  const resolveOwned = ownershipPath ? (await import(pathToFileURL(ownershipPath).href)).resolveOwned : undefined;
+  const resolveOwned = ownershipPath ? (await import(pathToFileURL(ownershipPath).href)).resolveOwned
+    : accept ? developmentOwnership(accept.split(',').map(value => value.trim()).filter(Boolean), { log })
+      : undefined;
   if (argv.includes('--http')) {
     const port = Number.parseInt(argument(argv, '--port') ?? process.env.FUTUREAIDE_REPORT_PORT ?? String(DEFAULT_PORT), 10);
-    const service = await startHttpService({ port, resolveOwned,
-      log: message => process.stderr.write(`[futureaide-report] ${message}\n`) });
+    const service = await startHttpService({ port, resolveOwned, log });
     process.stderr.write(`[futureaide-report] listening on ${service.url}\n`);
     const stop = async () => { await service.close(); process.exit(0); };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     return;
   }
-  await runStdioService({ resolveOwned });
+  await runStdioService({ resolveOwned, log });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

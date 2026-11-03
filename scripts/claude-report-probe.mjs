@@ -58,10 +58,17 @@ async function child({ configDir, url, resultFile, tamper }) {
   try {
     await client.connect(new StreamableHTTPClientTransport(new URL(url)));
     const { tools } = await client.listTools();
-    const call = await client.callTool({ name: 'report_parent', arguments: { message: 'probe final report', final: true } });
     result.tools = tools.map(tool => tool.name);
-    result.accepted = call.isError !== true;
-    result.payload = JSON.parse(call.content[0].text);
+    if (!result.tools.length) {
+      // Not an owned session: the service answers with a connected surface that
+      // lists nothing, so there is no tool to call and nothing to accept.
+      result.accepted = false;
+      result.note = 'surface lists no tools';
+    } else {
+      const call = await client.callTool({ name: 'report_parent', arguments: { message: 'probe final report', final: true } });
+      result.accepted = call.isError !== true;
+      result.payload = JSON.parse(call.content[0].text);
+    }
     result.elapsedMs = Math.round(performance.now() - started);
   } catch (error) {
     result.error = { code: error?.code ?? null, message: String(error?.message ?? error).slice(0, 400) };
@@ -130,9 +137,12 @@ async function main() {
   await writeFile(evidenceFile, JSON.stringify(evidence, null, 2));
   console.log(JSON.stringify({ evidenceFile, mode: evidence.mode, childPid: clientResult.pid,
     resolvedPid: resolution?.clientPid ?? null, sessionId: resolution?.sessionId ?? null,
-    refusal: resolution?.refusal?.code ?? null, accepted: evidence.accepted, calls: calls.length,
+    refusal: resolution?.refusal?.code ?? null, accepted: evidence.accepted,
+    tools: clientResult.tools ?? [], calls: calls.length,
     clientError: clientResult.error ?? null }, null, 2));
-  const ok = tamper ? !evidence.accepted && Boolean(resolution?.refusal) : evidence.accepted && evidence.identityMatchesChild;
+  const ok = tamper
+    ? !evidence.accepted && Boolean(resolution?.refusal) && (clientResult.tools?.length ?? 0) === 0
+    : evidence.accepted && evidence.identityMatchesChild && (clientResult.tools?.length ?? 0) === 2;
   process.exitCode = ok ? 0 : 1;
 }
 

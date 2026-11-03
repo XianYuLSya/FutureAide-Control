@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { createClaudeReportServer, startHttpService, REPORT_TOOL_NAMES } from '../src/claude-report-server.mjs';
+import { createClaudeReportServer, developmentOwnership, startHttpService, REPORT_TOOL_NAMES } from '../src/claude-report-server.mjs';
 
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
 const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', via: 'pid' };
@@ -132,15 +132,32 @@ test('a submission the state machine declines is an error, never a silent accept
   } finally { await close(); }
 });
 
-test('the shared loopback HTTP service answers a real MCP client and reports refusals', async () => {
+test('the development ownership stub accepts only the pinned session and records what it got', async () => {
+  const lines = [];
+  const resolveOwned = developmentOwnership([sessionId], { log: line => lines.push(line) });
+  const owned = await resolveOwned({ sessionId });
+  assert.equal(owned.agentName, 'development-stub');
+  assert.deepEqual(await owned.report({ message: 'hello', final: true }), { accepted: true });
+  assert.equal(await resolveOwned({ sessionId: '3725418e-ac07-45d6-877b-2ab22ef89017' }), null);
+  assert.equal(await resolveOwned(undefined), null);
+  assert.match(lines.join('\n'), /final=true/);
+});
+
+test('the shared loopback HTTP service answers an owned session and lists nothing for others', async () => {
   const { calls, owned } = ownership();
   const service = await startHttpService({ port: 0, resolveOwned: async () => owned, resolveCaller: async () => caller });
-  const refused = await startHttpService({ port: 0, resolveOwned: async () => owned,
+  // A peer that is not an owned session: its identification fails, and it must
+  // still get a connected surface with zero tools rather than an error or a tool.
+  const unowned = await startHttpService({ port: 0, resolveOwned: async () => owned,
     resolveCaller: async () => { throw Object.assign(new Error('not a session'), { code: 'caller-unresolved' }); } });
   const open = async url => {
     const client = new Client({ name: 'http-protocol-test', version: '1.0.0' });
     await client.connect(new StreamableHTTPClientTransport(new URL(url)));
     return client;
+  };
+  const callTool = async (client, name) => {
+    try { return await client.callTool({ name, arguments: { message: 'HTTP round trip' } }); }
+    catch (error) { return { isError: true, thrown: String(error?.message ?? error) }; }
   };
   try {
     assert.match(service.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
@@ -152,13 +169,19 @@ test('the shared loopback HTTP service answers a real MCP client and reports ref
     assert.equal(parse(result).accepted, true);
     await client.close();
 
-    // Same service shape, unowned peer: the connection is refused before MCP.
-    await assert.rejects(open(refused.url), /40[134]|refus|Caller|session/i);
-    const health = await fetch(`${refused.url.replace('/mcp', '/healthz')}`).then(response => response.json());
-    assert.equal(health.stats.refused >= 1, true);
+    const stranger = await open(unowned.url);
+    const strangerTools = await stranger.listTools();
+    assert.deepEqual(strangerTools.tools, []);
+    const refused = await callTool(stranger, 'report_parent');
+    assert.equal(refused.isError, true, 'a call to a surface with no tools can never be accepted');
+    await stranger.close();
+
+    const health = await fetch(`${unowned.url.replace('/mcp', '/healthz')}`).then(response => response.json());
+    assert.equal(health.stats.unowned >= 1, true);
+    assert.equal(health.stats.served >= 1, true);
     assert.deepEqual(calls.map(call => call.message), ['HTTP round trip']);
   } finally {
     await service.close();
-    await refused.close();
+    await unowned.close();
   }
 });

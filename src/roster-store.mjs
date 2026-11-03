@@ -205,13 +205,13 @@ export class RosterStore {
       WHERE id=? AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.task.cancelRequested')=1`)
       .run(record.agentId, record.task?.taskId).changes === 1;
   }
-  setWorker(id, pid) { this.db.prepare("UPDATE agents SET body=json_set(body,'$.workerPid',?) WHERE id=?").run(pid ?? null, id); }
-  setWorkerError(id, holder, error) {
-    // The launcher may have awaited spawn while another call advanced or removed
-    // this record. Update only the error, and only for our still-owned lease.
+  // Update only the error, and never overwrite a different error that a later
+  // attempt already recorded, so a delayed spawn failure cannot mask new state.
+  setError(id, error) {
+    const body = JSON.stringify(error);
     this.db.prepare(`UPDATE agents SET body=json_set(body,'$.error',json(?)) WHERE id=?
-      AND EXISTS (SELECT 1 FROM leases WHERE key=? AND holder=? AND expires>?)`)
-      .run(JSON.stringify(error), id, `worker:${id}`, holder, Date.now());
+      AND (json_type(body,'$.error') IS NULL OR json_extract(body,'$.error.code')=json_extract(?,'$.code'))`)
+      .run(body, id, body);
   }
   claimLease(key, holder, leaseMs) {
     return this.db.prepare(`INSERT INTO leases(key,holder,expires) VALUES (?,?,?)

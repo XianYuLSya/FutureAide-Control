@@ -5,7 +5,8 @@ import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createScopedAgents, workerSpawn } from '../src/scoped-agents.mjs';
+import { createScopedAgents } from '../src/scoped-agents.mjs';
+import { monitorSpawn } from '../src/shared-monitor.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
 
@@ -13,8 +14,10 @@ const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const A = '11111111-1111-4111-8111-111111111111';
 const B = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
+// Retire the shared listener's leases whatever holder claimed them.
+const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
-async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels } = {}) {
+async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -132,8 +135,15 @@ async function fixture({ startWorker, startIdleMonitor, monitorFailureGraceMs, b
   };
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json') }, {
     store, clientFactory: () => api, controlFactory, callCodex,
-    startWorker: startWorker ?? ((...args) => { workers.push(args); return 99999; }),
-    ...(startIdleMonitor ? { startIdleMonitor } : {}), ...(monitorFailureGraceMs !== undefined ? { monitorFailureGraceMs } : {}), removeTree: async directory => { removed.push(directory); },
+    // The fixture monitor announces itself exactly like the real worker does.
+    startSharedMonitor: startSharedMonitor ?? ((...args) => {
+      if (store.lease('idle-monitor')?.expires > Date.now()) return true;
+      workers.push(args);
+      store.claimLease('idle-monitor', 'fixture-monitor', 60000);
+      store.claimLease('idle-monitor:ready', 'fixture-monitor', 60000);
+      return true;
+    }),
+    ...(monitorFailureGraceMs !== undefined ? { monitorFailureGraceMs } : {}), removeTree: async directory => { removed.push(directory); },
   });
   const record = (name = 'artist', thread = A) => store.named(ownerIdFor(thread), name);
   function finish(name = 'artist', reply = '完成', thread = A) {
@@ -296,7 +306,7 @@ test('a proven pre-write read failure resumes the original dispatch; historical 
 });
 
 test('settled awaiting-report monitor sleeps and a supplement wakes the same task', async () => {
-  const f = await fixture({ startIdleMonitor: async () => true });
+  const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
   f.finish(); await f.service.poll(f.record().agentId);
@@ -305,61 +315,60 @@ test('settled awaiting-report monitor sleeps and a supplement wakes the same tas
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
   assert.equal((await f.service.list(extra(A))).items[0].monitor, 'sleeping');
+  const count = f.workers.length;
   await f.service.send({ name: 'artist', message: 'continue' }, extra(A));
-  const lease = f.store.lease(`worker:${before.agentId}`);
-  assert.equal(f.record().sleep.wakePending, true);
-  f.store.releaseLease(`worker:${before.agentId}`, lease.holder);
-  await f.service.resume();
+  assert.equal(f.record().sleep, undefined, 'a live monitor wakes the same task without another process');
+  assert.equal(f.workers.length, count, 'the one shared listener absorbed the wake');
+  assert.equal(f.record().task.taskId, before.task.taskId);
+  f.service.close();
+});
+
+test('a wake after the monitor retires is recovered by restarting one listener', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+  f.finish(); await f.service.poll(f.record().agentId);
+  const before = f.record();
+  f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
+  assert.equal(await f.service.trySleep(before.agentId), true);
+  stopMonitor(f.store);
+  const count = f.workers.length;
+  assert.equal(await f.service.wake(before.agentId, before.task.taskId), true);
+  assert.equal(f.workers.length, count + 1, 'exactly one listener is restarted for the pending wake');
   assert.equal(f.record().sleep, undefined);
   assert.equal(f.record().task.taskId, before.task.taskId);
   f.service.close();
 });
 
-test('a wake racing worker exit is recovered after the old lease is released', async () => {
-  const f = await fixture({ startIdleMonitor: async () => true });
+test('a sleeping name is never polled twice and keeps the same task across a monitor restart', async () => {
+  const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
   f.finish(); await f.service.poll(f.record().agentId);
-  const before = f.record(), lease = f.store.lease(`worker:${before.agentId}`);
+  const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
+  assert.equal(await f.service.monitorScan().catch(() => undefined), false, 'a sleeping name is not polled');
+  stopMonitor(f.store);
   const count = f.workers.length;
-  assert.equal(await f.service.wake(before.agentId, before.task.taskId), true);
-  assert.equal(f.workers.length, count);
-  f.store.releaseLease(`worker:${before.agentId}`, lease.holder);
-  await f.service.resume();
-  assert.equal(f.workers.length, count + 1);
-  f.service.close();
-});
-
-test('pending wake survives loss of the retiring worker until its lease expires', async () => {
-  const f = await fixture({ startIdleMonitor: async () => true });
-  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-  await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
-  f.finish(); await f.service.poll(f.record().agentId);
-  const before = f.record(), lease = f.store.lease(`worker:${before.agentId}`);
-  f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
-  assert.equal(await f.service.trySleep(before.agentId), true);
-  await f.service.wake(before.agentId, before.task.taskId);
-  assert.equal(f.record().sleep.wakePending, true);
-  const count = f.workers.length;
-  f.store.releaseLease(`worker:${before.agentId}`, lease.holder);
   await f.service.wake(before.agentId, before.task.taskId);
   assert.equal(f.workers.length, count + 1);
   assert.equal(f.record().sleep, undefined);
+  assert.equal(f.record().task.taskId, before.task.taskId);
+  assert.equal(f.sends.length, 1, 'the original dispatch was never repeated');
   f.service.close();
 });
 
 test('a stale sleep marker from an older client wakes the newer task in the same session', async () => {
-  const f = await fixture({ startIdleMonitor: async () => true });
+  const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
   f.finish(); await f.service.poll(f.record().agentId);
-  const before = f.record(), lease = f.store.lease(`worker:${before.agentId}`);
+  const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
   const oldClient = f.record(); oldClient.task.taskId = 'task-new'; oldClient.state = 'running'; f.store.save(oldClient);
-  f.store.releaseLease(`worker:${before.agentId}`, lease.holder);
+  stopMonitor(f.store);
   const count = f.workers.length;
   assert.equal(await f.service.wake(before.agentId, before.task.taskId), true);
   assert.equal(f.workers.length, count + 1);
@@ -368,59 +377,63 @@ test('a stale sleep marker from an older client wakes the newer task in the same
   f.service.close();
 });
 
-test('a lost shared monitor falls back to the original agent worker', async () => {
+test('a lost shared monitor keeps the task durable and sweeps in process instead of spawning', async () => {
   let ready = true;
-  const f = await fixture({ startIdleMonitor: async () => ready, monitorFailureGraceMs: 0 });
+  const f = await fixture({ startSharedMonitor: async () => ready, monitorFailureGraceMs: 0 });
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
   f.finish(); await f.service.poll(f.record().agentId);
-  const before = f.record(), lease = f.store.lease(`worker:${before.agentId}`);
+  const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
-  f.store.releaseLease(`worker:${before.agentId}`, lease.holder);
+  stopMonitor(f.store);
   ready = false;
   const count = f.workers.length;
-  await f.service.ensureIdleMonitor();
-  assert.equal(f.record().sleep, undefined);
-  assert.equal(f.workers.length, count + 1);
+  assert.equal(await f.service.ensureIdleMonitor(), true, 'the degraded sweep runs in this process');
+  assert.equal(f.workers.length, count, 'no process is spawned per name');
+  assert.equal(f.record().sleep.taskId, before.task.taskId, 'the sleeping baseline is kept for a later attempt');
+  await f.service.wake(before.agentId, before.task.taskId);
+  assert.equal(f.record().error.code, 'monitor-unavailable');
+  assert.equal(f.record().sleep.taskId, before.task.taskId);
   f.service.close();
 });
 
 test('a failed wake spawn retains the sleeping baseline for another attempt', async () => {
   let fail = false;
-  const f = await fixture({ startIdleMonitor: async () => true, startWorker: async () => { if (fail) throw new Error('spawn failed'); return 99999; } });
+  const f = await fixture({ startSharedMonitor: async () => { if (fail) throw new Error('spawn failed'); return true; } });
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
   f.finish(); await f.service.poll(f.record().agentId);
-  const before = f.record(), lease = f.store.lease(`worker:${before.agentId}`);
+  const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
-  f.store.releaseLease(`worker:${before.agentId}`, lease.holder); fail = true;
+  stopMonitor(f.store); fail = true;
   await f.service.wake(before.agentId, before.task.taskId);
   assert.equal(f.record().sleep.taskId, before.task.taskId);
+  assert.equal(f.record().error.code, 'operation-failed', 'the spawn failure is recorded, not swallowed');
+  assert.equal(f.record().error.message, 'spawn failed');
   f.service.close();
 });
 
-test('asynchronous worker spawn errors retain the task and release its lease without crashing MCP', async () => {
+test('asynchronous monitor spawn errors retain the task without crashing MCP', async () => {
   let attempts = 0;
   const spawnProcess = () => {
     attempts++;
     const child = new EventEmitter();
-    child.unref = () => assert.fail('a failed worker must not be detached');
-    setImmediate(() => child.emit('error', Object.assign(new Error('worker spawn denied'), { code: 'EACCES' })));
+    child.unref = () => assert.fail('a failed monitor must not be detached');
+    setImmediate(() => child.emit('error', Object.assign(new Error('monitor spawn denied'), { code: 'EACCES' })));
     return child;
   };
-  const f = await fixture({ startWorker: (...args) => workerSpawn(...args, spawnProcess) });
+  const f = await fixture({ startSharedMonitor: () => monitorSpawn('D:/fixture.json', 'monitor-00000000-0000-4000-8000-000000000000', spawnProcess) });
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
     const result = await f.service.send({ name: 'artist', message: 'Retain this task' }, extra(A));
     assert.equal(result.state, 'running');
     assert.equal(result.error.code, 'EACCES');
     assert.equal(f.record().task.message, 'Retain this task');
-    assert.equal(f.record().workerPid, undefined);
     assert.equal(f.sends.length, 1);
     await f.service.resume();
-    assert.equal(attempts, 2, 'failed spawn releases its lease for the next attempt');
+    assert.equal(attempts, 2, 'a failed spawn releases its lease for the next attempt');
     assert.equal((await f.service.status(extra(A))).ready, true, 'the service still answers requests');
   } finally { f.service.close(); }
 
@@ -428,7 +441,7 @@ test('asynchronous worker spawn errors retain the task and release its lease wit
   child.pid = 99999;
   let detached = false, confirmed = false;
   child.unref = () => { detached = true; };
-  const started = workerSpawn('D:/fixture.json', 'agent', 'lease', () => child).then(pid => { confirmed = true; return pid; });
+  const started = monitorSpawn('D:/fixture.json', 'monitor-00000000-0000-4000-8000-000000000000', () => child).then(pid => { confirmed = true; return pid; });
   await Promise.resolve();
   assert.equal(confirmed, false, 'a PID alone does not confirm a successful spawn');
   child.emit('spawn');
@@ -436,12 +449,9 @@ test('asynchronous worker spawn errors retain the task and release its lease wit
   assert.equal(detached, true);
 });
 
-test('a delayed worker spawn failure cannot overwrite concurrent task state or a replacement lease', async () => {
-  let rejectSpawn, workerLease;
-  const f = await fixture({ startWorker: (_config, _id, holder) => {
-    workerLease = holder;
-    return new Promise((_resolve, reject) => { rejectSpawn = reject; });
-  } });
+test('a delayed monitor spawn failure cannot overwrite concurrent task state or a newer error', async () => {
+  let rejectSpawn;
+  const f = await fixture({ startSharedMonitor: () => new Promise((_resolve, reject) => { rejectSpawn = reject; }) });
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
     for (const state of ['cleaning', 'delivery_pending']) {
@@ -458,13 +468,10 @@ test('a delayed worker spawn failure cannot overwrite concurrent task state or a
     }
     const resumed = f.service.resume();
     const fresh = f.record(); fresh.error = { code: 'new-owner' }; f.store.save(fresh);
-    const key = `worker:${fresh.agentId}`;
-    f.store.releaseLease(key, workerLease);
-    f.store.claimLease(key, 'replacement-worker', 30000);
     rejectSpawn(new Error('old launcher failure'));
     await resumed;
-    assert.equal(f.record().error.code, 'new-owner');
-    f.store.setWorkerError('removed-agent', 'unused-holder', { code: 'EACCES' });
+    assert.equal(f.record().error.code, 'new-owner', 'a late failure never masks a newer recorded error');
+    f.store.setError('removed-agent', { code: 'EACCES' });
   } finally { f.service.close(); }
 });
 
@@ -713,14 +720,14 @@ test('accepted dispatch receipt restores a lost acknowledgement without another 
   f.service.close();
 });
 
-test('worker lease expiry restarts monitoring and list does not overwrite task state', async () => {
+test('monitor lease expiry restarts one shared listener and list does not overwrite task state', async () => {
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'task' }, extra(A));
   const r = f.record();
-  assert.equal(f.workers.length, 1);
-  await f.service.list(extra(A)); assert.equal(f.workers.length, 1);
-  f.store.db.prepare('UPDATE leases SET expires=0 WHERE key=?').run(`worker:${r.agentId}`);
+  assert.equal(f.workers.length, 1, 'one shared listener for the whole plugin');
+  await f.service.list(extra(A)); assert.equal(f.workers.length, 1, 'listing never starts another listener');
+  f.store.db.prepare('UPDATE leases SET expires=0 WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
   await f.service.list(extra(A));
   assert.equal(f.workers.length, 2);
   assert.equal(f.record().task.dispatches[0].requestId, r.task.dispatches[0].requestId);
@@ -728,17 +735,17 @@ test('worker lease expiry restarts monitoring and list does not overwrite task s
 });
 
 test('resume and monitor health use projections instead of loading the full roster', async () => {
-  const f = await fixture({ startIdleMonitor: async () => true });
+  const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
     await f.service.send({ name: 'artist', message: 'task' }, extra(A));
-    const r = f.record(), lease = f.store.lease(`worker:${r.agentId}`);
-    f.store.releaseLease(`worker:${r.agentId}`, lease.holder);
+    f.store.db.prepare('UPDATE leases SET expires=0 WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
     const before = f.workers.length;
     f.store.list = () => { throw new Error('full roster must not be loaded'); };
     await f.service.resume();
     assert.equal(f.workers.length, before + 1);
-    assert.equal(await f.service.ensureIdleMonitor(), false);
+    f.store.db.prepare('UPDATE leases SET expires=0 WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
+    assert.equal(await f.service.ensureIdleMonitor(), true);
     assert.equal((await f.service.status(extra(A))).agents, 1);
   } finally { f.service.close(); }
 });

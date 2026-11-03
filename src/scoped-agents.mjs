@@ -1,8 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { lstat, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
@@ -10,7 +8,8 @@ import { invokeCodexTool } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, resolveCallingContext, threadFromResult } from './calling-context.mjs';
 import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
-import { ensureIdleMonitor, idleSignal } from './idle-monitor.mjs';
+import { idleSignal } from './idle-monitor.mjs';
+import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
 import { diagnoseTarget, DSH_HOST_METHODS, normalizeTarget, resolveBackend, targetOf } from './agent-backend.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -133,20 +132,6 @@ function publicResult(record, { fullResult = false } = {}) {
   };
 }
 
-export async function workerSpawn(configFile, agentId, lease, spawnProcess = spawn) {
-  if (!configFile) throw new Error('The installed plugin has no private configuration path for recovery.');
-  const script = fileURLToPath(new URL('./scoped-worker.mjs', import.meta.url));
-  const child = spawnProcess(process.execPath, [script, '--config', configFile, '--agent', agentId, '--lease', lease], {
-    detached: true, stdio: 'ignore', windowsHide: true,
-  });
-  return new Promise((resolve, reject) => {
-    // Spawn failures arrive asynchronously; a surrounding try/catch cannot catch
-    // an unhandled ChildProcess error event. Confirm spawn before saving its PID.
-    child.once('error', reject);
-    child.once('spawn', () => { child.unref(); resolve(child.pid); });
-  });
-}
-
 /** Name-addressed operations; owner and native identifiers never come from tool arguments. */
 export function createScopedAgents(config, {
   store = new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
@@ -155,14 +140,13 @@ export function createScopedAgents(config, {
     target: settings.target, instanceFile: settings.instanceFile, preferredInstanceFile: settings.preferredInstanceFile,
     baseUrl: settings.baseUrl, timeoutMs: settings.timeoutMs, hostBridgeFile: settings.hostBridgeFile }),
   controlFactory = createControl,
-  startWorker = workerSpawn,
-  startIdleMonitor = ensureIdleMonitor,
+  startSharedMonitor = ensureSharedMonitor,
   monitorFailureGraceMs = 60000,
   removeTree = rm,
   backendAdapters = {},
 } = {}) {
   const clients = new Map();
-  let monitorUnavailableSince;
+  let monitorUnavailableSince, monitorError;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
   const settings = record => ({ ...config, target: targetOf(record), workspace: record.workspace,
     stateDirectory: agentDirectory(record), codexThreadId: undefined, futureaideSessionId: undefined });
@@ -263,26 +247,43 @@ export function createScopedAgents(config, {
     return entry;
   }
 
-  async function ensureWorker(record, { wake = false } = {}) {
-    if (!record) return;
-    const previousSleep = wake ? record.sleep : undefined;
-    if (wake && record.sleep && store.lease(`worker:${record.agentId}`)?.expires > Date.now()) {
-      store.markWake(record.agentId, record.sleep.taskId);
-      return true;
-    }
-    if (wake && record.sleep) { store.wake(record.agentId, record.sleep.taskId); record = store.get(record.agentId) ?? record; }
-    if (record.sleep) return;
-    const queued = store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
-    if (!ACTIVE.has(record.state) && !queued && (record.callbackBlocked || !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered' && report.delivery.state !== 'blocked'))) return;
-    const holder = uid('worker');
-    if (!store.claimLease(`worker:${record.agentId}`, holder, 30000)) return true;
-    try { record.workerPid = await startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); return true; }
+  // Does this name still owe the shared monitor a poll? Sleeping names are driven
+  // by the monitor's existing DSH host-state wake path instead.
+  function needsPoll(record) {
+    if (!record || record.closed || record.sleep) return false;
+    if (ACTIVE.has(record.state)) return true;
+    if (store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return true;
+    return !record.callbackBlocked
+      && (record.task?.reports ?? []).some(report => !['delivered', 'blocked'].includes(report.delivery.state));
+  }
+
+  async function ensureMonitor() {
+    try { return await startSharedMonitor(config, store); }
     catch (error) {
-      try { store.setWorkerError(record.agentId, holder, safeError(error)); }
-      finally { store.releaseLease(`worker:${record.agentId}`, holder); }
-      if (previousSleep) store.restoreSleep({ ...record, sleep: previousSleep });
+      monitorError = safeError(error);
       return false;
     }
+  }
+
+  // One monitor serves every name: this only makes sure it exists and, for a
+  // sleeping name, clears the marker so the same durable task is polled again.
+  async function ensureWorker(record, { wake = false } = {}) {
+    if (!record) return false;
+    if (wake && record.sleep) {
+      if (!await ensureMonitor()) {
+        // Nothing can watch this installation right now. Keep the sleeping
+        // baseline so a later call resumes the same task instead of losing it.
+        store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+        return false;
+      }
+      store.wake(record.agentId, record.sleep.taskId);
+      record = store.get(record.agentId) ?? record;
+    }
+    if (record.sleep) return true;
+    if (!needsPoll(record)) return false;
+    const ready = await ensureMonitor();
+    if (!ready) store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+    return ready;
   }
 
   async function observe(record) {
@@ -864,7 +865,7 @@ export function createScopedAgents(config, {
       for (const record of store.list(owner.ownerId)) await ensureWorker(record);
       const records = store.list(owner.ownerId);
       return { items: records.map(record => ({ ...publicResult(record),
-        monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping') : (store.lease(`worker:${record.agentId}`)?.expires > Date.now() ? 'running' : 'stopped'),
+        monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping') : (monitorAlive(store) ? 'running' : 'stopped'),
         supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
     },
     async changes({ name, task = 0 }, extra) {
@@ -969,19 +970,43 @@ export function createScopedAgents(config, {
     },
     async resume() {
       const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
-      for (const record of records) await ensureWorker(record, { wake: record.sleep?.wakePending === true });
+      const pending = records.filter(record => record.sleep?.wakePending === true || needsPoll(record));
+      if (!pending.length) return;
+      if (await ensureMonitor()) return;
+      // One listener serves every name: record the failure on each waiting name
+      // instead of starting a process per agent.
+      for (const record of pending) {
+        store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+      }
+    },
+    // One shared round: poll every name that still owes work through the same
+    // state machine. The shared monitor calls this each round, and the degraded
+    // in-process sweep below reuses it when no monitor can be started.
+    async monitorScan() {
+      const candidates = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
+      let busy = false;
+      for (const candidate of candidates) {
+        const record = store.get(candidate.agentId);
+        if (!record || !needsPoll(record)) continue;
+        busy = true;
+        try { await service.poll(record.agentId); } catch { /* The next round retries from durable state. */ }
+        try { await service.trySleep(record.agentId); } catch { /* Keep the round going. */ }
+      }
+      return busy;
     },
     async ensureIdleMonitor() {
-      if (!store.hasSleeping()) { monitorUnavailableSince = undefined; return false; }
+      const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
+      const pending = records.some(record => record.sleep?.wakePending === true || needsPoll(record));
+      if (!store.hasSleeping() && !pending) { monitorUnavailableSince = undefined; return false; }
       let ready = false;
-      try { ready = await startIdleMonitor(config, store); } catch { /* Fall back to active workers below. */ }
+      try { ready = await startSharedMonitor(config, store); } catch { ready = false; }
       if (ready) { monitorUnavailableSince = undefined; return true; }
       monitorUnavailableSince ??= Date.now();
       if (Date.now() - monitorUnavailableSince >= monitorFailureGraceMs) {
-        for (const record of store.listSleeping()) {
-          await ensureWorker(record, { wake: true });
-        }
-        monitorUnavailableSince = undefined;
+        // Degraded mode: sweep in this process instead of spawning one per name.
+        monitorUnavailableSince = Date.now();
+        try { await service.monitorScan(); } catch { /* The next call retries. */ }
+        return true;
       }
       return false;
     },
@@ -995,7 +1020,7 @@ export function createScopedAgents(config, {
       return store.locked(agentId, async () => {
         const record = store.get(agentId);
         if (!record || !canSleep(record, store.supplements(agentId), treeSettled)) return false;
-        if (!await startIdleMonitor(config, store)) return false;
+        if (!await startSharedMonitor(config, store)) return false;
         return store.sleep(record, idleSignal({ ...record.observation, taskId: record.task.taskId }));
       });
     },

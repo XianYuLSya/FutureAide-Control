@@ -1,10 +1,7 @@
-import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { hasPendingDelivery } from './idle-monitor-eligibility.mjs';
-import { fileURLToPath } from 'node:url';
 
 export function idleSignal(value) {
   return JSON.stringify([value.taskId ?? null, value.throughSeq ?? -1,
@@ -76,20 +73,4 @@ export function backgroundBatch(run, notify) {
     },
     async drain() { await active; },
   };
-}
-
-export async function ensureIdleMonitor(config, store) {
-  if (!config.configFile || !config.hostBridgeFile) return false;
-  const ready = store.lease('idle-monitor:ready');
-  const owner = store.lease('idle-monitor');
-  if (ready && owner && ready.holder === owner.holder && ready.expires > Date.now() && owner.expires > Date.now()) return true;
-  const holder = `monitor-${randomUUID()}`;
-  if (!store.claimLease('idle-monitor', holder, 30000)) return false;
-  try {
-    const child = spawn(process.execPath, [fileURLToPath(new URL('./idle-monitor-worker.mjs', import.meta.url)), '--config', config.configFile, '--lease', holder],
-      { detached: true, stdio: 'ignore', windowsHide: true });
-    await new Promise((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
-    child.unref();
-  } catch (error) { store.releaseLease('idle-monitor', holder); throw error; }
-  return false; // A later poll may sleep once the child announces readiness.
 }

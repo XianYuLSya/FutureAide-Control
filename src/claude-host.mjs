@@ -947,24 +947,43 @@ export async function resume({ nativeSessionId, hostSessionId: hint }, {
 // ------------------------------------------------------------------- models
 
 /** Effort words the composer's model control appends after the model name. */
-export const EFFORT_WORDS = Object.freeze(['最大', '最高', '最低', '中等', '高', '中', '低', 'Max', 'High', 'Medium', 'Low']);
+export const EFFORT_WORDS = Object.freeze(['最大', '最高', '最低', '超高', '中等', '高', '中', '低',
+  'XHigh', 'Max', 'High', 'Medium', 'Low']);
 
 /**
- * Effort label <-> host effort value. The pairs marked `observed` were seen for
- * real on this host: its own sessions recorded `effort: max` while the composer
- * showed `最高`, and a fresh session recorded `effort: medium` while it showed
- * `中等`.
+ * The effort menu this host shows for a model, as surveyed in the app itself on
+ * this machine: low / medium (recommended, preselected) / high / xhigh / max,
+ * where max carries the "3.5× or more usage" hint. Ultracode is a separate
+ * toggle, not an effort.
+ */
+export const EFFORT_MENU = Object.freeze({
+  order: Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']),
+  labels: Object.freeze({ low: '低', medium: '中等', high: '高', xhigh: '超高', max: '最高' }),
+  recommended: Object.freeze({ effort: 'medium', label: '中等' }),
+  usageHintOnMax: '3.5× 或更多',
+  ultracode: 'separate toggle, not an effort',
+});
+
+/**
+ * Effort label <-> host effort value. Every pair here is the host's own menu
+ * wording; the value side was seen in this host's session records and launch
+ * arguments (`effort: max` with `最高`, `effort: medium` with `中等`).
  */
 export const EFFORT_LABELS = Object.freeze({
   '最高': 'max', '最大': 'max', 'Max': 'max',
+  '超高': 'xhigh', 'XHigh': 'xhigh',
   '高': 'high', 'High': 'high',
   '中等': 'medium', '中': 'medium', 'Medium': 'medium',
   '低': 'low', 'Low': 'low',
 });
 
-export const EFFORT_LABEL_FOR = Object.freeze({
-  max: '最高', high: '高', medium: '中等', low: '低',
-});
+export const EFFORT_LABEL_FOR = Object.freeze(EFFORT_MENU.labels);
+export const EFFORT_VALUE_FOR_LABEL = EFFORT_LABELS;
+
+/** Is this effort value one the host's effort menu offers? */
+export function isOfferedEffort(value) {
+  return EFFORT_MENU.order.includes(value);
+}
 
 /**
  * Model id -> the label the host shows. Only ids with a observed pairing are
@@ -975,6 +994,26 @@ export const EFFORT_LABEL_FOR = Object.freeze({
 export const MODEL_LABELS = Object.freeze({
   'claude-opus-5-5': Object.freeze({ provider: 'anthropic', label: 'Opus 5.5', evidence: 'transcript model + host launch arg --model=claude-opus-5-5 with composer label "Opus 5.5"' }),
 });
+
+/**
+ * The model menu this host shows, in the app's own order, surveyed directly in
+ * the app on this machine: the primary entries, then the entries behind "more".
+ * A label listed here is proven to exist as a menu option; that says nothing
+ * about its model id, which is only mapped where it was observed.
+ */
+export const MODEL_MENU = Object.freeze({
+  primary: Object.freeze(['Opus 5.5', 'Sonnet 5.5', 'Fable 5.1', 'Haiku 5.5']),
+  more: Object.freeze(['Haiku 4.5', 'Sonnet 5', 'Opus 5', 'Fable 5', 'Opus 4.8', 'Opus 4.7', 'Opus 4.6', 'Sonnet 4.6']),
+});
+
+/** Every model label the host's menu offers, primary entries first. */
+export function offeredModelLabels() {
+  return [...MODEL_MENU.primary, ...MODEL_MENU.more];
+}
+
+export function isOfferedModelLabel(label) {
+  return offeredModelLabels().includes(String(label ?? '').trim());
+}
 
 export function labelForModel({ provider = 'anthropic', model } = {}) {
   const known = MODEL_LABELS[model];
@@ -997,6 +1036,7 @@ export function parseModelControl(raw) {
   let text = raw.trim();
   const colon = text.search(/[:：]/);
   if (colon >= 0) text = text.slice(colon + 1).trim();
+  text = text.replace(/[（(]\s*(推荐|recommended)\s*[)）]/gi, '').trim();
   const cross = text.search(/[×]/); // a usage hint follows ('3.5× or more')
   if (cross > 0) {
     let index = cross;
@@ -1186,7 +1226,8 @@ export async function readDefaultModel({
     ? Object.entries(MODEL_LABELS).find(([, value]) => value.label === control.label)?.[0]
     : undefined;
   const model = controlModel ?? launchArgs?.model ?? MODEL_LABELS['claude-opus-5-5'].model;
-  const reasoningEffort = (control.effort ? EFFORT_LABELS[control.effort] : undefined) ?? launchArgs?.effort ?? 'medium';
+  const reasoningEffort = (control.effort ? EFFORT_LABELS[control.effort] : undefined)
+    ?? launchArgs?.effort ?? EFFORT_MENU.recommended.effort;
   return {
     provider: 'anthropic',
     model,
@@ -1201,10 +1242,12 @@ export async function readDefaultModel({
       newestSession: newest ? { nativeSessionId: newest.nativeSessionId, pid: newest.pid, startedAt: newest.startedAt } : null,
       launchArgs: launchArgs ?? null,
       control: control.label ? control : null,
+      modelMenu: MODEL_MENU,
+      effortMenu: EFFORT_MENU,
     },
     gaps: [
       'No host settings file on this machine carries the default model, so the value comes from the app\'s own session launch arguments and its composer control.',
-      'The exact wording and order of the options inside the model menu is not verified; only the label the control shows is mapped.',
+      `Model ids are mapped for ${Object.keys(MODEL_LABELS).join(', ')} only; the other menu labels (${offeredModelLabels().filter(label => !Object.values(MODEL_LABELS).some(known => known.label === label)).join(', ')}) are known options without a proven id.`,
     ],
   };
 }
@@ -1234,10 +1277,19 @@ export async function selectModel({ nativeSessionId, provider = 'anthropic', mod
   driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, timeoutMs = 15000, pollMs = 250,
 } = {}) {
   const mapped = labelForModel({ provider, model });
-  if (!mapped.resolved) throw fail(mapped.reason, `Cannot map ${JSON.stringify(model)} to a host label: ${mapped.reason}.`, mapped);
+  if (!mapped.resolved) {
+    throw fail(mapped.reason,
+      `Cannot map ${JSON.stringify(model)} to a host label: ${mapped.reason}. The host menu offers ${offeredModelLabels().join(', ')}; only labels with a proven id are selectable by id.`,
+      { ...mapped, menu: offeredModelLabels() });
+  }
+  const offeredLabel = isOfferedModelLabel(mapped.label);
   const effortLabel = reasoningEffort ? EFFORT_LABEL_FOR[reasoningEffort] : undefined;
   if (reasoningEffort && !effortLabel) {
-    throw fail('unmapped-effort', `reasoningEffort ${JSON.stringify(reasoningEffort)} has no host label on this build.`);
+    throw fail('unmapped-effort',
+      `reasoningEffort ${JSON.stringify(reasoningEffort)} is not on this host's effort menu (${EFFORT_MENU.order.join(' / ')}).`);
+  }
+  if (reasoningEffort && !isOfferedEffort(reasoningEffort)) {
+    throw fail('unmapped-effort', `reasoningEffort ${JSON.stringify(reasoningEffort)} is not offered by this host.`);
   }
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
   const ui = requireDriver(driver, 'selecting a model');
@@ -1268,7 +1320,8 @@ export async function selectModel({ nativeSessionId, provider = 'anthropic', mod
       model: after.model, reasoningEffort: after.reasoningEffort, source: after.source, conflicts: after.conflicts },
     verifiedBy: ['ui-model-control-read-back', 'session-state'],
     attempt,
-    gap: 'The mapping from model id to the label the menu shows is proven for Opus 5.5 only; other ids stay unmapped.',
+    menuLabelOffered: offeredLabel,
+    gap: 'The mapping from model id to the label the menu shows is proven for Opus 5.5 only; the other labels the menu offers stay unmapped until each id is observed.',
   };
 }// -------------------------------------------------------------------- probe
 

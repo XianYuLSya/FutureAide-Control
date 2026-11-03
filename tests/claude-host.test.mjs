@@ -11,6 +11,7 @@ import {
   createNullDriver, createFirstTurn, interrupt, destroy, resume, readDefaultModel, selectModel,
   probeClaudeHost, parseModelControl, modelInfo, resolveModelEvidence, confirmModelAfterTurn, sessionArtifacts,
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
+  MODEL_MENU, EFFORT_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
 } from '../src/claude-host.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -443,6 +444,23 @@ test('resume of a closed session only succeeds when the record comes back', asyn
 });
 
 ﻿// ------------------------------------------------------------------ models
+
+test('the surveyed model and effort menus are the ones this host shows', () => {
+  assert.deepEqual(MODEL_MENU.primary, ['Opus 5.5', 'Sonnet 5.5', 'Fable 5.1', 'Haiku 5.5']);
+  assert.equal(offeredModelLabels().length, 12);
+  assert.equal(isOfferedModelLabel('Opus 4.6'), true);
+  assert.equal(isOfferedModelLabel('Opus 5.6'), false);
+  assert.deepEqual(EFFORT_MENU.order, ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(EFFORT_MENU.labels.xhigh, '超高');
+  assert.equal(EFFORT_LABELS['超高'], 'xhigh');
+  assert.equal(EFFORT_LABEL_FOR.max, '最高');
+  assert.equal(isOfferedEffort('xhigh'), true);
+  assert.equal(isOfferedEffort('turbo'), false);
+  // The menu decorates the recommended entry and the max entry with hints.
+  assert.equal(parseModelControl('模型：Opus 5.5 中等（推荐）').effort, '中等');
+  assert.equal(parseModelControl('模型：Opus 5.5 中等（推荐）').label, 'Opus 5.5');
+  assert.equal(parseModelControl('模型：Opus 5.5 最高 3.5× 或更多').effort, '最高');
+});
 
 test('model ids map to host labels only where a pairing was observed', () => {
   const mapped = labelForModel({ provider: 'anthropic', model: 'claude-opus-5-5' });

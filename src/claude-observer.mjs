@@ -16,7 +16,7 @@ const FILE_TOOLS = new Map([['Write', 'create'], ['Edit', 'edit'], ['MultiEdit',
 
 export function emptyClaudeProjection(taskId, { throughSeq = 0, currentModel } = {}) {
   return { taskId, throughSeq, currentModel, messages: [], messagesOmitted: 0, pendingTools: {},
-    completedTools: [], successfulTools: [], changes: [], reports: [], questions: [], deliveries: {}, children: {},
+    completedTools: [], successfulTools: [], agentTools: {}, changes: [], reports: [], questions: [], deliveries: {}, children: {},
     completions: [], badLines: 0, activity: 'idle' };
 }
 
@@ -98,6 +98,7 @@ export function projectClaudePage(projection, page, { workspace, agentId, reques
       projection.activity = event.tools.length ? `tool: ${event.tools.at(-1).name}` : 'responding';
       for (const tool of event.tools) if (!projection.completedTools.includes(tool.id)) {
         projection.pendingTools[tool.id] = { ...tool, seq: event.seq };
+        if (['Agent', 'Task'].includes(tool.name)) (projection.agentTools ??= {})[tool.id] = { ...tool, seq: event.seq };
       }
       if (event.stopReason === 'end_turn' || event.stopReason === 'stop_sequence' || event.apiError) {
         projection.completions.push({ seq: event.seq, timestamp: event.timestamp,
@@ -110,6 +111,7 @@ export function projectClaudePage(projection, page, { workspace, agentId, reques
     for (const result of event.results ?? []) completeTool(projection, result, event, { workspace, agentId, reportTools });
     if (event.type === 'user' && event.text === '[Request interrupted by user]' && !event.results?.length) {
       projection.completions.push({ seq: event.seq, timestamp: event.timestamp, reason: { kind: 'cancelled' } });
+      projection.lastInterruptSeq = event.seq;
       projection.activity = 'interrupted';
     }
   }

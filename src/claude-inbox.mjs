@@ -198,7 +198,15 @@ export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576
       // Busy-session inbox messages are attachments, not user messages. Native
       // source_uuid correlates them without asking the model to echo our marker.
       const attachment = event.attachment;
-      if (event.type === 'attachment' && attachment?.type === 'queued_command'
+      const enqueued = event.type === 'queue-operation' && event.operation === 'enqueue'
+        && typeof event.content === 'string'
+        ? /^<cross-session-message from-name="FutureAide Control">\r?\n\[FutureAide request ([A-Za-z0-9-]{1,100})\]\r?\n/.exec(event.content) : null;
+      if (enqueued) {
+        // This is our fixed transport envelope at the start of a native queue
+        // record, not an id quoted by the model. The observer still intersects
+        // it with persisted request ids; insertion remains a separate receipt.
+        deliveries.push({ requestId: enqueued[1], stage: 'accepted', timestamp: event.timestamp, seq });
+      } else if (event.type === 'attachment' && attachment?.type === 'queued_command'
           && attachment.origin?.kind === 'peer' && typeof attachment.source_uuid === 'string') {
         deliveries.push({ requestId: attachment.source_uuid, deliveryId: attachment.delivery_id,
           stage: 'accepted', timestamp: event.timestamp, seq });

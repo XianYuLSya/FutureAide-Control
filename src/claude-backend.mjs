@@ -42,7 +42,7 @@ export async function createClaudeBackend(record, deps = {}) {
     state.requests ??= {};
     return state;
   }
-  const hostOptions = () => ({ driver, env });
+  const hostOptions = () => ({ driver, env, workspace: load().workspace });
 
   async function requireReports() {
     if (deps.ensureClaudeReports) {
@@ -220,7 +220,7 @@ export async function createClaudeBackend(record, deps = {}) {
       if (previous && previous.status !== 'retryable') return {
         accepted: previous.status === 'accepted', status: previous.status, afterSeq: previous.afterSeq };
       state.projection ??= emptyClaudeProjection(current.task?.taskId);
-      const request = { requestId, status: 'unknown', attempted: true, afterSeq: state.projection.throughSeq,
+      const request = { requestId, status: 'retryable', attempted: false, afterSeq: state.projection.throughSeq,
         taskId: current.task?.taskId, startedAt: new Date().toISOString() };
       state.requests[requestId] = request;
       save(state); // write intent before either native write or UI submit
@@ -232,15 +232,22 @@ export async function createClaudeBackend(record, deps = {}) {
           + '完成当前任务并验证后调用 report_parent(message, final=true)，提问后结束本轮等待回答。\n\n' + message;
         let created;
         try {
-          created = await lockedHost(() => host.createFirstTurn({ workspace: current.workspace,
-            requestId, message: prompt, bindingNonce }, { ...hostOptions(),
-            onBound: native => rememberBinding(state, native) }));
-        } catch (error) { throw failure(error.code ?? 'claude-create-unconfirmed', error.message, { uncertain: true }); }
+          created = await lockedHost(() => {
+            request.attempted = true; request.status = 'unknown'; save(state);
+            return host.createFirstTurn({ workspace: current.workspace, requestId, message: prompt, bindingNonce },
+              { ...hostOptions(), onBound: native => rememberBinding(state, native) });
+          });
+        } catch (error) { throw failure(error.code ?? 'claude-create-unconfirmed', error.message,
+          request.attempted ? { uncertain: true } : { retryableRead: true }); }
         if (!created?.nativeSessionId || (!created.created && !created.reused)) {
           return { accepted: false, status: 'unknown', afterSeq: request.afterSeq };
         }
-        await rememberBinding(state, created);
-        ({ state } = await refresh());
+        try {
+          await rememberBinding(state, created);
+          ({ state } = await refresh());
+        } catch (error) {
+          throw failure(error.code ?? 'claude-created-observation-pending', error.message, { uncertain: true });
+        }
         // The host verified our unique request+nonce in the initial user event.
         // It is native acceptance evidence even though UI sends do not use our
         // request id as the native user UUID.
@@ -248,23 +255,39 @@ export async function createClaudeBackend(record, deps = {}) {
           && item.text.includes(host.markerLine(requestId, bindingNonce)))?.seq ?? request.afterSeq;
         state.requests[requestId].status = 'accepted';
         state.projection.deliveries[requestId] = { requestId, stage: 'inserted', seq: acceptedAt };
-        save(state);
+        try { save(state); }
+        catch (error) { throw failure(error.code ?? 'claude-receipt-pending', error.message, { uncertain: true }); }
         return { accepted: true, afterSeq: request.afterSeq };
       }
       try {
         await nativeSession(state, { resume: true });
-        const result = await send(state.binding, message, { requestId });
-        request.status = result.status === 'failed' ? 'retryable' : 'unknown';
-        request.transport = result.status;
-        save(state);
       } catch (error) {
-        // bind/read failures happen before sendClaude enters the socket write.
-        // A pipe write result itself is returned as written/uncertain/failed.
-        request.status = 'retryable'; request.error = error.code ?? error.message;
+        request.error = error.code ?? error.message;
         save(state);
         throw failure(error.code ?? 'claude-send-unavailable', error.message, { retryableRead: true });
       }
-      ({ state } = await refresh());
+      request.attempted = true; request.status = 'unknown'; save(state);
+      let result;
+      try { result = await send(state.binding, message, { requestId }); }
+      catch (error) {
+        // sendClaude throws only during its pre-write record/key checks. Once
+        // it connects, every outcome is a written/uncertain/failed receipt.
+        request.attempted = false; request.status = 'retryable'; request.error = error.code ?? error.message;
+        save(state);
+        throw failure(error.code ?? 'claude-send-unavailable', error.message, { retryableRead: true });
+      }
+      request.status = result.status === 'failed' ? 'retryable' : 'unknown';
+      request.attempted = result.status !== 'failed';
+      request.transport = result.status;
+      // A state-save failure after the write must leave the earlier unknown
+      // intent intact, never turn a written message into a retryable request.
+      try {
+        save(state);
+        ({ state } = await refresh());
+      } catch (error) {
+        throw failure(error.code ?? 'claude-written-observation-pending', error.message,
+          result.status === 'failed' ? { retryableRead: true } : { uncertain: true });
+      }
       const receipt = receiptFrom(state, requestId);
       return { accepted: receipt.status === 'accepted', status: receipt.status === 'retryable' ? 'retrying' : receipt.status,
         afterSeq: receipt.afterSeq };
@@ -298,7 +321,7 @@ export async function createClaudeBackend(record, deps = {}) {
     },
     async cancel() {
       const state = await recoverFirstBinding(stateForTask());
-      if (!state.binding) return { cancelRequested: !Object.keys(state.requests ?? {}).length };
+      if (!state.binding) return { cancelRequested: !Object.values(state.requests ?? {}).some(request => request.attempted) };
       const native = await nativeSession(state);
       if (native.status === 'idle') {
         const observed = await refresh();
@@ -310,8 +333,9 @@ export async function createClaudeBackend(record, deps = {}) {
     },
     async destroy() {
       const state = await recoverFirstBinding(stateForTask());
-      if (!state.binding) return { destroyed: !Object.keys(state.requests ?? {}).length,
-        ...(Object.keys(state.requests ?? {}).length ? { message: 'The first native send is still unconfirmed; retaining its ownership record.' } : {}) };
+      const attempted = Object.values(state.requests ?? {}).some(request => request.attempted);
+      if (!state.binding) return { destroyed: !attempted,
+        ...(attempted ? { message: 'The first native send is still unconfirmed; retaining its ownership record.' } : {}) };
       return lockedHost(() => host.destroy({ nativeSessionId: state.binding.sessionId, binding: state.binding }, hostOptions()));
     },
     async cursor() { return { throughSeq: (await refresh()).state.projection.throughSeq }; },

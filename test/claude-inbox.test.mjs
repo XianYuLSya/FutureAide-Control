@@ -63,3 +63,13 @@ test('idle inbox delivery retains the user-frame UUID, unlike a tool result', as
   const result = await readClaudeEvents(binding);
   assert.deepEqual(result.deliveries.map(({ requestId: id, stage }) => [id, stage]), [[requestId, 'inserted']]);
 });
+
+test('enqueue acknowledges only the exact transport envelope, before busy insertion', async () => {
+  const envelope = `<cross-session-message from-name="FutureAide Control">\n[FutureAide request ${requestId}]\nDo work.\n</cross-session-message>`;
+  const binding = await fixture(
+    line({ type: 'queue-operation', operation: 'enqueue', content: 'Quoted: ' + envelope })
+    + line({ type: 'queue-operation', operation: 'enqueue', content: envelope.replace('FutureAide Control', 'Other peer') })
+    + line({ type: 'queue-operation', operation: 'enqueue', content: envelope }));
+  const result = await readClaudeEvents(binding);
+  assert.deepEqual(result.deliveries.map(({ requestId: id, stage }) => [id, stage]), [[requestId, 'accepted']]);
+});

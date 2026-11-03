@@ -120,3 +120,32 @@ test('a failed report-service startup leaves the native host untouched', async (
   assert.equal(f.counters.created, 0);
   assert.equal(f.counters.sent, 0);
 });
+
+test('waiting for another UI operation does not become an uncertain native send', async () => {
+  const f = await setup();
+  const busy = await createClaudeBackend(f.record, { ...f.deps, withHostLock: async () => {
+    throw Object.assign(new Error('Host busy'), { code: 'agent-busy' });
+  } });
+  await assert.rejects(busy.deliver({ requestId: 'first', message: 'First' }), { code: 'agent-busy', retryableRead: true });
+  assert.equal((await busy.receipt({ requestId: 'first' })).status, 'retryable');
+  assert.equal(f.counters.created, 0);
+  assert.equal((await f.adapter.deliver({ requestId: 'first', message: 'First' })).accepted, true);
+  assert.equal(f.counters.created, 1);
+});
+
+test('a failed receipt save after a native write cannot cause a resend', async () => {
+  const f = await setup();
+  await f.adapter.create();
+  await f.adapter.beginTask();
+  await f.adapter.deliver({ requestId: 'first', message: 'First' });
+  let failed = false;
+  const interrupted = await createClaudeBackend(f.record, { ...f.deps, writeNativeState: state => {
+    if (!failed && state.requests?.followup?.transport === 'written') { failed = true; throw new Error('Temporary database failure'); }
+    return f.deps.writeNativeState(state);
+  } });
+  await assert.rejects(interrupted.deliver({ requestId: 'followup', message: 'More' }), /database failure/);
+  const recovered = await createClaudeBackend(f.record, f.deps);
+  assert.equal((await recovered.receipt({ requestId: 'followup' })).status, 'unknown');
+  await recovered.deliver({ requestId: 'followup', message: 'More' });
+  assert.equal(f.counters.sent, 1);
+});

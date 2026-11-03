@@ -1,28 +1,27 @@
 // Claude Desktop host operations for FutureAide Control.
 //
 // This module is the program-callable surface for the *lifecycle* of a Claude
-// Desktop session: create on the first turn, interrupt, destroy, resume, and the
-// default model. It drives only what the installed application really exposes:
+// Desktop session: create on the first turn, interrupt, delete, resume, and the
+// model. It drives only what the installed application really exposes:
 //
 //   1. Native session records `<configRoot>/sessions/<pid>.json` (written by the
 //      app when a session actually starts) and their transcripts under
-//      `<configRoot>/projects/<munged-cwd>/<sessionId>.jsonl`.
+//      `<configRoot>/projects/<munged-cwd>/<sessionId>.jsonl`, plus the
+//      per-session `session-env` / `file-history` directories.
 //   2. The renderer's documented deep links (`claude://code/new?q=&folder=`,
-//      `claude://code/continue?session=local_<id>`). Checked against the shipped
+//      `claude://code/continue?session=local_<id>`), checked against the shipped
 //      bundle: `new` only prefills the composer, `continue` targets an existing
 //      session through its `hostSessionId`.
 //   3. A minimal UI operation surface (Windows UI Automation, see
-//      `scripts/claude-host.ps1`) for the two things that have no native entry
-//      point: pressing send, and interrupting a running turn.
+//      `scripts/claude-host.ps1`) for what has no native entry point: the
+//      sidebar's "new session in this folder", pressing send, interrupting a
+//      running turn, and the sidebar's own "more options -> delete".
 //
-// `LocalSessions.start/sendMessage/interrupt/stop/setModel` exist in the main
-// process bundle (`index.chunk-CEuIhp7O.js`) but are renderer-only IPC, so they
-// are not reachable from this process and are not used.
-//
-// Nothing here starts a Claude CLI or SDK model, imports a former three-way
-// implementation, or keeps an LLM as a scheduler. A UI driver may be injected;
-// when it is missing every operation that needs it fails explicitly instead of
-// reporting a made-up success.
+// `LocalSessions.*` exists in the main-process bundle but is renderer-only IPC,
+// so it is unreachable from this process and is not used. Nothing here starts a
+// Claude CLI or SDK model, imports a former three-way implementation, or keeps an
+// LLM as a scheduler. A UI driver may be injected; when it is missing every
+// operation that needs it fails explicitly instead of reporting a fake success.
 import { readdir, readFile, stat, open } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
@@ -32,8 +31,9 @@ import { fileURLToPath } from 'node:url';
 export const NATIVE_HOST = 'claude-desktop';
 /** Exact user message the app appends to a transcript when a turn is stopped. */
 export const INTERRUPT_MARKER = '[Request interrupted by user]';
-/** Deep-link prompt cap measured in the shipped bundle (`KN`). */
+/** Deep-link prompt cap measured in the shipped bundle. */
 export const DEEP_LINK_PROMPT_LIMIT = 14336;
+
 const SESSION_FILE = /^([1-9][0-9]*)\.json$/;
 const HOST_SESSION_ID = /^local_[A-Za-z0-9-]{1,64}$/;
 const REQUEST_ID = /^[a-zA-Z0-9-]{1,100}$/;
@@ -44,7 +44,8 @@ const TRANSCRIPT_TAIL_BYTES = 8 * 1024 * 1024;
 
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
 const configRoot = env => path.resolve(env?.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'));
-const samePath = (a, b) => typeof a === 'string' && typeof b === 'string' && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+const samePath = (a, b) => typeof a === 'string' && typeof b === 'string'
+  && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export function defaultIsAlive(pid) {
@@ -75,7 +76,6 @@ export function assertBindingNonce(value) {
   return value;
 }
 
-/** Markdown-safe text that survives the deep-link `q` parameter and the composer. */
 export function assertMessage(value) {
   if (typeof value !== 'string' || !value.trim()) throw fail('message-empty', 'message must be non-empty text.');
   return value;
@@ -147,17 +147,20 @@ export async function listNativeSessions({ env = process.env, isAlive = defaultI
 
 /**
  * Resolve one native session by the identifier the plugin stored for it.
- * A record that no longer exists is reported as unknown; a stale file for a dead
- * process still resolves and carries `alive: false`.
+ * A record for a dead process still resolves and carries `alive: false`.
  */
-export async function resolveNativeSession(nativeSessionId, { env = process.env, isAlive = defaultIsAlive, workspace } = {}) {
+export async function resolveNativeSession(nativeSessionId, {
+  env = process.env, isAlive = defaultIsAlive, workspace,
+} = {}) {
   if (typeof nativeSessionId !== 'string' || !nativeSessionId.trim()) {
     throw fail('invalid-native-session', 'nativeSessionId must be the Claude session id string.');
   }
   const { sessions } = await scanNativeSessions({ env, isAlive });
   const matches = sessions.filter(session => session.nativeSessionId === nativeSessionId);
   if (!matches.length) throw fail('unknown-native-session', `Claude Desktop has no registered session ${nativeSessionId}.`);
-  if (matches.length > 1) throw fail('ambiguous-native-session', `Claude Desktop registered ${matches.length} processes for session ${nativeSessionId}.`);
+  if (matches.length > 1) {
+    throw fail('ambiguous-native-session', `Claude Desktop registered ${matches.length} processes for session ${nativeSessionId}.`);
+  }
   const [record] = matches;
   if (workspace && !samePath(record.workspace, workspace)) {
     throw fail('session-workspace-mismatch',
@@ -192,11 +195,7 @@ export async function findTranscript({ env = process.env, nativeSessionId, works
   return found[0];
 }
 
-/**
- * Parsed events of a transcript, reading at most the last `maxBytes`. Only the
- * fields a caller can verify against are kept; nothing is echoed verbatim except
- * text the user or the assistant wrote in this session.
- */
+/** Parsed events of a transcript, reading at most the last `maxBytes`. */
 export async function readTranscriptEvents(file, { maxBytes = TRANSCRIPT_TAIL_BYTES } = {}) {
   const handle = await open(file, 'r').catch(() => null);
   if (!handle) return { file, events: [], size: 0 };
@@ -214,13 +213,17 @@ export async function readTranscriptEvents(file, { maxBytes = TRANSCRIPT_TAIL_BY
       try { event = JSON.parse(line); } catch { continue; }
       if (!event || typeof event !== 'object') continue;
       const content = event.message?.content;
+      const parts = Array.isArray(content) ? content : [];
+      const text = typeof content === 'string' ? content
+        : parts.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n');
       events.push({
         type: event.type,
         uuid: event.uuid,
         timestamp: event.timestamp,
         model: event.message?.model,
-        text: typeof content === 'string' ? content
-          : (Array.isArray(content) ? content.filter(part => part?.type === 'text').map(part => part.text).join('\n') : ''),
+        effort: event.effort ?? event.perTurnEffort,
+        stopReason: event.message?.stop_reason,
+        text,
       });
     }
     return { file, events, size, partial: start > 0 };
@@ -234,10 +237,14 @@ export function countMarker(events, marker) {
   return events.filter(event => userText(event).includes(marker)).length;
 }
 
-/** True when the app recorded an interrupt after `sinceIso`. */
+/**
+ * True when the app recorded an interrupt after `sinceIso`. The marker can be
+ * its own user message or a text part of the next request blob, so every event
+ * type is checked; the timestamp keeps an older interrupt from counting.
+ */
 export function interruptedSince(events, sinceIso) {
   const since = sinceIso ? Date.parse(sinceIso) : -Infinity;
-  return events.some(event => event.type === 'user' && userText(event).includes(INTERRUPT_MARKER)
+  return events.some(event => typeof event.text === 'string' && event.text.includes(INTERRUPT_MARKER)
     && !(Date.parse(event.timestamp) < since));
 }
 
@@ -254,9 +261,12 @@ export function createNullDriver(reason = 'ui-driver-unavailable') {
     async probe() { return { available: false, reason }; },
     async currentView() { return { available: false, reason }; },
     openNewSession: refuse,
+    clickButton: refuse,
     submit: refuse,
     interrupt: refuse,
     revealSession: refuse,
+    sessionMenu: refuse,
+    deleteSession: refuse,
     readModel: refuse,
     selectModel: refuse,
   };
@@ -268,8 +278,9 @@ function scriptPath() {
 
 /**
  * Anchors of the Claude Desktop conversation UI, localized. Measured on
- * Claude 4.4212.0.0: the composer is `Edit "提示词"`, the model control is the
- * button named `模型：…` and the sidebar offers `在 <folder> 中新建会话`.
+ * Claude 4.4212.0.0: the composer is the `Edit` named with the prompt label, the
+ * model control is the button whose name starts with the model label, and the
+ * sidebar offers a "new session in <folder>" button per folder group.
  * Every label travels to the bridge as JSON, never as a script literal.
  */
 export const DEFAULT_UI_PATTERNS = Object.freeze({
@@ -279,7 +290,16 @@ export const DEFAULT_UI_PATTERNS = Object.freeze({
   stop: '^(停止|Stop)$',
   newInFolder: '^(在 .+ 中新建会话|New session in .+)$',
   newSession: '^(新建|New chat|New session)$',
+  trust: '^(信任工作区|信任|Trust workspace|Trust)$',
+  cancel: '^(取消|Cancel)$',
 });
+
+/** The app's own workspace-trust question on a fresh Claude Code page. */
+export const DEFAULT_TRUST_PATTERN = '^(信任工作区|信任|Trust workspace|Trust)$';
+/** The sidebar menu entry that starts the host's own session deletion. */
+export const DEFAULT_DELETE_LABEL = '删除';
+/** Buttons the host's deletion confirmation may offer; only these are pressed. */
+export const DEFAULT_DELETE_CONFIRM_LABELS = Object.freeze(['删除', 'Delete', '删除会话', 'Delete session']);
 
 /**
  * The real UI bridge: one PowerShell script, JSON in on stdin, JSON out on a
@@ -288,23 +308,21 @@ export const DEFAULT_UI_PATTERNS = Object.freeze({
  */
 export function createPowerShellDriver({
   script = scriptPath(), timeoutMs = 20000, powershell = 'powershell.exe',
-  patterns = DEFAULT_UI_PATTERNS,
+  patterns = DEFAULT_UI_PATTERNS, trustPattern = DEFAULT_TRUST_PATTERN,
 } = {}) {
   async function run(action, payload = {}, { timeoutMs: actionTimeout = timeoutMs } = {}) {
-    const outFile = path.join(os.tmpdir(), `futureaide-claude-host-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
-    const body = JSON.stringify({ ...payload, action, patterns });
+    const outFile = path.join(os.tmpdir(),
+      `futureaide-claude-host-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+    const body = JSON.stringify({ ...payload, action, patterns, trustPattern });
     const child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
       '-File', script, '-Action', action, '-OutFile', outFile], {
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, FA_CLAUDE_HOST_ACTION: action },
     });
     const stderr = [];
     child.stderr.on('data', chunk => { if (stderr.length < 40) stderr.push(chunk.toString('utf8')); });
     child.stdout.on('data', () => {});
     child.stdin.on('error', () => {}); // the bridge may exit before reading
-    // The payload (including every localized label and the prompt) travels on
-    // stdin as UTF-8, never through argv.
     child.stdin.end(body, 'utf8');
     const timer = setTimeout(() => { try { child.kill(); } catch { /* already gone */ } }, actionTimeout);
     const exit = await new Promise(resolve => {
@@ -320,7 +338,9 @@ export function createPowerShellDriver({
         `The Claude Desktop UI bridge (${action}) produced no result${stderr.length ? `: ${stderr.join('').trim().slice(0, 400)}` : ''}.`,
         { action, exit });
     }
-    if (parsed.ok !== true) throw fail(parsed.code ?? 'ui-bridge-refused', parsed.message ?? `The ${action} action was refused.`, { action, detail: parsed });
+    if (parsed.ok !== true) {
+      throw fail(parsed.code ?? 'ui-bridge-refused', parsed.message ?? `The ${action} action was refused.`, { action, detail: parsed });
+    }
     return parsed.value;
   }
   return {
@@ -328,13 +348,22 @@ export function createPowerShellDriver({
     available: true,
     async probe() { return run('probe'); },
     async currentView() { return run('view'); },
-    async openNewSession({ workspace, prompt, allowDeepLink = true, folderLabel }) {
-      return run('new-session', { workspace, prompt, allowDeepLink, folderLabel: folderLabel ?? path.basename(workspace) });
+    async openNewSession({ workspace, prompt, allowDeepLink = true, folderLabel, launchVia = 'protocol',
+      allowExecutable = true, trustWorkspace = false }) {
+      return run('new-session', { workspace, prompt, allowDeepLink, launchVia, allowExecutable, trustWorkspace,
+        folderLabel: folderLabel ?? path.basename(workspace) }, { timeoutMs: Math.max(timeoutMs, 60000) });
     },
-    async submit({ prompt } = {}) { return run('submit', { prompt }); },
+    async clickButton({ namePattern }) { return run('click-button', { namePattern }); },
+    async submit({ prompt, prefilled, trustWorkspace = false } = {}) {
+      return run('submit', { prompt, prefilled, trustWorkspace });
+    },
     async interrupt() { return run('interrupt'); },
-    async revealSession({ hostSessionId, title, allowDeepLink = true }) {
-      return run('reveal', { hostSessionId, title, allowDeepLink });
+    async revealSession({ hostSessionId, title, allowDeepLink = true, launchVia = 'protocol' }) {
+      return run('reveal', { hostSessionId, title, allowDeepLink, launchVia });
+    },
+    async sessionMenu({ title }) { return run('menu-dump', { title }); },
+    async deleteSession({ title, deleteLabel = DEFAULT_DELETE_LABEL, confirmLabels = DEFAULT_DELETE_CONFIRM_LABELS }) {
+      return run('session-delete', { title, deleteLabel, confirmLabels }, { timeoutMs: Math.max(timeoutMs, 60000) });
     },
     async readModel() { return run('model-read'); },
     async selectModel({ label }) { return run('model-select', { label }); },
@@ -355,6 +384,17 @@ function requireDriver(driver, operation) {
 
 // -------------------------------------------------------------------- views
 
+/**
+ * The title the host shows for the page it is displaying. Claude names a code
+ * page `<title> - Claude Code`; a registered record's own `name` can be a
+ * placeholder written before the title was derived, so the page is the truth.
+ */
+export function displayTitle(documentName) {
+  if (typeof documentName !== 'string' || !documentName.trim()) return undefined;
+  const suffix = ' - Claude Code';
+  return documentName.endsWith(suffix) ? documentName.slice(0, -suffix.length).trim() : documentName.trim();
+}
+
 /** Does the visible Claude page belong to this session? Never guess by title alone. */
 export function viewMatchesSession(view, record) {
   if (!view?.available || typeof view.documentName !== 'string') return false;
@@ -364,18 +404,61 @@ export function viewMatchesSession(view, record) {
   return document === name || document.startsWith(`${name} - `) || document.startsWith(`${name} — `);
 }
 
-async function ensureSessionVisible(record, { driver, env, allowDeepLink }) {
-  const view = await driver.currentView().catch(() => undefined);
-  if (viewMatchesSession(view, record)) return { view, revealed: false };
+/** A distinctive slice of what this session said or was told, to find it on screen. */
+async function sessionContentMarker({ env, record }) {
+  const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
+    .catch(() => undefined);
+  if (!file) return undefined;
+  const { events } = await readTranscriptEvents(file);
+  const text = [...events].reverse().map(event => event.text ?? '').find(value => value.trim().length > 24);
+  if (!text) return undefined;
+  return text.replace(/\s+/g, ' ').trim().slice(0, 32);
+}
+
+/** Is this session's own content on the displayed page? Titles are not identity. */
+export function pageShowsSession(view, marker) {
+  if (!marker || !Array.isArray(view?.texts)) return false;
+  const haystack = view.texts.join(' ').replace(/\s+/g, ' ');
+  return haystack.includes(marker);
+}
+
+/** UI Automation can read a window mid-repaint; retry before concluding anything. */
+async function readViewStable(driver, { attempts = 5, delayMs = 300 } = {}) {
+  let last;
+  for (let index = 0; index < attempts; index += 1) {
+    last = await driver.currentView().catch(() => undefined);
+    if (last?.available) return last;
+    await sleep(delayMs);
+  }
+  return last;
+}
+
+async function ensureSessionVisible(record, { driver, allowDeepLink, env = process.env }) {
+  const marker = await sessionContentMarker({ env, record });
+  const view = await readViewStable(driver);
+  if (viewMatchesSession(view, record)) {
+    return { view, revealed: false, title: displayTitle(view.documentName), titleMatchesRecord: true,
+      targetConfirmedBy: 'document-title' };
+  }
+  if (pageShowsSession(view, marker)) {
+    // The record name can be a placeholder; the session's own text on screen is
+    // stronger identity than the title.
+    return { view, revealed: false, title: displayTitle(view.documentName), titleMatchesRecord: false,
+      targetConfirmedBy: 'page-content' };
+  }
   const revealed = await driver.revealSession({ hostSessionId: record.hostSessionId, title: record.name, allowDeepLink })
     .catch(error => ({ revealed: false, error: { code: error.code, message: error.message } }));
-  const after = await driver.currentView().catch(() => undefined);
-  if (!viewMatchesSession(after, record)) {
+  const after = await readViewStable(driver);
+  const title = displayTitle(after?.documentName);
+  const titleMatches = viewMatchesSession(after, record);
+  const contentMatches = pageShowsSession(after, marker);
+  if (!titleMatches && !contentMatches) {
     throw fail('session-not-visible',
       `The Claude Desktop window is not showing ${record.name ?? record.nativeSessionId}; refusing to send UI input that could reach another session.`,
-      { view: after, reveal: revealed });
+      { view: after, reveal: revealed, marker });
   }
-  return { view: after, revealed: true };
+  return { view: after, revealed: true, title, titleMatchesRecord: titleMatches,
+    targetConfirmedBy: contentMatches ? 'page-content-after-reveal' : 'document-title-after-reveal' };
 }
 
 // ------------------------------------------------------------------ creating
@@ -420,9 +503,9 @@ export const deepLinks = Object.freeze({ newSessionDeepLink, continueSessionDeep
  *
  * A Claude Desktop session does not exist until a message is actually sent, so
  * this is the only place a session is created. The caller's request id and
- * binding nonce are written into the first message; the session is reported as
- * created only when a *new* native record registers in this workspace and its
- * transcript carries that marker exactly once.
+ * binding nonce go into the first message; the session is reported as created
+ * only when a *new* native record registers in this workspace and its transcript
+ * carries that marker exactly once.
  */
 export async function createFirstTurn({
   workspace, requestId, message, bindingNonce, model = undefined,
@@ -433,14 +516,16 @@ export async function createFirstTurn({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   pollMs = DEFAULT_POLL_MS,
   allowDeepLink = true,
+  allowExecutable = true,
+  folderLabel = undefined,
+  trustWorkspace = false,
 } = {}) {
   const directory = await assertWorkspace(workspace);
   const request = assertRequestId(requestId);
   const nonce = assertBindingNonce(bindingNonce);
   const text = assertMessage(message).trimEnd();
   const marker = markerLine(request, nonce);
-  if (text.includes(marker)) throw fail('message-already-marked', 'message already carries this request marker.');
-  if (text.includes('[FutureAide Control request ')) {
+  if (text.includes(marker) || text.includes('[FutureAide Control request ')) {
     throw fail('message-already-marked', 'message already carries a FutureAide request marker.');
   }
   const payload = `${text}\n\n${marker}`;
@@ -455,8 +540,19 @@ export async function createFirstTurn({
   const ui = requireDriver(driver, 'creating a session');
   const baseline = new Set((await scanNativeSessions({ env, isAlive })).sessions.map(session => session.nativeSessionId));
   const startedAt = new Date().toISOString();
-  const launch = await ui.openNewSession({ workspace: directory, prompt: payload, allowDeepLink });
-  const submitted = await ui.submit({ prompt: payload, prefilled: launch?.prefilled === true });
+  const launch = await ui.openNewSession({ workspace: directory, prompt: payload, allowDeepLink, allowExecutable,
+    trustWorkspace, ...(folderLabel ? { folderLabel } : {}) });
+  // No keystroke is sent into a page that did not become the new session: input
+  // in an unidentified page could reach somebody else's conversation.
+  if (launch?.navigated === false) {
+    return {
+      created: false, status: 'unconfirmed',
+      reason: launch?.blocked === 'workspace-trust-prompt' ? 'workspace-trust-prompt' : 'launch-not-navigated',
+      requestId: request, bindingNonce: nonce, workspace: directory, evidence: { launch }, startedAt,
+      elapsedMs: Date.now() - Date.parse(startedAt),
+    };
+  }
+  const submitted = await ui.submit({ prompt: payload, prefilled: launch?.prefilled === true, trustWorkspace });
 
   const deadline = Date.now() + timeoutMs;
   let observed;
@@ -465,8 +561,9 @@ export async function createFirstTurn({
     const fresh = sessions.filter(session => session.alive && !baseline.has(session.nativeSessionId)
       && samePath(session.workspace, directory));
     if (fresh.length > 1) {
-      return { created: false, status: 'ambiguous', reason: 'several-new-sessions', candidates: fresh.map(session => session.nativeSessionId),
-        requestId: request, workspace: directory, evidence: { launch, submitted } };
+      return { created: false, status: 'ambiguous', reason: 'several-new-sessions',
+        candidates: fresh.map(session => session.nativeSessionId), requestId: request, workspace: directory,
+        evidence: { launch, submitted } };
     }
     if (fresh.length === 1) {
       const record = fresh[0];
@@ -477,8 +574,7 @@ export async function createFirstTurn({
         observed = { record, file, hits };
         if (hits === 1) {
           return {
-            created: true,
-            status: 'sent',
+            created: true, status: 'sent',
             nativeSessionId: record.nativeSessionId,
             hostSessionId: record.hostSessionId,
             pid: record.pid,
@@ -493,7 +589,7 @@ export async function createFirstTurn({
             strategy: launch?.strategy,
             submit: submitted?.method,
             model: model === undefined ? undefined
-              : { requested: model, applied: false, note: 'the deep link carries no model; the session uses the host default' },
+              : { requested: model, applied: false, note: 'a deep link carries no model; the session uses the host default' },
             startedAt,
             elapsedMs: Date.now() - Date.parse(startedAt),
           };
@@ -504,19 +600,12 @@ export async function createFirstTurn({
   }
 
   return {
-    created: false,
-    status: 'unconfirmed',
+    created: false, status: 'unconfirmed',
     reason: observed ? `transcript-marker-count-${observed.hits}` : 'no-native-session-registered',
-    requestId: request,
-    bindingNonce: nonce,
-    workspace: directory,
-    evidence: {
-      launch,
-      submitted,
-      session: observed ? { nativeSessionId: observed.record.nativeSessionId, markerCount: observed.hits } : undefined,
-    },
-    startedAt,
-    elapsedMs: Date.now() - Date.parse(startedAt),
+    requestId: request, bindingNonce: nonce, workspace: directory,
+    evidence: { launch, submitted,
+      session: observed ? { nativeSessionId: observed.record.nativeSessionId, markerCount: observed.hits } : undefined },
+    startedAt, elapsedMs: Date.now() - Date.parse(startedAt),
   };
 }
 
@@ -524,7 +613,7 @@ export async function createFirstTurn({
 
 /**
  * Stop the running turn of one session. Verification is the app's own marker,
- * never "the click succeeded".
+ * never "the click was accepted".
  */
 export async function interrupt({ nativeSessionId }, {
   env = process.env,
@@ -539,7 +628,7 @@ export async function interrupt({ nativeSessionId }, {
     return { interrupted: false, status: 'not-running', reason: 'session-process-gone', nativeSessionId, verifiedBy: [] };
   }
   const ui = requireDriver(driver, 'interrupting a turn');
-  const visible = await ensureSessionVisible(record, { driver: ui, env, allowDeepLink });
+  const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink, env });
   const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace });
   if (!file) throw fail('transcript-missing', `No transcript for session ${nativeSessionId}; refusing to interrupt unverifiably.`);
   const before = await readTranscriptEvents(file);
@@ -562,54 +651,112 @@ export async function interrupt({ nativeSessionId }, {
 
 // ------------------------------------------------------------------ destroy
 
+/** Everything the host owns for one session, so a deletion can be verified. */
+export async function sessionArtifacts({ env = process.env, record }) {
+  const root = configRoot(env);
+  const transcriptFile = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
+    .catch(() => undefined);
+  const sessionEnvDirectory = path.join(root, 'session-env', record.nativeSessionId);
+  const fileHistoryDirectory = path.join(root, 'file-history', record.nativeSessionId);
+  const kind = async value => {
+    const info = await stat(value).catch(() => null);
+    if (!info) return false;
+    return info.isDirectory() ? 'directory' : 'file';
+  };
+  return {
+    recordFile: record.recordFile,
+    transcriptFile,
+    sessionEnvDirectory,
+    fileHistoryDirectory,
+    state: {
+      recordFile: await kind(record.recordFile),
+      transcriptFile: transcriptFile ? await kind(transcriptFile) : false,
+      sessionEnvDirectory: await kind(sessionEnvDirectory),
+      fileHistoryDirectory: await kind(fileHistoryDirectory),
+    },
+  };
+}
+
 /**
- * End a session by ending its own host process. This never deletes a transcript,
- * a project directory, or any user data, and it refuses to act on a session the
- * caller did not supply by id.
+ * Delete a session the way the application deletes it: the sidebar entry's own
+ * "more options" menu, then the host's own confirmation. Verification is the
+ * host's own state afterwards — registry record, transcript, per-session
+ * directories, host process — never the fact that a click was accepted.
+ *
+ * Project files are untouched by design, and the returned `kept` block says so.
+ * There is deliberately no process-kill fallback: terminating the host would not
+ * be the application's cleanup.
  */
 export async function destroy({ nativeSessionId }, {
   env = process.env,
+  driver = createNullDriver(),
   isAlive = defaultIsAlive,
-  kill = pid => process.kill(pid),
-  timeoutMs = 15000,
-  pollMs = DEFAULT_POLL_MS,
+  timeoutMs = 40000,
+  pollMs = 500,
   protectedPids = [],
+  deleteLabel = DEFAULT_DELETE_LABEL,
+  confirmLabels = DEFAULT_DELETE_CONFIRM_LABELS,
 } = {}) {
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
   if (protectedPids.includes(record.pid)) {
-    throw fail('protected-pid', `Refusing to stop pid ${record.pid}: it is a protected process.`);
+    throw fail('protected-pid', `Refusing to delete pid ${record.pid}: it is a protected process.`);
   }
-  if (!record.procStart || !record.pidDomain) {
-    throw fail('unbound-record', `Session ${nativeSessionId} has no process identity; refusing to stop it.`);
+  if (!record.name) {
+    throw fail('session-title-missing',
+      `Session ${nativeSessionId} has no title, so its sidebar entry cannot be addressed unambiguously.`);
   }
-  const file = await findTranscript({ env, nativeSessionId, workspace: record.workspace }).catch(() => undefined);
-  if (!record.alive) {
-    return { destroyed: false, status: 'already-stopped', nativeSessionId, deleted: false,
-      transcriptKept: Boolean(file), verifiedBy: ['process-not-running'] };
+  const ui = requireDriver(driver, 'deleting a session');
+  // The sidebar entry carries the title the host derived, which can differ from
+  // the record's placeholder name; bring the session up and read that title.
+  const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink: true, env });
+  const title = visible.title ?? record.name;
+  const before = await sessionArtifacts({ env, record });
+  if (!before.state.recordFile) {
+    return { destroyed: false, deleted: false, status: 'already-gone', nativeSessionId, title: record.name,
+      before: before.state, kept: { projectFiles: true }, verifiedBy: ['registry-record-already-absent'] };
   }
-  try { kill(record.pid); }
-  catch (error) {
-    if (error.code !== 'ESRCH') throw fail('destroy-failed', `Could not stop pid ${record.pid}: ${error.message}`, { nativeSessionId });
-  }
+  const hostAction = await ui.deleteSession({ title, deleteLabel, confirmLabels });
+
   const deadline = Date.now() + timeoutMs;
-  let gone = false;
+  let after = before;
+  let processGone = !record.alive;
   while (Date.now() < deadline) {
-    if (!isAlive(record.pid)) { gone = true; break; }
+    after = await sessionArtifacts({ env, record });
+    processGone = !isAlive(record.pid);
+    if (!after.state.recordFile && !after.state.transcriptFile && processGone) break;
     await sleep(pollMs);
   }
-  let recordRemoved = false;
-  try { await stat(record.recordFile); }
-  catch (error) { if (error.code === 'ENOENT') recordRemoved = true; }
+
+  const recordGone = !after.state.recordFile;
+  const transcriptGone = !after.state.transcriptFile;
+  const directoriesGone = (!before.state.sessionEnvDirectory || !after.state.sessionEnvDirectory)
+    && (!before.state.fileHistoryDirectory || !after.state.fileHistoryDirectory);
+  const deleted = recordGone && transcriptGone;
+  const destroyed = deleted && processGone && directoriesGone;
+  const verifiedBy = [];
+  if (recordGone) verifiedBy.push('registry-record-gone');
+  if (transcriptGone) verifiedBy.push('transcript-gone');
+  if (processGone) verifiedBy.push('host-process-exited');
+  if (directoriesGone) verifiedBy.push('session-directories-gone');
   return {
-    destroyed: gone,
-    status: gone ? 'ended' : 'unconfirmed',
-    reason: gone ? undefined : 'process-still-running',
-    nativeSessionId,
-    pid: record.pid,
-    deleted: false,
-    recordRemoved,
-    transcriptKept: Boolean(file),
-    verifiedBy: gone ? ['process-exit'] : [],
+    destroyed, deleted,
+    status: destroyed ? 'deleted' : recordGone ? 'partially-deleted' : 'unconfirmed',
+    nativeSessionId, title, recordName: record.name, pid: record.pid,
+    titleMatchesRecord: visible.titleMatchesRecord, targetConfirmedBy: visible.targetConfirmedBy,
+    before: before.state, after: after.state,
+    removed: {
+      recordFile: recordGone,
+      transcriptFile: transcriptGone,
+      sessionEnvDirectory: !after.state.sessionEnvDirectory,
+      fileHistoryDirectory: !after.state.fileHistoryDirectory,
+      process: processGone,
+    },
+    kept: { projectFiles: true, note: 'The workspace, its files and any git state are untouched.' },
+    verifiedBy,
+    ...(destroyed ? {} : {
+      detail: 'The host did not remove all session state within the timeout; the remaining pieces are listed in `after`.',
+    }),
+    hostAction,
   };
 }
 
@@ -617,8 +764,8 @@ export async function destroy({ nativeSessionId }, {
 
 /**
  * Reattach to a session. A live session needs no window work: the caller keeps
- * delivering through the native inbox. A dead session is reopened through the
- * `code/continue` deep link and only reported resumed when a record for the same
+ * delivering through the native inbox. A closed session is reopened through the
+ * `code/continue` deep link and reported resumed only when a record for the same
  * session id registers again.
  */
 export async function resume({ nativeSessionId, hostSessionId: hint }, {
@@ -639,8 +786,8 @@ export async function resume({ nativeSessionId, hostSessionId: hint }, {
   }
   const hostSessionId = record?.hostSessionId ?? hint;
   if (!hostSessionId) {
-    return { resumed: false, status: 'gone', reason: 'unknown-native-session',
-      nativeSessionId, detail: 'No record and no hostSessionId to reopen; nothing was created.' };
+    return { resumed: false, status: 'gone', reason: 'unknown-native-session', nativeSessionId,
+      detail: 'No record and no hostSessionId to reopen; nothing was created.' };
   }
   const ui = requireDriver(driver, 'resuming a closed session');
   const opened = await ui.revealSession({ hostSessionId, title: record?.name, allowDeepLink });
@@ -662,7 +809,18 @@ export async function resume({ nativeSessionId, hostSessionId: hint }, {
 // ------------------------------------------------------------------- models
 
 /** Effort words the composer's model control appends after the model name. */
-export const EFFORT_WORDS = Object.freeze(['最高', '高', '中', '低', 'Max', 'High', 'Medium', 'Low']);
+export const EFFORT_WORDS = Object.freeze(['最大', '最高', '最低', '中等', '高', '中', '低', 'Max', 'High', 'Medium', 'Low']);
+
+/**
+ * Label -> host effort values. A table alone is not evidence: it is only used
+ * next to an observation, and every result says which one it used.
+ */
+export const EFFORT_LABELS = Object.freeze({
+  '最高': 'max', '最大': 'max', 'Max': 'max',
+  '高': 'high', 'High': 'high',
+  '中等': 'medium', '中': 'medium', 'Medium': 'medium',
+  '低': 'low', 'Low': 'low',
+});
 
 /**
  * Split the model control's accessible name into a model label and an effort.
@@ -704,62 +862,194 @@ export function modelInfo(value) {
   return { label: null };
 }
 
-/** Read the model the composer would use. Null beats a guess. */
-export async function readDefaultModel({ driver = createNullDriver() } = {}) {
-  if (!driverAvailable(driver)) {
-    return { model: null, label: null, source: 'unavailable', verified: false, reason: 'ui-driver-unavailable' };
+/**
+ * The model a session actually ran, from its own transcript. The UI shows a
+ * label; the transcript carries the id and the effort the host used.
+ */
+async function transcriptModel({ env, record }) {
+  const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
+    .catch(() => undefined);
+  if (!file) return undefined;
+  const { events } = await readTranscriptEvents(file);
+  const models = [];
+  const efforts = [];
+  let current;
+  for (const event of events) {
+    if (typeof event.effort === 'string' && !efforts.includes(event.effort)) efforts.push(event.effort);
+    if (event.type !== 'assistant' || typeof event.model !== 'string' || event.model === '<synthetic>') continue;
+    if (!models.includes(event.model)) models.push(event.model);
+    current = { model: event.model, effort: typeof event.effort === 'string' ? event.effort : undefined, timestamp: event.timestamp };
   }
-  const view = await driver.readModel();
-  const info = modelInfo(view);
-  if (!info.label) {
-    return { model: null, label: null, source: 'unavailable', verified: false, reason: 'model-control-not-found' };
+  return { nativeSessionId: record.nativeSessionId, name: record.name, models, efforts, current };
+}
+
+/** Model ids the app itself cached for the desktop entrypoint. */
+async function configModelSlots(env) {
+  const file = path.join(path.dirname(configRoot(env)), '.claude.json');
+  try {
+    const value = JSON.parse((await readFile(file, 'utf8')).replace(/^\uFEFF/, ''));
+    return Object.values(value?.clientDataCacheSlots ?? {})
+      .filter(slot => slot?.entrypoint === 'claude-desktop' && typeof slot?.model === 'string')
+      .map(slot => slot.model);
+  } catch { return []; }
+}
+
+/** Collect the local evidence for a model id without opening any new session. */
+export async function hostModelEvidence({ env = process.env, isAlive = defaultIsAlive, workspace } = {}) {
+  const { sessions } = await scanNativeSessions({ env, isAlive });
+  const live = sessions.filter(session => session.alive && (!workspace || samePath(session.workspace, workspace)));
+  const observed = [];
+  for (const record of live) {
+    const info = await transcriptModel({ env, record });
+    if (info) observed.push(info);
   }
-  return { model: null, label: info.label, effort: info.effort, raw: info.raw,
-    source: 'ui-model-control', verified: true };
+  return { sessions: observed, configModels: [...new Set(await configModelSlots(env))] };
 }
 
 /**
- * Select the model through the host's own control and confirm it by reading the
- * control back. `accepted` is false unless the host shows the new value.
+ * Turn a UI label plus local evidence into `{provider, model, reasoningEffort}`.
+ * A label whose id cannot be proven stays unresolved instead of being mapped to
+ * a plausible-looking default.
+ */
+export function resolveModelEvidence({ label, effortLabel, evidence = {}, provider = 'anthropic' }) {
+  const sessions = evidence.sessions ?? [];
+  const configModels = evidence.configModels ?? [];
+  const currentModels = [...new Set(sessions.map(session => session.current?.model).filter(Boolean))];
+  const allModels = [...new Set([...currentModels, ...configModels])];
+  const observedEfforts = [...new Set(sessions.flatMap(session => session.efforts ?? []))];
+  const base = {
+    provider, providerEvidence: 'claude-model-id-namespace',
+    label: label ?? null, effortLabel: effortLabel ?? null,
+    model: null, reasoningEffort: undefined, resolved: false,
+    evidence: { sessions, configModels, observedEfforts },
+  };
+  if (allModels.length > 1) return { ...base, reason: 'conflicting-model-evidence', candidates: allModels };
+  if (allModels.length === 0) {
+    return { ...base, reason: sessions.length ? 'no-model-recorded-yet' : 'no-host-session-to-observe' };
+  }
+  const model = allModels[0];
+  let reasoningEffort;
+  let effortResolution;
+  if (!effortLabel) effortResolution = { source: 'no-ui-effort-label', observedEfforts };
+  else {
+    const mapped = EFFORT_LABELS[effortLabel];
+    if (!mapped) effortResolution = { source: 'unmapped-effort-label', label: effortLabel, observedEfforts, unresolved: true };
+    else if (observedEfforts.length === 1 && observedEfforts[0] === mapped) {
+      reasoningEffort = mapped;
+      effortResolution = { source: 'paired-observation', label: effortLabel, observed: observedEfforts[0] };
+    } else if (observedEfforts.length === 0) {
+      effortResolution = { source: 'label-table-only', label: effortLabel, mapped, verified: false };
+    } else {
+      reasoningEffort = mapped;
+      effortResolution = { source: 'label-table', label: effortLabel, mapped, observedEfforts, verified: false };
+    }
+  }
+  return { ...base, model, reasoningEffort, resolved: true, effortResolution };
+}
+
+/**
+ * The model a new turn in this host would use, as
+ * `{provider, model, reasoningEffort}` plus the label the host really showed.
+ */
+export async function readDefaultModel({
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, workspace, nativeSessionId = undefined,
+} = {}) {
+  const observed = driverAvailable(driver) ? await driver.readModel().catch(() => undefined) : undefined;
+  const info = modelInfo(observed);
+  let evidence = await hostModelEvidence({ env, isAlive, workspace });
+  if (nativeSessionId) {
+    // One session the caller already bound: its own transcript pairs the label
+    // with the effort the host used, with no cross-session guessing.
+    const scoped = evidence.sessions.filter(session => session.nativeSessionId === nativeSessionId);
+    if (scoped.length) evidence = { ...evidence, sessions: scoped };
+  }
+  const resolved = resolveModelEvidence({ label: info.label, effortLabel: info.effort, evidence });
+  return {
+    ...resolved,
+    verified: Boolean(info.label),
+    source: info.label ? 'ui-model-control+host-evidence' : 'host-evidence',
+    ...(info.label ? {} : { reason: resolved.reason ?? 'ui-model-control-not-found' }),
+    raw: info.raw,
+  };
+}
+
+/** The model of the newest assistant turn; used to confirm a selection. */
+export async function confirmModelAfterTurn({ nativeSessionId, after } = {}, {
+  env = process.env, isAlive = defaultIsAlive,
+} = {}) {
+  const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
+  const info = await transcriptModel({ env, record });
+  if (!info?.current) return null;
+  if (after && !(Date.parse(info.current.timestamp) >= Date.parse(after))) return null;
+  return {
+    nativeSessionId, provider: 'anthropic', providerEvidence: 'claude-model-id-namespace',
+    model: info.current.model, reasoningEffort: info.current.effort, timestamp: info.current.timestamp,
+    verifiedBy: ['session-transcript-assistant-turn'],
+  };
+}
+
+/**
+ * Select the model through the host's own control, then read the control back.
+ * `accepted` requires the host to show the requested value; the resulting model
+ * id is only claimed when the host's evidence proves it.
  */
 export async function selectModel({ model, nativeSessionId = undefined }, {
-  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, timeoutMs = 10000, pollMs = 200,
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, timeoutMs = 12000, pollMs = 250,
 } = {}) {
   const label = typeof model === 'string' ? model.trim() : '';
   if (!label) throw fail('invalid-model', 'model must be a model label such as "Opus 5.5".');
+  let record;
   if (nativeSessionId !== undefined) {
-    const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
-    await ensureSessionVisible(record, { driver: requireDriver(driver, 'selecting a model'), env, allowDeepLink: true });
+    record = await resolveNativeSession(nativeSessionId, { env, isAlive });
+    await ensureSessionVisible(record, { driver: requireDriver(driver, 'selecting a model'), allowDeepLink: true, env });
   }
   const ui = requireDriver(driver, 'selecting a model');
-  const before = modelInfo(await ui.readModel().catch(() => undefined));
+  const scope = { env, isAlive, workspace: record?.workspace };
+  const before = await readDefaultModel({ driver: ui, ...scope });
   const attempt = await ui.selectModel({ label });
-  let after = attempt?.observed ? modelInfo(attempt.observed) : { label: null };
+  let shown = modelInfo(attempt?.observed ?? await ui.readModel().catch(() => undefined));
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!after.label) after = modelInfo(await ui.readModel().catch(() => undefined));
-    if (after.label === label) {
-      return { accepted: true, model: label, requested: label,
-        before: before.label, after: after.label, attempt };
-    }
+  while (Date.now() < deadline && shown.label !== label) {
     await sleep(pollMs);
+    shown = modelInfo(await ui.readModel().catch(() => undefined));
   }
-  return { accepted: false, status: 'unconfirmed', requested: label, observedBefore: before.label,
-    observedAfter: after.label, attempt,
-    detail: 'The Claude Desktop model control did not show the requested model, so no selection is claimed.' };
+  const after = await readDefaultModel({ driver: ui, ...scope });
+  if (shown.label !== label) {
+    return {
+      accepted: false, status: 'unconfirmed', requested: label,
+      observedBefore: before.label, observedAfter: shown.label ?? null, attempt,
+      detail: 'The Claude Desktop model control did not show the requested model, so no selection is claimed.',
+    };
+  }
+  return {
+    accepted: true, requested: label,
+    before: { label: before.label, model: before.model, reasoningEffort: before.reasoningEffort },
+    after: {
+      label: after.label, provider: after.provider, model: after.model,
+      reasoningEffort: after.reasoningEffort, resolved: after.resolved, reason: after.reason,
+    },
+    verifiedBy: after.resolved && after.model
+      ? ['ui-model-control-read-back', 'host-model-evidence'] : ['ui-model-control-read-back'],
+    attempt,
+    ...(after.resolved && after.model ? {} : {
+      note: 'The control shows the requested model; a model id is only provable from the next assistant turn (confirmModelAfterTurn).',
+    }),
+  };
 }
 
 // -------------------------------------------------------------------- probe
 
 /**
  * What this host can really do right now. Each capability is reported as
- * verified, unavailable, or unsupported — never as "probably fine".
+ * verified or unavailable — never as "probably fine".
  */
 export async function probeClaudeHost({ env = process.env, driver = createNullDriver(), isAlive = defaultIsAlive } = {}) {
   const { directory, sessions } = await scanNativeSessions({ env, isAlive });
   const live = sessions.filter(session => session.alive);
-  const ui = driverAvailable(driver) ? await driver.probe().catch(error => ({ available: false, reason: error.code ?? 'ui-bridge-failed' })) : { available: false, reason: 'ui-driver-unavailable' };
-  const model = await readDefaultModel({ driver }).catch(() => ({ model: null, verified: false }));
+  const ui = driverAvailable(driver)
+    ? await driver.probe().catch(error => ({ available: false, reason: error.code ?? 'ui-bridge-failed' }))
+    : { available: false, reason: 'ui-driver-unavailable' };
+  const model = await readDefaultModel({ driver, env, isAlive }).catch(() => ({ model: null, verified: false }));
   return {
     application: NATIVE_HOST,
     configRoot: configRoot(env),
@@ -770,10 +1060,12 @@ export async function probeClaudeHost({ env = process.env, driver = createNullDr
     capabilities: {
       createFirstTurn: ui.available ? 'verified-surface' : 'unavailable',
       interrupt: ui.available ? 'verified-surface' : 'unavailable',
-      destroy: 'verified-surface',
+      // A deletion is the host's own sidebar action; without a UI bridge the
+      // plugin refuses rather than terminating a process behind the app.
+      destroy: ui.available ? 'verified-surface' : 'unavailable',
       resume: { live: 'verified-surface', closed: ui.available ? 'unverified' : 'unavailable' },
       readDefaultModel: model.verified ? 'verified-surface' : 'unavailable',
-      selectModel: ui.available ? 'unverified' : 'unavailable',
+      selectModel: ui.available ? 'verified-surface' : 'unavailable',
       nativeInbox: 'separate-module',
     },
     deepLinks: {
@@ -788,9 +1080,9 @@ export async function probeClaudeHost({ env = process.env, driver = createNullDr
 
 /**
  * `node src/claude-host.mjs <action> [json]` — one command per host operation, so
- * a human or a supervisor can verify the surface without a UI test harness.
- * The payload is JSON on the command line or on stdin; prompts never travel
- * through argv text.
+ * a human or a supervisor can verify the surface without a test harness. The
+ * payload is JSON on the command line or on stdin; prompts never travel through
+ * argv text.
  */
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const action = process.argv[2];
@@ -806,15 +1098,20 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       probe: () => probeClaudeHost({ driver }),
       sessions: () => listNativeSessions({ workspace: payload.workspace }),
       model: () => readDefaultModel({ driver }),
-      create: () => createFirstTurn(payload, { driver,
+      create: () => createFirstTurn(payload, {
+        driver,
         allowDeepLink: payload.allowDeepLink !== false,
-        ...(Number.isSafeInteger(payload.timeoutMs) ? { timeoutMs: payload.timeoutMs } : {}) }),
-      interrupt: () => interrupt(payload, { driver,
+        allowExecutable: payload.allowExecutable !== false,
+        trustWorkspace: payload.trustWorkspace === true,
+        ...(typeof payload.folderLabel === 'string' && payload.folderLabel ? { folderLabel: payload.folderLabel } : {}),
+        ...(Number.isSafeInteger(payload.timeoutMs) ? { timeoutMs: payload.timeoutMs } : {}),
+      }),
+      interrupt: () => interrupt(payload, {
+        driver,
         allowDeepLink: payload.allowDeepLink !== false,
-        ...(Number.isSafeInteger(payload.timeoutMs) ? { timeoutMs: payload.timeoutMs } : {}) }),
-      // The window process and the partner session a person is talking to are
-      // never destroyed from the command line by accident.
-      destroy: () => destroy(payload, { protectedPids: payload.protectedPids ?? [] }),
+        ...(Number.isSafeInteger(payload.timeoutMs) ? { timeoutMs: payload.timeoutMs } : {}),
+      }),
+      destroy: () => destroy(payload, { driver, protectedPids: payload.protectedPids ?? [] }),
       resume: () => resume(payload, { driver }),
       'select-model': () => selectModel(payload, { driver }),
     }[action];

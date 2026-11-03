@@ -9,7 +9,8 @@ import {
   assertMessage, scanNativeSessions, listNativeSessions, resolveNativeSession, findTranscript,
   readTranscriptEvents, countMarker, interruptedSince, viewMatchesSession, deepLinks,
   createNullDriver, createFirstTurn, interrupt, destroy, resume, readDefaultModel, selectModel,
-  probeClaudeHost, parseModelControl, modelInfo,
+  probeClaudeHost, parseModelControl, modelInfo, resolveModelEvidence, confirmModelAfterTurn, sessionArtifacts,
+  displayTitle, pageShowsSession,
 } from '../src/claude-host.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -72,6 +73,9 @@ async function host({ sessions = [], alive = new Set([50124]), transcriptLines =
 let stamp = 0;
 const userLine = text => ({ type: 'user', uuid: `u-${++stamp}`, timestamp: new Date(Date.now() + stamp * 1000).toISOString(),
   message: { role: 'user', content: text } });
+const assistantLine = (model, effort) => ({ type: 'assistant', uuid: `a-${++stamp}`,
+  timestamp: new Date(Date.now() + stamp * 1000).toISOString(), effort,
+  message: { role: 'assistant', model, content: [{ type: 'text', text: 'ok' }] } });
 
 /** A stand-in for the UI bridge. It records what it was asked to do. */
 function uiDriver(behaviour = {}) {
@@ -81,12 +85,14 @@ function uiDriver(behaviour = {}) {
     available: true,
     calls,
     async probe() { calls.push('probe'); return { available: true, documentName: behaviour.documentName ?? 'Fixture session - Claude Code' }; },
-    async currentView() { calls.push('view'); return { available: true, documentName: behaviour.documentName ?? 'Fixture session - Claude Code', composerFound: true }; },
-    async openNewSession(input) { calls.push(['openNewSession', input]); return behaviour.openNewSession?.() ?? { strategy: 'deep-link-code-new', prefilled: true }; },
+    async currentView() { calls.push('view'); return { available: true, documentName: behaviour.documentName ?? 'Fixture session - Claude Code', composerFound: true, texts: behaviour.texts ?? [] }; },
+    async openNewSession(input) { calls.push(['openNewSession', input]); return behaviour.openNewSession?.() ?? { strategy: 'deep-link-code-new-protocol', prefilled: true }; },
     async submit(input) { calls.push(['submit', input]); return behaviour.submit?.() ?? { method: 'enter-on-prefilled-composer' }; },
     async interrupt() { calls.push('interrupt'); return behaviour.interrupt?.() ?? { method: 'escape' }; },
-    async revealSession(input) { calls.push(['revealSession', input]); behaviour.revealSession?.(input); return { revealed: true, method: 'deep-link-continue' }; },
-    async readModel() { calls.push('readModel'); return behaviour.readModel?.() ?? { label: 'Opus 5.5', raw: '模型：Opus 5.5 最高 3.5× 或更多用量' }; },
+    async revealSession(input) { calls.push(['revealSession', input]); behaviour.revealSession?.(input); return { revealed: true, method: 'deep-link-continue-protocol' }; },
+    async sessionMenu(input) { calls.push(['sessionMenu', input]); return behaviour.sessionMenu?.(input) ?? { opened: true, items: [{ type: 'MenuItem', name: '删除会话' }] }; },
+    async deleteSession(input) { calls.push(['deleteSession', input]); return behaviour.deleteSession?.(input) ?? { clicked: '删除会话', confirmed: '删除' }; },
+    async readModel() { calls.push('readModel'); return behaviour.readModel?.() ?? { raw: '模型：Opus 5.5 最高 3.5× 或更多用量' }; },
     async selectModel(input) { calls.push(['selectModel', input]); return behaviour.selectModel?.(input) ?? { clicked: input.label, observed: input.label }; },
   };
   return driver;
@@ -288,44 +294,87 @@ test('view matching never guesses from a shared prefix alone', () => {
   assert.equal(viewMatchesSession({ available: true, documentName: 'x - Claude Code' }, {}), false);
 });
 
-// ----------------------------------------------------------------- destroy
+﻿// ----------------------------------------------------------------- destroy
 
-test('destroy ends the session process and never claims a deletion', async () => {
+/** The host's native delete: its own menu removes this session's state. */
+function nativeDelete(host1, { remove = ['record', 'transcript', 'sessionEnv', 'process'] } = {}) {
+  return async () => {
+    const removed = [];
+    if (remove.includes('record')) {
+      await rm(path.join(host1.configRoot, 'sessions', '50124.json'), { force: true });
+      removed.push('record');
+    }
+    if (remove.includes('transcript')) {
+      const file = await findTranscript({ env: host1.env, nativeSessionId: SESSION, workspace: CWD }).catch(() => undefined);
+      if (file) { await rm(file, { force: true }); removed.push('transcript'); }
+    }
+    if (remove.includes('sessionEnv')) {
+      await rm(path.join(host1.configRoot, 'session-env', SESSION), { recursive: true, force: true });
+      removed.push('sessionEnv');
+    }
+    if (remove.includes('process')) host1.alivePids.delete(50124);
+    return { clicked: '删除会话', confirmed: '删除', removed };
+  };
+}
+
+test('destroy deletes through the host menu and verifies every artifact', async () => {
   const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [userLine('work')] } });
-  const killed = [];
+  await mkdir(path.join(host1.configRoot, 'session-env', SESSION), { recursive: true });
   try {
-    const transcript = await findTranscript({ env: host1.env, nativeSessionId: SESSION, workspace: CWD });
-    const result = await destroy({ nativeSessionId: SESSION }, {
-      env: host1.env, isAlive: host1.isAlive, kill: pid => { killed.push(pid); host1.alivePids.delete(pid); }, timeoutMs: 500, pollMs: 20,
-    });
-    assert.deepEqual(killed, [50124]);
+    const driver = uiDriver({ deleteSession: nativeDelete(host1) });
+    const result = await destroy({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 500, pollMs: 20 });
     assert.equal(result.destroyed, true);
-    assert.equal(result.status, 'ended');
-    assert.equal(result.deleted, false);
-    assert.equal(result.transcriptKept, true);
-    assert.deepEqual(result.verifiedBy, ['process-exit']);
-    assert.equal((await readFile(transcript, 'utf8')).includes('work'), true, 'the transcript is untouched');
+    assert.equal(result.deleted, true);
+    assert.equal(result.status, 'deleted');
+    assert.deepEqual(result.verifiedBy,
+      ['registry-record-gone', 'transcript-gone', 'host-process-exited', 'session-directories-gone']);
+    assert.deepEqual(result.removed, { recordFile: true, transcriptFile: true, sessionEnvDirectory: true, fileHistoryDirectory: true, process: true });
+    assert.equal(result.kept.projectFiles, true);
+    assert.equal(result.hostAction.clicked, '删除会话');
+    assert.equal(result.hostAction.confirmed, '删除');
+    assert.equal(driver.calls.filter(call => Array.isArray(call) && call[0] === 'deleteSession').length, 1);
+    assert.equal((await listNativeSessions({ env: host1.env, isAlive: host1.isAlive })).length, 0);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
-test('destroy refuses an unknown session and a protected pid', async () => {
+test('a host that only drops the registry entry is reported as partially deleted', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [userLine('work')] } });
+  try {
+    const driver = uiDriver({ deleteSession: nativeDelete(host1, { remove: ['record'] }) });
+    const result = await destroy({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 200, pollMs: 20 });
+    assert.equal(result.destroyed, false);
+    assert.equal(result.deleted, false);
+    assert.equal(result.status, 'partially-deleted');
+    assert.equal(result.removed.recordFile, true);
+    assert.equal(result.removed.transcriptFile, false);
+    assert.equal(result.after.transcriptFile, 'file');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('destroy never falls back to killing a process', async () => {
   const host1 = await host({ sessions: [record()] });
   try {
-    await assert.rejects(destroy({ nativeSessionId: OTHER }, { env: host1.env, isAlive: host1.isAlive }),
-      { code: 'unknown-native-session' });
-    await assert.rejects(destroy({ nativeSessionId: SESSION }, { env: host1.env, isAlive: host1.isAlive, protectedPids: [50124] }),
+    await assert.rejects(destroy({ nativeSessionId: SESSION }, { env: host1.env, driver: createNullDriver(), isAlive: host1.isAlive }),
+      { code: 'ui-driver-unavailable' });
+    await assert.rejects(destroy({ nativeSessionId: SESSION }, { env: host1.env, driver: uiDriver(), isAlive: host1.isAlive, protectedPids: [50124] }),
       { code: 'protected-pid' });
+    await assert.rejects(destroy({ nativeSessionId: OTHER }, { env: host1.env, driver: uiDriver(), isAlive: host1.isAlive }),
+      { code: 'unknown-native-session' });
     assert.equal(host1.alivePids.has(50124), true, 'a refused destroy changes nothing');
+
+    const anonymous = await host({ sessions: [{ ...record(), name: undefined }] });
+    try {
+      await assert.rejects(destroy({ nativeSessionId: SESSION }, { env: anonymous.env, driver: uiDriver(), isAlive: anonymous.isAlive }),
+        { code: 'session-title-missing' });
+    } finally { await rm(anonymous.dir, { recursive: true, force: true }); }
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
-test('destroy on an already stopped session reports the truth instead of success', async () => {
-  const host1 = await host({ sessions: [record()], alive: new Set() });
+test('destroy on a session whose record is already gone says so', async () => {
+  const host1 = await host({ sessions: [] });
   try {
-    const result = await destroy({ nativeSessionId: SESSION }, { env: host1.env, isAlive: host1.isAlive });
-    assert.equal(result.destroyed, false);
-    assert.equal(result.status, 'already-stopped');
-    assert.equal(result.deleted, false);
+    await assert.rejects(destroy({ nativeSessionId: SESSION }, { env: host1.env, driver: uiDriver(), isAlive: host1.isAlive }),
+      { code: 'unknown-native-session' });
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
@@ -372,20 +421,46 @@ test('resume of a closed session only succeeds when the record comes back', asyn
   } finally { await rm(gone.dir, { recursive: true, force: true }); }
 });
 
-// ------------------------------------------------------------------ models
+﻿// ------------------------------------------------------------------ models
 
-test('the default model is read from the host control or reported unavailable', async () => {
-  const read = await readDefaultModel({ driver: uiDriver() });
-  assert.equal(read.label, 'Opus 5.5');
-  assert.equal(read.effort, '最高');
-  assert.equal(read.verified, true);
-  assert.equal(read.source, 'ui-model-control');
-  const none = await readDefaultModel({ driver: createNullDriver() });
-  assert.equal(none.model, null);
-  assert.equal(none.verified, false);
-  const blank = await readDefaultModel({ driver: uiDriver({ readModel: () => ({ label: '' }) }) });
-  assert.equal(blank.verified, false);
-  assert.equal(blank.reason, 'model-control-not-found');
+test('the model is reported as provider/model/effort with the real label', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: {
+    [SESSION]: [userLine('hi'), assistantLine('claude-opus-5-5', 'max')],
+  } });
+  try {
+    const read = await readDefaultModel({ driver: uiDriver(), env: host1.env, isAlive: host1.isAlive });
+    assert.equal(read.provider, 'anthropic');
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.reasoningEffort, 'max');
+    assert.equal(read.label, 'Opus 5.5');
+    assert.equal(read.effortLabel, '最高');
+    assert.equal(read.resolved, true);
+    assert.equal(read.verified, true);
+    assert.equal(read.effortResolution.source, 'paired-observation');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a label that no local evidence can map stays unresolved', async () => {
+  const host1 = await host({ sessions: [] });
+  try {
+    const read = await readDefaultModel({ driver: uiDriver({ readModel: () => ({ raw: '模型：Frobnicator 最高 3× 或更多用量' }) }),
+      env: host1.env, isAlive: host1.isAlive });
+    assert.equal(read.label, 'Frobnicator');
+    assert.equal(read.model, null);
+    assert.equal(read.resolved, false);
+    assert.equal(read.reason, 'no-host-session-to-observe');
+
+    const conflict = resolveModelEvidence({
+      label: 'Opus 5.5', effortLabel: '最高',
+      evidence: { sessions: [
+        { nativeSessionId: 'a', current: { model: 'claude-opus-5-5' }, efforts: ['max'] },
+        { nativeSessionId: 'b', current: { model: 'claude-sonnet-5-5' }, efforts: ['max'] },
+      ], configModels: [] },
+    });
+    assert.equal(conflict.resolved, false);
+    assert.equal(conflict.reason, 'conflicting-model-evidence');
+    assert.deepEqual(conflict.candidates, ['claude-opus-5-5', 'claude-sonnet-5-5']);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
 test('the model control name is parsed, not echoed as the model', () => {
@@ -400,20 +475,58 @@ test('the model control name is parsed, not echoed as the model', () => {
   assert.equal(modelInfo(undefined).label, null);
 });
 
-test('model selection is only accepted when the host shows the new model', async () => {
-  const accepted = await selectModel({ model: 'Sonnet 5.5' }, { driver: uiDriver() });
-  assert.equal(accepted.accepted, true);
-  assert.equal(accepted.after, 'Sonnet 5.5');
+test('a selection is accepted only when the control shows it, and the id comes from evidence', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: {
+    [SESSION]: [userLine('hi'), assistantLine('claude-opus-5-5', 'max')],
+  } });
+  let raw = '模型：Opus 5.5 最高 3.5× 或更多用量';
+  const driver = uiDriver({
+    readModel: () => ({ raw }),
+    selectModel: input => {
+      raw = `模型：${input.label} 最高 3.5× 或更多用量`;
+      return { clicked: input.label, observed: raw };
+    },
+  });
+  try {
+    const result = await selectModel({ model: 'Opus 5.5', nativeSessionId: SESSION },
+      { env: host1.env, driver, isAlive: host1.isAlive });
+    assert.equal(result.accepted, true);
+    assert.equal(result.after.label, 'Opus 5.5');
+    assert.equal(result.after.model, 'claude-opus-5-5');
+    assert.equal(result.after.reasoningEffort, 'max');
+    assert.equal(result.after.resolved, true);
+    assert.deepEqual(result.after.provider, 'anthropic');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
 
-  const mismatch = await selectModel({ model: 'Sonnet 5.5' },
-    { driver: uiDriver({ readModel: () => ({ label: 'Opus 5.5' }), selectModel: () => ({ clicked: 'Sonnet 5.5', observed: 'Opus 5.5' }) }),
-      timeoutMs: 120, pollMs: 20 });
-  assert.equal(mismatch.accepted, false);
-  assert.equal(mismatch.status, 'unconfirmed');
-  assert.equal(mismatch.observedAfter, 'Opus 5.5');
+test('a selection the host does not show is never reported as accepted', async () => {
+  const host1 = await host({ sessions: [] });
+  try {
+    const stuck = await selectModel({ model: 'Sonnet 5.5' }, { env: host1.env,
+      driver: uiDriver({ readModel: () => ({ raw: '模型：Opus 5.5 最高 3.5× 或更多用量' }),
+        selectModel: () => ({ clicked: 'Sonnet 5.5', observed: '模型：Opus 5.5 最高 3.5× 或更多用量' }) }),
+      isAlive: host1.isAlive, timeoutMs: 120, pollMs: 20 });
+    assert.equal(stuck.accepted, false);
+    assert.equal(stuck.status, 'unconfirmed');
+    assert.equal(stuck.observedAfter, 'Opus 5.5');
+    await assert.rejects(selectModel({ model: '  ' }, { driver: uiDriver() }), { code: 'invalid-model' });
+    await assert.rejects(selectModel({ model: 'Sonnet 5.5' }, { driver: createNullDriver() }), { code: 'ui-driver-unavailable' });
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
 
-  await assert.rejects(selectModel({ model: '  ' }, { driver: uiDriver() }), { code: 'invalid-model' });
-  await assert.rejects(selectModel({ model: 'Sonnet 5.5' }, { driver: createNullDriver() }), { code: 'ui-driver-unavailable' });
+test('the model of the newest assistant turn can be confirmed after a turn', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: {
+    [SESSION]: [userLine('hi'), assistantLine('claude-opus-5-5', 'max')],
+  } });
+  try {
+    const confirmed = await confirmModelAfterTurn({ nativeSessionId: SESSION }, { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(confirmed.model, 'claude-opus-5-5');
+    assert.equal(confirmed.reasoningEffort, 'max');
+    assert.deepEqual(confirmed.verifiedBy, ['session-transcript-assistant-turn']);
+    const stale = await confirmModelAfterTurn({ nativeSessionId: SESSION, after: new Date(Date.now() + 600000).toISOString() },
+      { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(stale, null);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
 // ------------------------------------------------------------------- probe
@@ -426,14 +539,15 @@ test('the probe states what is really available', async () => {
     assert.equal(withUi.sessions.live, 1);
     assert.equal(withUi.capabilities.createFirstTurn, 'verified-surface');
     assert.equal(withUi.capabilities.readDefaultModel, 'verified-surface');
-    assert.equal(withUi.capabilities.selectModel, 'unverified');
+    assert.equal(withUi.capabilities.selectModel, 'verified-surface');
+    assert.equal(withUi.capabilities.destroy, 'verified-surface');
     assert.equal(withUi.deepLinks.newSession, 'prefill-only');
 
     const withoutUi = await probeClaudeHost({ env: host1.env, driver: createNullDriver(), isAlive: host1.isAlive });
     assert.equal(withoutUi.ui.available, false);
     assert.equal(withoutUi.capabilities.createFirstTurn, 'unavailable');
     assert.equal(withoutUi.capabilities.interrupt, 'unavailable');
-    assert.equal(withoutUi.capabilities.destroy, 'verified-surface');
+    assert.equal(withoutUi.capabilities.destroy, 'unavailable');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
@@ -444,5 +558,80 @@ test('resolveNativeSession refuses a session from another workspace', async () =
       { code: 'session-workspace-mismatch' });
     const ok = await resolveNativeSession(SESSION, { env: host1.env, isAlive: host1.isAlive, workspace: CWD });
     assert.equal(ok.nativeSessionId, SESSION);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+// ------------------------------------------- identity, interrupt shapes, delete
+
+test('the page title is normalized and page content can identify a session', () => {
+  assert.equal(displayTitle('FutureAide host verify - Claude Code'), 'FutureAide host verify');
+  assert.equal(displayTitle('Bare title'), 'Bare title');
+  assert.equal(displayTitle(''), undefined);
+  assert.equal(displayTitle(undefined), undefined);
+  assert.equal(pageShowsSession({ texts: ['a', 'FutureAide host verify: reply OK only.'] }, 'FutureAide host verify: reply'), true);
+  assert.equal(pageShowsSession({ texts: ['something else'] }, 'FutureAide host verify: reply'), false);
+  assert.equal(pageShowsSession({ texts: [] }, undefined), false);
+});
+
+test('an interrupt recorded inside a request blob still counts', () => {
+  const blob = { type: 'api-request-blob', timestamp: new Date(Date.now() + 5000).toISOString(),
+    message: { role: 'user', content: [{ type: 'text', text: `${INTERRUPT_MARKER}\n` }, { type: 'text', text: 'next message' }] } };
+  const old = { type: 'user', timestamp: new Date(Date.now() - 600000).toISOString(), message: { role: 'user', content: INTERRUPT_MARKER } };
+  assert.equal(interruptedSince(parseEvents([blob]), new Date(Date.now() - 60000).toISOString()), true,
+    'a blob-shaped marker is still the app reporting an interrupt');
+  assert.equal(interruptedSince(parseEvents([old]), new Date(Date.now() - 60000).toISOString()), false,
+    'an older interrupt does not count for a newer request');
+});
+
+/** Parse transcript lines the same way the reader does, without touching a file. */
+function parseEvents(events) {
+  const file = path.join(os.tmpdir(), `fa-events-${process.pid}-${Date.now()}.jsonl`);
+  return events.map(event => {
+    const content = event.message?.content;
+    const parts = Array.isArray(content) ? content : [];
+    return {
+      type: event.type,
+      timestamp: event.timestamp,
+      text: typeof content === 'string' ? content
+        : parts.filter(part => part?.type === 'text').map(part => part.text).join('\n'),
+    };
+  }).map(event => { void file; return event; });
+}
+
+test('a host that shows the derived title is deleted through that title', async () => {
+  const host1 = await host({ sessions: [record({ name: 'xiayuls-workflow-c4' })],
+    transcriptLines: { [SESSION]: [userLine('FutureAide host verify: reply OK only.')] } });
+  const seen = [];
+  const driver = uiDriver({
+    documentName: 'FutureAide host verify - Claude Code',
+    texts: ['Claude Code', 'FutureAide host verify: reply OK only.', 'Claude 已完成回复'],
+    deleteSession: input => { seen.push(input); return nativeDelete(host1)(); },
+  });
+  try {
+    const result = await destroy({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 500, pollMs: 20 });
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].title, 'FutureAide host verify', 'the sidebar entry is addressed by the title the host shows');
+    assert.equal(seen[0].deleteLabel, '删除');
+    assert.deepEqual(seen[0].confirmLabels, ['删除', 'Delete', '删除会话', 'Delete session']);
+    assert.equal(result.title, 'FutureAide host verify');
+    assert.equal(result.recordName, 'xiayuls-workflow-c4');
+    // The record name is a placeholder, so the session's own text on the page is
+    // what identifies it; the title is still the one used for the sidebar entry.
+    assert.equal(result.targetConfirmedBy, 'page-content');
+    assert.equal(result.destroyed, true);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('model evidence from one session pairs its label with its own effort', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: {
+    [SESSION]: [userLine('hi'), assistantLine('claude-opus-5-5', 'medium')],
+  } });
+  try {
+    const read = await readDefaultModel({ driver: uiDriver({ readModel: () => ({ raw: '模型：Opus 5.5 中等' }) }),
+      env: host1.env, isAlive: host1.isAlive, nativeSessionId: SESSION });
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.reasoningEffort, 'medium');
+    assert.equal(read.effortLabel, '中等');
+    assert.equal(read.effortResolution.source, 'paired-observation');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

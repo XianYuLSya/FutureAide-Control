@@ -10,7 +10,9 @@ import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend, targetOf } from './agent-backend.mjs';
+import { ensureReportService, readReportStatus, reportPort } from './report-endpoint.mjs';
+import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
+  TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
@@ -145,6 +147,8 @@ export function createScopedAgents(config, {
   removeTree = rm,
   backendAdapters = {},
   backendAdapterLoader = undefined,
+  hostReportService = true,
+  ensureReportReady = ensureReportService,
 } = {}) {
   const clients = new Map();
   let monitorUnavailableSince, monitorError;
@@ -157,15 +161,27 @@ export function createScopedAgents(config, {
   // Handles an adapter needs on the shared side: the target's own state in its own
   // row (never inside the record the shared layer will save again) and one host
   // lock per target application, reusing the existing lease table.
-  const adapterDeps = record => {
+  //
+  // ensureClaudeReports() makes the loopback tool service ready and returns
+  // {url, ready}; readClaudeReportStatus() only reads readiness/registration, so a
+  // status probe can ask without starting anything. The task-scoped monitor never
+  // hosts the service (hostReportService: false); it reuses whatever the plugin
+  // process started, because a session must not be handed an endpoint that dies
+  // with its task.
+  const adapterDeps = (record, { startReports = hostReportService } = {}) => {
     const load = () => store.get(record.agentId) ?? record;
     const target = targetOf(record);
+    const readStatus = () => readReportStatus({ port: reportPort() });
     return {
       load,
       requestDirectory: () => agentDirectory(load()),
       readNativeState: () => store.backendState(record.agentId),
       writeNativeState: value => store.saveBackendState(record.agentId, value),
       withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
+      ensureClaudeReports: () => (startReports
+        ? ensureReportReady({ store, port: reportPort() })
+        : readStatus()),
+      readClaudeReportStatus: readStatus,
     };
   };
   // The chosen backend is rebuilt per operation from the live record, so a new
@@ -186,12 +202,32 @@ export function createScopedAgents(config, {
   }
   const forgetBackend = record => clients.delete(record.agentId);
   // A target without a usable adapter is refused before the name is taken, and is
-  // never answered by the DSH path instead.
+  // never answered by the DSH path instead. Pre-conditions that would only fail
+  // later (unfinished protocols, a tool service that never came up) are settled
+  // here too, so a broken name is never left in the roster.
   async function ensureTargetBackend(record) {
     const target = targetOf(record);
     if (target === 'dsh') return target;
-    await resolveBackend(record, { target, load: () => record, deps: adapterDeps(record), adapters: backendAdapters,
+    const deps = adapterDeps(record);
+    const backend = await resolveBackend(record, { target, load: () => record, deps, adapters: backendAdapters,
       ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
+    const probe = await backend.probe();
+    const required = backend.requiredMethods ?? probe.methods ?? [];
+    const label = backend.labels?.host ?? hostLabel(record);
+    if (!required.every(method => probe.methods?.includes(method))) {
+      throw Object.assign(new Error(`${backend.labels?.bridge ?? `The ${label} backend`} needs this plugin version installed before subagents can be created.`), { code: 'managed-host-required' });
+    }
+    if (probe.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(label);
+    if (probe.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(label);
+    // A zero-model session whose tool endpoint is not up would make the target's
+    // first turn call nothing. Refuse the name instead of creating it half-wired.
+    if (TARGET_REQUIRES_REPORT_SERVICE[target] === true) {
+      const endpoint = await deps.ensureClaudeReports();
+      if (endpoint?.ready !== true) {
+        throw Object.assign(new Error('The loopback tool service that managed sessions report through is not ready; no subagent was created.'),
+          { code: 'report-service-unavailable', ...(endpoint?.reason ? { detail: endpoint.reason } : {}) });
+      }
+    }
     return target;
   }
 
@@ -785,7 +821,7 @@ export function createScopedAgents(config, {
         // reports false instead of inventing a row.
         'claude-desktop': await diagnoseTarget('claude-desktop', { adapters: backendAdapters,
           ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
-          record: probe, deps: adapterDeps(probe) }),
+          record: probe, deps: adapterDeps(probe, { startReports: false }) }),
       };
       return status;
     },

@@ -12,6 +12,10 @@
 //
 // Exit: after three quiet rounds with no sleeping agent the leases are released
 // and the process ends, so an idle plugin keeps zero background processes.
+//
+// This process never hosts the loopback tool service that managed sessions report
+// through (hostReportService: false): that service must outlive a task, so the
+// plugin's long-lived process owns it and this monitor only reads readiness.
 import { watch } from 'node:fs';
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
@@ -27,7 +31,7 @@ if (!values['--config'] || !/^monitor-[0-9a-f-]{36}$/.test(values['--lease'] ?? 
 const config = await loadConfig(values['--config']);
 const hostDirectory = config.managedStateDirectory ?? path.join(path.dirname(config.hostBridgeFile), 'managed-host');
 const rosterDirectory = config.stateDirectory;
-const service = createScopedAgents(config), store = service.store, holder = values['--lease'];
+const service = createScopedAgents(config, { hostReportService: false }), store = service.store, holder = values['--lease'];
 
 let watcher, wake, heartbeat, running = true, signalled = false, idleRounds = 0, lastDelivery = 0;
 const failures = new Map();

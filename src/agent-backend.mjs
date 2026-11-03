@@ -45,6 +45,10 @@
 //   withHostLock(fn,{key}) Serialize host-wide work across names and processes
 //                         through the shared lease table, per target (+ optional
 //                         key); reuses store.locked, no second locking scheme.
+//   ensureClaudeReports() Make the loopback tool service ready and return
+//                         {url, ready}; only normal create/deliver calls may start
+//                         it, never a status probe or an adapter probe().
+//   readClaudeReportStatus() Readiness/registration only; never starts anything.
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -83,6 +87,11 @@ export function hostLabel(record) {
   const target = targetOf(record);
   return TARGET_LABELS[target] ?? target;
 }
+
+// Targets whose sessions call back through the plugin's loopback tool service.
+// Their adapter deps must make that service ready before a zero-model session is
+// created, otherwise the target's first turn has no tool to call.
+export const TARGET_REQUIRES_REPORT_SERVICE = Object.freeze({ 'claude-desktop': true });
 
 const reason = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 400) });
 

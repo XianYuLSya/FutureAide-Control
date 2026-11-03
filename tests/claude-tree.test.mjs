@@ -488,6 +488,21 @@ test('a finished unpaired meta does not block a stop verdict, an unfinished one 
   assert.equal(claudeTreeStopEvidence(tree, { afterSeq: 0 }).stopped, false);
 });
 
+test('a user-stopped subagent is ended by the host stop marker', async t => {
+  const f = await fixture(t);
+  await writeFile(f.subagent('a1'), assistant(f.sessionId, [toolUse('toolu_b', 'Bash', { command: 'sleep' })],
+    { sidechain: true, agentId: 'a1' }));
+  await writeFile(f.meta('a1'), JSON.stringify({ description: 'stopped leaf', toolUseId: 'toolu_a',
+    spawnDepth: 1, requestShape: 'background', stoppedByUser: true }));
+  await f.writeRoot([...launched('toolu_a', 'stopped leaf', { agentId: 'a1' }),
+    reply(f.sessionId, 'launched', { stopReason: 'end_turn' })]);
+  const projection = await rootProjection(f);
+  const { tree } = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'idle' }));
+  assert.equal(tree.nodes[1].status, 'ended');
+  assert.equal(tree.nodes[1].evidence, 'agent-stopped-by-user');
+  assert.equal(tree.settled, true);
+  assert.equal(claudeTreeStopEvidence(tree, { afterSeq: 0 }).stopped, true);
+});
 test('an unbound root is refused instead of producing an empty tree', async () => {
   await assert.rejects(observeClaudeTree({}, emptyClaudeProjection('task-1'), { logicalSessionId: 'logical-1' }),
     /transcript file/i);

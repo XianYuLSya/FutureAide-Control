@@ -100,6 +100,7 @@ async function indexSubagentTranscripts(directory) {
 function metaShape(value, file) {
   return { file, finished: value.finished === true,
     ...(value.finished === false ? { running: true } : {}),
+    ...(value.stoppedByUser === true ? { stoppedByUser: true } : {}),
     ...(typeof value.toolUseId === 'string' ? { toolUseId: value.toolUseId } : {}),
     ...(typeof value.parentAgentId === 'string' ? { parentAgentId: value.parentAgentId } : {}),
     ...(Number.isSafeInteger(value.spawnDepth) ? { spawnDepth: value.spawnDepth } : {}),
@@ -217,6 +218,11 @@ function childStatus(entry) {
   if (entry.meta?.finished === true) {
     return { status: 'ended', evidence: 'agent-meta-finished', endSeq: entry.projection.throughSeq ?? 0,
       activity: entry.meta.agentType ? `finished: ${entry.meta.agentType}` : 'native agent meta reports finished' };
+  }
+  // 2.1.309 writes stoppedByUser on a background task the user stopped.
+  if (entry.meta?.stoppedByUser === true) {
+    return { status: 'ended', evidence: 'agent-stopped-by-user', endSeq: entry.projection.throughSeq ?? 0,
+      activity: 'the host recorded a user stop for this subagent' };
   }
   if (!entry.background && entry.resultSeq !== undefined) {
     return { status: 'ended', evidence: 'parent-agent-tool-result',

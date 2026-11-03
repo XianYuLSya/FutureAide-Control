@@ -1003,6 +1003,69 @@ export function sliceBalancedArray(source, from) {
   return undefined;
 }
 
+/** The value of a JS single-quoted string literal starting at `quoteIndex`. */
+export function readQuotedLiteral(source, quoteIndex) {
+  if (source[quoteIndex] !== "'") return undefined;
+  let out = '';
+  for (let index = quoteIndex + 1; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === '\\') {
+      const next = source[index + 1];
+      if (next === undefined) return undefined;
+      if (next === "'" || next === '"' || next === '\\') { out += next; index += 1; continue; }
+      if (next === 'n') { out += '\n'; index += 1; continue; }
+      if (next === 'r') { out += '\r'; index += 1; continue; }
+      if (next === 't') { out += '\t'; index += 1; continue; }
+      if (next === 'u') { out += String.fromCharCode(parseInt(source.slice(index + 2, index + 6), 16)); index += 5; continue; }
+      out += next; index += 1; continue;
+    }
+    if (character === "'") return out;
+    out += character;
+  }
+  return undefined;
+}
+
+/** The catalog metadata sits just before the surfaces literal in the bundle. */
+function catalogMetaNear(source, index) {
+  const window = source.slice(Math.max(0, index - 400), index);
+  const version = /,\s*version:(\d+)/.exec(window)?.[1];
+  return {
+    version: version ? Number(version) : undefined,
+    issuedAt: /issued_at:"([^"]+)"/.exec(window)?.[1],
+    expiresAt: /expires_at:"([^"]+)"/.exec(window)?.[1],
+    keyId: /key_id:"([^"]+)"/.exec(window)?.[1],
+  };
+}
+
+/**
+ * The embedded model catalog the app ships: `surfaces:JSON.parse('<json>')`
+ * holding one `model_selector_config` per surface. The JSON is parsed as data;
+ * no bundle code is evaluated.
+ */
+export function extractEmbeddedCatalog(source) {
+  const marker = "JSON.parse('";
+  let index = source.indexOf(marker);
+  while (index !== -1) {
+    const literal = readQuotedLiteral(source, index + marker.length - 1);
+    // The catalog literal holds the surface map itself (`surfaces:JSON.parse('<json>')`),
+    // so the guard is on the payload, not on a key outside it.
+    if (literal && literal.includes('model_selector_config')) {
+      try {
+        const parsed = JSON.parse(literal);
+        if (parsed && typeof parsed === 'object') {
+          // The literal is the value of `surfaces`, so it is the surface map
+          // itself; older shapes nest it under `surfaces`.
+          const surfaces = (parsed.surfaces && typeof parsed.surfaces === 'object') ? parsed.surfaces
+            : (parsed.ccd || parsed.cc) ? parsed : undefined;
+          if (surfaces) return { surfaces, meta: catalogMetaNear(source, index) };
+        }
+      } catch { /* another JSON.parse literal */ }
+    }
+    index = source.indexOf(marker, index + marker.length);
+  }
+  return undefined;
+}
+
 /** Every `model_selector_config` array found in a bundle's source. */
 export function extractModelSelectorConfigs(source) {
   const found = [];
@@ -1134,13 +1197,18 @@ export async function loadModelCatalog({ asar = undefined, driver, env = process
     let surface;
     let selectionSource;
     let usedBundle;
+    let catalogMeta;
     for (const bundle of bundles) {
       const buffer = Buffer.alloc(bundle.size);
       await handle.read(buffer, 0, bundle.size, dataBase + bundle.offset);
       const source = buffer.toString('utf8');
-      const configs = extractModelSelectorConfigs(source);
+      const embedded = extractEmbeddedCatalog(source);
+      const surfaceConfig = embedded?.surfaces?.ccd?.model_selector_config
+        ?? embedded?.surfaces?.cc?.model_selector_config;
+      const configs = Array.isArray(surfaceConfig) ? surfaceConfig : extractModelSelectorConfigs(source);
       const ccd = configs.find(entry => entry?.id === 'ccd') ?? configs.find(entry => entry?.id === 'cc');
       if (!ccd) continue;
+      catalogMeta = embedded?.meta;
       surface = normalizeSurface(ccd);
       const match = /"selection_source"\s*:\s*"([a-z_]+)"/.exec(source);
       selectionSource = match?.[1];
@@ -1151,7 +1219,8 @@ export async function loadModelCatalog({ asar = undefined, driver, env = process
       return { ...snapshotSurface(BUILT_IN_MODEL_CATALOG), catalogSource: 'built-in-snapshot',
         asar: resolved.asar, note: 'catalog-not-found-in-archive' };
     }
-    const result = { ...surface, selectionSource, catalogSource: 'app-asar', asar: resolved.asar, bundle: usedBundle };
+    const result = { ...surface, selectionSource, catalogSource: 'app-asar', asar: resolved.asar, bundle: usedBundle,
+      catalogVersion: catalogMeta?.version, catalogIssuedAt: catalogMeta?.issuedAt, catalogExpiresAt: catalogMeta?.expiresAt };
     catalogCache.set(cacheKey, result);
     return result;
   } catch (error) {
@@ -1330,94 +1399,168 @@ async function launchArgsOf({ driver, record }) {
  * the session is on screen, corroborated by what its transcript recorded and what
  * the host launched it with. Disagreement is reported, not averaged.
  */
+/** What this session ran before: context for a control reading, never a substitute. */
+async function readModelHistory({ env, record, driver }) {
+  const transcript = await transcriptModel({ env, record }).catch(() => undefined);
+  const launchArgs = await launchArgsOf({ driver, record });
+  return { transcript: transcript?.current ?? null, launchArgs: launchArgs ?? null };
+}
+
+/**
+ * The model the *next* turn of this session will use.
+ *
+ * The session is located in the window first (the same identity check the other
+ * operations use) and its model control is read; if that control cannot be read
+ * the call fails explicitly. What the session ran before is returned as context
+ * only — a past turn cannot prove the next one. A control that differs from the
+ * transcript is a normal selection change, and the control wins.
+ */
 export async function readCurrentModel({ nativeSessionId }, {
   driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, catalog = undefined, asar = undefined,
 } = {}) {
   const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
+  const ui = requireDriver(driver, 'reading the current model');
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
-  const transcript = await transcriptModel({ env, record });
-  const launchArgs = await launchArgsOf({ driver, record });
-  let control;
-  if (driverAvailable(driver)) {
-    const view = await readViewStable(driver);
-    const marker = await sessionContentMarker({ env, record });
-    const onScreen = viewMatchesSession(view, record) || pageShowsSession(view, marker);
-    if (onScreen) {
-      const raw = modelInfo(await driver.readModel().catch(() => undefined));
-      if (raw.label) {
-        const known = modelCatalog.models.find(model => model.name === raw.label);
-        control = {
-          label: raw.label,
-          effortLabel: raw.effort,
-          model: known?.id,
-          reasoningEffort: raw.effort ? EFFORT_LABELS[raw.effort] : undefined,
-        };
-      }
-    }
+  const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink: true, env });
+  const raw = modelInfo(await ui.readModel());
+  const history = await readModelHistory({ env, record, driver });
+  if (!raw.label) {
+    return {
+      nativeSessionId, provider: 'anthropic', model: null, reasoningEffort: undefined,
+      resolved: false, status: 'unreadable', reason: 'model-control-unreadable',
+      label: null, effortLabel: null, targetConfirmedBy: visible.targetConfirmedBy,
+      evidence: { control: null, history },
+      detail: 'The session is on screen but its model control could not be read; what it used before does not prove the next turn.',
+    };
   }
-  const conflicts = [];
-  if (control?.model && transcript?.current?.model && control.model !== transcript.current.model) {
-    conflicts.push('control-vs-transcript');
-  }
-  if (control?.reasoningEffort && transcript?.current?.effort && control.reasoningEffort !== transcript.current.effort) {
-    conflicts.push('effort-control-vs-transcript');
-  }
-  if (launchArgs?.model && transcript?.current?.model && launchArgs.model !== transcript.current.model) {
-    conflicts.push('launch-args-vs-transcript');
-  }
-  if (launchArgs?.effort && transcript?.current?.effort && launchArgs.effort !== transcript.current.effort) {
-    conflicts.push('effort-launch-args-vs-transcript');
-  }
-  const model = control?.model ?? transcript?.current?.model ?? launchArgs?.model ?? null;
-  const reasoningEffort = control?.reasoningEffort ?? transcript?.current?.effort ?? launchArgs?.effort ?? undefined;
+  const known = modelCatalog.models.find(model => model.name === raw.label);
+  const reasoningEffort = raw.effort ? EFFORT_LABELS[raw.effort] : undefined;
+  const historyDiffers = Boolean((history.transcript?.model && known?.id && history.transcript.model !== known.id))
+    || Boolean((history.transcript?.effort && reasoningEffort && history.transcript.effort !== reasoningEffort))
+    || Boolean((history.launchArgs?.model && known?.id && history.launchArgs.model !== known.id));
   return {
     nativeSessionId,
     provider: 'anthropic',
-    model,
+    model: known?.id ?? null,
     reasoningEffort,
-    resolved: Boolean(model),
-    label: control?.label ?? (model ? modelCatalog.models.find(entry => entry.id === model)?.name : undefined),
-    effortLabel: control?.effortLabel ?? (reasoningEffort ? EFFORT_LABEL_FOR[reasoningEffort] : undefined),
-    source: control?.model ? 'composer-control+transcript' : transcript?.current ? 'session-transcript' : 'host-launch-args',
+    resolved: Boolean(known?.id),
+    status: known?.id ? 'read' : 'unmapped',
+    label: raw.label,
+    effortLabel: raw.effort,
+    source: 'composer-control',
+    targetConfirmedBy: visible.targetConfirmedBy,
+    verifiedBy: ['session-model-control'],
     catalogSource: modelCatalog.catalogSource,
-    evidence: {
-      transcript: transcript?.current ?? null,
-      launchArgs: launchArgs ?? null,
-      control: control ?? null,
-    },
-    conflicts,
-    ...(model ? {} : { reason: 'no-model-evidence-for-session' }),
+    evidence: { control: raw, history },
+    historyDiffers,
+    ...(known ? {} : { reason: 'label-not-in-catalog', unresolvedLabel: raw.label }),
+    ...(historyDiffers ? {
+      note: 'The control differs from what this session ran before; that is a selection change, and the control is the current value.',
+    } : {}),
   };
 }
 
 /**
- * The model a *new* session would start with on this host.
+ * The default a *new* session would start with, read from a draft composer.
  *
- * Read from the composer of the page in front of the user (a fresh draft shows
- * the current default) and resolved through the app's own catalogue. A session
- * that happens to be running is never used as a stand-in: its launch arguments
- * can predate a change of the global default. `selection_source: global_default`
- * in the shipped config is what makes the control the right source.
+ * A draft page shows the global default, so it is read in place when the window
+ * already shows one (nothing is typed, so the user's draft text is untouched).
+ * When the window shows a session instead, the same new-session navigation that
+ * creation uses opens a fresh draft, the control is read, and the previous view
+ * is restored. A page whose composer holds unsent text is never navigated away
+ * from, so a user draft is never overwritten. No message is ever sent, so this
+ * costs no model turn.
  */
 export async function readDefaultModel({
-  driver = createNullDriver(), env = process.env, catalog = undefined, asar = undefined,
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive,
+  catalog = undefined, asar = undefined, workspace = undefined, folderLabel = undefined, readOnly = false,
 } = {}) {
   const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
-  const control = driverAvailable(driver)
-    ? modelInfo(await driver.readModel().catch(() => undefined))
-    : { label: null };
+  const ui = requireDriver(driver, 'reading the default model');
   const summary = {
     surface: modelCatalog.surface,
     models: modelCatalog.models.map(model => ({ id: model.id, name: model.name, section: model.section })),
     efforts: modelCatalog.efforts,
+    catalogSource: modelCatalog.catalogSource,
+    catalogVersion: modelCatalog.catalogVersion,
+    selectionSource: modelCatalog.selectionSource ?? 'global_default',
   };
+  const startView = await readViewStable(ui);
+  const composerLength = Number(startView?.composerLength ?? 0);
+  const isDraft = Boolean(startView?.composerFound) && Number(startView?.messages ?? 0) === 0;
+
+  let control;
+  let navigation;
+  if (isDraft) {
+    control = modelInfo(await ui.readModel());
+    navigation = { navigated: false, draft: 'in-place', draftPreserved: true,
+      previousDocumentName: startView?.documentName };
+  } else if (readOnly) {
+    // A caller that must not touch the window (a status probe) gets an explicit
+    // answer instead of a page navigation.
+    return {
+      provider: 'anthropic', model: null, reasoningEffort: undefined, label: null, effortLabel: null,
+      resolved: false, verified: false, status: 'not-a-draft', reason: 'draft-not-shown',
+      selectionSource: summary.selectionSource, catalogSource: modelCatalog.catalogSource,
+      evidence: { control: null, catalog: summary },
+      navigation: { navigated: false, draft: 'none', previousDocumentName: startView?.documentName },
+      detail: 'The window is not showing a draft and this caller asked for a read-only answer, so no page was opened.',
+    };
+  } else {
+    if (composerLength > 0) {
+      throw fail('unsent-text-present',
+        'The composer holds unsent text; refusing to navigate away and overwrite it just to read the default.',
+        { documentName: startView?.documentName, composerLength });
+    }
+    const previousTitle = displayTitle(startView?.documentName);
+    const { sessions } = await scanNativeSessions({ env, isAlive });
+    const previous = sessions.find(session => session.alive && session.name && session.name === previousTitle);
+    const targetWorkspace = workspace ?? previous?.workspace;
+    if (!targetWorkspace) {
+      throw fail('workspace-required',
+        'No workspace to open a draft in; pass one explicitly (a folder the user already works in).',
+        { documentName: startView?.documentName });
+    }
+    const launch = await ui.openNewSession({ workspace: targetWorkspace, prompt: undefined, prefill: false,
+      allowDeepLink: true, allowExecutable: true, trustWorkspace: false,
+      ...(folderLabel ? { folderLabel } : {}) });
+    const draftView = await readViewStable(ui);
+    const restore = async () => {
+      if (!previous?.hostSessionId) return 'none';
+      const revealed = await ui.revealSession({ hostSessionId: previous.hostSessionId, allowDeepLink: true })
+        .catch(() => undefined);
+      const back = await readViewStable(ui);
+      const marker = await sessionContentMarker({ env, record: previous });
+      const ok = viewMatchesSession(back, previous) || pageShowsSession(back, marker);
+      return ok ? 'session' : (revealed ? 'unconfirmed' : 'failed');
+    };
+    if (launch?.blocked === 'workspace-trust-prompt' || draftView?.trustPrompt) {
+      const restored = await restore();
+      throw fail('workspace-trust-prompt',
+        'Opening a draft for that folder asks the host\'s workspace-trust question; it is not answered on the caller\'s behalf.',
+        { launch, restored });
+    }
+    const draftReady = Boolean(draftView?.hasComposer ?? draftView?.composerFound)
+      && Number(draftView?.messages ?? 0) === 0;
+    if (!draftReady) {
+      const restored = await restore();
+      throw fail('draft-not-opened', 'The window did not reach a fresh draft, so no default was read.',
+        { launch, view: draftView, restored });
+    }
+    control = modelInfo(await ui.readModel());
+    const restored = await restore();
+    navigation = { navigated: true, draft: 'fresh', restored,
+      previousDocumentName: startView?.documentName, workspace: targetWorkspace,
+      launch: launch?.strategy ?? null };
+  }
+
   if (!control.label) {
     return {
       provider: 'anthropic', model: null, reasoningEffort: undefined, label: null, effortLabel: null,
-      resolved: false, verified: false, reason: 'draft-control-required',
-      selectionSource: modelCatalog.selectionSource ?? 'global_default',
-      catalogSource: modelCatalog.catalogSource, evidence: { control: null, catalog: summary },
-      detail: 'The current default is whatever the host shows in a draft composer; open or read that control instead of inferring it from a running session.',
+      resolved: false, verified: false, status: 'unreadable', reason: 'model-control-unreadable',
+      selectionSource: summary.selectionSource, catalogSource: modelCatalog.catalogSource,
+      evidence: { control: null, catalog: summary }, navigation,
+      detail: 'The draft is on screen but its model control could not be read.',
     };
   }
   const known = modelCatalog.models.find(model => model.name === control.label);
@@ -1430,17 +1573,20 @@ export async function readDefaultModel({
     effortLabel: control.effort,
     resolved: Boolean(known?.id),
     verified: Boolean(known?.id),
+    status: known?.id ? 'read' : 'unmapped',
     source: 'draft-control+app-catalog',
-    selectionSource: modelCatalog.selectionSource ?? 'global_default',
+    selectionSource: summary.selectionSource,
     catalogSource: modelCatalog.catalogSource,
+    catalogVersion: modelCatalog.catalogVersion,
+    verifiedBy: ['draft-model-control', 'app-catalog-id-pair'],
     ...(known ? {} : { reason: 'label-not-in-catalog', unresolvedLabel: control.label }),
-    evidence: { control: control.raw ? control : null, catalog: summary },
+    evidence: { control, catalog: summary },
+    navigation,
     gaps: [
       'The label list is the app catalogue (sections main and overflow); a catalogue entry can be hidden from the visible menu, so the control stays the source of the current value.',
     ],
   };
 }
-
 /** The model of the newest assistant turn; used to confirm a selection. */
 export async function confirmModelAfterTurn({ nativeSessionId, after } = {}, {
   env = process.env, isAlive = defaultIsAlive,
@@ -1523,7 +1669,9 @@ export async function probeClaudeHost({ env = process.env, driver = createNullDr
   const ui = driverAvailable(driver)
     ? await driver.probe().catch(error => ({ available: false, reason: error.code ?? 'ui-bridge-failed' }))
     : { available: false, reason: 'ui-driver-unavailable' };
-  const model = await readDefaultModel({ driver, env, isAlive }).catch(() => ({ model: null, verified: false }));
+  // A probe must never navigate the user's window; it reads a draft only if one is showing.
+  const model = await readDefaultModel({ driver, env, isAlive, readOnly: true })
+    .catch(error => ({ model: null, verified: false, reason: error.code ?? 'unavailable' }));
   return {
     application: NATIVE_HOST,
     configRoot: configRoot(env),
@@ -1573,7 +1721,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const handler = {
       probe: () => probeClaudeHost({ driver }),
       sessions: () => listNativeSessions({ workspace: payload.workspace }),
-      model: () => readDefaultModel({ driver }),
+      model: () => readDefaultModel({ driver, readOnly: payload.navigate !== true }),
+      current: () => readCurrentModel(payload, { driver }),
       'current-model': () => readCurrentModel(payload, { driver }),
       create: () => createFirstTurn(payload, {
         driver,

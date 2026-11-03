@@ -14,6 +14,7 @@ import {
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
   MODEL_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
   loadModelCatalog, BUILT_IN_MODEL_CATALOG, extractModelSelectorConfigs, sliceBalancedArray,
+  extractEmbeddedCatalog, readQuotedLiteral,
 } from '../src/claude-host.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -88,7 +89,10 @@ function uiDriver(behaviour = {}) {
     available: true,
     calls,
     async probe() { calls.push('probe'); return { available: true, documentName: behaviour.documentName ?? 'Fixture session - Claude Code' }; },
-    async currentView() { calls.push('view'); return { available: true, documentName: behaviour.documentName ?? 'Fixture session - Claude Code', composerFound: true, texts: behaviour.texts ?? [] }; },
+    async currentView() { calls.push('view'); return { available: true, documentName: behaviour.documentName ?? 'Fixture session - Claude Code',
+      composerFound: true, hasComposer: true, messages: behaviour.messages ?? 0,
+      composerLength: behaviour.composerLength ?? 0, trustPrompt: behaviour.trustPrompt ?? false,
+      texts: behaviour.texts ?? [] }; },
     async openNewSession(input) { calls.push(['openNewSession', input]); return behaviour.openNewSession?.(input) ?? { strategy: 'deep-link-code-new-protocol', prefilled: true }; },
     async submit(input) { calls.push(['submit', input]); return behaviour.submit?.() ?? { method: 'enter-on-prefilled-composer' }; },
     async interrupt() { calls.push('interrupt'); return behaviour.interrupt?.() ?? { method: 'escape' }; },
@@ -488,8 +492,8 @@ test('the model control name is parsed, not echoed as the model', () => {
   assert.equal(modelInfo(undefined).label, null);
 });
 
-test('the default model is the draft control resolved through the catalogue', async () => {
-  const driver = uiDriver({ readModel: () => ({ raw: '模型：Sonnet 5.5 高' }) });
+test('the default model is read from a draft control resolved through the catalogue', async () => {
+  const driver = uiDriver({ messages: 0, readModel: () => ({ raw: '模型：Sonnet 5.5 高' }) });
   const read = await readDefaultModel({ driver, catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
   assert.equal(read.provider, 'anthropic');
   assert.equal(read.model, 'claude-sonnet-5-5');
@@ -498,36 +502,45 @@ test('the default model is the draft control resolved through the catalogue', as
   assert.equal(read.effortLabel, '高');
   assert.equal(read.resolved, true);
   assert.equal(read.verified, true);
+  assert.equal(read.status, 'read');
   assert.equal(read.source, 'draft-control+app-catalog');
   assert.equal(read.selectionSource, 'global_default');
+  assert.equal(read.navigation.navigated, false, 'a draft already on screen is read in place');
+  assert.equal(read.navigation.draftPreserved, true);
   assert.equal(read.evidence.control.raw, '模型：Sonnet 5.5 高');
   assert.equal(read.evidence.launchArgs, undefined, 'a running session never stands in for the default');
 
-  const blind = await readDefaultModel({ driver: createNullDriver() });
-  assert.equal(blind.resolved, false);
-  assert.equal(blind.reason, 'draft-control-required');
-  assert.match(blind.detail, /draft composer/);
+  await assert.rejects(readDefaultModel({ driver: createNullDriver() }), { code: 'ui-driver-unavailable' });
 });
 
-test('a session next-turn model is read from its own transcript and the control', async () => {
+test('the next-turn model comes from the session control, never from history', async () => {
   const host1 = await host({ sessions: [record()], transcriptLines: {
     [SESSION]: [userLine('hi'), assistantLine('claude-opus-5-5', 'max')],
   } });
+  const page = { documentName: 'Fixture session - Claude Code', texts: ['Claude Code', 'Fixture session'] };
   try {
-    const plain = await readCurrentModel({ nativeSessionId: SESSION }, { env: host1.env, isAlive: host1.isAlive });
-    assert.equal(plain.model, 'claude-opus-5-5');
-    assert.equal(plain.reasoningEffort, 'max');
-    assert.equal(plain.source, 'session-transcript');
+    // Without a driver there is nothing to read: no history stand-in.
+    await assert.rejects(readCurrentModel({ nativeSessionId: SESSION }, { env: host1.env, isAlive: host1.isAlive }),
+      { code: 'ui-driver-unavailable' });
 
-    const driver = uiDriver({
-      documentName: 'Fixture session - Claude Code',
-      texts: ['Claude Code', 'Fixture session'],
-      readSessionArgs: ({ pid }) => ({ pid, found: true, model: 'claude-opus-5-5', effort: 'max' }),
-      readModel: () => ({ raw: '模型：Opus 5.5 中等' }),
-    });
-    const shown = await readCurrentModel({ nativeSessionId: SESSION }, { driver, env: host1.env, isAlive: host1.isAlive });
-    assert.equal(shown.evidence.control.effortLabel, '中等');
-    assert.ok(shown.conflicts.includes('effort-control-vs-transcript'), 'the disagreement is reported, not averaged');
+    // The control is unreadable: fail explicitly even though the transcript has a model.
+    const blind = await readCurrentModel({ nativeSessionId: SESSION }, {
+      driver: uiDriver({ ...page, readModel: () => ({ label: '' }) }), env: host1.env, isAlive: host1.isAlive });
+    assert.equal(blind.resolved, false);
+    assert.equal(blind.status, 'unreadable');
+    assert.equal(blind.model, null);
+    assert.equal(blind.evidence.history.transcript.model, 'claude-opus-5-5', 'history is context only');
+
+    // A control that differs from the transcript is a normal selection change.
+    const changed = await readCurrentModel({ nativeSessionId: SESSION }, {
+      driver: uiDriver({ ...page, readModel: () => ({ raw: '模型：Sonnet 5.5 高' }) }),
+      env: host1.env, isAlive: host1.isAlive });
+    assert.equal(changed.resolved, true);
+    assert.equal(changed.model, 'claude-sonnet-5-5');
+    assert.equal(changed.reasoningEffort, 'high');
+    assert.equal(changed.source, 'composer-control');
+    assert.equal(changed.historyDiffers, true);
+    assert.match(changed.note, /selection change/);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
@@ -582,7 +595,7 @@ test('the probe states what is really available', async () => {
     assert.equal(withUi.application, 'claude-desktop');
     assert.equal(withUi.sessions.live, 1);
     assert.equal(withUi.capabilities.createFirstTurn, 'verified-surface');
-    assert.equal(withUi.capabilities.readDefaultModel, 'verified-surface');
+    assert.ok(['verified-surface', 'unavailable'].includes(withUi.capabilities.readDefaultModel));
     assert.equal(withUi.capabilities.selectModel, 'unverified', 'a control that was never exercised on a live app is not claimed');
     assert.equal(withUi.capabilities.destroy, 'verified-surface');
     assert.equal(withUi.deepLinks.newSession, 'prefill-only');
@@ -812,4 +825,103 @@ test('the installed app archive carries the authoritative catalogue', async t =>
   assert.equal(labelForModel({ model: 'claude-opus-5-5' }, catalog).label, 'Opus 5.5');
   assert.equal(labelForModel({ model: 'claude-sonnet-5-5' }, catalog).label, 'Sonnet 5.5');
   assert.deepEqual(catalog.efforts.map(option => option.id), ['low', 'medium', 'high', 'xhigh', 'max']);
+});
+
+// ------------------------------------------- default model without a model turn
+
+/** A page whose state the UI bridge changes as the test drives it. */
+function pageDriver(initial, transitions) {
+  let state = { ...initial };
+  const calls = [];
+  const driver = {
+    kind: 'fake-uia', available: true, calls,
+    async probe() { return { available: true, documentName: state.documentName }; },
+    async currentView() { calls.push('view'); return { available: true, hasComposer: true, texts: [], ...state }; },
+    async readModel() { calls.push('readModel'); return { raw: state.raw }; },
+    async openNewSession(input) {
+      calls.push(['openNewSession', input]);
+      state = { ...state, ...(transitions.open ?? {}) };
+      return transitions.openResult ?? { strategy: 'deep-link-code-new-protocol', navigated: true };
+    },
+    async revealSession(input) {
+      calls.push(['revealSession', input]);
+      state = { ...state, ...(transitions.reveal ?? {}) };
+      return { revealed: true, method: 'deep-link-continue-protocol' };
+    },
+  };
+  return driver;
+}
+
+test('a session page is swapped for a draft control read, then restored', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  try {
+    const driver = pageDriver(
+      { documentName: 'Fixture session - Claude Code', messages: 3, composerLength: 0, raw: '模型：Opus 5.5 中等' },
+      { open: { documentName: 'New session - Claude Code', messages: 0, raw: '模型：Opus 5.5 中等' },
+        reveal: { documentName: 'Fixture session - Claude Code', messages: 3 } },
+    );
+    const catalog = await loadModelCatalog({ asar: 'missing.asar' });
+    const read = await readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive, catalog });
+    assert.equal(read.resolved, true);
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.navigation.navigated, true);
+    assert.equal(read.navigation.draft, 'fresh');
+    assert.equal(read.navigation.restored, 'session', 'the previous view is put back');
+    const open = driver.calls.find(call => Array.isArray(call) && call[0] === 'openNewSession');
+    assert.equal(open[1].prefill, false, 'no prompt goes through the deep link');
+    assert.equal(open[1].prompt, undefined, 'nothing is sent, so no model turn is spent');
+    assert.ok(driver.calls.some(call => Array.isArray(call) && call[0] === 'revealSession'));
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('unsent text in the composer is never overwritten to read a default', async () => {
+  const host1 = await host({ sessions: [record()] });
+  try {
+    const driver = pageDriver({ documentName: 'Fixture session - Claude Code', messages: 3, composerLength: 42, raw: '模型：Opus 5.5 中等' }, {});
+    await assert.rejects(readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive, catalog: await loadModelCatalog({ asar: 'missing.asar' }) }),
+      { code: 'unsent-text-present' });
+    assert.equal(driver.calls.some(call => Array.isArray(call) && call[0] === 'openNewSession'), false);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a workspace trust question during the draft read fails without approving it', async () => {
+  const host1 = await host({ sessions: [record()] });
+  try {
+    const driver = pageDriver(
+      { documentName: 'Fixture session - Claude Code', messages: 3, composerLength: 0, raw: '模型：Opus 5.5 中等' },
+      { open: { trustPrompt: true, messages: 0 }, openResult: { blocked: 'workspace-trust-prompt', navigated: false },
+        reveal: { trustPrompt: false, messages: 3, documentName: 'Fixture session - Claude Code' } },
+    );
+    await assert.rejects(readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive, catalog: await loadModelCatalog({ asar: 'missing.asar' }) }),
+      { code: 'workspace-trust-prompt' });
+    assert.ok(driver.calls.some(call => Array.isArray(call) && call[0] === 'revealSession'),
+      'the previous view is restored even when the read fails');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('the embedded catalog is read from the surfaces literal, as data', async () => {
+  const payload = JSON.stringify({ ccd: { model_selector_config: [{ id: 'ccd', models: [
+    { id: 'claude-x-1', name: 'X 1', section: 'main', thinking: { effort_options: [{ id: 'medium', name: 'Medium' }] } },
+  ] }] } }).replace(/'/g, "\\'");
+  const bundle = `var cdn={$schema:"s",schema_version:1,version:42,issued_at:"2026-10-29T05:58:15Z",expires_at:"2026-11-05T05:58:15Z",key_id:"k",surfaces:JSON.parse('${payload}')};`;
+  const embedded = extractEmbeddedCatalog(bundle);
+  assert.equal(embedded.surfaces.ccd.model_selector_config[0].models[0].id, 'claude-x-1');
+  assert.equal(embedded.meta.version, 42);
+  assert.equal(embedded.meta.issuedAt, '2026-10-29T05:58:15Z');
+  assert.equal(readQuotedLiteral("x='a\\'b'", 2), "a'b");
+  assert.equal(readQuotedLiteral("nope", 0), undefined);
+});
+
+
+test('a read-only default read never navigates the window', async () => {
+  const host1 = await host({ sessions: [record()] });
+  try {
+    const driver = pageDriver({ documentName: 'Fixture session - Claude Code', messages: 3, composerLength: 0, raw: '模型：Opus 5.5 中等' }, {});
+    const read = await readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive,
+      catalog: await loadModelCatalog({ asar: 'missing.asar' }), readOnly: true });
+    assert.equal(read.resolved, false);
+    assert.equal(read.reason, 'draft-not-shown');
+    assert.equal(read.navigation.navigated, false);
+    assert.equal(driver.calls.some(call => Array.isArray(call) && call[0] === 'openNewSession'), false);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

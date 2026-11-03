@@ -315,12 +315,16 @@ try {
         $name = $element.Current.Name
         if ($name) { $texts += $name }
       }
+      $signature = Get-PageSignature $window
       Write-Result @{ ok = $true; value = @{
         available = $true
         documentName = $web.DocumentName
         windowTitle = $window.Title
         composerFound = ($composers.Count -gt 0)
         modelLabel = $(if ($models.Count -gt 0) { $models[0].Current.Name } else { $null })
+        messages = $signature.messages
+        composerLength = $(if ($null -ne $signature.composerValue) { $signature.composerValue.Length } else { 0 })
+        trustPrompt = $signature.trustPrompt
         texts = $texts
       } }
     }

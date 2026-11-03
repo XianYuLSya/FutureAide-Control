@@ -13,6 +13,7 @@
 // the single shared scoped state machine, which owns delivery, backoff and
 // cleanup. Reads only; the roster stays the source of truth.
 import { createHash } from 'node:crypto';
+import { requireRootCall, transcriptPathFor } from './claude-report-binding.mjs';
 
 const refuse = (code, message) => Object.assign(new Error(message), { code });
 
@@ -38,11 +39,12 @@ export function receiptIdFor(agentId, taskId, kind, final = false) {
  *   when the session is not bound to a plugin-owned name, and throws a coded
  *   Error when the name exists but must not report right now.
  */
-export function createReportOwnership({ store } = {}) {
+export function createReportOwnership({ store, env = process.env, transcript = transcriptPathFor,
+  requireCall = requireRootCall } = {}) {
   if (typeof store?.agentForNativeSession !== 'function' || typeof store?.get !== 'function') {
     throw new TypeError('createReportOwnership requires the shared RosterStore');
   }
-  return async (caller, _context = {}) => {
+  return async (caller, { tool, input, toolUseId } = {}) => {
     const sessionId = caller?.sessionId;
     if (typeof sessionId !== 'string' || !sessionId) return null;
     const agent = store.agentForNativeSession(sessionId);
@@ -63,6 +65,18 @@ export function createReportOwnership({ store } = {}) {
     if ((task.reports ?? []).some(report => report.final === true)) {
       throw refuse('report-final-already-submitted',
         `A final report was already submitted for task ${task.taskId}; do not submit another.`);
+    }
+    // Submissions additionally need the root session's own open tool call: a
+    // sub-agent shares the process and connection but its calls are sidechain
+    // records the main chat never observes.
+    if (tool === 'ask' || tool === 'report') {
+      const file = await transcript({ sessionId, workspace: caller.cwd, env });
+      if (!file) {
+        throw refuse('transcript-unavailable',
+          'This session transcript could not be read, so the report cannot be tied to a tool call.');
+      }
+      await requireCall({ transcriptFile: file, tool: tool === 'ask' ? 'question' : 'report',
+        message: input?.message, final: input?.final === true, toolUseId });
     }
     const { agentId, name } = record;
     const { taskId } = task;

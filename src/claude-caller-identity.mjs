@@ -206,10 +206,21 @@ export async function readSessionRecord(pid, { env = process.env } = {}) {
   } catch { return null; }
 }
 
-const callerOf = ({ record, pid, depth }, image) => ({
+const normalizePipe = value => (typeof value === 'string'
+  ? value.replace(/^\\\\\?\\/, '\\\\.\\').toLowerCase() : undefined);
+
+// The verified fields a native binding needs, carried on the authenticated caller:
+// pid, session id, procStart, workspace, the registry record and the messaging
+// pipe. The peer token and every other credential stay out.
+const callerOf = ({ record, pid, depth }, { image, env = process.env } = {}) => ({
   pid, sessionId: record.sessionId, cwd: record.cwd,
   name: typeof record.name === 'string' ? record.name : undefined,
   procStart: String(record.procStart), via: depth === 0 ? 'pid' : 'parent-pid',
+  pidDomain: record.pidDomain,
+  recordFile: sessionRecordPath(pid, { env }),
+  directory: path.join(configRoot(env), 'sessions'),
+  socketPath: normalizePipe(record.messagingSocketPath),
+  ...(typeof record.hostSessionId === 'string' ? { hostSessionId: record.hostSessionId } : {}),
   ...(image ? { image } : {}),
 });
 
@@ -219,23 +230,24 @@ const notSession = (detail) => refuse('caller-unresolved',
   + 'Report and question tools are only available to plugin-owned sessions; no argument can supply an identity.');
 
 /** Identity for the stdio transport: the process that spawned this server. */
-export async function resolveStdioCaller({ parentPid = process.ppid, image = processImageName, ...options } = {}) {
-  const owner = await resolveSessionOwner(parentPid, options);
+export async function resolveStdioCaller({ parentPid = process.ppid, image = processImageName,
+  env = process.env, ...options } = {}) {
+  const owner = await resolveSessionOwner(parentPid, { env, ...options });
   if (!owner) throw notSession('no verified session record for the parent process');
   if (owner.refusal) throw notSession(owner.refusal.code);
-  return callerOf(owner, await image(owner.pid));
+  return callerOf(owner, { image: await image(owner.pid), env });
 }
 
 /** Identity for the loopback HTTP transport: the TCP peer's owning process. */
 export async function resolveSocketCaller(socket, {
-  serverPort, tcpOwner = tcpOwnerPid, image = processImageName, ...options
+  serverPort, tcpOwner = tcpOwnerPid, image = processImageName, env = process.env, ...options
 } = {}) {
   const clientPort = socket?.remotePort;
   const localPort = Number.isSafeInteger(serverPort) ? serverPort : socket?.localPort;
   const pid = await tcpOwner({ clientPort, serverPort: localPort });
   if (!pid) throw notSession('the TCP peer could not be mapped to a process');
-  const owner = await resolveSessionOwner(pid, options);
+  const owner = await resolveSessionOwner(pid, { env, ...options });
   if (!owner) throw notSession('the TCP peer is not a Claude Desktop session');
   if (owner.refusal) throw notSession(owner.refusal.code);
-  return callerOf(owner, await image(owner.pid));
+  return callerOf(owner, { image: await image(owner.pid), env });
 }

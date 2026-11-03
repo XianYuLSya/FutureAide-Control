@@ -23,20 +23,10 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { reportReceipt } from '../src/claude-inbox.mjs';
+import { REPORT_TOOL_ALLOWLIST } from '../src/claude-report-binding.mjs';
 
-/**
- * Exact registered names. `mcp__<config key>__<tool>` is how Claude namespaces an
- * MCP tool, and the plugin's config key is `futureaide-report`; the underscore
- * variant is kept because the observer accepts both spellings. Confirm the real
- * name in the first live transcript and shrink or extend this list, never match by
- * suffix.
- */
-export const REPORT_TOOL_ALLOWLIST = Object.freeze([
-  'mcp__futureaide-report__ask_parent',
-  'mcp__futureaide-report__report_parent',
-  'mcp__futureaide_report__ask_parent',
-  'mcp__futureaide_report__report_parent',
-]);
+// The same allowlist the runtime gate uses: exact registered names only.
+export { REPORT_TOOL_ALLOWLIST };
 
 /** Names that look like reports but are not registered MCP tools: diagnostics only. */
 const LOOKALIKE = /(?:^|__)(ask_parent|report_parent)$/;

@@ -155,6 +155,43 @@ test('the development ownership stub accepts only the pinned session and records
   assert.match(lines.join('\n'), /final=true/);
 });
 
+test('a submission hands the tool, its arguments and any native tool-use id to ownership', async () => {
+  const contexts = [];
+  const owned = { agentId: 'agent-test', agentName: '绘图副手', taskId: 7,
+    async ask() { return { accepted: true }; }, async report() { return { accepted: true }; } };
+  const { client, close } = await inMemory(async (caller, context) => { contexts.push(context); return owned; });
+  try {
+    await client.listTools();
+    await client.callTool({ name: 'report_parent', arguments: { message: 'delivered', final: true },
+      _meta: { toolUseId: 'toolu_9' } });
+    assert.equal(contexts.length, 1, 'only the submission asks ownership');
+    const submission = contexts[0];
+    assert.equal(submission.tool, 'report');
+    assert.deepEqual(submission.input, { message: 'delivered', final: true });
+    assert.equal(submission.toolUseId, 'toolu_9');
+  } finally { await close(); }
+});
+
+test('an unbound session is adopted on its first list and gets the tools', async () => {
+  let adopted = 0;
+  let bound = false;
+  const owned = { agentId: 'agent-x', agentName: '首列表副手', taskId: 3,
+    async ask() { return { accepted: true }; }, async report() { return { accepted: true }; } };
+  const service = await startHttpService({ port: 0,
+    resolveCaller: async () => caller,
+    resolveOwned: async () => (bound ? owned : null),
+    adopt: async () => { adopted += 1; bound = true;
+      return { adopted: true, agentId: 'agent-x', name: '首列表副手', waitedMs: 24 }; } });
+  const client = new Client({ name: 'adopt-test', version: '1.0.0' });
+  try {
+    await client.connect(new StreamableHTTPClientTransport(new URL(service.url)));
+    const { tools } = await client.listTools();
+    assert.deepEqual(tools.map(tool => tool.name).sort(), [...REPORT_TOOL_NAMES].sort());
+    assert.equal(adopted, 1, 'adoption runs once, then ownership answers');
+    assert.equal(service.stats.adopted, 1);
+  } finally { await client.close(); await service.close(); }
+});
+
 test('a second binder on the same port is refused while the first keeps serving', async () => {
   const first = await startHttpService({ port: 0, resolveOwned: async () => null, resolveCaller: async () => caller });
   try {

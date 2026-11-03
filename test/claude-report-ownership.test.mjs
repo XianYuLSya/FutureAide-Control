@@ -26,9 +26,14 @@ function fixture({ task = {}, record = {}, binding = true } = {}) {
   return { store, record: value, agentId };
 }
 
+// The root-call gate needs a real transcript; these tests stand it in, and the
+// gate's own behaviour is covered in claude-report-binding.test.mjs.
+const own = (options, overrides = {}) => createReportOwnership({ transcript: async () => 'D:\\probe.jsonl',
+  requireCall: async () => ({ matched: true, id: 'toolu_1', by: 'unique-message' }), ...options, ...overrides });
+
 test('an owned session with an open task is accepted with agent, task and a stable id', async () => {
   const { store, agentId } = fixture();
-  const owned = await createReportOwnership({ store })({ sessionId }, { tool: 'report' });
+  const owned = await own({ store })({ sessionId }, { tool: 'report' });
   assert.equal(owned.agentId, agentId);
   assert.equal(owned.taskId, 7);
   assert.equal(owned.agentName, '绘图副手');
@@ -47,45 +52,61 @@ test('an owned session with an open task is accepted with agent, task and a stab
 test('a session with no roster binding is not owned at all', async () => {
   // A roster row without native binding state is not visible to a native session.
   const unbound = fixture({ binding: false });
-  const resolve = createReportOwnership({ store: unbound.store });
+  const resolve = own({ store: unbound.store });
   assert.equal(await resolve({ sessionId }, { tool: 'list' }), null);
   assert.equal(await resolve({}, { tool: 'list' }), null);
   // A bound roster row belongs to its own native session, not to another one.
   const bound = fixture();
-  assert.equal(await createReportOwnership({ store: bound.store })({ sessionId: '3725418e-ac07-45d6-877b-2ab22ef89017' }, { tool: 'list' }), null);
-  assert.ok(await createReportOwnership({ store: bound.store })({ sessionId }, { tool: 'list' }));
+  assert.equal(await own({ store: bound.store })({ sessionId: '3725418e-ac07-45d6-877b-2ab22ef89017' }, { tool: 'list' }), null);
+  assert.ok(await own({ store: bound.store })({ sessionId }, { tool: 'list' }));
 });
 
 test('a cancelled task refuses with task-cancelled', async () => {
   const { store } = fixture({ task: { cancelRequested: true } });
-  await assert.rejects(createReportOwnership({ store })({ sessionId }, { tool: 'report' }),
+  await assert.rejects(own({ store })({ sessionId }, { tool: 'report' }),
     error => error.code === 'task-cancelled');
 });
 
 test('a closed name is not owned, and a finished task refuses with task-finished', async () => {
   const closed = fixture({ record: { closed: true } });
-  assert.equal(await createReportOwnership({ store: closed.store })({ sessionId }, { tool: 'list' }), null);
+  assert.equal(await own({ store: closed.store })({ sessionId }, { tool: 'list' }), null);
 
   const completed = fixture({ task: { state: 'completed' } });
-  await assert.rejects(createReportOwnership({ store: completed.store })({ sessionId }, { tool: 'report' }),
+  await assert.rejects(own({ store: completed.store })({ sessionId }, { tool: 'report' }),
     error => error.code === 'task-finished');
 
   const withResult = fixture({ task: { result: { state: 'completed', reply: 'done' } } });
-  await assert.rejects(createReportOwnership({ store: withResult.store })({ sessionId }, { tool: 'report' }),
+  await assert.rejects(own({ store: withResult.store })({ sessionId }, { tool: 'report' }),
     error => error.code === 'task-finished');
 });
 
 test('a task that already holds a final report refuses another one', async () => {
   const { store } = fixture({ task: { reports: [{ id: 'toolu_1', taskId: 7, message: 'done', final: true,
     delivery: { id: 'report-toolu_1', state: 'delivered' } }] } });
-  await assert.rejects(createReportOwnership({ store })({ sessionId }, { tool: 'report' }),
+  await assert.rejects(own({ store })({ sessionId }, { tool: 'report' }),
     error => error.code === 'report-final-already-submitted');
 });
 
 test('a name without a current task refuses instead of inventing a task id', async () => {
   const { store } = fixture({ task: { taskId: undefined } });
-  await assert.rejects(createReportOwnership({ store })({ sessionId }, { tool: 'ask' }),
+  await assert.rejects(own({ store })({ sessionId }, { tool: 'ask' }),
     error => error.code === 'task-missing');
+});
+
+test('a submission without its root tool call is refused as not-root-agent', async () => {
+  const { store } = fixture();
+  const gate = async () => { throw Object.assign(new Error('no open matching tool call'), { code: 'not-root-agent' }); };
+  await assert.rejects(own({ store }, { requireCall: gate })({ sessionId, cwd: 'D:\\Work\\xiayuls_workflow' },
+    { tool: 'report', input: { message: 'done', final: true } }),
+  error => error.code === 'not-root-agent');
+  // Listing does not need a call behind it, so the same session still gets tools.
+  assert.ok(await own({ store }, { requireCall: gate })({ sessionId }, { tool: 'list' }));
+});
+
+test('a submission whose transcript cannot be read is refused instead of trusted', async () => {
+  const { store } = fixture();
+  await assert.rejects(own({ store }, { transcript: async () => undefined })({ sessionId, cwd: 'D:\\Work' },
+    { tool: 'ask', input: { message: 'which?' } }), error => error.code === 'transcript-unavailable');
 });
 
 test('ownership needs the shared store, not a stand-in object', () => {
@@ -106,7 +127,7 @@ test('the surface re-reads ownership on every tools/list (server side only)', as
     state: 'creating', closed: false, sessionId: 'logical-late',
     task: { taskId: 9, state: 'running', reports: [] } });
   const caller = { pid: 50124, sessionId, via: 'pid' };
-  const service = await startHttpService({ port: 0, resolveOwned: createReportOwnership({ store }),
+  const service = await startHttpService({ port: 0, resolveOwned: own({ store }),
     resolveCaller: async () => caller });
   const client = new Client({ name: 'late-binding-test', version: '1.0.0' });
   await client.connect(new StreamableHTTPClientTransport(new URL(service.url)));
@@ -127,9 +148,9 @@ test('the surface re-reads ownership on every tools/list (server side only)', as
 test('the HTTP service with real ownership answers the owned session and lists nothing for others', async () => {
   const { store, agentId } = fixture();
   const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', via: 'pid' };
-  const service = await startHttpService({ port: 0, resolveOwned: createReportOwnership({ store }),
+  const service = await startHttpService({ port: 0, resolveOwned: own({ store }),
     resolveCaller: async () => caller });
-  const outsider = await startHttpService({ port: 0, resolveOwned: createReportOwnership({ store }),
+  const outsider = await startHttpService({ port: 0, resolveOwned: own({ store }),
     resolveCaller: async () => ({ pid: 42632, sessionId: '3725418e-ac07-45d6-877b-2ab22ef89017', via: 'pid' }) });
   const open = async url => {
     const client = new Client({ name: 'ownership-http-test', version: '1.0.0' });

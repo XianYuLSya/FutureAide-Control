@@ -15,7 +15,8 @@ const domain = `win32:${hostname().toLowerCase()}`;
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
 const recordFor = (pid, overrides = {}) => ({
   pid, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', entrypoint: 'claude-desktop',
-  pidDomain: domain, procStart: '134381970992798945', name: 'FutureAide 插件生命周期测试', ...overrides,
+  pidDomain: domain, procStart: '134381970992798945', name: 'FutureAide 插件生命周期测试',
+  messagingSocketPath: '\\\\.\\pipe\\LOCAL\\cc-msg-abc', ...overrides,
 });
 const live = () => true;
 
@@ -148,12 +149,13 @@ test('the start-time check is cached so a tool call does not pay it twice', asyn
 });
 
 test('a socket caller resolves through the TCP peer and reports how it was found', async () => {
-  const record = recordFor(50124);
+  const record = recordFor(50124, { hostSessionId: 'local_abc' });
   const caller = await resolveSocketCaller({ remotePort: 57361, localPort: 17654 }, {
     tcpOwner: async ({ clientPort, serverPort }) => {
       assert.deepEqual({ clientPort, serverPort }, { clientPort: 57361, serverPort: 17654 });
       return 50124;
     },
+    env: { CLAUDE_CONFIG_DIR: 'D:\\tmp\\claude-config' },
     readRecord: async pid => (pid === 50124 ? record : null),
     startTime: async () => record.procStart, isAlive: live,
     // The image name is diagnosis only; it is read once per connection and never
@@ -161,7 +163,12 @@ test('a socket caller resolves through the TCP peer and reports how it was found
     image: async pid => (pid === 50124 ? 'claude.exe' : null),
   });
   assert.deepEqual(caller, { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow',
-    name: 'FutureAide 插件生命周期测试', procStart: '134381970992798945', via: 'pid', image: 'claude.exe' });
+    name: 'FutureAide 插件生命周期测试', procStart: '134381970992798945', via: 'pid',
+    pidDomain: domain, recordFile: 'D:\\tmp\\claude-config\\sessions\\50124.json',
+    directory: 'D:\\tmp\\claude-config\\sessions', socketPath: '\\\\.\\pipe\\local\\cc-msg-abc',
+    hostSessionId: 'local_abc', image: 'claude.exe' });
+  // A binding carries the verified fields and never a peer token.
+  assert.ok(!('peerToken' in caller));
 });
 
 test('an unmappable peer is refused with a code and no fallback identity', async () => {

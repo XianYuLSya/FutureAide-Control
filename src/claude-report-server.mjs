@@ -29,6 +29,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { resolveSocketCaller, resolveStdioCaller } from './claude-caller-identity.mjs';
+import { adoptFirstListBinding } from './claude-report-binding.mjs';
 import { createReportOwnership } from './claude-report-ownership.mjs';
 
 export const SERVER_NAME = 'futureaide-report';
@@ -66,6 +67,18 @@ const errorResult = error => ({
 const okResult = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
 
 /**
+ * A native tool-use id, when the MCP client happens to expose one. MCP itself does
+ * not carry it, so this is only a shortcut: without it the ownership layer matches
+ * the open tool call by exact tool and arguments instead. The first live report
+ * shows which one applies.
+ */
+const nativeToolUseId = extra => {
+  const meta = extra?._meta ?? {};
+  return [extra?.toolUseId, meta.toolUseId, meta['claude/toolUseId'], meta['anthropic/toolUseId']]
+    .find(value => typeof value === 'string' && value.length > 0);
+};
+
+/**
  * Build the MCP server for one already-identified caller.
  * @param {object} options
  * @param {() => Promise<object>} options.resolveCaller Verified caller; bound by
@@ -83,9 +96,10 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
   if (typeof resolveOwned !== 'function') throw new TypeError('createClaudeReportServer requires resolveOwned');
   const server = new McpServer({ name: SERVER_NAME, version }, { instructions });
 
-  const submit = async (kind, { message, final = false }) => {
+  const submit = async (kind, { message, final = false, extra }) => {
     const caller = await resolveCaller();
-    const owned = await resolveOwned(caller, { tool: kind });
+    const owned = await resolveOwned(caller, { tool: kind, input: { message, final },
+      toolUseId: nativeToolUseId(extra) });
     if (!owned) {
       throw refuse('not-owned-session',
         `Claude session ${caller?.sessionId ?? '(unknown)'} is not bound to a FutureAide-owned agent. `
@@ -124,8 +138,8 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
     description: 'Ask the Codex parent chat a question you cannot decide yourself. Returns accepted once the question is queued for the parent; end your turn and the answer arrives as a new message in this session. Ordinary replies and the end of a turn never reach the parent, so this tool is the only way to ask.',
     inputSchema: { message },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, async args => {
-    try { return okResult(await submit('ask', { message: args.message })); }
+  }, async (args, extra) => {
+    try { return okResult(await submit('ask', { message: args.message, extra })); }
     catch (error) { return errorResult(error); }
   });
 
@@ -136,8 +150,8 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
       final: z.boolean().optional().describe('true submits the final deliverable of this task. Omit or false for a progress report.'),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
-  }, async args => {
-    try { return okResult(await submit('report', { message: args.message, final: args.final === true })); }
+  }, async (args, extra) => {
+    try { return okResult(await submit('report', { message: args.message, final: args.final === true, extra })); }
     catch (error) { return errorResult(error); }
   });
 
@@ -156,12 +170,18 @@ export function createUnavailableReportServer({ version = SERVER_VERSION } = {})
 }
 
 /** Run the stdio transport: one process per Claude Desktop session. */
-export async function runStdioService({ resolveOwned, resolveCaller, instructions, identity = {}, log = () => {} } = {}) {
+export async function runStdioService({ resolveOwned, resolveCaller, instructions, identity = {},
+  adopt, log = () => {} } = {}) {
   const resolve = resolveCaller ?? (() => resolveStdioCaller(identity));
   let server;
   try {
     const caller = await resolve();
-    const owned = typeof resolveOwned === 'function' ? await resolveOwned(caller, { tool: 'list' }) : null;
+    let owned = typeof resolveOwned === 'function' ? await resolveOwned(caller, { tool: 'list' }) : null;
+    if (!owned && typeof adopt === 'function') {
+      const outcome = await adopt(caller).catch(error => ({ adopted: false, reason: error?.code ?? 'adopt-failed' }));
+      if (outcome?.adopted) owned = await resolveOwned(caller, { tool: 'list' }).catch(() => null);
+      else log(`first list left unbound (${outcome?.reason ?? 'unknown'})`);
+    }
     server = owned ? createClaudeReportServer({ resolveOwned, instructions, resolveCaller: async () => caller })
       : createUnavailableReportServer();
     if (!owned) log('this session is not plugin-owned; the report surface lists no tools');
@@ -200,9 +220,9 @@ async function readBody(req, limitBytes = 1024 * 1024) {
  * request, so one shared process cannot leak another session's identity.
  */
 export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1', resolveOwned,
-  resolveCaller, instructions, identity = {}, log = () => {} } = {}) {
+  resolveCaller, instructions, identity = {}, adopt, log = () => {} } = {}) {
   const startedAt = new Date().toISOString();
-  const stats = { requests: 0, owned: 0, unowned: 0, served: 0 };
+  const stats = { requests: 0, owned: 0, unowned: 0, adopted: 0, served: 0 };
   // One identity per TCP connection, dropped when that socket closes.
   const identities = new WeakMap();
   let boundPort = port;
@@ -255,6 +275,23 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
           resolution.ownershipNoted = true;
           log(`owned session ${caller.sessionId} cannot report now (${error?.code ?? 'not-accepted'}): `
             + `${String(error?.message ?? error).slice(0, 200)}`);
+        }
+      }
+      // The session may ask for tools before the plugin has bound it. Adopt the
+      // pending creation it can prove it belongs to, then re-read ownership for
+      // this same request; the client is never assumed to list again.
+      if (!owned && typeof adopt === 'function') {
+        const outcome = await adopt(caller).catch(error => ({ adopted: false, reason: error?.code ?? 'adopt-failed' }));
+        if (outcome?.adopted) {
+          stats.adopted += 1;
+          if (!resolution.adoptionNoted) {
+            resolution.adoptionNoted = true;
+            log(`first list adopted ${outcome.name ?? outcome.agentId} after ${outcome.waitedMs ?? 0}ms`);
+          }
+          owned = await resolveOwned(caller, { tool: 'list' }).catch(() => null);
+        } else if (!resolution.adoptionNoted) {
+          resolution.adoptionNoted = true;
+          log(`first list left unbound (${outcome?.reason ?? 'unknown'})`);
         }
       }
     }
@@ -313,17 +350,18 @@ export function developmentOwnership(sessions, { log = () => {} } = {}) {
 }
 
 /**
- * The production wiring. Host it in the plugin's own long-lived process — the one
- * that is already up before any Claude session starts and stays up while managed
- * sessions idle — never in the shared monitor, which is created for a task and
- * exits when work stops. The roster is the same SQLite database the plugin
- * process already holds; the service adds no file, lock or process of its own.
- * Throws when the port is taken (another install is serving it); the caller
- * decides whether that is fatal.
+ * The production wiring. Host it in the one long-lived plugin process that is
+ * already up before any managed Claude session starts and stays up while they
+ * idle; the roster is the SQLite database that process already holds, so the
+ * service adds no file, lock or process of its own. Throws when the port is taken
+ * (another install is serving it); the caller decides whether that is fatal.
  */
-export async function startReportService({ store, port = DEFAULT_PORT, host = '127.0.0.1', log = () => {} } = {}) {
+export async function startReportService({ store, port = DEFAULT_PORT, host = '127.0.0.1',
+  env = process.env, log = () => {} } = {}) {
   if (!store) throw new TypeError('startReportService requires the shared RosterStore');
-  return startHttpService({ port, host, resolveOwned: createReportOwnership({ store }), log });
+  return startHttpService({ port, host, log,
+    resolveOwned: createReportOwnership({ store, env }),
+    adopt: caller => adoptFirstListBinding({ store, caller, env }) });
 }
 
 function argument(argv, name) {
@@ -341,22 +379,25 @@ async function main(argv = process.argv.slice(2)) {
   // Precedence: the shared roster (production), an explicit adapter module, then
   // the pinned-session development stub.
   let resolveOwned;
+  let adopt;
   if (rosterPath) {
     const { RosterStore } = await import('./roster-store.mjs');
-    resolveOwned = createReportOwnership({ store: new RosterStore(rosterPath) });
+    const store = new RosterStore(rosterPath);
+    resolveOwned = createReportOwnership({ store });
+    adopt = caller => adoptFirstListBinding({ store, caller });
     log(`ownership from the shared roster at ${rosterPath}`);
   } else if (ownershipPath) resolveOwned = (await import(pathToFileURL(ownershipPath).href)).resolveOwned;
   else if (accept) resolveOwned = developmentOwnership(accept.split(',').map(value => value.trim()).filter(Boolean), { log });
   if (argv.includes('--http')) {
     const port = Number.parseInt(argument(argv, '--port') ?? process.env.FUTUREAIDE_REPORT_PORT ?? String(DEFAULT_PORT), 10);
-    const service = await startHttpService({ port, resolveOwned, log });
+    const service = await startHttpService({ port, resolveOwned, adopt, log });
     process.stderr.write(`[futureaide-report] listening on ${service.url}\n`);
     const stop = async () => { await service.close(); process.exit(0); };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
     return;
   }
-  await runStdioService({ resolveOwned, log });
+  await runStdioService({ resolveOwned, adopt, log });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

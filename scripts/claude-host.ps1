@@ -194,14 +194,37 @@ function Invoke-Element($element) {
 }
 
 function Invoke-ElementByMouse($element) {
-  if ($null -eq $element) { throw 'element-missing' }
+  # A control can be scrolled out of view or rendered without geometry, and then
+  # it has no clickable point. That is reported as a result instead of thrown, so
+  # the caller can fall back to another route (the link, or the automation
+  # pattern) rather than failing the whole operation.
+  if ($null -eq $element) { return @{ clicked = $false; reason = 'element-missing' } }
+  $name = $element.Current.Name
+  try {
+    $scrollItem = $element.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern)
+    $scrollItem.ScrollIntoView()
+    Start-Sleep -Milliseconds 150
+  } catch { }
   Add-Win32
-  $point = $element.GetClickablePoint()
-  [FutureAideHost.Win32]::SetCursorPos([int]$point.X, [int]$point.Y) | Out-Null
-  [FutureAideHost.Win32]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
-  [FutureAideHost.Win32]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
-  Start-Sleep -Milliseconds 120
-  return @{ x = [int]$point.X; y = [int]$point.Y }
+  $point = $null
+  try { $point = $element.GetClickablePoint() } catch { $point = $null }
+  if ($null -eq $point) {
+    $rect = $element.Current.BoundingRectangle
+    if (-not $rect.IsEmpty -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
+      $point = New-Object System.Windows.Point([int]($rect.X + $rect.Width / 2), [int]($rect.Y + $rect.Height / 2))
+    }
+  }
+  if ($null -ne $point) {
+    [FutureAideHost.Win32]::SetCursorPos([int]$point.X, [int]$point.Y) | Out-Null
+    [FutureAideHost.Win32]::mouse_event(0x0002, 0, 0, 0, [IntPtr]::Zero)
+    [FutureAideHost.Win32]::mouse_event(0x0004, 0, 0, 0, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 120
+    return @{ clicked = $true; method = 'mouse'; name = $name; x = [int]$point.X; y = [int]$point.Y }
+  }
+  $patternMethod = $null
+  try { $patternMethod = Invoke-Element $element } catch { $patternMethod = $null }
+  if ($patternMethod) { return @{ clicked = $true; method = $patternMethod; name = $name } }
+  return @{ clicked = $false; reason = 'no-clickable-point'; name = $name }
 }
 
 function Focus-Window($window) {
@@ -518,10 +541,14 @@ try {
           Where-Object { $_.Current.Name -notmatch ('\s*' + [char]0x7684 + [char]0x66F4 + [char]0x591A + [char]0x9009 + [char]0x9879 + '$') })
         if ($entries.Count -eq 0) { throw "session-entry-not-found:$title" }
         Focus-Window $window.Element
-        $null = Invoke-ElementByMouse $entries[0]
-        Start-Sleep -Milliseconds 1200
-        $attempted += 'sidebar-entry'
-        if (Test-OnTitle $title) { $revealed = $true; $method = 'sidebar-entry' }
+        $entryClick = Invoke-ElementByMouse $entries[0]
+        if ($entryClick.clicked) {
+          Start-Sleep -Milliseconds 1200
+          $attempted += 'sidebar-entry'
+          if (Test-OnTitle $title) { $revealed = $true; $method = 'sidebar-entry' }
+        } else {
+          $attempted += ('sidebar-entry-click-unavailable:' + $entryClick.reason)
+        }
       }
       if (-not $revealed) {
         Write-Result @{ ok = $false; code = 'reveal-not-confirmed'
@@ -588,6 +615,13 @@ try {
         break
       }
       $deleteClickedAt = Invoke-ElementByMouse $target
+      if (-not $deleteClickedAt.clicked) {
+        Send-Keys '{ESC}'
+        Write-Result @{ ok = $false; code = 'delete-click-unavailable'
+          message = ('the delete item has no clickable point: ' + $deleteClickedAt.reason)
+          value = @{ menuItems = $menuNames } }
+        break
+      }
       Start-Sleep -Milliseconds 1400
       $dialogTexts = @(Get-WindowTexts $window.Element 24)
       $buttons = @(Get-WindowButtons $window.Element)
@@ -643,12 +677,16 @@ try {
       $opened = $false
       if ($anchors.Count -eq 1) {
         Focus-Window $window.Element
-        $null = Invoke-ElementByMouse $anchors[0]
-        Start-Sleep -Milliseconds 1800
-        $attempted += 'sidebar-folder-new-session'
-        $probeSidebar = Get-PageSignature $window
-        $opened = ($probeSidebar.hasComposer -and $probeSidebar.messages -eq 0)
-        if ($opened) { $strategy = 'sidebar-folder-new-session' }
+        $sidebarClick = Invoke-ElementByMouse $anchors[0]
+        if ($sidebarClick.clicked) {
+          Start-Sleep -Milliseconds 1800
+          $attempted += 'sidebar-folder-new-session'
+          $probeSidebar = Get-PageSignature $window
+          $opened = ($probeSidebar.hasComposer -and $probeSidebar.messages -eq 0)
+          if ($opened) { $strategy = 'sidebar-folder-new-session' }
+        } else {
+          $attempted += ('sidebar-click-unavailable:' + $sidebarClick.reason)
+        }
       }
       # 2) the renderer's own code-new link (prefill only), protocol first and the
       #    context-verified executable as the second attempt.

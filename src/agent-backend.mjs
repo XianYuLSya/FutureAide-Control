@@ -76,6 +76,14 @@ export function normalizeTarget(value) {
 }
 export function targetOf(record) { return normalizeTarget(record?.target); }
 
+// Display name of the application behind a target, used in user-facing text.
+// DSH keeps its historical wording; an unknown target falls back to its id.
+export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'claude-desktop': 'Claude Desktop' });
+export function hostLabel(record) {
+  const target = targetOf(record);
+  return TARGET_LABELS[target] ?? target;
+}
+
 const reason = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 400) });
 
 /**
@@ -87,10 +95,10 @@ const reason = error => ({ code: error?.code ?? 'operation-failed', message: Str
  * @param {object} options Injected adapters, a probe record, and the adapter's
  * private request directory. Probe must not write anything.
  */
-export async function diagnoseTarget(target, { adapters = {}, record = {}, requestDirectory = () => '', deps = {} } = {}) {
+export async function diagnoseTarget(target, { adapters = {}, record = {}, requestDirectory = () => '', deps = {}, adapterLoader = adapterFactory } = {}) {
   const wanted = normalizeTarget(target);
   let factory;
-  try { factory = await adapterFactory(wanted, adapters); }
+  try { factory = await adapterLoader(wanted, adapters); }
   catch (error) { return { ready: false, present: true, reason: reason(error) }; }
   if (typeof factory !== 'function') return { ready: false, present: false, reason: reason(backendNotReady(wanted)) };
   let backend;
@@ -138,13 +146,13 @@ async function adapterFactory(target, adapters = {}) {
  * @param {object} options Target, injected adapters, and the DSH client/control
  * factories already resolved by the caller.
  */
-export async function resolveBackend(record, { target, adapters = {}, dsh, load = () => record, deps = {} } = {}) {
+export async function resolveBackend(record, { target, adapters = {}, dsh, load = () => record, deps = {}, adapterLoader = adapterFactory } = {}) {
   const wanted = normalizeTarget(target ?? record?.target);
   if (wanted === DEFAULT_TARGET) {
     if (!dsh) throw backendNotReady(DEFAULT_TARGET);
     return assertBackend(createDshBackend({ ...dsh, load }), DEFAULT_TARGET);
   }
-  const factory = await adapterFactory(wanted, adapters);
+  const factory = await adapterLoader(wanted, adapters);
   if (typeof factory !== 'function') throw backendNotReady(wanted);
   return assertBackend(await factory(load(), { load, ...deps }), wanted);
 }

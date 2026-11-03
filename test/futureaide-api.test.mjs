@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { after, test } from 'node:test';
 import { FutureAideClient, FutureAideError } from '../src/futureaide-api.mjs';
+
+const workspaceRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 
 const savedEnvironment = Object.fromEntries(['FUTUREAIDE_LAUNCH_URL', 'FUTUREAIDE_INSTANCE_FILE']
   .map(key => [key, process.env[key]]));
@@ -98,9 +101,11 @@ function reply(res, body, result) {
 }
 
 async function tempHome(t) {
-  const path = await mkdtemp(join(tmpdir(), 'futureaide-api-test-'));
-  t.after(() => rm(path, { recursive: true, force: true }));
-  return path;
+  // Explicit D: fixture inside the project instead of the machine's %TEMP%: the
+  // discovery tests must never depend on an inherited home layout.
+  const base = join(workspaceRoot, '.runtime', 'tests');
+  await mkdir(base, { recursive: true });
+  return mkdtemp(join(base, 'api-home-'));
 }
 
 function failure(code, uncertain = false) {
@@ -485,7 +490,7 @@ test('marks timed-out writes uncertain and never redelivers the prompt', async t
   assert.equal(f.state.calls.filter(call => call.body.method === 'session/prompt').length, 1);
 });
 
-test('discovers the legacy runtime and extracts only a bounded matching startup URL', async t => {
+test('ignores a legacy FutureAide runtime layout instead of adopting it', async t => {
   const f = await fixture(t);
   const home = await tempHome(t);
   const runtime = join(home, '.runtime', 'futureaide');
@@ -494,33 +499,45 @@ test('discovers the legacy runtime and extracts only a bounded matching startup 
   await writeFile(join(runtime, 'futureaide-web.pid'), String(process.pid));
   await writeFile(join(runtime, 'logs', 'futureaide-desktop-service.log'), `${'x'.repeat(600 * 1024)}\n[I] dsh web: ${f.launchUrl}\n[I] dsh web: https://example.com/?token=untrusted\n`);
   const status = await new FutureAideClient({ dataHome: home }).status();
-  assert.equal(status.connected, true);
-  assert.equal(status.baseUrl, f.baseUrl);
-  assert.equal(status.pid, process.pid);
-  assert.equal(status.source, 'desktop-runtime');
-  assert.ok(!JSON.stringify(status).includes(f.state.token));
+  // A pre-0.5 runtime directory is not a discovery source: only a registered DSH
+  // host is, so the legacy port, pid and log are all left unread and unadopted.
+  assert.equal(status.connected, false);
+  assert.equal(status.baseUrl, undefined);
+  assert.equal(status.source, undefined);
+  assert.equal(status.error.code, 'instance-not-found');
+  assert.match(status.error.message, /registered DSH Web host/);
+  assert.ok(!JSON.stringify(status).includes(f.state.token), 'the legacy layout leaks no credential');
+  assert.ok(!JSON.stringify(status).includes('example.com'), 'no startup URL is ever mined out of a log');
+  assert.equal(f.state.calls.length, 0, 'the legacy port is never contacted');
+  assert.equal(f.state.exchanges, 0);
 });
 
-test('supports instance files shaped like the native desktop snapshot', async t => {
+test('refuses a legacy instance file shape instead of adopting its address', async t => {
   const f = await fixture(t);
   const home = await tempHome(t);
   const instanceFile = join(home, 'instance.json');
   await writeFile(instanceFile, JSON.stringify({ url: f.baseUrl, authToken: f.state.token, pid: process.pid }));
   const client = new FutureAideClient({ instanceFile });
-  assert.equal((await client.status()).connected, true);
-  assert.deepEqual(await client.modelCatalog(), { default: { provider: 'fixture', model: 'fixture-model' }, groups: [] });
-  assert.deepEqual(f.state.calls.at(-1).body.payload, { args: {} });
+  const status = await client.status();
+  assert.equal(status.connected, false);
+  assert.equal(status.error.code, 'invalid-instance');
+  assert.match(status.error.message, /must identify a native DSH instance/);
+  await assert.rejects(client.modelCatalog(), failure('invalid-instance'));
+  assert.equal(f.state.calls.length, 0, 'a refused address is never contacted');
+  assert.equal(f.state.exchanges, 0);
 });
 
-test('does not send a write if the instance changes after target preflight', async t => {
+test('does not send a write if the discovery record changes after target preflight', async t => {
   const next = await fixture(t);
   const home = await tempHome(t);
   const instanceFile = join(home, 'instance.json');
+  const record = (owner, instanceId) => JSON.stringify({ version: 1, application: 'dsh', pid: process.pid,
+    instanceId, dataRoot: home, baseUrl: owner.baseUrl, launchUrl: owner.launchUrl });
   const previous = await fixture(t, { rpc: async (body, res) => {
-    await writeFile(instanceFile, JSON.stringify({ launchUrl: next.launchUrl, pid: process.pid }));
+    await writeFile(instanceFile, record(next, randomUUID()));
     reply(res, body, { ok: true, value: { items: [ordinary] } });
   } });
-  await writeFile(instanceFile, JSON.stringify({ launchUrl: previous.launchUrl, pid: process.pid }));
+  await writeFile(instanceFile, record(previous, randomUUID()));
   const client = new FutureAideClient({ instanceFile });
   await assert.rejects(client.sendMessage('session-parent', 'Continue'), failure('instance-changed'));
   assert.equal(previous.state.calls.length, 1);

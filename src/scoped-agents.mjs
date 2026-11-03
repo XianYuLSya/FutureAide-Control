@@ -10,7 +10,7 @@ import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { diagnoseTarget, DSH_HOST_METHODS, normalizeTarget, resolveBackend, targetOf } from './agent-backend.mjs';
+import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend, targetOf } from './agent-backend.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
@@ -19,8 +19,8 @@ const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_repor
 const METHODS = DSH_HOST_METHODS;
 const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
-const reportProtocolError = () => Object.assign(new Error('Update the DSH plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting DSH is not required.'), { code: 'report-protocol-required' });
-const treeProtocolError = () => Object.assign(new Error('The DSH bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting DSH is not required.'), { code: 'tree-protocol-required' });
+const reportProtocolError = (host = 'DSH') => Object.assign(new Error(`Update the ${host} plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting ${host} is not required.`), { code: 'report-protocol-required' });
+const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host} bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting ${host} is not required.`), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
 
 function assertName(name) {
@@ -100,7 +100,7 @@ function publicTree(record, view) {
 
 function treeCoverage(record, view) {
   const { nodes } = ownedTree(record, view);
-  return nodes.length > 1 ? { scope: 'DSH task tree',
+  return nodes.length > 1 ? { scope: `${hostLabel(record)} task tree`,
     nodes: nodes.map(({ node, agentPath }) => ({ agentPath, coverage: node.coverage ?? 'Not observed' })) }
     : view.coverage ?? 'Not observed yet; zero known files is not a complete filesystem audit.';
 }
@@ -144,6 +144,7 @@ export function createScopedAgents(config, {
   monitorFailureGraceMs = 60000,
   removeTree = rm,
   backendAdapters = {},
+  backendAdapterLoader = undefined,
 } = {}) {
   const clients = new Map();
   let monitorUnavailableSince, monitorError;
@@ -181,7 +182,7 @@ export function createScopedAgents(config, {
         control: () => controlFactory(settings(load()), { client, managed: hostArgs(load()) }),
         hostArgs: () => hostArgs(load()) } });
     }
-    return resolveBackend(record, { target, load, deps, adapters: backendAdapters });
+    return resolveBackend(record, { target, load, deps, adapters: backendAdapters, ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
   }
   const forgetBackend = record => clients.delete(record.agentId);
   // A target without a usable adapter is refused before the name is taken, and is
@@ -189,7 +190,8 @@ export function createScopedAgents(config, {
   async function ensureTargetBackend(record) {
     const target = targetOf(record);
     if (target === 'dsh') return target;
-    await resolveBackend(record, { target, load: () => record, deps: adapterDeps(record), adapters: backendAdapters });
+    await resolveBackend(record, { target, load: () => record, deps: adapterDeps(record), adapters: backendAdapters,
+      ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
     return target;
   }
 
@@ -226,8 +228,8 @@ export function createScopedAgents(config, {
       if (!required.every(method => probe.methods?.includes(method))) {
         throw Object.assign(new Error(`${labels.bridge ?? `The ${targetOf(record)} backend`} needs this plugin version installed before subagents can be created.`), { code: 'managed-host-required' });
       }
-      if (probe.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
-      if (probe.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
+      if (probe.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(labels.host ?? hostLabel(record));
+      if (probe.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(labels.host ?? hostLabel(record));
     }
     record.host ??= stable;
     return backend;
@@ -292,7 +294,7 @@ export function createScopedAgents(config, {
     if (observed.sessionId !== record.sessionId || (record.task && observed.taskId !== record.task.taskId)) {
       throw new Error('The host returned a different subagent task.');
     }
-    if (record.task?.treeProtocol === TREE_PROTOCOL && !observed.tree) throw treeProtocolError();
+    if (record.task?.treeProtocol === TREE_PROTOCOL && !observed.tree) throw treeProtocolError(hostLabel(record));
     record.observation = { ...observed, capturedAt: now() };
     record.error = undefined;
     return observed;
@@ -429,8 +431,8 @@ export function createScopedAgents(config, {
     const after = record.task.dispatches[0]?.afterSeq;
     const started = await backend.beginTask({
       ...(Number.isSafeInteger(after) && after >= -1 ? { taskStartSeq: after } : {}) });
-    if (started.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
-    if (started.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
+    if (started.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(hostLabel(record));
+    if (started.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(hostLabel(record));
     record.task.treeProtocol = TREE_PROTOCOL;
     record.task.reportProtocol = REPORT_PROTOCOL;
     store.save(record);
@@ -488,7 +490,7 @@ export function createScopedAgents(config, {
   async function deliverReports(record) {
     for (const report of record.task.reports ?? []) {
       if (report.final && !report.treeSettledConfirmed) continue;
-      await deliver(record, report.delivery, `DSH「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`);
+      await deliver(record, report.delivery, `${hostLabel(record)}「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`);
       if (report.delivery.state !== 'delivered') return false;
     }
     return true;
@@ -560,7 +562,7 @@ export function createScopedAgents(config, {
 
   function waitForTree(record, view, summaryOnly = false) {
     record.state = record.task.state = 'running';
-    record.observation = { ...view, activity: summaryOnly ? 'Waiting for the top-level DSH summary' : 'Waiting for the DSH task tree and notifications to settle' };
+    record.observation = { ...view, activity: summaryOnly ? `Waiting for the top-level ${hostLabel(record)} summary` : `Waiting for the ${hostLabel(record)} task tree and notifications to settle` };
     store.save(record);
     return publicResult(record);
   }
@@ -699,7 +701,7 @@ export function createScopedAgents(config, {
         task.questionNotices ??= {};
         const notice = task.questionNotices[question.id] ??= { state: 'pending' };
         await deliver(record, notice,
-          `DSH 子代理「${record.name}」等待回答：\n${question.message}\n\n请调用 futureaide_answer_agent，name=${JSON.stringify(record.name)}，message 为回答正文。任务保持等待；无需文件、命令或内部编号。`);
+          `${hostLabel(record)} 子代理「${record.name}」等待回答：\n${question.message}\n\n请调用 futureaide_answer_agent，name=${JSON.stringify(record.name)}，message 为回答正文。任务保持等待；无需文件、命令或内部编号。`);
       }
       for (const dispatch of task.dispatches) {
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
@@ -782,6 +784,7 @@ export function createScopedAgents(config, {
         // This probe name is not in the roster, so a state write during diagnostics
         // reports false instead of inventing a row.
         'claude-desktop': await diagnoseTarget('claude-desktop', { adapters: backendAdapters,
+          ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
           record: probe, deps: adapterDeps(probe) }),
       };
       return status;

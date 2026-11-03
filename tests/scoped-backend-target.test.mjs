@@ -127,16 +127,19 @@ async function stateRoot() {
   return mkdtemp(path.join(base, 'target-'));
 }
 
-async function fixture({ adapters = {}, store } = {}) {
+async function fixture({ adapters = {}, store, adapterLoader } = {}) {
   const events = [];
   const stateDirectory = await stateRoot();
   const roster = store ?? new RosterStore(':memory:');
   const dsh = dshFixture(events);
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
     store: roster, clientFactory: () => dsh.api, controlFactory: dsh.controlFactory, callCodex: calling(events),
-    startWorker: (...args) => { events.push(['worker', args[1]]); return 99999; },
+    startSharedMonitor: () => true,
     removeTree: async () => {},
     backendAdapters: adapters,
+    // These cases pin the refusal path, so the installed adapter file must not
+    // decide the outcome; an injected loader says whether one exists here.
+    ...(adapterLoader ? { backendAdapterLoader: adapterLoader } : {}),
   });
   return { events, service, store: roster, stateDirectory, dsh,
     record: (name = 'artist', thread = A) => roster.named(ownerIdFor(thread), name) };
@@ -179,7 +182,7 @@ test('a roster record written without a target keeps the DSH behavior', async ()
 });
 
 test('a claude-desktop subagent without an adapter is refused before the name exists', async () => {
-  const f = await fixture();
+  const f = await fixture({ adapterLoader: async () => undefined });
   try {
     const error = await rejection(f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)));
     assert.equal(error.code, 'backend-not-ready');
@@ -236,7 +239,7 @@ test('an adapter that only covers part of the contract is refused with the missi
 });
 
 test('status keeps every DSH field and refuses to look ready without a claude adapter', async () => {
-  const f = await fixture();
+  const f = await fixture({ adapterLoader: async () => undefined });
   try {
     const status = await f.service.status(extra(A));
     // The 0.5.7 fields stay exactly as they were.

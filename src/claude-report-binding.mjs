@@ -22,6 +22,13 @@
 // Everything here is read-only apart from that single guarded UPDATE. No second
 // database, no file writes, no keys or credentials, and no scanning of sessions
 // other than the caller's own transcript.
+// Everything here reuses the host adapter's own readers: `markerLine`,
+// `findTranscript` and `firstTurnBinding` (which reads the transcript head with
+// `readTranscriptHead` and compares the marker against the first real enqueue/user
+// input via `firstInputOf`). One raw tail read remains, for the root-call gate
+// only: `readTranscriptEvents` normalises events down to text, so tool_use and
+// tool_result blocks never reach a caller. When that reader carries them, this
+// module's tail helper goes away.
 import { open } from 'node:fs/promises';
 import { firstTurnBinding, findTranscript, markerLine } from './claude-host.mjs';
 
@@ -195,20 +202,21 @@ export function bindPendingCreation(store, { agentId, caller, requestId, binding
 /**
  * Adopt the pending creation this caller proves it owns, or nothing.
  *
- * No pending creation answers immediately; a pending one may wait up to
- * `timeoutMs` for the opening marker to be written. The client is never assumed to
- * re-list, so the caller of this function re-reads ownership itself.
+ * The head read is the host's own: `firstTurnBinding` resolves the transcript,
+ * reads its opening with `readTranscriptHead` and compares the marker against the
+ * first real enqueue/user input via `firstInputOf`. Nothing here re-implements
+ * that. No pending creation answers immediately; a pending one may wait up to
+ * `timeoutMs` for the opening marker to be written — the transcript may not even
+ * exist yet, which is exactly what the wait is for. The client is never assumed to
+ * re-list, so the caller re-reads ownership itself.
  */
 export async function adoptFirstListBinding({ store, caller, env = process.env, timeoutMs = 3000,
   pollMs = 100, now = () => Date.now(), sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
-  candidates = pendingCreations, confirm = firstTurnBinding, transcript = transcriptPathFor,
-  bind = bindPendingCreation } = {}) {
+  candidates = pendingCreations, confirm = firstTurnBinding, bind = bindPendingCreation } = {}) {
   const started = now();
   if (!store?.db || typeof caller?.sessionId !== 'string' || !caller.sessionId || typeof caller.cwd !== 'string') {
     return { adopted: false, reason: 'caller-incomplete' };
   }
-  const file = await transcript({ sessionId: caller.sessionId, workspace: caller.cwd, env });
-  if (!file) return { adopted: false, reason: 'no-transcript', waitedMs: now() - started };
   const record = { nativeSessionId: caller.sessionId, workspace: caller.cwd };
   for (;;) {
     const list = candidates(store, caller.cwd);
@@ -217,11 +225,13 @@ export async function adoptFirstListBinding({ store, caller, env = process.env, 
     for (const candidate of list) {
       const marker = markerLine(candidate.requestId, candidate.bindingNonce);
       const found = await confirm({ env, record, marker }).catch(() => undefined);
-      if (found?.firstInput?.hasMarker === true && found.markerCount === 1) matches.push({ candidate, marker });
+      if (found?.file && found.firstInput?.hasMarker === true && found.markerCount === 1) {
+        matches.push({ candidate, marker, file: found.file });
+      }
     }
     if (matches.length > 1) return { adopted: false, reason: 'marker-ambiguous', waitedMs: now() - started };
     if (matches.length === 1) {
-      const [{ candidate }] = matches;
+      const [{ candidate, file }] = matches;
       const binding = bind(store, { agentId: candidate.agentId, caller: { ...caller, transcriptFile: file },
         requestId: candidate.requestId, bindingNonce: candidate.bindingNonce });
       return binding

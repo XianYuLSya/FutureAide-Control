@@ -87,29 +87,41 @@ test('adoption waits for this session opener marker and writes the binding', asy
   const fixture = roster();
   let reads = 0;
   const outcome = await adoptFirstListBinding({ store: fixture.store, caller: caller(),
-    transcript: async () => 'D:\\c\\projects\\p\\s.jsonl',
-    // The marker appears only on the third poll, as a real UI send would.
-    confirm: async ({ marker }) => { reads += 1; return reads >= 3
-      ? { firstInput: { hasMarker: marker.includes('req-1') }, markerCount: 1 } : { firstInput: {}, markerCount: 0 }; },
+    // The host's head reader only finds the marker once the UI has sent the first
+    // turn; here it appears on the third poll, with the transcript still absent before.
+    confirm: async ({ marker }) => {
+      reads += 1;
+      if (reads < 3) return { file: undefined, firstInput: undefined, markerCount: 0 };
+      return { file: 'D:\\c\\projects\\p\\s.jsonl', firstInput: { hasMarker: marker.includes('req-1') }, markerCount: 1 };
+    },
     sleep: async () => {}, timeoutMs: 1000, pollMs: 0 });
   assert.equal(outcome.adopted, true);
   assert.equal(outcome.agentId, fixture.agentId);
   assert.equal(fixture.store.backendState(fixture.agentId).binding.sessionId, nativeSessionId);
+  assert.equal(fixture.store.backendState(fixture.agentId).binding.transcriptFile, 'D:\\c\\projects\\p\\s.jsonl');
 });
 
 test('no pending creation answers at once, and a silent marker gives up at the deadline', async () => {
   const empty = roster({ requests: {} });
   const none = await adoptFirstListBinding({ store: empty.store, caller: caller(),
-    transcript: async () => 'D:\\c\\p\\s.jsonl', sleep: async () => {}, timeoutMs: 1000 });
+    sleep: async () => {}, timeoutMs: 1000 });
   assert.deepEqual([none.adopted, none.reason], [false, 'no-pending-creation']);
 
   const fixture = roster();
   let clock = 0;
   const timedOut = await adoptFirstListBinding({ store: fixture.store, caller: caller(),
-    transcript: async () => 'D:\\c\\p\\s.jsonl',
-    confirm: async () => ({ firstInput: {}, markerCount: 0 }),
+    confirm: async () => ({ file: 'D:\\c\\p\\s.jsonl', firstInput: {}, markerCount: 0 }),
     now: () => clock, sleep: async () => { clock += 400; }, timeoutMs: 1000, pollMs: 400 });
   assert.deepEqual([timedOut.adopted, timedOut.reason], [false, 'marker-timeout']);
+  assert.equal(fixture.store.backendState(fixture.agentId).binding, undefined);
+});
+
+test('a transcript that does not exist yet keeps polling instead of giving up', async () => {
+  const fixture = roster();
+  const outcome = await adoptFirstListBinding({ store: fixture.store, caller: caller(),
+    confirm: async () => ({ file: undefined, firstInput: undefined, markerCount: 0 }),
+    sleep: async () => {}, timeoutMs: 100 });
+  assert.deepEqual([outcome.adopted, outcome.reason], [false, 'marker-timeout']);
   assert.equal(fixture.store.backendState(fixture.agentId).binding, undefined);
 });
 
@@ -121,12 +133,12 @@ test('an ambiguous marker binds nothing', async () => {
       db: first.store.db, get: first.store.get, agentForNativeSession: first.store.agentForNativeSession,
       backendState: first.store.backendState,
     },
-    caller: caller(), transcript: async () => 'D:\\c\\p\\s.jsonl',
+    caller: caller(),
     candidates: () => [
       { agentId: first.agentId, name: 'a', bindingNonce: first.bindingNonce, requestId: 'req-1' },
       { agentId: second.agentId, name: 'b', bindingNonce: second.bindingNonce, requestId: 'req-1' },
     ],
-    confirm: async () => ({ firstInput: { hasMarker: true }, markerCount: 1 }),
+    confirm: async () => ({ file: 'D:\\x.jsonl', firstInput: { hasMarker: true }, markerCount: 1 }),
     sleep: async () => {}, timeoutMs: 1000 });
   assert.deepEqual([outcome.adopted, outcome.reason], [false, 'marker-ambiguous']);
   assert.equal(first.store.backendState(first.agentId).binding, undefined);
@@ -135,13 +147,11 @@ test('an ambiguous marker binds nothing', async () => {
 test('the marker must be the first input and appear exactly once', async () => {
   const fixture = roster();
   const laterOnly = await adoptFirstListBinding({ store: fixture.store, caller: caller(),
-    transcript: async () => 'D:\\x.jsonl',
-    confirm: async () => ({ firstInput: { hasMarker: false }, markerCount: 1 }),
+    confirm: async () => ({ file: 'D:\\x.jsonl', firstInput: { hasMarker: false }, markerCount: 1 }),
     sleep: async () => {}, timeoutMs: 100 });
   assert.deepEqual([laterOnly.adopted, laterOnly.reason], [false, 'marker-timeout']);
   const twice = await adoptFirstListBinding({ store: fixture.store, caller: caller(),
-    transcript: async () => 'D:\\x.jsonl',
-    confirm: async () => ({ firstInput: { hasMarker: true }, markerCount: 2 }),
+    confirm: async () => ({ file: 'D:\\x.jsonl', firstInput: { hasMarker: true }, markerCount: 2 }),
     sleep: async () => {}, timeoutMs: 100 });
   assert.deepEqual([twice.adopted, twice.reason], [false, 'marker-timeout']);
 });

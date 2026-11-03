@@ -16,7 +16,7 @@ const FILE_TOOLS = new Map([['Write', 'create'], ['Edit', 'edit'], ['MultiEdit',
 
 export function emptyClaudeProjection(taskId, { throughSeq = 0, currentModel } = {}) {
   return { taskId, throughSeq, currentModel, messages: [], messagesOmitted: 0, pendingTools: {},
-    completedTools: [], changes: [], reports: [], questions: [], deliveries: {}, children: {},
+    completedTools: [], successfulTools: [], changes: [], reports: [], questions: [], deliveries: {}, children: {},
     completions: [], badLines: 0, activity: 'idle' };
 }
 
@@ -41,6 +41,8 @@ function completeTool(projection, result, event, { workspace, agentId, reportToo
   projection.completedTools = projection.completedTools.slice(-512);
   projection.activity = `finished tool: ${use.name}`;
   if (result.isError) return;
+  (projection.successfulTools ??= []).push(result.id);
+  projection.successfulTools = projection.successfulTools.slice(-512);
   const kind = reportTools[use.name];
   const receipt = result.receipt;
   if (kind && receipt?.accepted === true && receipt.taskId === projection.taskId

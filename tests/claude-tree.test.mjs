@@ -429,6 +429,26 @@ test('the tool-use interrupt variant from 2.1.309 also stops counting open calls
   assert.equal(tree.settled, true);
 });
 
+test('a finished child from an earlier task never enters a new task tree', async t => {
+  const f = await fixture(t);
+  // Left over from a previous task in the same session: its own transcript and
+  // meta are on disk, but this task's transcript never emitted its tool id.
+  await writeFile(f.subagent('old1'), reply(f.sessionId, 'old reply', { stopReason: 'end_turn', sidechain: true, agentId: 'old1' }));
+  await writeFile(f.meta('old1'), JSON.stringify({ description: 'old child', toolUseId: 'toolu_old',
+    spawnDepth: 1, requestShape: 'foreground', finished: true }));
+  await writeFile(f.subagent('a1'), reply(f.sessionId, 'reply', { stopReason: 'end_turn', sidechain: true, agentId: 'a1' }));
+  await f.writeRoot([...launched('toolu_a', 'current child', { agentId: 'a1', background: false }),
+    reply(f.sessionId, 'done', { stopReason: 'end_turn' })]);
+
+  const projection = await rootProjection(f);
+  const { tree, state, histories } = await observeClaudeTree(f.binding, projection, treeOptions(f));
+  assert.deepEqual(tree.nodes.map(node => node.sessionId), ['logical-1', claudeNodeId('a1')]);
+  assert.equal(state.nodes.old1, undefined);
+  assert.deepEqual(Object.keys(histories), [claudeNodeId('a1')]);
+  assert.deepEqual(tree.unpaired, ['old1'], 'the unpaired meta is reported, never attached');
+  assert.equal(tree.settled, true);
+});
+
 test('an unbound root is refused instead of producing an empty tree', async () => {
   await assert.rejects(observeClaudeTree({}, emptyClaudeProjection('task-1'), { logicalSessionId: 'logical-1' }),
     /transcript file/i);

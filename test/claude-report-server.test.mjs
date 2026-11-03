@@ -93,22 +93,33 @@ test('a caller that cannot be identified is refused instead of defaulting to som
   } finally { await close(); }
 });
 
-test('one final report per task, then the surface refuses further reports', async () => {
-  const { calls, owned } = ownership();
+test('results carry the task id and the acceptance id so a late result is attributable', async () => {
+  const finals = [];
+  const owned = {
+    agentName: '绘图副手', taskId: 7,
+    async ask() { return { accepted: true, submissionId: 'accept-ask' }; },
+    async report({ final }) { finals.push(final); return { accepted: true, submissionId: final ? 'accept-final' : 'accept-progress' }; },
+  };
   const { client, close } = await inMemory(async () => owned);
   try {
-    const progress = await client.callTool({ name: 'report_parent', arguments: { message: 'half way' } });
-    assert.notEqual(progress.isError, true);
-    assert.equal(parse(progress).final, false);
+    const progress = parse(await client.callTool({ name: 'report_parent', arguments: { message: 'half way' } }));
+    assert.deepEqual([progress.accepted, progress.taskId, progress.final, progress.submissionId],
+      [true, 7, false, 'accept-progress']);
+    const final = parse(await client.callTool({ name: 'report_parent', arguments: { message: 'delivered', final: true } }));
+    assert.deepEqual([final.accepted, final.taskId, final.final, final.submissionId], [true, 7, true, 'accept-final']);
+    const asked = parse(await client.callTool({ name: 'ask_parent', arguments: { message: 'which model?' } }));
+    assert.deepEqual([asked.kind, asked.taskId, asked.submissionId], ['question', 7, 'accept-ask']);
+    assert.deepEqual(finals, [false, true]);
+  } finally { await close(); }
+});
 
-    const final = await client.callTool({ name: 'report_parent', arguments: { message: 'delivered', final: true } });
-    assert.notEqual(final.isError, true);
-    assert.equal(parse(final).final, true);
-
-    const again = await client.callTool({ name: 'report_parent', arguments: { message: 'one more', final: true } });
-    assert.equal(again.isError, true);
-    assert.equal(parse(again).error.code, 'report-final-already-submitted');
-    assert.deepEqual(calls.map(call => call.final), [false, true]);
+test('whether a second final report is allowed is the ownership decision, not the surface', async () => {
+  const repeats = ownership({ reportError: Object.assign(new Error('A final report was already submitted for task 7; do not submit another.'), { code: 'report-final-already-submitted' }) });
+  const { client, close } = await inMemory(async () => repeats.owned);
+  try {
+    const result = await client.callTool({ name: 'report_parent', arguments: { message: 'one more', final: true } });
+    assert.equal(result.isError, true);
+    assert.equal(parse(result).error.code, 'report-final-already-submitted');
   } finally { await close(); }
 });
 

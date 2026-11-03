@@ -29,6 +29,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { resolveSocketCaller, resolveStdioCaller } from './claude-caller-identity.mjs';
+import { createReportOwnership } from './claude-report-ownership.mjs';
 
 export const SERVER_NAME = 'futureaide-report';
 export const SERVER_VERSION = '0.1.0';
@@ -48,8 +49,8 @@ What reaches the parent:
 - After a final report is accepted, do not submit another report for that task. The parent decides what happens next; a cancelled or closed task refuses further reports.
 
 Reading the result:
-- accepted:true means the parent side accepted this submission for delivery. It is not proof of delivery, of reading, or of an answer.
-- isError true means the submission was refused. Read error.code and act on it: not-owned-session and caller-unresolved mean this session must not report at all; task-closed, task-cancelled and report-final-already-submitted mean stop writing reports for this task. Do not retry the same call with different wording or arguments.
+- accepted:true means the parent side accepted this submission for delivery, and the result carries the taskId it belongs to. It is not proof of delivery, of reading, or of an answer. A late result whose taskId is not your current task belongs to an older task: ignore it.
+- isError true means the submission was refused. Read error.code and act on it: not-owned-session and caller-unresolved mean this session must not report at all; task-closed, task-cancelled, task-finished and report-final-already-submitted mean stop writing reports for this task. Do not retry the same call with different wording or arguments.
 - Never state in your reply that you reported something unless the tool returned accepted:true.`;
 
 const refuse = (code, message) => Object.assign(new Error(message), { code });
@@ -80,9 +81,6 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
   if (typeof resolveCaller !== 'function') throw new TypeError('createClaudeReportServer requires resolveCaller');
   if (typeof resolveOwned !== 'function') throw new TypeError('createClaudeReportServer requires resolveOwned');
   const server = new McpServer({ name: SERVER_NAME, version }, { instructions });
-  // Process-local safety net only; the roster remains the single source of truth
-  // for task state. A final report is one per task even if the roster lags.
-  const finals = new Set();
 
   const submit = async (kind, { message, final = false }) => {
     const caller = await resolveCaller();
@@ -92,13 +90,8 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
         `Claude session ${caller?.sessionId ?? '(unknown)'} is not bound to a FutureAide-owned agent. `
         + 'Only plugin-owned sessions may report or ask; this session must answer in its own chat.');
     }
-    if (typeof owned.ask !== 'function' || typeof owned.report !== 'function') {
-      throw refuse('ownership-incomplete', 'The ownership record does not accept submissions; nothing was submitted.');
-    }
-    const taskKey = `${caller?.sessionId ?? 'unknown'}:${owned.taskId ?? 'current'}`;
-    if (kind === 'report' && finals.has(taskKey)) {
-      throw refuse('report-final-already-submitted',
-        'A final report was already accepted for this task. Stop writing reports and end your turn.');
+    if (owned.taskId === undefined || owned.taskId === null) {
+      throw refuse('task-missing', 'This subagent has no current task; the submission was not recorded.');
     }
     const result = kind === 'ask'
       ? await owned.ask({ message, caller })
@@ -107,13 +100,13 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
       throw refuse(result?.code ?? 'not-accepted',
         result?.message ?? 'The submission was not accepted by the FutureAide state machine.');
     }
-    if (kind === 'report' && final) finals.add(taskKey);
     return {
       accepted: true,
       kind: kind === 'ask' ? 'question' : 'report',
+      taskId: owned.taskId,
       ...(owned.agentName ? { agent: owned.agentName } : {}),
+      ...(result.submissionId ? { submissionId: result.submissionId } : {}),
       ...(kind === 'report' ? { final } : {}),
-      ...(result.questionId ? { questionId: result.questionId } : {}),
       note: kind === 'ask'
         ? 'Accepted for delivery. End your turn; the answer arrives as a new message in this session.'
         : final
@@ -289,6 +282,18 @@ export function developmentOwnership(sessions, { log = () => {} } = {}) {
   } : null);
 }
 
+/**
+ * The production wiring: the shared monitor process owns this service, so no Node
+ * process is started per Claude session. The monitor is the one process that
+ * already holds the roster, lives exactly while a task is in flight, and needs no
+ * extra configuration file. Returns the running service, or throws when the port
+ * is taken; the caller decides whether that is fatal.
+ */
+export async function startReportService({ store, port = DEFAULT_PORT, host = '127.0.0.1', log = () => {} } = {}) {
+  if (!store) throw new TypeError('startReportService requires the shared RosterStore');
+  return startHttpService({ port, host, resolveOwned: createReportOwnership({ store }), log });
+}
+
 function argument(argv, name) {
   const index = argv.indexOf(name);
   return index === -1 ? undefined : argv[index + 1];
@@ -297,12 +302,19 @@ function argument(argv, name) {
 async function main(argv = process.argv.slice(2)) {
   const ownershipPath = argument(argv, '--ownership');
   const accept = argument(argv, '--accept-session');
+  const rosterPath = argument(argv, '--roster');
   const log = message => process.stderr.write(`[futureaide-report] ${message}\n`);
-  // No ownership integration is bundled here on purpose: without a resolver the
+  // No ownership integration is bundled by default: without a resolver the
   // service refuses every call, so a mistakenly started service exposes nothing.
-  const resolveOwned = ownershipPath ? (await import(pathToFileURL(ownershipPath).href)).resolveOwned
-    : accept ? developmentOwnership(accept.split(',').map(value => value.trim()).filter(Boolean), { log })
-      : undefined;
+  // Precedence: the shared roster (production), an explicit adapter module, then
+  // the pinned-session development stub.
+  let resolveOwned;
+  if (rosterPath) {
+    const { RosterStore } = await import('./roster-store.mjs');
+    resolveOwned = createReportOwnership({ store: new RosterStore(rosterPath) });
+    log(`ownership from the shared roster at ${rosterPath}`);
+  } else if (ownershipPath) resolveOwned = (await import(pathToFileURL(ownershipPath).href)).resolveOwned;
+  else if (accept) resolveOwned = developmentOwnership(accept.split(',').map(value => value.trim()).filter(Boolean), { log });
   if (argv.includes('--http')) {
     const port = Number.parseInt(argument(argv, '--port') ?? process.env.FUTUREAIDE_REPORT_PORT ?? String(DEFAULT_PORT), 10);
     const service = await startHttpService({ port, resolveOwned, log });

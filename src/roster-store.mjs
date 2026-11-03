@@ -135,6 +135,33 @@ export class RosterStore {
     return { agentId: row.agentId, ownerId: row.ownerId, name: row.name, target: row.target,
       state: row.state, logicalSessionId: row.logicalSessionId, binding: JSON.parse(row.body).binding ?? null };
   }
+  /**
+   * Direct children of a managed record, whatever owner they belong to: a name
+   * created from inside another managed session is its child even though that
+   * session has its own owner id.
+   */
+  childrenOf(agentId) {
+    if (typeof agentId !== 'string' || !agentId) return [];
+    return this.db.prepare("SELECT body FROM agents WHERE json_extract(body,'$.parentAgentId')=? ORDER BY name")
+      .all(agentId).map(row => JSON.parse(row.body));
+  }
+  /** Whole descendant closure beneath these records, breadth first. */
+  descendantsOf(agentIds) {
+    const seen = new Set(agentIds);
+    const found = [];
+    let frontier = [...agentIds];
+    while (frontier.length) {
+      const next = [];
+      for (const id of frontier) {
+        for (const child of this.childrenOf(id)) {
+          if (seen.has(child.agentId)) continue;
+          seen.add(child.agentId); found.push(child); next.push(child.agentId);
+        }
+      }
+      frontier = next;
+    }
+    return found;
+  }
   list(owner) {
     const rows = owner === undefined
       ? this.db.prepare('SELECT body FROM agents ORDER BY name').all()

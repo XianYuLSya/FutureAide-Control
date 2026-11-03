@@ -286,8 +286,19 @@ export function createScopedAgents(config, {
     const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
     return store.saveOwner(await resolveCallingContext(extra, { knownOwner: store.owner(ownerId), callCodex, verifyClaude }));
   }
+  /**
+   * Records this owner can see: its own, plus every managed descendant that a
+   * session beneath it created — including descendants on another application,
+   * which have their own owner id. One tree, one state machine.
+   */
+  function visibleRecords(ownerId) {
+    const own = store.list(ownerId);
+    return { own, all: [...own, ...store.descendantsOf(own.map(record => record.agentId))] };
+  }
   function named(owner, name) {
-    const record = store.named(owner.ownerId, assertName(name));
+    const wanted = assertName(name);
+    const { own, all } = visibleRecords(owner.ownerId);
+    const record = own.find(item => item.name === wanted) ?? all.find(item => item.name === wanted);
     if (!record) throw Object.assign(new Error(`No subagent named “${name}” exists in this chat.`), { code: 'agent-not-found' });
     return record;
   }
@@ -687,6 +698,13 @@ export function createScopedAgents(config, {
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       store.remove(record);
       forgetBackend(record);
+      // Managed descendants created beneath this name close with it, whichever
+      // application runs them; each child keeps its own cleanup verdict.
+      for (const child of store.childrenOf(record.agentId)) {
+        if (child.closed) continue;
+        const current = store.get(child.agentId);
+        if (current) await clearRecord(current);
+      }
       return { name: record.name, deleted: true, sessionDataRemoved: true };
     } catch (error) {
       const current = store.get(record.agentId);
@@ -1006,10 +1024,12 @@ export function createScopedAgents(config, {
       if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
       const backendTarget = normalizeTarget(target);
       const owner = await context(extra);
-      // A cross-application call: when the caller's own native session is already a
-      // managed name, the new name is its child and follows that owner tree.
+      // A cross-application call: when the caller is itself a managed name — a
+      // Claude session by its native id, or a Codex child by its own chat — the new
+      // name is its child and follows that owner tree.
       const caller = trustedCaller(extra);
-      const parent = caller ? store.agentForNativeSession(caller.nativeSessionId) : undefined;
+      const parent = caller ? store.agentForNativeSession(caller.nativeSessionId)
+        : store.agentForCodexThread(callingThread(extra));
       const record = { agentId: uid('agent'), ownerId: owner.ownerId, sessionId: uid('session-codex'), name, lifetime,
         target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
         ...(parent ? { parentAgentId: parent.agentId } : {}) };
@@ -1082,9 +1102,11 @@ export function createScopedAgents(config, {
     },
     async list(extra) {
       const owner = await context(extra);
-      for (const record of store.list(owner.ownerId)) await ensureWorker(record);
-      const records = store.list(owner.ownerId);
+      for (const record of visibleRecords(owner.ownerId).all) await ensureWorker(record);
+      const records = visibleRecords(owner.ownerId).all;
+      const names = new Map(records.map(record => [record.agentId, record.name]));
       return { items: records.map(record => ({ ...publicResult(record),
+        ...(record.parentAgentId ? { parent: names.get(record.parentAgentId) ?? null } : {}),
         monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping') : (monitorAlive(store) ? 'running' : 'stopped'),
         supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
     },
@@ -1097,7 +1119,15 @@ export function createScopedAgents(config, {
             coverage: historical.coverage, tree: historical.tree ?? historical.result?.tree };
         }
         try { await observe(record); store.save(record); } catch (error) { record.error = safeError(error); }
-        return { name, task: 0, changes: attributedChanges(record, record.observation ?? {}),
+        // Descendants on any application belong to this tree; their changes are
+        // attributed with their own agentPath instead of disappearing from it.
+        const changes = attributedChanges(record, record.observation ?? {});
+        for (const child of store.descendantsOf([record.agentId])) {
+          if (!child.task) continue;
+          try { await observe(child); store.save(child); } catch (error) { child.error = safeError(error); }
+          changes.push(...attributedChanges(child, child.observation ?? {}));
+        }
+        return { name, task: 0, changes,
           tree: publicTree(record, record.observation ?? {}), coverage: treeCoverage(record, record.observation ?? {}),
           stale: Boolean(record.error || record.observation?.stale), ...(record.error ? { error: record.error } : {}) };
       });
@@ -1153,6 +1183,19 @@ export function createScopedAgents(config, {
       try {
         const result = await (await checkHost(record)).cancel();
         if (result.cancelRequested === true) store.confirmCancel(record);
+        // Descendants on any application stop with their parent; each keeps its own
+        // record and report, so nothing is dropped from the tree.
+        for (const child of store.descendantsOf([record.agentId])) {
+          if (child.closed || !child.task) continue;
+          try {
+            await store.locked(child.agentId, async () => {
+              const current = store.get(child.agentId);
+              if (!current || current.closed || !store.requestCancel(current)) return;
+              const cancelled = await (await checkHost(current)).cancel();
+              if (cancelled.cancelRequested === true) store.confirmCancel(current);
+            });
+          } catch { /* its own poll reports the failure on that record. */ }
+        }
         return { name, accepted: result.cancelRequested === true, state: 'cancelling' };
       } finally {
         const current = store.get(record.agentId);

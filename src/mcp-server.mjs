@@ -131,25 +131,6 @@ export function scopedManagement({ service } = {}) {
 }
 
 /**
- * Entry the HTTP side (owned by the report surface) uses for a verified Claude
- * caller: one service instance over the same roster, plus the trusted-caller
- * context its tools pass to the shared state machine. The caller record is never
- * derived from tool arguments.
- * @param {{configPath?: string, caller: {nativeSessionId: string, workspace: string, source?: string}}} options
- */
-export async function createScopedServiceForCaller({ configPath, caller } = {}) {
-  if (!caller || typeof caller.nativeSessionId !== 'string' || typeof caller.workspace !== 'string') {
-    throw new Error('A verified native session and its workspace are required.');
-  }
-  const config = await loadConfig(configPath);
-  const service = createScopedAgents(config);
-  await service.resume?.();
-  const extra = { [TRUSTED_CALLER]: { source: caller.source ?? 'claude-desktop',
-    nativeSessionId: caller.nativeSessionId, workspace: caller.workspace, label: caller.label } };
-  return { service, extra, close: () => service.close() };
-}
-
-/**
  * Build a server that resolves each connection per call without a shared active profile.
  * @param {object} [control] Optional default control retained for existing in-process callers.
  * @param {object} [options] Base configPath and optional controlFactory for resolved connections.

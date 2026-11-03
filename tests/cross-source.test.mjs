@@ -110,6 +110,32 @@ test('the management hook builds the trusted context from the connection', async
     error => error.code === 'calling-context-unavailable');
 });
 
+test('a managed name created from another managed session follows the parent tree', async () => {
+  const { service, store } = await fixture();
+  try {
+    const rootId = 'agent-' + 'd'.repeat(32);
+    const childId = 'agent-' + 'e'.repeat(32);
+    const base = { createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), history: [],
+      lifetime: 'persistent', workspace, created: true, nativeDestroyed: true, state: 'idle' };
+    store.insert({ ...base, agentId: rootId, ownerId: ownerIdFor(THREAD), sessionId: 'session-root', name: 'root', target: 'claude-desktop' });
+    // The child was created from inside the parent's Claude session, so it belongs to
+    // that session's own owner and runs on a third application.
+    store.insert({ ...base, agentId: childId, ownerId: ownerIdForSource('claude-desktop', 'native-s'),
+      sessionId: 'session-child', name: 'child', target: 'codex-desktop', parentAgentId: rootId });
+    store.insert({ ...base, agentId: 'agent-' + 'f'.repeat(32), ownerId: ownerIdForSource('claude-desktop', 'native-deep'),
+      sessionId: 'session-deep', name: 'deep', target: 'dsh', parentAgentId: childId });
+
+    assert.deepEqual(store.descendantsOf([rootId]).map(item => item.name), ['child', 'deep'], 'the closure crosses owners');
+    const listed = await service.list(extra(THREAD));
+    assert.deepEqual(listed.items.map(item => [item.name, item.parent ?? null]),
+      [['root', null], ['child', 'root'], ['deep', 'child']], 'the chat sees its whole cross-application tree');
+
+    const deleted = await service.delete({ name: 'root' }, extra(THREAD));
+    assert.equal(deleted.deleted, true);
+    assert.equal(store.count(), 0, 'every managed descendant closes with its parent');
+  } finally { service.close(); }
+});
+
 test('a verified Claude owner keeps its host session and binding for cold resume', async () => {
   const { store } = await fixture();
   try {

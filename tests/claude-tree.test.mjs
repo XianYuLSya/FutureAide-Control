@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { emptyClaudeProjection, observeClaudeTranscript } from '../src/claude-observer.mjs';
 import { readClaudeEvents } from '../src/claude-inbox.mjs';
@@ -129,17 +129,15 @@ test('a background child without meta needs a successful handback, never quiet t
   assert.equal(result.tree.nodes[1].status, 'running');
   assert.equal(result.tree.nodes[1].evidence, 'no-completed-turn');
 
-  await writeFile(child, assistant(f.sessionId, [toolUse('toolu_b', 'Bash', { command: 'sleep' })], { sidechain: true, agentId: 'b1' })
-    + toolResult(f.sessionId, 'toolu_b', { sidechain: true, agentId: 'b1' })
-    + assistant(f.sessionId, [toolUse('toolu_h', 'SubagentHandback', { message: 'done' })], { sidechain: true, agentId: 'b1' }));
+  // Native transcripts are append-only, so the fixture appends too: rewriting a
+  // file under a live byte cursor is not something the runtime can ever see.
+  await appendFile(child, assistant(f.sessionId, [toolUse('toolu_h', 'SubagentHandback', { message: 'done' })],
+    { sidechain: true, agentId: 'b1' }));
   projection = await rootProjection(f);
   result = await observeClaudeTree(f.binding, projection, treeOptions(f, { state: result.state }));
   assert.equal(result.tree.nodes[1].status, 'running', 'an unanswered handback is not a finished subagent');
 
-  await writeFile(child, assistant(f.sessionId, [toolUse('toolu_b', 'Bash', { command: 'sleep' })], { sidechain: true, agentId: 'b1' })
-    + toolResult(f.sessionId, 'toolu_b', { sidechain: true, agentId: 'b1' })
-    + assistant(f.sessionId, [toolUse('toolu_h', 'SubagentHandback', { message: 'done' })], { sidechain: true, agentId: 'b1' })
-    + toolResult(f.sessionId, 'toolu_h', { sidechain: true, agentId: 'b1' }));
+  await appendFile(child, toolResult(f.sessionId, 'toolu_h', { sidechain: true, agentId: 'b1' }));
   projection = await rootProjection(f);
   result = await observeClaudeTree(f.binding, projection, treeOptions(f, { state: result.state }));
   assert.equal(result.tree.nodes[1].status, 'ended');

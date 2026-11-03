@@ -1,0 +1,275 @@
+// Claude Desktop managed-session report surface.
+//
+// One narrow job: let a Claude Desktop session that FutureAide Control owns call
+// `ask_parent` and `report_parent`, and make nothing else leave the session.
+// Ordinary assistant text, tool use and the end of a turn never notify the
+// parent; only an accepted tool call is a report. This server holds no task,
+// roster or notification state of its own: it validates that the calling
+// session is plugin-owned and that its current task can accept the submission,
+// then returns `accepted` for the shared scoped state machine to deliver. The
+// native transcript stays the persistent record of what was reported.
+//
+// Two transports, one implementation:
+//   stdio — one process per Claude session (`node claude-report-server.mjs --stdio`);
+//   HTTP  — one shared loopback Streamable HTTP service for every owned session,
+//           so no Node process is started per session. The service is bound to
+//           127.0.0.1 and identifies each caller from its TCP peer (see
+//           claude-caller-identity.mjs); it is never reachable from another host.
+import http from 'node:http';
+import { pathToFileURL } from 'node:url';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z } from 'zod';
+import { resolveSocketCaller, resolveStdioCaller } from './claude-caller-identity.mjs';
+
+export const SERVER_NAME = 'futureaide-report';
+export const SERVER_VERSION = '0.1.0';
+export const HTTP_PATH = '/mcp';
+export const DEFAULT_PORT = 17654;
+export const REPORT_TOOL_NAMES = Object.freeze(['ask_parent', 'report_parent']);
+
+export const INSTRUCTIONS = `FutureAide managed session bridge.
+
+This server exists for one purpose: a Claude Desktop session owned by FutureAide Control reports to, and asks, the Codex parent chat that created it. It has two tools, ask_parent and report_parent. Your session is identified from the connection itself; no session id, chat id, name or route is accepted as an argument, so never look for one.
+
+What reaches the parent:
+- Your ordinary replies, tool use and the end of a turn are never forwarded. Nothing is automatic: a turn that ends without a tool call notifies nobody.
+- ask_parent(message) asks the parent something you cannot decide yourself: a decision, a permission, or a missing fact. The tool returns accepted for delivery; end your turn and wait. The parent's answer arrives in this session as a new message. Ask once, do not poll, and do not repeat the question.
+- report_parent(message, final=false) submits a progress report. Use it for a milestone or a change of plan the parent must know now, not for every step.
+- report_parent(message, final=true) submits the final deliverable of the current task. Send it once the work is really finished and verified, and include what was done, how it was verified, and what remains.
+- After a final report is accepted, do not submit another report for that task. The parent decides what happens next; a cancelled or closed task refuses further reports.
+
+Reading the result:
+- accepted:true means the parent side accepted this submission for delivery. It is not proof of delivery, of reading, or of an answer.
+- isError true means the submission was refused. Read error.code and act on it: not-owned-session and caller-unresolved mean this session must not report at all; task-closed, task-cancelled and report-final-already-submitted mean stop writing reports for this task. Do not retry the same call with different wording or arguments.
+- Never state in your reply that you reported something unless the tool returned accepted:true.`;
+
+const refuse = (code, message) => Object.assign(new Error(message), { code });
+
+const errorResult = error => ({
+  isError: true,
+  content: [{ type: 'text', text: JSON.stringify({
+    error: { code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 2000) },
+  }) }],
+});
+
+const okResult = value => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
+
+/**
+ * Build the MCP server for one already-identified caller.
+ * @param {object} options
+ * @param {() => Promise<object>} options.resolveCaller Verified caller; bound by
+ *   the transport (parent process for stdio, TCP peer for HTTP).
+ * @param {(caller: object, context: object) => Promise<object|null>} options.resolveOwned
+ *   Returns the plugin-owned handle for this caller: `{ agentName, taskId,
+ *   ask({message}), report({message, final}) }`, or null when the session is not
+ *   bound to an owned agent. Submission methods resolve `{accepted:true,...}` or
+ *   throw an Error with a `code`; they are supplied by the shared roster/state
+ *   machine and are the only place task state is read.
+ */
+export function createClaudeReportServer({ resolveCaller, resolveOwned, instructions = INSTRUCTIONS,
+  version = SERVER_VERSION } = {}) {
+  if (typeof resolveCaller !== 'function') throw new TypeError('createClaudeReportServer requires resolveCaller');
+  if (typeof resolveOwned !== 'function') throw new TypeError('createClaudeReportServer requires resolveOwned');
+  const server = new McpServer({ name: SERVER_NAME, version }, { instructions });
+  // Process-local safety net only; the roster remains the single source of truth
+  // for task state. A final report is one per task even if the roster lags.
+  const finals = new Set();
+
+  const submit = async (kind, { message, final = false }) => {
+    const caller = await resolveCaller();
+    const owned = await resolveOwned(caller, { tool: kind });
+    if (!owned) {
+      throw refuse('not-owned-session',
+        `Claude session ${caller?.sessionId ?? '(unknown)'} is not bound to a FutureAide-owned agent. `
+        + 'Only plugin-owned sessions may report or ask; this session must answer in its own chat.');
+    }
+    if (typeof owned.ask !== 'function' || typeof owned.report !== 'function') {
+      throw refuse('ownership-incomplete', 'The ownership record does not accept submissions; nothing was submitted.');
+    }
+    const taskKey = `${caller?.sessionId ?? 'unknown'}:${owned.taskId ?? 'current'}`;
+    if (kind === 'report' && finals.has(taskKey)) {
+      throw refuse('report-final-already-submitted',
+        'A final report was already accepted for this task. Stop writing reports and end your turn.');
+    }
+    const result = kind === 'ask'
+      ? await owned.ask({ message, caller })
+      : await owned.report({ message, final, caller });
+    if (result?.accepted !== true) {
+      throw refuse(result?.code ?? 'not-accepted',
+        result?.message ?? 'The submission was not accepted by the FutureAide state machine.');
+    }
+    if (kind === 'report' && final) finals.add(taskKey);
+    return {
+      accepted: true,
+      kind: kind === 'ask' ? 'question' : 'report',
+      ...(owned.agentName ? { agent: owned.agentName } : {}),
+      ...(kind === 'report' ? { final } : {}),
+      ...(result.questionId ? { questionId: result.questionId } : {}),
+      note: kind === 'ask'
+        ? 'Accepted for delivery. End your turn; the answer arrives as a new message in this session.'
+        : final
+          ? 'Final report accepted. Do not submit another report for this task.'
+          : 'Progress report accepted. Continue the task unless the parent says otherwise.',
+    };
+  };
+
+  const message = z.string().min(1).max(100000)
+    .describe('Report or question text. Pass it directly; do not create a file to communicate.');
+
+  server.registerTool('ask_parent', {
+    description: 'Ask the Codex parent chat a question you cannot decide yourself. Returns accepted once the question is queued for the parent; end your turn and the answer arrives as a new message in this session. Ordinary replies and the end of a turn never reach the parent, so this tool is the only way to ask.',
+    inputSchema: { message },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, async args => {
+    try { return okResult(await submit('ask', { message: args.message })); }
+    catch (error) { return errorResult(error); }
+  });
+
+  server.registerTool('report_parent', {
+    description: 'Submit a progress report (final false, the default) or the final deliverable (final true) of the current task to the Codex parent chat. Returns accepted once the report is queued; accepted is not delivery or reading. Only explicit reports reach the parent: ordinary assistant text and turn ends notify nobody. Submit final once, after the work is finished and verified, and submit no reports for that task afterwards.',
+    inputSchema: {
+      message,
+      final: z.boolean().optional().describe('true submits the final deliverable of this task. Omit or false for a progress report.'),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  }, async args => {
+    try { return okResult(await submit('report', { message: args.message, final: args.final === true })); }
+    catch (error) { return errorResult(error); }
+  });
+
+  return server;
+}
+
+/** Run the stdio transport: one process per Claude Desktop session. */
+export async function runStdioService({ resolveOwned, resolveCaller, instructions, identity = {} } = {}) {
+  const server = createClaudeReportServer({
+    resolveOwned, instructions,
+    resolveCaller: resolveCaller ?? (() => resolveStdioCaller(identity)),
+  });
+  await server.connect(new StdioServerTransport());
+  return server;
+}
+
+function sendJson(res, status, value, headers = {}) {
+  const body = JSON.stringify(value);
+  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), ...headers });
+  res.end(body);
+}
+
+async function readBody(req, limitBytes = 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limitBytes) throw refuse('request-too-large', 'The request body exceeds the accepted size.');
+    chunks.push(chunk);
+  }
+  if (!size) return undefined;
+  const text = Buffer.concat(chunks).toString('utf8');
+  try { return JSON.parse(text); }
+  catch { throw refuse('invalid-json', 'The request body is not valid JSON.'); }
+}
+
+/**
+ * Start the shared loopback Streamable HTTP service. Stateless per request: each
+ * POST gets its own server and transport instance (the SDK forbids reusing a
+ * stateless transport), and the caller is re-verified from the TCP peer on every
+ * request, so one shared process cannot leak another session's identity.
+ */
+export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1', resolveOwned,
+  resolveCaller, instructions, identity = {}, log = () => {} } = {}) {
+  const startedAt = new Date().toISOString();
+  const stats = { requests: 0, refused: 0, served: 0 };
+  let boundPort = port;
+
+  const server = http.createServer(async (req, res) => {
+    const path = (req.url ?? '').split('?')[0];
+    if (path !== HTTP_PATH) {
+      if (path === '/healthz' && req.method === 'GET') {
+        sendJson(res, 200, { ok: true, server: SERVER_NAME, version: SERVER_VERSION, startedAt, stats });
+        return;
+      }
+      sendJson(res, 404, { error: { code: 'not-found', message: `Use POST ${HTTP_PATH}.` } });
+      return;
+    }
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: { code: 'method-not-allowed', message: `Only POST ${HTTP_PATH} is supported.` } }, { allow: 'POST' });
+      return;
+    }
+    stats.requests += 1;
+    let caller;
+    try {
+      // The default resolver reads the request socket; an injected resolver gets
+      // the same context so it can be verified or replaced without a second path.
+      caller = await (resolveCaller ?? (() => resolveSocketCaller(req.socket, { serverPort: boundPort, ...identity })))(
+        { req, socket: req.socket, serverPort: boundPort });
+    } catch (error) {
+      stats.refused += 1;
+      log(`refused ${error?.code ?? 'caller-unresolved'}: ${String(error?.message ?? error).slice(0, 200)}`);
+      sendJson(res, 403, { error: { code: error?.code ?? 'caller-unresolved',
+        message: 'This connection is not a FutureAide-owned Claude Desktop session; no tool is available to it.' } });
+      return;
+    }
+    let body;
+    try { body = await readBody(req); }
+    catch (error) { stats.refused += 1; sendJson(res, 400, { error: { code: error.code ?? 'invalid-request', message: error.message } }); return; }
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    const mcp = createClaudeReportServer({ resolveCaller: async () => caller,
+      resolveOwned: resolveOwned ?? (() => null), instructions });
+    const close = () => { void transport.close().catch(() => {}); void mcp.close().catch(() => {}); };
+    res.once('close', close);
+    try {
+      await mcp.connect(transport);
+      await transport.handleRequest(req, res, body);
+      stats.served += 1;
+    } catch (error) {
+      log(`request failed: ${String(error?.message ?? error).slice(0, 200)}`);
+      if (!res.headersSent) sendJson(res, 500, { error: { code: 'transport-failed', message: 'The MCP request could not be handled.' } });
+      else res.end();
+      close();
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, () => { server.off('error', reject); resolve(); });
+  });
+  boundPort = server.address()?.port ?? port;
+  const url = `http://${host}:${boundPort}${HTTP_PATH}`;
+  return {
+    server, stats, url, port: boundPort, host,
+    close: () => new Promise(resolve => server.close(() => resolve())),
+  };
+}
+
+function argument(argv, name) {
+  const index = argv.indexOf(name);
+  return index === -1 ? undefined : argv[index + 1];
+}
+
+async function main(argv = process.argv.slice(2)) {
+  const ownershipPath = argument(argv, '--ownership');
+  // No ownership integration is bundled here on purpose: without a resolver the
+  // service refuses every call, so a mistakenly started service exposes nothing.
+  const resolveOwned = ownershipPath ? (await import(pathToFileURL(ownershipPath).href)).resolveOwned : undefined;
+  if (argv.includes('--http')) {
+    const port = Number.parseInt(argument(argv, '--port') ?? process.env.FUTUREAIDE_REPORT_PORT ?? String(DEFAULT_PORT), 10);
+    const service = await startHttpService({ port, resolveOwned,
+      log: message => process.stderr.write(`[futureaide-report] ${message}\n`) });
+    process.stderr.write(`[futureaide-report] listening on ${service.url}\n`);
+    const stop = async () => { await service.close(); process.exit(0); };
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+    return;
+  }
+  await runStdioService({ resolveOwned });
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main().catch(error => {
+    process.stderr.write(`[futureaide-report] ${error?.code ?? 'failed'}: ${error?.message ?? error}\n`);
+    process.exitCode = 1;
+  });
+}

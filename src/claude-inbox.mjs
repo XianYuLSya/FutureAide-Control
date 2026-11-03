@@ -159,6 +159,11 @@ export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576
           && event.reason === 'absorbed_mid_turn' && typeof event.commandUuid === 'string') {
         deliveries.push({ requestId: event.commandUuid, deliveryId: event.deliveryId,
           stage: 'inserted', timestamp: event.timestamp });
+      } else if (event.type === 'user' && typeof event.uuid === 'string'
+          && typeof event.message?.content === 'string') {
+        // An idle-session inbox frame retains its UUID as a user message. The
+        // caller matches this against its persisted request IDs, never by text.
+        deliveries.push({ requestId: event.uuid, stage: 'inserted', timestamp: event.timestamp });
       }
       if (!['user', 'assistant'].includes(event.type)) continue;
       const content = event.message?.content;

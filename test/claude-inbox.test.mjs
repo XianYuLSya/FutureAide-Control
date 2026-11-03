@@ -54,3 +54,12 @@ test('byte cursor defers an unfinished UTF-8 line and does not replay prior rece
   assert.equal(third.offset, second.offset);
   await assert.rejects(readClaudeEvents(binding, { maxBytes: 16 }), /claude-transcript-line-exceeds-page/);
 });
+
+test('idle inbox delivery retains the user-frame UUID, unlike a tool result', async () => {
+  const binding = await fixture(
+    line({ type: 'user', uuid: requestId, message: { role: 'user', content: 'Peer request.' } })
+    + line({ type: 'user', uuid: 'tool-result-id', message: { role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'Done.' }] } }));
+  const result = await readClaudeEvents(binding);
+  assert.deepEqual(result.deliveries.map(({ requestId: id, stage }) => [id, stage]), [[requestId, 'inserted']]);
+});

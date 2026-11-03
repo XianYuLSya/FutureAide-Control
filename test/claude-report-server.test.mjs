@@ -211,8 +211,8 @@ test('an owned session carries the management tools next to its own two', async 
     assert.deepEqual(tools.map(tool => tool.name).sort(), ['ask_parent', 'futureaide_list_agents', 'report_parent']);
     assert.equal(seen.length, 1);
     assert.deepEqual(await seen[0].caller(), caller);
-    assert.deepEqual(await seen[0].trusted(), { nativeSessionId: sessionId,
-      workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, via: 'pid' });
+    assert.deepEqual(await seen[0].trusted(), { source: 'claude-desktop', nativeSessionId: sessionId,
+      workspace: 'D:\\Work\\xiayuls_workflow', via: 'pid', binding: { pid: 50124 } });
     const result = await client.callTool({ name: 'futureaide_list_agents', arguments: {} });
     assert.equal(result.content[0].text, '[]');
   } finally { await close(); }
@@ -231,8 +231,8 @@ test('a verified session that is not owned gets the management tools and no repo
     const refused = await client.callTool({ name: 'report_parent', arguments: { message: 'x' } })
       .catch(error => ({ isError: true, thrown: String(error?.message ?? error) }));
     assert.equal(refused.isError, true, 'a parent session has no report surface');
-    assert.deepEqual(await seen[0].trusted(), { nativeSessionId: sessionId,
-      workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, via: 'pid' });
+    assert.deepEqual(await seen[0].trusted(), { source: 'claude-desktop', nativeSessionId: sessionId,
+      workspace: 'D:\\Work\\xiayuls_workflow', via: 'pid', binding: { pid: 50124 } });
     assert.equal(client.getInstructions(), undefined, 'no reporting instructions for a parent session');
   } finally { await client.close(); await server.close(); }
 });
@@ -261,12 +261,20 @@ test('the HTTP service gives a verified parent the management tools and an unkno
   } finally { await service.close(); await stranger.close(); }
 });
 
-test('the trusted context carries only what the connection proved', () => {
-  assert.deepEqual(trustedContextOf(caller), { nativeSessionId: sessionId,
-    workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, via: 'pid' });
+test('the trusted caller carries only what the connection proved', () => {
+  assert.deepEqual(trustedContextOf(caller), { source: 'claude-desktop', nativeSessionId: sessionId,
+    workspace: 'D:\\Work\\xiayuls_workflow', via: 'pid', binding: { pid: 50124 } });
   assert.equal(trustedContextOf({}), undefined);
   assert.equal(trustedContextOf({ sessionId }), undefined, 'a workspace is required');
-  assert.ok(!('image' in trustedContextOf(caller)) && !('recordFile' in trustedContextOf(caller)));
+  const full = trustedContextOf({ ...caller, hostSessionId: 'local_1', name: '测试会话',
+    procStart: '134381970992798945', pidDomain: 'win32:h', socketPath: '\\\\.\\pipe\\p',
+    recordFile: 'D:\\s\\50124.json', directory: 'D:\\s', image: 'claude.exe', peerToken: 'secret' });
+  assert.equal(full.hostSessionId, 'local_1');
+  assert.equal(full.label, '测试会话');
+  assert.deepEqual(full.binding, { pid: 50124, procStart: '134381970992798945', pidDomain: 'win32:h',
+    socketPath: '\\\\.\\pipe\\p', recordFile: 'D:\\s\\50124.json', directory: 'D:\\s' });
+  assert.ok(!('peerToken' in full) && !('image' in full) && !('recordFile' in full));
+  assert.ok(!JSON.stringify(full).includes('secret'));
 });
 
 test('a second binder on the same port is refused while the first keeps serving', async () => {

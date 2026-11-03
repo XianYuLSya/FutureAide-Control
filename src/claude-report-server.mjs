@@ -79,14 +79,30 @@ const nativeToolUseId = extra => {
 };
 
 /**
- * The private context a verified Claude caller stands for. It is built only from
- * what the TCP peer proved (native session id and workspace), never from a tool
- * argument, and it carries no token. The management tools use it as their owner
- * key, so one Claude session's roster stays its own.
+ * The trusted caller record the shared service expects under
+ * `calling-context`'s TRUSTED_CALLER symbol: built only from what the transport
+ * proved (native session id, workspace, registry record), never from a tool
+ * argument, and carrying no token. `source` names the calling application so the
+ * roster namespaces this owner apart from a Codex chat.
  */
 export function trustedContextOf(caller) {
   if (!caller || typeof caller.sessionId !== 'string' || typeof caller.cwd !== 'string') return undefined;
-  return { nativeSessionId: caller.sessionId, workspace: caller.cwd, pid: caller.pid, via: caller.via };
+  return {
+    source: 'claude-desktop',
+    nativeSessionId: caller.sessionId,
+    workspace: caller.cwd,
+    ...(caller.hostSessionId ? { hostSessionId: caller.hostSessionId } : {}),
+    ...(caller.name ? { label: caller.name } : {}),
+    ...(caller.via ? { via: caller.via } : {}),
+    binding: {
+      pid: caller.pid,
+      ...(caller.procStart ? { procStart: caller.procStart } : {}),
+      ...(caller.pidDomain ? { pidDomain: caller.pidDomain } : {}),
+      ...(caller.socketPath ? { socketPath: caller.socketPath } : {}),
+      ...(caller.recordFile ? { recordFile: caller.recordFile } : {}),
+      ...(caller.directory ? { directory: caller.directory } : {}),
+    },
+  };
 }
 
 /**

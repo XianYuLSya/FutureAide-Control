@@ -34,7 +34,7 @@ const values = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, in
 if (!values['--config'] || !/^monitor-[0-9a-f-]{36}$/.test(values['--lease'] ?? '')) throw new Error('Invalid shared monitor identity.');
 const config = await loadConfig(values['--config']);
 const hostDirectory = config.managedStateDirectory ?? path.join(path.dirname(config.hostBridgeFile), 'managed-host');
-const service = createScopedAgents(config, { hostReportService: true }), store = service.store, holder = values['--lease'];
+const service = createScopedAgents(config), store = service.store, holder = values['--lease'];
 
 let watcher, watchedKey = '', wake, heartbeat, running = true, signalled = false, lastDelivery = 0;
 let idleSince, lastVersion = store.dataVersion(), rounds = 0;
@@ -68,8 +68,9 @@ function sleepUntilSignalled(timeoutMs) {
   });
 }
 
-/** Open managed Claude sessions keep this process (and its tool service) alive. */
-const hasManagedClaude = () => store.listClaudeBindings().length > 0;
+/** Open managed Claude names — including an idle zero-model reservation — keep this
+ *  process (and therefore its tool service) alive. */
+const hasManagedClaude = () => store.hasOpenTarget('claude-desktop');
 
 try {
   // The loopback tool service is hosted here so an idle managed session always

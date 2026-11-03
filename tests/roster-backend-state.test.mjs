@@ -114,6 +114,23 @@ test('only open claude-desktop bindings are offered for watching', () => {
   } finally { store.close(); }
 });
 
+test('an idle reservation keeps its target open, a closed name does not', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    assert.equal(store.hasOpenTarget('claude-desktop'), false);
+    // A zero-model reservation has no native binding yet, and still counts: the
+    // listener that will serve its first turn must not retire while it exists.
+    store.insert(agent({ agentId: 'agent-reserved', name: 'reserved' }));
+    assert.equal(store.hasOpenTarget('claude-desktop'), true);
+    assert.deepEqual(store.listClaudeBindings(), [], 'a reservation has no transcript to watch yet');
+    store.insert(agent({ agentId: 'agent-dsh', name: 'artist', target: 'dsh' }));
+    assert.equal(store.hasOpenTarget('dsh'), true);
+    assert.equal(store.hasOpenTarget('claude-desktop'), true);
+    const closed = store.get('agent-reserved'); closed.closed = true; store.save(closed);
+    assert.equal(store.hasOpenTarget('claude-desktop'), false, 'a closed name no longer holds the listener open');
+  } finally { store.close(); }
+});
+
 test('target state and the reverse lookup share the roster database across processes', async () => {
   const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const base = path.join(workspace, '.runtime', 'tests');

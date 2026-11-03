@@ -187,6 +187,16 @@ export class RosterStore {
       WHERE json_extract(a.body,'$.target')='claude-desktop' AND coalesce(json_extract(a.body,'$.closed'),0)=0`)
       .all().map(row => JSON.parse(row.body)?.binding ?? {});
   }
+  /**
+   * Does this chat still own any open name on that target? A zero-model
+   * reservation counts: the session has been promised a place before its first
+   * turn, so the listener that serves it must not retire while it exists.
+   */
+  hasOpenTarget(target) {
+    return this.db.prepare(`SELECT 1 AS found FROM agents
+      WHERE coalesce(json_extract(body,'$.target'),'dsh')=? AND coalesce(json_extract(body,'$.closed'),0)=0 LIMIT 1`)
+      .get(target) !== undefined;
+  }
   save(record) {
     record.updatedAt = new Date().toISOString();
     // A watcher or sender can wake without the operation lock. Never restore a

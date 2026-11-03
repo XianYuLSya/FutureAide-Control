@@ -10,7 +10,7 @@ import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { ensureReportService, readReportStatus, reportPort } from './report-endpoint.mjs';
+import { readReportStatus, reportPort, reportUrl } from './report-endpoint.mjs';
 import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
   TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
 
@@ -147,8 +147,7 @@ export function createScopedAgents(config, {
   removeTree = rm,
   backendAdapters = {},
   backendAdapterLoader = undefined,
-  hostReportService = true,
-  ensureReportReady = ensureReportService,
+  reportStatusProbe = readReportStatus,
   reportReadyTimeoutMs = 2000,
 } = {}) {
   const clients = new Map();
@@ -164,15 +163,15 @@ export function createScopedAgents(config, {
   // lock per target application, reusing the existing lease table.
   //
   // ensureClaudeReports() makes the loopback tool service ready and returns
-  // {url, ready}: it starts the shared monitor (which hosts the service and stays
-  // up while managed Claude sessions exist) and waits for its health check with a
-  // short deadline, falling back to a service in this process if the monitor never
-  // answers. readClaudeReportStatus() only reads readiness/registration, so a
-  // status probe can ask without starting anything.
-  const adapterDeps = (record, { startReports = hostReportService } = {}) => {
+  // {url, ready}: it starts THE shared monitor (the single host of that service —
+  // never a service per MCP connection) and waits for its health check with a
+  // short deadline. If the monitor cannot answer, ready is false with a reason; no
+  // other process grabs the port. readClaudeReportStatus() only reads
+  // readiness/registration, so a status probe can ask without starting anything.
+  const adapterDeps = (record, { startReports = true } = {}) => {
     const load = () => store.get(record.agentId) ?? record;
     const target = targetOf(record);
-    const readStatus = () => readReportStatus({ port: reportPort() });
+    const readStatus = () => reportStatusProbe({ port: reportPort() });
     return {
       load,
       requestDirectory: () => agentDirectory(load()),
@@ -188,13 +187,14 @@ export function createScopedAgents(config, {
     await ensureMonitor();
     const deadline = Date.now() + reportReadyTimeoutMs;
     for (;;) {
-      const status = await readReportStatus({ port });
+      const status = await reportStatusProbe({ port });
       if (status.ready) return { ...status, via: 'monitor' };
       if (Date.now() >= deadline) break;
       await wait(50);
     }
-    const local = await ensureReportReady({ store, port });
-    return { ...local, via: local.ready ? 'process' : 'none' };
+    // The single monitor owns the service; this call never takes the port itself.
+    return { port, url: reportUrl(port), ready: false, via: 'none',
+      reason: { code: 'report-service-unavailable', message: 'The shared monitor that hosts the tool service did not answer in time.' } };
   }
   // The chosen backend is rebuilt per operation from the live record, so a new
   // task id or state never hides behind a cached binding. Only the DSH client

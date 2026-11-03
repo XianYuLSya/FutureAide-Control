@@ -127,29 +127,30 @@ async function stateRoot() {
   return mkdtemp(path.join(base, 'target-'));
 }
 
-async function fixture({ adapters = {}, store, adapterLoader, ensureReportReady } = {}) {
+async function fixture({ adapters = {}, store, adapterLoader, reportStatusProbe } = {}) {
   const events = [];
   const reports = [];
+  const monitors = [];
   const stateDirectory = await stateRoot();
   const roster = store ?? new RosterStore(':memory:');
   const dsh = dshFixture(events);
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
     store: roster, clientFactory: () => dsh.api, controlFactory: dsh.controlFactory, callCodex: calling(events),
-    startSharedMonitor: () => true,
+    startSharedMonitor: () => { monitors.push('start'); return true; },
     reportReadyTimeoutMs: 0,
     removeTree: async () => {},
     backendAdapters: adapters,
-    // No real loopback server in unit tests: the readiness link is injected and
-    // counted so a test can prove when it was and was not asked for.
-    ensureReportReady: ensureReportReady ?? (async () => {
-      reports.push('ensure');
-      return { url: 'http://127.0.0.1:17654/mcp', port: 17654, ready: true, started: false };
+    // No real loopback server in unit tests: the read-only health probe is
+    // injected and counted, so a test can prove when readiness was asked for.
+    reportStatusProbe: reportStatusProbe ?? (async () => {
+      reports.push('probe');
+      return { url: 'http://127.0.0.1:17654/mcp', port: 17654, ready: true, hosting: 'monitor' };
     }),
     // These cases pin the refusal path, so the installed adapter file must not
     // decide the outcome; an injected loader says whether one exists here.
     ...(adapterLoader ? { backendAdapterLoader: adapterLoader } : {}),
   });
-  return { events, reports, service, store: roster, stateDirectory, dsh,
+  return { events, reports, monitors, service, store: roster, stateDirectory, dsh,
     record: (name = 'artist', thread = A) => roster.named(ownerIdFor(thread), name) };
 }
 
@@ -212,6 +213,8 @@ test('claude-desktop is created, dispatched and listed only through its own adap
     assert.ok(events.includes('claude:create'));
     assert.equal(f.record('partner').target, 'claude-desktop');
     assert.deepEqual(dshCalls(f.events), [], 'no DSH call runs for a claude-desktop name');
+    assert.deepEqual(f.reports, ['probe'], 'a zero-model create first waits for the monitor-owned tool service');
+    assert.deepEqual(f.monitors, ['start'], 'and the single monitor is what provides it');
 
     const receipt = await f.service.send({ name: 'partner', message: 'read the plan' }, extra(A));
     assert.equal(receipt.accepted, true, 'written is accepted, not completion');
@@ -221,7 +224,6 @@ test('claude-desktop is created, dispatched and listed only through its own adap
     assert.equal(events.includes('claude:selectModel'), false, 'a matching target default needs no selection');
     assert.deepEqual((await f.service.list(extra(A))).items.map(item => [item.name, item.target]), [['partner', 'claude-desktop']]);
     assert.deepEqual(dshCalls(f.events), [], 'the DSH bridge stayed untouched');
-    assert.deepEqual(f.reports, ['ensure'], 'a zero-model create first makes the tool service ready');
     assert.equal(typeof f.record('partner').binding, 'undefined');
   } finally { f.service.close(); }
 });
@@ -229,8 +231,7 @@ test('claude-desktop is created, dispatched and listed only through its own adap
 test('a create that cannot reach the tool service takes no name', async () => {
   const f = await fixture({
     adapters: { 'claude-desktop': record => { const backend = claudeAdapter([]); backend.record = record; return backend; } },
-    ensureReportReady: async () => ({ port: 17654, url: 'http://127.0.0.1:17654/mcp', ready: false,
-      reason: { code: 'report-service-unavailable', message: 'no answer' } }),
+    reportStatusProbe: async () => ({ port: 17654, url: 'http://127.0.0.1:17654/mcp', ready: false }),
   });
   try {
     const error = await rejection(f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)));
@@ -259,6 +260,7 @@ test('status reads tool-service readiness without starting it', async () => {
     const status = await f.service.status(extra(A));
     assert.equal(status.backends['claude-desktop'].ready, true);
     assert.deepEqual(f.reports, [], 'a status probe never starts the loopback service');
+    assert.deepEqual(f.monitors, [], 'nor does it start the shared monitor');
     assert.equal(f.store.count(ownerIdFor(A)), 0);
   } finally { f.service.close(); }
 });

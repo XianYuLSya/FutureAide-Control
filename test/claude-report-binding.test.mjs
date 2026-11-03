@@ -83,18 +83,19 @@ test('a stale nonce, a different request or a closed name blocks the write', () 
     requestId: 'req-1', bindingNonce: closed.bindingNonce }), undefined);
 });
 
-test('adoption waits for this session opener marker and writes the binding', async () => {
+test('pending exists and the transcript only appears on the second poll', async () => {
   const fixture = roster();
   let reads = 0;
   const outcome = await adoptFirstListBinding({ store: fixture.store, caller: caller(),
-    // The host's head reader only finds the marker once the UI has sent the first
-    // turn; here it appears on the third poll, with the transcript still absent before.
+    // First request lands before the UI sends the first turn, so no transcript
+    // exists yet; it appears on the second poll and carries the marker.
     confirm: async ({ marker }) => {
       reads += 1;
-      if (reads < 3) return { file: undefined, firstInput: undefined, markerCount: 0 };
+      if (reads < 2) return { file: undefined, firstInput: undefined, markerCount: 0 };
       return { file: 'D:\\c\\projects\\p\\s.jsonl', firstInput: { hasMarker: marker.includes('req-1') }, markerCount: 1 };
     },
     sleep: async () => {}, timeoutMs: 1000, pollMs: 0 });
+  assert.equal(reads, 2);
   assert.equal(outcome.adopted, true);
   assert.equal(outcome.agentId, fixture.agentId);
   assert.equal(fixture.store.backendState(fixture.agentId).binding.sessionId, nativeSessionId);

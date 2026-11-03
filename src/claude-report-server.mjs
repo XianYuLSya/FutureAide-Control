@@ -27,6 +27,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { TRUSTED_CALLER } from './calling-context.mjs';
 import { z } from 'zod';
 import { resolveSocketCaller, resolveStdioCaller } from './claude-caller-identity.mjs';
 import { adoptFirstListBinding } from './claude-report-binding.mjs';
@@ -40,7 +41,9 @@ export const REPORT_TOOL_NAMES = Object.freeze(['ask_parent', 'report_parent']);
 
 export const INSTRUCTIONS = `FutureAide managed session bridge.
 
-This server exists for one purpose: a Claude Desktop session owned by FutureAide Control reports to, and asks, the Codex parent chat that created it. It has two tools, ask_parent and report_parent. Your session is identified from the connection itself; no session id, chat id, name or route is accepted as an argument, so never look for one.
+This server exists for one purpose: a Claude Desktop session owned by FutureAide Control reports to, and asks, the Codex parent chat that created it. It also carries the shared management tools, so any verified Claude session can create and supervise named subagents. Your session is identified from the connection itself; no session id, chat id, name or route is accepted as an argument, so never look for one.
+
+Only a session this plugin manages may ask or report. Any other session that calls these two tools is refused with not-owned-session and nothing is sent, and its own parent never hears about the attempt.
 
 What reaches the parent:
 - Your ordinary replies, tool use and the end of a turn are never forwarded. Nothing is automatic: a turn that ends without a tool call notifies nobody.
@@ -79,11 +82,11 @@ const nativeToolUseId = extra => {
 };
 
 /**
- * The trusted caller record the shared service expects under
- * `calling-context`'s TRUSTED_CALLER symbol: built only from what the transport
- * proved (native session id, workspace, registry record), never from a tool
- * argument, and carrying no token. `source` names the calling application so the
- * roster namespaces this owner apart from a Codex chat.
+ * The trusted caller record the shared service reads from `calling-context`
+ * TRUSTED_CALLER: built only from what the transport proved — the native session
+ * id, its workspace and the registry record — never from a tool argument, and
+ * carrying no token and no image name. The verified binding rides along so a
+ * parent session can answer cold without re-discovering the native session.
  */
 export function trustedContextOf(caller) {
   if (!caller || typeof caller.sessionId !== 'string' || typeof caller.cwd !== 'string') return undefined;
@@ -91,18 +94,22 @@ export function trustedContextOf(caller) {
     source: 'claude-desktop',
     nativeSessionId: caller.sessionId,
     workspace: caller.cwd,
+    pid: caller.pid,
+    ...(caller.procStart ? { procStart: caller.procStart } : {}),
+    ...(caller.pidDomain ? { pidDomain: caller.pidDomain } : {}),
+    ...(caller.socketPath ? { socketPath: caller.socketPath } : {}),
+    ...(caller.recordFile ? { recordFile: caller.recordFile } : {}),
+    ...(caller.directory ? { directory: caller.directory } : {}),
     ...(caller.hostSessionId ? { hostSessionId: caller.hostSessionId } : {}),
     ...(caller.name ? { label: caller.name } : {}),
     ...(caller.via ? { via: caller.via } : {}),
-    binding: {
-      pid: caller.pid,
-      ...(caller.procStart ? { procStart: caller.procStart } : {}),
-      ...(caller.pidDomain ? { pidDomain: caller.pidDomain } : {}),
-      ...(caller.socketPath ? { socketPath: caller.socketPath } : {}),
-      ...(caller.recordFile ? { recordFile: caller.recordFile } : {}),
-      ...(caller.directory ? { directory: caller.directory } : {}),
-    },
   };
+}
+
+/** The `extra` the shared tool actions receive: the transport's own plus the verified caller. */
+export function trustedExtra(extra, caller) {
+  const trusted = trustedContextOf(caller);
+  return trusted ? { ...extra, [TRUSTED_CALLER]: trusted } : extra;
 }
 
 /**
@@ -165,7 +172,7 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, manageme
     .describe('Report or question text. Pass it directly; do not create a file to communicate.');
 
   server.registerTool('ask_parent', {
-    description: 'Ask the Codex parent chat a question you cannot decide yourself. Returns accepted once the question is queued for the parent; end your turn and the answer arrives as a new message in this session. Ordinary replies and the end of a turn never reach the parent, so this tool is the only way to ask.',
+    description: 'Ask the Codex parent chat a question you cannot decide yourself. Returns accepted once the question is queued for the parent; end your turn and the answer arrives as a new message in this session. Ordinary replies and the end of a turn never reach the parent, so this tool is the only way to ask. Only a session this plugin manages may use it; any other session is refused with not-owned-session and nothing is sent.',
     inputSchema: { message },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async (args, extra) => {
@@ -174,7 +181,7 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, manageme
   });
 
   server.registerTool('report_parent', {
-    description: 'Submit a progress report (final false, the default) or the final deliverable (final true) of the current task to the Codex parent chat. Returns accepted once the report is queued; accepted is not delivery or reading. Only explicit reports reach the parent: ordinary assistant text and turn ends notify nobody. Submit final once, after the work is finished and verified, and submit no reports for that task afterwards.',
+    description: 'Submit a progress report (final false, the default) or the final deliverable (final true) of the current task to the Codex parent chat. Returns accepted once the report is queued; accepted is not delivery or reading. Only explicit reports reach the parent: ordinary assistant text and turn ends notify nobody. Submit final once, after the work is finished and verified, and submit no reports for that task afterwards. Only a session this plugin manages may use it; any other session is refused with not-owned-session and nothing is sent.',
     inputSchema: {
       message,
       final: z.boolean().optional().describe('true submits the final deliverable of this task. Omit or false for a progress report.'),
@@ -193,18 +200,6 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, manageme
     management({ server, caller: async () => resolveCaller(),
       trusted: async () => trustedContextOf(await resolveCaller()) });
   }
-  return server;
-}
-
-/**
- * The surface for a verified Claude session the plugin does not own. It is a
- * parent in the reverse direction: it manages names through the same tools a Codex
- * chat uses, but it cannot ask or report here, because only an owned child does.
- */
-export function createManagementServer({ management, caller, version = SERVER_VERSION } = {}) {
-  if (typeof management !== 'function') throw new TypeError('createManagementServer requires a management registrar');
-  const server = new McpServer({ name: SERVER_NAME, version });
-  management({ server, caller: async () => caller, trusted: async () => trustedContextOf(caller) });
   return server;
 }
 
@@ -232,11 +227,12 @@ export async function runStdioService({ resolveOwned, resolveCaller, instruction
       if (outcome?.adopted) owned = await resolveOwned(caller, { tool: 'list' }).catch(() => null);
       else log(`first list left unbound (${outcome?.reason ?? 'unknown'})`);
     }
-    server = owned ? createClaudeReportServer({ resolveOwned, instructions, management,
-      resolveCaller: async () => caller })
-      : (typeof management === 'function'
-        ? createManagementServer({ management, caller })
-        : createUnavailableReportServer());
+    // Every verified session gets the same static table: the shared management
+    // tools plus ask/report. Which of them a session may actually use is decided
+    // per call (an unowned session is refused with not-owned-session), so the
+    // surface no longer depends on when a binding lands.
+    server = createClaudeReportServer({ resolveOwned, instructions, management,
+      resolveCaller: async () => caller });
     if (!owned) log('this session is not plugin-owned; the report surface lists no tools');
   } catch (error) {
     server = createUnavailableReportServer();
@@ -355,11 +351,12 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     catch (error) { sendJson(res, 400, { error: { code: error.code ?? 'invalid-request', message: error.message } }); return; }
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     // Only a verified caller is a parent here; an unidentified peer gets nothing.
-    const mcp = owned
+    // Every verified session gets the same static table; role is enforced per call,
+    // so an unowned parent lists ask/report and is refused with not-owned-session
+    // when it uses them, and an unverified peer still gets nothing.
+    const mcp = caller
       ? createClaudeReportServer({ resolveCaller: async () => caller, resolveOwned, instructions, management })
-      : (caller && typeof management === 'function'
-        ? createManagementServer({ management, caller })
-        : createUnavailableReportServer());
+      : createUnavailableReportServer();
     const close = () => { void transport.close().catch(() => {}); void mcp.close().catch(() => {}); };
     res.once('close', close);
     try {

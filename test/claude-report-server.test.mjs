@@ -8,10 +8,13 @@ import http from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { createClaudeReportServer, createManagementServer, developmentOwnership, startHttpService,
-  trustedContextOf, REPORT_TOOL_NAMES } from '../src/claude-report-server.mjs';
+import { createClaudeReportServer, developmentOwnership, startHttpService, trustedContextOf,
+  trustedExtra, REPORT_TOOL_NAMES } from '../src/claude-report-server.mjs';
+import { TRUSTED_CALLER } from '../src/calling-context.mjs';
 
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
+const trustedShape = { source: 'claude-desktop', nativeSessionId: sessionId,
+  workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, via: 'pid' };
 const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', via: 'pid' };
 const parse = result => JSON.parse(result.content[0].text);
 
@@ -211,30 +214,26 @@ test('an owned session carries the management tools next to its own two', async 
     assert.deepEqual(tools.map(tool => tool.name).sort(), ['ask_parent', 'futureaide_list_agents', 'report_parent']);
     assert.equal(seen.length, 1);
     assert.deepEqual(await seen[0].caller(), caller);
-    assert.deepEqual(await seen[0].trusted(), { source: 'claude-desktop', nativeSessionId: sessionId,
-      workspace: 'D:\\Work\\xiayuls_workflow', via: 'pid', binding: { pid: 50124 } });
+    assert.deepEqual(await seen[0].trusted(), trustedShape);
     const result = await client.callTool({ name: 'futureaide_list_agents', arguments: {} });
     assert.equal(result.content[0].text, '[]');
   } finally { await close(); }
 });
 
-test('a verified session that is not owned gets the management tools and no report surface', async () => {
+test('a verified session sees the same static table whether or not it is owned', async () => {
   const seen = [];
-  const server = createManagementServer({ management: managementRegistrar(seen), caller });
-  const client = new Client({ name: 'management-test', version: '1.0.0' });
-  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
-  await server.connect(serverSide);
-  await client.connect(clientSide);
+  const { client, close } = await inMemory(async () => null, async () => caller, managementRegistrar(seen));
   try {
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map(tool => tool.name), ['futureaide_list_agents']);
-    const refused = await client.callTool({ name: 'report_parent', arguments: { message: 'x' } })
-      .catch(error => ({ isError: true, thrown: String(error?.message ?? error) }));
-    assert.equal(refused.isError, true, 'a parent session has no report surface');
-    assert.deepEqual(await seen[0].trusted(), { source: 'claude-desktop', nativeSessionId: sessionId,
-      workspace: 'D:\\Work\\xiayuls_workflow', via: 'pid', binding: { pid: 50124 } });
-    assert.equal(client.getInstructions(), undefined, 'no reporting instructions for a parent session');
-  } finally { await client.close(); await server.close(); }
+    assert.deepEqual(tools.map(tool => tool.name).sort(),
+      ['ask_parent', 'futureaide_list_agents', 'report_parent']);
+    // Role is enforced per call, not by hiding the tool.
+    const refused = parse(await client.callTool({ name: 'report_parent', arguments: { message: 'x' } }));
+    assert.equal(refused.error.code, 'not-owned-session');
+    const listed = await client.callTool({ name: 'futureaide_list_agents', arguments: {} });
+    assert.equal(listed.content[0].text, '[]', 'management still works for a parent session');
+    assert.deepEqual(await seen[0].trusted(), trustedShape);
+  } finally { await close(); }
 });
 
 test('the HTTP service gives a verified parent the management tools and an unknown peer none', async () => {
@@ -251,7 +250,8 @@ test('the HTTP service gives a verified parent the management tools and an unkno
   };
   try {
     const parent = await open(service.url);
-    assert.deepEqual((await parent.listTools()).tools.map(tool => tool.name), ['futureaide_list_agents']);
+    assert.deepEqual((await parent.listTools()).tools.map(tool => tool.name).sort(),
+      ['ask_parent', 'futureaide_list_agents', 'report_parent']);
     await parent.close();
 
     const unknown = await open(stranger.url);
@@ -262,19 +262,23 @@ test('the HTTP service gives a verified parent the management tools and an unkno
 });
 
 test('the trusted caller carries only what the connection proved', () => {
-  assert.deepEqual(trustedContextOf(caller), { source: 'claude-desktop', nativeSessionId: sessionId,
-    workspace: 'D:\\Work\\xiayuls_workflow', via: 'pid', binding: { pid: 50124 } });
+  assert.deepEqual(trustedContextOf(caller), trustedShape);
   assert.equal(trustedContextOf({}), undefined);
   assert.equal(trustedContextOf({ sessionId }), undefined, 'a workspace is required');
   const full = trustedContextOf({ ...caller, hostSessionId: 'local_1', name: '测试会话',
     procStart: '134381970992798945', pidDomain: 'win32:h', socketPath: '\\\\.\\pipe\\p',
     recordFile: 'D:\\s\\50124.json', directory: 'D:\\s', image: 'claude.exe', peerToken: 'secret' });
-  assert.equal(full.hostSessionId, 'local_1');
-  assert.equal(full.label, '测试会话');
-  assert.deepEqual(full.binding, { pid: 50124, procStart: '134381970992798945', pidDomain: 'win32:h',
-    socketPath: '\\\\.\\pipe\\p', recordFile: 'D:\\s\\50124.json', directory: 'D:\\s' });
-  assert.ok(!('peerToken' in full) && !('image' in full) && !('recordFile' in full));
+  assert.deepEqual(full, { source: 'claude-desktop', nativeSessionId: sessionId,
+    workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, procStart: '134381970992798945',
+    pidDomain: 'win32:h', socketPath: '\\\\.\\pipe\\p', recordFile: 'D:\\s\\50124.json',
+    directory: 'D:\\s', hostSessionId: 'local_1', label: '测试会话', via: 'pid' });
+  assert.ok(!('peerToken' in full) && !('image' in full));
   assert.ok(!JSON.stringify(full).includes('secret'));
+  // The record reaches the shared service under the name the core defines.
+  const extra = trustedExtra({ _meta: { threadId: 'x' } }, caller);
+  assert.deepEqual(extra[TRUSTED_CALLER], trustedShape);
+  assert.deepEqual(extra._meta, { threadId: 'x' }, 'the transport extras are kept');
+  assert.deepEqual(trustedExtra({ a: 1 }, {}), { a: 1 }, 'an incomplete caller injects nothing');
 });
 
 test('a second binder on the same port is refused while the first keeps serving', async () => {

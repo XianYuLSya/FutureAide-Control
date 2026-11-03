@@ -62,11 +62,14 @@ test('busy acceptance is not insertion and a running tree is not an ended turn',
 });
 
 test('the native interrupt marker ends the turn but does not manufacture a final report', () => {
-  const p = emptyClaudeProjection('task-1');
-  project(p, page(2, [event(2, { type: 'user', text: '[Request interrupted by user]' })],
-    { deliveries: [{ requestId: 'request-1', stage: 'inserted', seq: 1 }] }));
-  assert.equal(claudeTurn(p, 'request-1').completionReason.kind, 'cancelled');
-  assert.equal(p.reports.length, 0);
+  for (const text of ['[Request interrupted by user]', '[Request interrupted by user for tool use]']) {
+    const p = emptyClaudeProjection('task-1');
+    project(p, page(2, [event(2, { type: 'user', text })],
+      { deliveries: [{ requestId: 'request-1', stage: 'inserted', seq: 1 }] }));
+    assert.equal(claudeTurn(p, 'request-1').completionReason.kind, 'cancelled');
+    assert.equal(p.lastInterruptSeq, 2);
+    assert.equal(p.reports.length, 0);
+  }
 });
 
 test('MCP envelopes require accepted true and preserve the task identity', () => {

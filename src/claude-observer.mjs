@@ -109,7 +109,8 @@ export function projectClaudePage(projection, page, { workspace, agentId, reques
       }
     }
     for (const result of event.results ?? []) completeTool(projection, result, event, { workspace, agentId, reportTools });
-    if (event.type === 'user' && event.text === '[Request interrupted by user]' && !event.results?.length) {
+    if (event.type === 'user' && ['[Request interrupted by user]', '[Request interrupted by user for tool use]'].includes(event.text)
+        && !event.results?.length) {
       projection.completions.push({ seq: event.seq, timestamp: event.timestamp, reason: { kind: 'cancelled' } });
       projection.lastInterruptSeq = event.seq;
       projection.activity = 'interrupted';

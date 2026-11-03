@@ -1,6 +1,6 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { lstat, readFile, realpath, rm } from 'node:fs/promises';
+import { lstat, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createControl, endedState, historyMessages, modelTurnError } from './control.mjs';
@@ -12,12 +12,13 @@ import { callingThread, ownerIdFor, resolveCallingContext, threadFromResult } fr
 import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { ensureIdleMonitor, idleSignal } from './idle-monitor.mjs';
+import { DSH_HOST_METHODS, normalizeTarget, resolveBackend, targetOf } from './agent-backend.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
 const now = () => new Date().toISOString();
 const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_report', 'reconnecting', 'delivery_pending', 'cleaning']);
-const METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+const METHODS = DSH_HOST_METHODS;
 const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
 const reportProtocolError = () => Object.assign(new Error('Update the DSH plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting DSH is not required.'), { code: 'report-protocol-required' });
@@ -113,7 +114,7 @@ function publicResult(record, { fullResult = false } = {}) {
   const view = record.observation ?? {};
   const changes = attributedChanges(record, view);
   return {
-    name: record.name, lifetime: record.lifetime, state: record.state,
+    name: record.name, lifetime: record.lifetime, target: targetOf(record), state: record.state,
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
       ...(task.finishedAt ? { finishedAt: task.finishedAt } : {}),
       ...(task.result ? { result: { state: task.result.state,
@@ -159,20 +160,42 @@ export function createScopedAgents(config, {
   startIdleMonitor = ensureIdleMonitor,
   monitorFailureGraceMs = 60000,
   removeTree = rm,
+  backendAdapters = {},
 } = {}) {
   const clients = new Map();
   let monitorUnavailableSince;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
-  const settings = record => ({ ...config, workspace: record.workspace, stateDirectory: agentDirectory(record),
-    codexThreadId: undefined, futureaideSessionId: undefined });
-  const apiFor = record => {
-    if (!clients.has(record.agentId)) clients.set(record.agentId, clientFactory(settings(record)));
-    return clients.get(record.agentId);
-  };
-  const controlFor = record => controlFactory(settings(record), { client: apiFor(record), managed: hostArgs(record) });
+  const settings = record => ({ ...config, target: targetOf(record), workspace: record.workspace,
+    stateDirectory: agentDirectory(record), codexThreadId: undefined, futureaideSessionId: undefined });
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
     sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
     ...(record.task ? { taskId: record.task.taskId } : {}) });
+  // The chosen backend is rebuilt per operation from the live record, so a new
+  // task id or state never hides behind a cached binding. Only the DSH client
+  // (one authenticated connection per agent) is kept.
+  async function backendFor(record) {
+    const target = targetOf(record);
+    const load = () => store.get(record.agentId) ?? record;
+    const requestDirectory = () => agentDirectory(load());
+    if (target === 'dsh') {
+      if (!clients.has(record.agentId)) clients.set(record.agentId, clientFactory(settings(record)));
+      const client = clients.get(record.agentId);
+      return resolveBackend(record, { target, load, dsh: { client, requestDirectory,
+        control: () => controlFactory(settings(load()), { client, managed: hostArgs(load()) }),
+        hostArgs: () => hostArgs(load()) } });
+    }
+    return resolveBackend(record, { target, load, adapters: backendAdapters, dsh: { requestDirectory } });
+  }
+  const forgetBackend = record => clients.delete(record.agentId);
+  // A target without a usable adapter is refused before the name is taken, and is
+  // never answered by the DSH path instead.
+  async function ensureTargetBackend(record) {
+    const target = targetOf(record);
+    if (target === 'dsh') return target;
+    await resolveBackend(record, { target, load: () => record, adapters: backendAdapters,
+      dsh: { requestDirectory: () => agentDirectory(record) } });
+    return target;
+  }
 
   async function context(extra) {
     const threadId = callingThread(extra);
@@ -195,22 +218,23 @@ export function createScopedAgents(config, {
   }
 
   async function checkHost(record, { creation = false, taskTree = false } = {}) {
-    const api = apiFor(record);
-    const identity = await api.connectionIdentity();
-    const stable = stableHost(identity);
+    const backend = await backendFor(record);
+    const probe = await backend.probe();
+    const stable = stableHost(probe.identity);
+    const labels = backend.labels ?? {};
     if (record.host && JSON.stringify(record.host) !== JSON.stringify(stable)) {
-      throw Object.assign(new Error('The original DSH data store is not connected. The task was not sent to another host.'), { code: 'host-ownership-mismatch' });
+      throw Object.assign(new Error(`The original ${labels.host ?? targetOf(record)} data store is not connected. The task was not sent to another host.`), { code: 'host-ownership-mismatch' });
     }
     if (creation || taskTree) {
-      const status = await api.hostStatus();
-      if (!METHODS.every(method => status.methods?.includes(method))) {
-        throw Object.assign(new Error('The DSH bridge needs this plugin version installed before subagents can be created.'), { code: 'managed-host-required' });
+      const required = backend.requiredMethods ?? probe.methods ?? [];
+      if (!required.every(method => probe.methods?.includes(method))) {
+        throw Object.assign(new Error(`${labels.bridge ?? `The ${targetOf(record)} backend`} needs this plugin version installed before subagents can be created.`), { code: 'managed-host-required' });
       }
-      if (status.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
-      if (status.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
+      if (probe.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
+      if (probe.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
     }
     record.host ??= stable;
-    return api;
+    return backend;
   }
 
   async function ensureWorker(record, { wake = false } = {}) {
@@ -236,8 +260,8 @@ export function createScopedAgents(config, {
   }
 
   async function observe(record) {
-    const api = await checkHost(record);
-    const observed = await api.managedStatus(hostArgs(record));
+    const backend = await checkHost(record);
+    const observed = await backend.observe();
     if (observed.sessionId !== record.sessionId || (record.task && observed.taskId !== record.task.taskId)) {
       throw new Error('The host returned a different subagent task.');
     }
@@ -255,19 +279,17 @@ export function createScopedAgents(config, {
 
   async function followHostModel(record, dispatch, observed) {
     if (dispatch.modelReady) return;
-    const control = controlFor(record);
+    const backend = await backendFor(record);
     if (!dispatch.model) {
-      dispatch.model = resolveModel(await control.models(), {});
+      dispatch.model = resolveModel(await backend.models(), {});
       store.save(record);
     }
     // Only a live host observation proves what the session will use. The roster
     // model is a display snapshot and may have been migrated while asleep.
-    const current = observed ? observed.currentModel
-      : (await apiFor(record).managedSession(hostArgs(record))).projections?.values?.modelSelection?.next;
+    const current = observed ? observed.currentModel : await backend.model();
     if (!sameModel(current, dispatch.model)) {
-      const selected = await control.selectModel({ sessionId: record.sessionId, ...dispatch.model,
-        requestId: `${dispatch.requestId}-model` });
-      if (selected.accepted !== true) throw Object.assign(new Error('DSH did not confirm the default model selection.'),
+      const selected = await backend.selectModel({ ...dispatch.model, requestId: `${dispatch.requestId}-model` });
+      if (selected.accepted !== true) throw Object.assign(new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the default model selection.`),
         { code: 'model-selection-unconfirmed', uncertain: selected.status === 'unknown' });
     }
     record.model = dispatch.model;
@@ -278,7 +300,7 @@ export function createScopedAgents(config, {
   async function sendDispatch(record, message, kind = 'task', answerIds = [], requestId = uid('request'), observed) {
     const task = record.task;
     const baseline = Number.isSafeInteger(observed?.throughSeq)
-      ? observed : await apiFor(record).historyCursor(record.sessionId, record.workspace);
+      ? observed : await (await backendFor(record)).cursor();
     const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now() };
     task.dispatches.push(dispatch);
     record.state = 'running'; task.state = 'running';
@@ -292,8 +314,8 @@ export function createScopedAgents(config, {
     if (current?.task?.taskId !== record.task?.taskId || current.task.cancelRequested) return;
     try {
       await followHostModel(record, dispatch, observed);
-      const sent = await controlFor(record).send({ sessionId: record.sessionId, message: dispatch.message, requestId: dispatch.requestId,
-        background: false, suppressCallback: true, mode: 'queue' });
+      const sent = await (await backendFor(record)).deliver({ requestId: dispatch.requestId,
+        message: dispatch.message, kind: dispatch.kind });
       Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
         afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined } : {}) });
     } catch (error) {
@@ -305,7 +327,7 @@ export function createScopedAgents(config, {
       record.task.cancelRequested = true;
       record.task.cancelVerified = false;
       store.save(record);
-      const result = await (await checkHost(record)).managedCancel(hostArgs(record));
+      const result = await (await checkHost(record)).cancel();
       if (result.cancelRequested === true) {
         store.confirmCancel(record);
         record.task.cancelVerified = true;
@@ -364,10 +386,10 @@ export function createScopedAgents(config, {
   }
 
   async function prepare(record) {
-    const api = await checkHost(record, { creation: true });
+    const backend = await checkHost(record, { creation: true });
     store.save(record);
-    const created = await api.managedCreate(hostArgs(record));
-    if (created.sessionId !== record.sessionId || created.modelRequestsStarted !== 0) throw new Error('DSH did not confirm the requested empty subagent.');
+    const created = await backend.create();
+    if (created.sessionId !== record.sessionId || created.modelRequestsStarted !== 0) throw new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the requested empty subagent.`);
     // The model is resolved from the live host default when the first input is
     // sent; creation must not add a second catalog round-trip or pin a stale model.
     record.model = created.model;
@@ -376,9 +398,9 @@ export function createScopedAgents(config, {
 
   async function negotiateTree(record, force = false) {
     if (!force && record.task.treeProtocol === TREE_PROTOCOL && record.task.reportProtocol === REPORT_PROTOCOL) return;
-    const api = await checkHost(record, { taskTree: true });
+    const backend = await checkHost(record, { taskTree: true });
     const after = record.task.dispatches[0]?.afterSeq;
-    const started = await api.managedBeginTask({ ...hostArgs(record),
+    const started = await backend.beginTask({
       ...(Number.isSafeInteger(after) && after >= -1 ? { taskStartSeq: after } : {}) });
     if (started.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
     if (started.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
@@ -395,7 +417,7 @@ export function createScopedAgents(config, {
 
   async function resolveAnswer(record, answer) {
     if (answer.questionIds) return;
-    const result = await apiFor(record).managedAnswer({ ...hostArgs(record), answerId: answer.answerId, message: answer.message });
+    const result = await (await backendFor(record)).answer({ answerId: answer.answerId, message: answer.message });
     if (!result.consumedQuestionIds?.length) throw new Error('This subagent has no unanswered question.');
     answer.questionIds = result.consumedQuestionIds;
     answer.continuation = result.continuation ?? `主控回答：\n${answer.message}\n请继续完成原任务。`;
@@ -407,8 +429,9 @@ export function createScopedAgents(config, {
     if (!autoClaimed) store.save(record);
     try {
       if (!record.nativeDestroyed) {
-        const result = await (await checkHost(record)).managedDestroy(hostArgs(record));
-        if (result.destroyed !== true) throw new Error(result.message ?? 'DSH has not confirmed complete session cleanup.');
+        const backend = await checkHost(record);
+        const result = await backend.destroy();
+        if (result.destroyed !== true) throw new Error(result.message ?? `${backend.labels?.host ?? targetOf(record)} has not confirmed complete session cleanup.`);
         record.nativeDestroyed = true; store.save(record);
       }
       const directory = agentDirectory(record);
@@ -425,7 +448,7 @@ export function createScopedAgents(config, {
         await removeTree(directory, { recursive: true, force: true });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       store.remove(record);
-      clients.delete(record.agentId);
+      forgetBackend(record);
       return { name: record.name, deleted: true, sessionDataRemoved: true };
     } catch (error) {
       const current = store.get(record.agentId);
@@ -517,23 +540,23 @@ export function createScopedAgents(config, {
 
   async function recoverDispatch(record, dispatch, { allowResend = true } = {}) {
     if (dispatch.accepted || !['sending', 'retrying', 'unknown'].includes(dispatch.state)) return;
-    const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, dispatch.requestId])).digest('hex');
-    try {
-      const receipt = JSON.parse(await readFile(path.join(agentDirectory(record), 'requests', `${key}.json`), 'utf8'));
-      dispatch.afterSeq = receipt.result?.afterSeq ?? receipt.afterSeq ?? dispatch.afterSeq;
-      if (receipt.status === 'accepted') { dispatch.accepted = true; dispatch.state = 'running'; }
-      if (receipt.status === 'rejected') dispatch.state = 'failed';
-      if (receipt.status === 'retryable') {
-        if (!allowResend) return 'not-sent';
-        await dispatchOnce(record, dispatch);
-      }
-    } catch (error) {
-      if (error.code === 'ENOENT' && ['sending', 'retrying'].includes(dispatch.state)) {
-        // writeOnce creates its receipt before entering the native send. No receipt
-        // means this saved intent never reached that send; keep the exact request ID.
-        if (!allowResend) return 'not-sent';
-        await dispatchOnce(record, dispatch);
-      } else if (error.code !== 'ENOENT') throw error;
+    // The backend owns its own receipt format; undefined means this saved intent
+    // never reached a native write.
+    const receipt = await (await backendFor(record)).receipt({ requestId: dispatch.requestId });
+    if (!receipt) {
+      if (!['sending', 'retrying'].includes(dispatch.state)) return;
+      // The receipt is written before entering the native send. No receipt means
+      // this intent never reached that send; keep the exact request ID.
+      if (!allowResend) return 'not-sent';
+      await dispatchOnce(record, dispatch);
+      return;
+    }
+    dispatch.afterSeq = receipt.afterSeq ?? dispatch.afterSeq;
+    if (receipt.status === 'accepted') { dispatch.accepted = true; dispatch.state = 'running'; }
+    if (receipt.status === 'rejected') dispatch.state = 'failed';
+    if (receipt.status === 'retryable') {
+      if (!allowResend) return 'not-sent';
+      await dispatchOnce(record, dispatch);
     }
   }
 
@@ -563,7 +586,7 @@ export function createScopedAgents(config, {
           await dispatchOnce(record, prior);
         }
         if (!prior.accepted && prior.state !== 'failed' && Number.isSafeInteger(prior.afterSeq)) {
-          const observed = await controlFor(record).wait({ sessionId: record.sessionId, requestId: prior.requestId,
+          const observed = await (await backendFor(record)).turn({ requestId: prior.requestId,
             afterSeq: prior.afterSeq, timeoutSeconds: 0, maxMessages: 100 });
           if (observed.state === 'ended' && observed.correlation === 'request-id') Object.assign(prior,
             { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq,
@@ -609,7 +632,7 @@ export function createScopedAgents(config, {
     const task = record.task;
     try {
       if (task?.cancelRequested && !task.cancelVerified) {
-        const result = await (await checkHost(record)).managedCancel(hostArgs(record));
+        const result = await (await checkHost(record)).cancel();
         if (result.cancelRequested === true) { store.confirmCancel(record); task.cancelAccepted = true; task.cancelVerified = true; store.save(record); }
       }
       if (task && store.supplements(record.agentId).length) await drainSupplements(record);
@@ -655,7 +678,7 @@ export function createScopedAgents(config, {
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
         await recoverDispatch(record, dispatch);
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
-        const result = await controlFor(record).wait({ sessionId: record.sessionId, requestId: dispatch.requestId,
+        const result = await (await backendFor(record)).turn({ requestId: dispatch.requestId,
           ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}), timeoutSeconds: 0, maxMessages: 100 });
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
@@ -695,7 +718,7 @@ export function createScopedAgents(config, {
     } catch (error) {
       record.state = record.task?.result ? 'delivery_pending' : 'reconnecting';
       record.error = safeError(error); record.observation = { ...record.observation, stale: true };
-      clients.delete(record.agentId);
+      forgetBackend(record);
       store.save(record);
       return publicResult(record);
     }
@@ -721,12 +744,14 @@ export function createScopedAgents(config, {
       status.ready = status.contextVerified && status.dshConnected && status.treeProtocolReady === true && status.reportProtocolReady === true;
       return status;
     },
-    async create({ name, lifetime }, extra) {
+    async create({ name, lifetime, target }, extra) {
       assertName(name);
       if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
+      const backendTarget = normalizeTarget(target);
       const owner = await context(extra);
       const record = { agentId: uid('agent'), ownerId: owner.ownerId, sessionId: uid('session-codex'), name, lifetime,
-        workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [] };
+        target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [] };
+      await ensureTargetBackend(record);
       store.insert(record); // The database's (owner,name) constraint arbitrates parallel creation.
       return store.locked(record.agentId, async () => {
         if (!store.get(record.agentId)) throw new Error('This subagent was removed while it was being created.');
@@ -828,11 +853,12 @@ export function createScopedAgents(config, {
         const tree = publicTree(record, inspectionView);
         const nodes = ownedTree(record, inspectionView).nodes;
         let rootHistory, rootError;
+        const backend = await backendFor(record);
         for (let index = 0; index < nodes.length; index++) {
           const { node } = nodes[index];
           try {
-            const raw = await apiFor(record).managedHistory({ ...hostArgs(record), targetSessionId: node.sessionId });
-            if (!Array.isArray(raw?.events)) throw Object.assign(new Error('The DSH bridge returned invalid session history.'), { code: 'invalid-response' });
+            const raw = await backend.history({ targetSessionId: node.sessionId });
+            if (!Array.isArray(raw?.events)) throw Object.assign(new Error(`${backend.labels?.bridge ?? `The ${targetOf(record)} backend`} returned invalid session history.`), { code: 'invalid-response' });
             const page = { records: raw.events.map(event => ({ type: 'event', event })), hasMore: false };
             const dispatch = node.sessionId === record.sessionId ? record.task?.dispatches?.at(-1) : undefined;
             if (dispatch?.state === 'failed' && !dispatch.failure) {
@@ -868,8 +894,7 @@ export function createScopedAgents(config, {
       if (!record.task || record.closed) return { name, accepted: false, state: record.state };
       if (!store.requestCancel(record)) return { name, accepted: false, state: store.get(record.agentId)?.state ?? 'removed' };
       try {
-        const api = await checkHost(record);
-        const result = await api.managedCancel(hostArgs(record));
+        const result = await (await checkHost(record)).cancel();
         if (result.cancelRequested === true) store.confirmCancel(record);
         return { name, accepted: result.cancelRequested === true, state: 'cancelling' };
       } finally {

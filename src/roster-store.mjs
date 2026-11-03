@@ -193,6 +193,7 @@ export class RosterStore {
     const checkpoint = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
     if (checkpoint?.busy) {
       this.insert({ agentId: record.agentId, ownerId: record.ownerId, name: record.name, lifetime: record.lifetime,
+        ...(record.target ? { target: record.target } : {}),
         workspace: record.workspace, sessionId: record.sessionId, state: 'cleanup_failed', nativeDestroyed: true,
         updatedAt: new Date().toISOString(), error: 'Database cleanup is waiting for another reader. Delete this name again to finish.' });
       throw new Error('The session was removed; local database cleanup is still pending.');

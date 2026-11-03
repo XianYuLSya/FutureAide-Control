@@ -414,6 +414,21 @@ test('an interrupted child stops counting as running and still pairs its late re
   assert.equal(result.tree.settled, true);
 });
 
+test('the tool-use interrupt variant from 2.1.309 also stops counting open calls', async t => {
+  const f = await fixture(t);
+  await writeFile(f.subagent('b1'),
+    assistant(f.sessionId, [toolUse('toolu_b', 'Bash', { command: 'sleep 90' })], { sidechain: true, agentId: 'b1' })
+    + line({ type: 'user', sessionId: f.sessionId, isSidechain: true, agentId: 'b1', timestamp: 'time',
+      message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }] } }));
+  await f.writeRoot([...launched('toolu_a', 'interrupted child', { agentId: 'b1' }),
+    reply(f.sessionId, 'launched', { stopReason: 'end_turn' })]);
+  const projection = await rootProjection(f);
+  const { tree } = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'idle' }));
+  assert.equal(tree.nodes[1].status, 'ended');
+  assert.equal(tree.nodes[1].evidence, 'agent-interrupted');
+  assert.equal(tree.settled, true);
+});
+
 test('an unbound root is refused instead of producing an empty tree', async () => {
   await assert.rejects(observeClaudeTree({}, emptyClaudeProjection('task-1'), { logicalSessionId: 'logical-1' }),
     /transcript file/i);

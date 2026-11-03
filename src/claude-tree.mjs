@@ -137,9 +137,26 @@ function collectAgentToolIds(projection, previous = []) {
   return [...ids];
 }
 
+/**
+ * The turn's own interrupt record. The observer sets lastInterruptSeq for the
+ * exact sentence, but Claude Desktop 2.1.309 also writes
+ * "[Request interrupted by user for tool use]" — measured in the live cancel
+ * run — so the normalized messages are checked for the same prefix.
+ */
+function interruptSeqOf(projection) {
+  const recorded = projection?.lastInterruptSeq ?? 0;
+  let seq = recorded;
+  for (const message of projection?.messages ?? []) {
+    if (message.role !== 'user' || typeof message.text !== 'string') continue;
+    if (!message.text.startsWith('[Request interrupted by user')) continue;
+    if ((message.seq ?? 0) > seq) seq = message.seq;
+  }
+  return seq;
+}
+
 /** Calls left open after the turn's own interrupt are not evidence of work. */
 function openTools(projection) {
-  const interruptSeq = projection?.lastInterruptSeq ?? 0;
+  const interruptSeq = interruptSeqOf(projection);
   return Object.values(projection?.pendingTools ?? {}).filter(tool => (tool.seq ?? 0) > interruptSeq);
 }
 
@@ -209,8 +226,9 @@ function childStatus(entry) {
   if (pending.length) return { status: 'running', evidence: 'pending-tool', activity: `tool: ${pending.at(-1).name}` };
   // The app's own interrupt record is stronger than an unfinished meta: the agent
   // stopped there, and any result that arrives later still pairs by tool id.
-  if ((entry.projection.lastInterruptSeq ?? 0) > 0) {
-    return { status: 'ended', evidence: 'agent-interrupted', endSeq: entry.projection.lastInterruptSeq,
+  const interruptSeq = interruptSeqOf(entry.projection);
+  if (interruptSeq > 0) {
+    return { status: 'ended', evidence: 'agent-interrupted', endSeq: interruptSeq,
       activity: 'the app recorded an interrupt in this agent\'s transcript' };
   }
   if (entry.meta?.running === true) {
@@ -383,12 +401,6 @@ export async function observeClaudeTree(binding, rootProjection, {
       let parentSessionId = anchors.map(id => byToolId.get(id)).find(Boolean);
       if (!parentSessionId && typeof meta?.parentAgentId === 'string' && parents.has(meta.parentAgentId)) {
         parentSessionId = claudeNodeId(meta.parentAgentId);
-      }
-      // A meta that declares itself first level of this session, in this session's
-      // own subagents directory, is a root child even when the bounded root
-      // projection has already aged out that Agent tool_use id.
-      if (!parentSessionId && meta && meta.parentAgentId === undefined && meta.spawnDepth === 1) {
-        parentSessionId = logicalSessionId;
       }
       if (!parentSessionId && entry?.parentSessionId && placedDepth.has(entry.parentSessionId)) {
         parentSessionId = entry.parentSessionId;

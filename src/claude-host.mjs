@@ -214,41 +214,56 @@ export async function readTranscriptEvents(file, { maxBytes = TRANSCRIPT_TAIL_BY
       if (!event || typeof event !== 'object') continue;
       const content = event.message?.content;
       const parts = Array.isArray(content) ? content : [];
-      const text = typeof content === 'string' ? content
-        : parts.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n');
+      // A string content is one text part; an array contributes each text part.
+      // Interrupt detection compares these exactly, so the shape matters.
+      const textParts = typeof content === 'string' ? [content.trim()]
+        : parts.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text.trim());
       events.push({
         type: event.type,
         uuid: event.uuid,
         timestamp: event.timestamp,
+        role: event.message?.role,
         model: event.message?.model,
         effort: event.effort ?? event.perTurnEffort,
         stopReason: event.message?.stop_reason,
-        text,
+        textParts,
+        text: typeof content === 'string' ? content
+          : (textParts.length ? textParts.join('\n') : ''),
       });
     }
     return { file, events, size, partial: start > 0 };
   } finally { await handle.close(); }
 }
 
-function userText(event) { return event?.type === 'user' ? event.text ?? '' : ''; }
+function userText(event) { return event?.role === 'user' || event?.type === 'user' ? event.text ?? '' : ''; }
 
-/** How many user messages carry exactly this marker (0, 1, or more). */
+/** How many user messages carry this marker line (0, 1, or more). */
 export function countMarker(events, marker) {
   return events.filter(event => userText(event).includes(marker)).length;
 }
 
 /**
- * True when the app recorded an interrupt after `sinceIso`. The marker can be
- * its own user message or a text part of the next request blob, so every event
- * type is checked; the timestamp keeps an older interrupt from counting.
+ * The app's own record of an interrupt. It is a *user* message whose text is
+ * exactly the interrupt sentence, either on its own or as one part of the next
+ * request; a longer text that merely quotes it, a tool result that mentions it,
+ * or an older interrupt is not a new one.
  */
-export function interruptedSince(events, sinceIso) {
+export function interruptEvidence(events, sinceIso) {
   const since = sinceIso ? Date.parse(sinceIso) : -Infinity;
-  return events.some(event => typeof event.text === 'string' && event.text.includes(INTERRUPT_MARKER)
-    && !(Date.parse(event.timestamp) < since));
+  for (const event of events) {
+    const at = Date.parse(event.timestamp);
+    if (!(at >= since)) continue;
+    if (event.role !== 'user') continue;
+    if (!(event.textParts ?? []).includes(INTERRUPT_MARKER)) continue;
+    return { type: event.type, uuid: event.uuid, timestamp: event.timestamp, matched: 'exact-text-part' };
+  }
+  return undefined;
 }
 
-// ------------------------------------------------------------------- driver
+/** True when the app recorded an interrupt after `sinceIso`. */
+export function interruptedSince(events, sinceIso) {
+  return Boolean(interruptEvidence(events, sinceIso));
+}// ------------------------------------------------------------------- driver
 
 /** A driver that refuses every UI action with a code the caller can surface. */
 export function createNullDriver(reason = 'ui-driver-unavailable') {
@@ -261,6 +276,7 @@ export function createNullDriver(reason = 'ui-driver-unavailable') {
     async probe() { return { available: false, reason }; },
     async currentView() { return { available: false, reason }; },
     openNewSession: refuse,
+    readSessionArgs: refuse,
     clickButton: refuse,
     submit: refuse,
     interrupt: refuse,
@@ -349,10 +365,11 @@ export function createPowerShellDriver({
     async probe() { return run('probe'); },
     async currentView() { return run('view'); },
     async openNewSession({ workspace, prompt, allowDeepLink = true, folderLabel, launchVia = 'protocol',
-      allowExecutable = true, trustWorkspace = false }) {
+      allowExecutable = true, trustWorkspace = false, prefill = undefined }) {
       return run('new-session', { workspace, prompt, allowDeepLink, launchVia, allowExecutable, trustWorkspace,
-        folderLabel: folderLabel ?? path.basename(workspace) }, { timeoutMs: Math.max(timeoutMs, 60000) });
+        prefill, folderLabel: folderLabel ?? path.basename(workspace) }, { timeoutMs: Math.max(timeoutMs, 120000) });
     },
+    async readSessionArgs({ pid }) { return run('session-args', { pid }); },
     async clickButton({ namePattern }) { return run('click-button', { namePattern }); },
     async submit({ prompt, prefilled, trustWorkspace = false } = {}) {
       return run('submit', { prompt, prefilled, trustWorkspace });
@@ -366,7 +383,7 @@ export function createPowerShellDriver({
       return run('session-delete', { title, deleteLabel, confirmLabels }, { timeoutMs: Math.max(timeoutMs, 60000) });
     },
     async readModel() { return run('model-read'); },
-    async selectModel({ label }) { return run('model-select', { label }); },
+    async selectModel({ label, effortLabel = undefined }) { return run('model-select', { label, effortLabel }); },
   };
 }
 
@@ -463,24 +480,75 @@ async function ensureSessionVisible(record, { driver, allowDeepLink, env = proce
 
 // ------------------------------------------------------------------ creating
 
-async function findDeliveredSession({ env, workspace, request, isAlive }) {
-  const { sessions } = await scanNativeSessions({ env, isAlive });
-  const candidates = sessions.filter(session => session.alive && samePath(session.workspace, workspace));
-  for (const record of candidates) {
-    const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace });
-    if (!file) continue;
-    const { events } = await readTranscriptEvents(file);
-    if (events.some(event => userText(event).includes(`[FutureAide Control request ${request} ·`))) return record;
-  }
-  return undefined;
+/** The identity a caller can persist for this host session. */
+export function bindingOf(record) {
+  return {
+    nativeSessionId: record.nativeSessionId,
+    hostSessionId: record.hostSessionId,
+    pid: record.pid,
+    name: record.name,
+    workspace: record.workspace,
+    recordFile: record.recordFile,
+    alive: record.alive,
+  };
 }
 
+async function markerCountInSession({ env, record, marker }) {
+  const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
+    .catch(() => undefined);
+  if (!file) return { file: undefined, count: 0 };
+  const { events } = await readTranscriptEvents(file);
+  return { file, count: countMarker(events, marker) };
+}
+
+/**
+ * Read-only: the session that already received this request's first turn.
+ *
+ * The match is the unique marker line (request id + binding nonce) appearing
+ * exactly once in a live session transcript in that workspace. A shared cwd, a
+ * start time, or a similar title is never used as evidence.
+ */
+export async function findCreatedSession({ workspace, requestId, bindingNonce }, {
+  env = process.env, isAlive = defaultIsAlive,
+} = {}) {
+  const directory = await assertWorkspace(workspace);
+  const request = assertRequestId(requestId);
+  const nonce = assertBindingNonce(bindingNonce);
+  const marker = markerLine(request, nonce);
+  const { sessions } = await scanNativeSessions({ env, isAlive });
+  const candidates = sessions.filter(session => samePath(session.workspace, directory));
+  const matches = [];
+  for (const record of candidates) {
+    const { file, count } = await markerCountInSession({ env, record, marker });
+    if (count > 0) matches.push({ record, file, count });
+  }
+  if (matches.length > 1) {
+    throw fail('ambiguous-created-session',
+      `${matches.length} sessions carry this request marker; refusing to pick one by time or path.`,
+      { candidates: matches.map(match => match.record.nativeSessionId) });
+  }
+  if (!matches.length) return undefined;
+  const [{ record, file, count }] = matches;
+  if (count !== 1) {
+    throw fail('marker-not-unique', `The request marker appears ${count} times in session ${record.nativeSessionId}.`);
+  }
+  return {
+    ...bindingOf(record),
+    requestId: request,
+    bindingNonce: nonce,
+    transcriptFile: file,
+    aliases: record.name,
+    verifiedBy: ['transcript-marker-once'],
+  };
+}
+
+/** The routes the shipped bundle accepts, for callers that open a page themselves. */
 function newSessionDeepLink({ workspace, prompt }) {
   const params = new URLSearchParams();
   if (prompt) {
     if (prompt.length > DEEP_LINK_PROMPT_LIMIT) {
       throw fail('prompt-exceeds-deep-link',
-        `The first message is ${prompt.length} characters; the Claude deep link carries at most ${DEEP_LINK_PROMPT_LIMIT}.`);
+        `The first message is ${prompt.length} characters; the deep link carries at most ${DEEP_LINK_PROMPT_LIMIT}. Use the composer surface for longer text.`);
     }
     params.set('q', prompt);
   }
@@ -505,7 +573,8 @@ export const deepLinks = Object.freeze({ newSessionDeepLink, continueSessionDeep
  * this is the only place a session is created. The caller's request id and
  * binding nonce go into the first message; the session is reported as created
  * only when a *new* native record registers in this workspace and its transcript
- * carries that marker exactly once.
+ * carries that marker exactly once. `onBound` is awaited the moment the session
+ * is identified, so a tool call can persist the binding before anything else.
  */
 export async function createFirstTurn({
   workspace, requestId, message, bindingNonce, model = undefined,
@@ -519,6 +588,7 @@ export async function createFirstTurn({
   allowExecutable = true,
   folderLabel = undefined,
   trustWorkspace = false,
+  onBound = undefined,
 } = {}) {
   const directory = await assertWorkspace(workspace);
   const request = assertRequestId(requestId);
@@ -530,18 +600,21 @@ export async function createFirstTurn({
   }
   const payload = `${text}\n\n${marker}`;
 
-  const reused = await findDeliveredSession({ env, workspace: directory, request, isAlive });
+  const reused = await findCreatedSession({ workspace: directory, requestId: request, bindingNonce: nonce }, { env, isAlive })
+    .catch(() => undefined);
   if (reused) {
-    return { created: false, reused: true, status: 'already-delivered', nativeSessionId: reused.nativeSessionId,
-      hostSessionId: reused.hostSessionId, pid: reused.pid, requestId: request, workspace: directory,
-      verifiedBy: ['existing-transcript-marker'] };
+    return { created: false, reused: true, status: 'already-delivered', ...reused, workspace: directory };
   }
 
   const ui = requireDriver(driver, 'creating a session');
   const baseline = new Set((await scanNativeSessions({ env, isAlive })).sessions.map(session => session.nativeSessionId));
   const startedAt = new Date().toISOString();
+  // The deep link carries at most DEEP_LINK_PROMPT_LIMIT characters, so a longer
+  // first message is not truncated: the page is opened without a prompt and the
+  // whole text is filled into the host's own composer before one send.
+  const prefillViaLink = payload.length <= DEEP_LINK_PROMPT_LIMIT;
   const launch = await ui.openNewSession({ workspace: directory, prompt: payload, allowDeepLink, allowExecutable,
-    trustWorkspace, ...(folderLabel ? { folderLabel } : {}) });
+    trustWorkspace, prefill: prefillViaLink, ...(folderLabel ? { folderLabel } : {}) });
   // No keystroke is sent into a page that did not become the new session: input
   // in an unidentified page could reach somebody else's conversation.
   if (launch?.navigated === false) {
@@ -556,6 +629,8 @@ export async function createFirstTurn({
 
   const deadline = Date.now() + timeoutMs;
   let observed;
+  let bound = false;
+  let bindingError;
   while (Date.now() < deadline) {
     const { sessions } = await scanNativeSessions({ env, isAlive });
     const fresh = sessions.filter(session => session.alive && !baseline.has(session.nativeSessionId)
@@ -567,33 +642,32 @@ export async function createFirstTurn({
     }
     if (fresh.length === 1) {
       const record = fresh[0];
-      const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace });
-      if (file) {
-        const { events } = await readTranscriptEvents(file);
-        const hits = countMarker(events, marker);
-        observed = { record, file, hits };
-        if (hits === 1) {
-          return {
-            created: true, status: 'sent',
-            nativeSessionId: record.nativeSessionId,
-            hostSessionId: record.hostSessionId,
-            pid: record.pid,
-            name: record.name,
-            workspace: directory,
-            recordFile: record.recordFile,
-            transcriptFile: file,
-            requestId: request,
-            bindingNonce: nonce,
-            marker,
-            verifiedBy: ['native-record-created', 'transcript-marker-once'],
-            strategy: launch?.strategy,
-            submit: submitted?.method,
-            model: model === undefined ? undefined
-              : { requested: model, applied: false, note: 'a deep link carries no model; the session uses the host default' },
-            startedAt,
-            elapsedMs: Date.now() - Date.parse(startedAt),
-          };
+      const { file, count } = await markerCountInSession({ env, record, marker });
+      observed = { record, file, count };
+      if (count === 1) {
+        if (!bound && typeof onBound === 'function') {
+          bound = true;
+          try { await onBound(bindingOf(record)); }
+          catch (error) { bindingError = { code: error.code, message: error.message }; }
         }
+        return {
+          created: true, status: 'sent',
+          ...bindingOf(record),
+          transcriptFile: file,
+          requestId: request,
+          bindingNonce: nonce,
+          marker,
+          verifiedBy: ['native-record-created', 'transcript-marker-once'],
+          strategy: launch?.strategy,
+          submit: submitted?.method,
+          submitDetail: submitted,
+          onBoundCalled: bound,
+          ...(bindingError ? { bindingError } : {}),
+          model: model === undefined ? undefined
+            : { requested: model, applied: false, note: 'a deep link carries no model; the session uses the host default' },
+          startedAt,
+          elapsedMs: Date.now() - Date.parse(startedAt),
+        };
       }
     }
     await sleep(pollMs);
@@ -601,19 +675,21 @@ export async function createFirstTurn({
 
   return {
     created: false, status: 'unconfirmed',
-    reason: observed ? `transcript-marker-count-${observed.hits}` : 'no-native-session-registered',
+    reason: observed ? `transcript-marker-count-${observed.count}` : 'no-native-session-registered',
     requestId: request, bindingNonce: nonce, workspace: directory,
     evidence: { launch, submitted,
-      session: observed ? { nativeSessionId: observed.record.nativeSessionId, markerCount: observed.hits } : undefined },
+      session: observed ? { nativeSessionId: observed.record.nativeSessionId, markerCount: observed.count } : undefined },
     startedAt, elapsedMs: Date.now() - Date.parse(startedAt),
   };
-}
-
-// ---------------------------------------------------------------- interrupt
+}// ---------------------------------------------------------------- interrupt
 
 /**
- * Stop the running turn of one session. Verification is the app's own marker,
- * never "the click was accepted".
+ * Stop the running turn of one session.
+ *
+ * Confirmation is the app's own interrupt record: a *user* message whose text is
+ * exactly the interrupt sentence, written after this request started. When the
+ * app has nothing running, the stop is still honoured — a cancel that arrives
+ * after the turn ended is reported as already satisfied, not as an error.
  */
 export async function interrupt({ nativeSessionId }, {
   env = process.env,
@@ -625,7 +701,8 @@ export async function interrupt({ nativeSessionId }, {
 } = {}) {
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
   if (!record.alive) {
-    return { interrupted: false, status: 'not-running', reason: 'session-process-gone', nativeSessionId, verifiedBy: [] };
+    return { interrupted: false, cancelled: true, status: 'not-running', reason: 'session-process-gone',
+      nativeSessionId, verifiedBy: ['host-process-exited'] };
   }
   const ui = requireDriver(driver, 'interrupting a turn');
   const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink, env });
@@ -638,56 +715,89 @@ export async function interrupt({ nativeSessionId }, {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const now = await readTranscriptEvents(file);
-    if (interruptedSince(now.events, since)) {
-      return { interrupted: true, status: 'interrupted', nativeSessionId, method: press?.method,
-        verifiedBy: ['transcript-interrupt-marker'], revealed: visible.revealed };
+    const evidence = interruptEvidence(now.events, since);
+    if (evidence) {
+      return { interrupted: true, cancelled: true, status: 'interrupted', nativeSessionId,
+        method: press?.method, verifiedBy: ['transcript-interrupt-marker'], evidence, revealed: visible.revealed };
     }
     await sleep(pollMs);
   }
-  return { interrupted: false, status: 'unconfirmed', reason: 'interrupt-marker-not-written',
+
+  // No interrupt record. If the host was already idle there was nothing to stop,
+  // which still satisfies a cancel request; that is stated, not dressed up as an
+  // interrupt.
+  const afterwards = await resolveNativeSession(nativeSessionId, { env, isAlive }).catch(() => record);
+  const idle = press?.stopButtonFound === false && String(afterwards?.status ?? '').toLowerCase() === 'idle';
+  if (idle) {
+    return { interrupted: false, cancelled: true, status: 'idle-no-turn', reason: 'no-running-turn',
+      nativeSessionId, method: press?.method,
+      verifiedBy: ['host-stop-control-absent', 'registry-idle'], revealed: visible.revealed };
+  }
+  return { interrupted: false, cancelled: false, status: 'unconfirmed', reason: 'interrupt-marker-not-written',
     nativeSessionId, method: press?.method, revealed: visible.revealed,
-    evidence: { since, transcriptFile: file } };
-}
+    evidence: { since, transcriptFile: file, stopButtonFound: press?.stopButtonFound } };
+}// ------------------------------------------------------------------ destroy
 
-// ------------------------------------------------------------------ destroy
-
-/** Everything the host owns for one session, so a deletion can be verified. */
-export async function sessionArtifacts({ env = process.env, record }) {
+/**
+ * Everything the host keeps for one session, so a deletion can be verified:
+ * the registry record, the transcript, the per-session directory (which holds
+ * `subagents/`), and the cached session directories.
+ */
+export async function sessionArtifacts({ env = process.env, record, workspace, nativeSessionId } = {}) {
   const root = configRoot(env);
-  const transcriptFile = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
-    .catch(() => undefined);
-  const sessionEnvDirectory = path.join(root, 'session-env', record.nativeSessionId);
-  const fileHistoryDirectory = path.join(root, 'file-history', record.nativeSessionId);
+  const id = nativeSessionId ?? record?.nativeSessionId;
+  const cwd = workspace ?? record?.workspace;
+  const recordFile = record?.recordFile ?? path.join(root, 'sessions', 'unknown.json');
+  const transcriptFile = await findTranscript({ env, nativeSessionId: id, workspace: cwd }).catch(() => undefined);
+  const sessionDirectory = cwd ? path.join(root, 'projects', mungedProject(cwd), id) : undefined;
+  const subagentDirectory = sessionDirectory ? path.join(sessionDirectory, 'subagents') : undefined;
+  const sessionEnvDirectory = path.join(root, 'session-env', id);
+  const fileHistoryDirectory = path.join(root, 'file-history', id);
   const kind = async value => {
+    if (!value) return false;
     const info = await stat(value).catch(() => null);
     if (!info) return false;
     return info.isDirectory() ? 'directory' : 'file';
   };
+  const subagentFiles = subagentDirectory
+    ? (await readdir(subagentDirectory).catch(() => [])).filter(name => name.endsWith('.jsonl'))
+    : [];
   return {
-    recordFile: record.recordFile,
+    recordFile,
     transcriptFile,
+    sessionDirectory,
+    subagentDirectory,
     sessionEnvDirectory,
     fileHistoryDirectory,
+    subagentFiles,
     state: {
-      recordFile: await kind(record.recordFile),
+      recordFile: record?.recordFile ? await kind(record.recordFile) : false,
       transcriptFile: transcriptFile ? await kind(transcriptFile) : false,
+      sessionDirectory: await kind(sessionDirectory),
+      subagentDirectory: await kind(subagentDirectory),
       sessionEnvDirectory: await kind(sessionEnvDirectory),
       fileHistoryDirectory: await kind(fileHistoryDirectory),
     },
   };
 }
 
+function leftoversOf(state) {
+  return Object.entries(state).filter(([, value]) => Boolean(value)).map(([key]) => key);
+}
+
 /**
  * Delete a session the way the application deletes it: the sidebar entry's own
- * "more options" menu, then the host's own confirmation. Verification is the
- * host's own state afterwards — registry record, transcript, per-session
- * directories, host process — never the fact that a click was accepted.
+ * "more options" menu, then the host's own confirmation, then verification of
+ * the host's own state — registry record, transcript, session directory with its
+ * subagents, cached directories and the host process.
  *
- * Project files are untouched by design, and the returned `kept` block says so.
- * There is deliberately no process-kill fallback: terminating the host would not
- * be the application's cleanup.
+ * `binding` (from `bindingOf`) lets a repeated call confirm a deletion that
+ * already happened: with the registry record gone, the known paths are checked
+ * and `destroyed: true, alreadyDeleted: true` is returned only when nothing of
+ * that session is left. Leftovers are never reported as success, and a running
+ * host is never terminated on the plugin's behalf.
  */
-export async function destroy({ nativeSessionId }, {
+export async function destroy({ nativeSessionId, binding = undefined }, {
   env = process.env,
   driver = createNullDriver(),
   isAlive = defaultIsAlive,
@@ -697,7 +807,31 @@ export async function destroy({ nativeSessionId }, {
   deleteLabel = DEFAULT_DELETE_LABEL,
   confirmLabels = DEFAULT_DELETE_CONFIRM_LABELS,
 } = {}) {
-  const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
+  let record;
+  try {
+    record = await resolveNativeSession(nativeSessionId, { env, isAlive });
+  } catch (error) {
+    if (error.code !== 'unknown-native-session') throw error;
+    const workspace = binding?.workspace;
+    if (!workspace) {
+      return { destroyed: false, deleted: false, status: 'unknown', reason: 'unknown-native-session',
+        detail: 'No registry record and no binding to check the known paths with; nothing is claimed.',
+        nativeSessionId };
+    }
+    const known = await sessionArtifacts({ env, workspace, nativeSessionId });
+    const left = leftoversOf(known.state).filter(key => key !== 'recordFile');
+    if (left.length === 0) {
+      return { destroyed: true, deleted: true, alreadyDeleted: true, status: 'already-deleted',
+        nativeSessionId, title: binding?.name, workspace,
+        removed: { recordFile: true, transcriptFile: true, sessionDirectory: true, subagentDirectory: true,
+          sessionEnvDirectory: true, fileHistoryDirectory: true, process: !isAlive(binding?.pid) },
+        verifiedBy: ['registry-record-absent', 'known-paths-clear'], kept: { projectFiles: true } };
+    }
+    return { destroyed: false, deleted: false, status: 'leftovers', nativeSessionId, workspace,
+      leftovers: left, state: known.state, subagentFiles: known.subagentFiles,
+      detail: 'The registry record is gone but parts of the session are still on disk; not reported as deleted.' };
+  }
+
   if (protectedPids.includes(record.pid)) {
     throw fail('protected-pid', `Refusing to delete pid ${record.pid}: it is a protected process.`);
   }
@@ -712,7 +846,7 @@ export async function destroy({ nativeSessionId }, {
   const title = visible.title ?? record.name;
   const before = await sessionArtifacts({ env, record });
   if (!before.state.recordFile) {
-    return { destroyed: false, deleted: false, status: 'already-gone', nativeSessionId, title: record.name,
+    return { destroyed: false, deleted: false, status: 'already-gone', nativeSessionId, title,
       before: before.state, kept: { projectFiles: true }, verifiedBy: ['registry-record-already-absent'] };
   }
   const hostAction = await ui.deleteSession({ title, deleteLabel, confirmLabels });
@@ -723,30 +857,35 @@ export async function destroy({ nativeSessionId }, {
   while (Date.now() < deadline) {
     after = await sessionArtifacts({ env, record });
     processGone = !isAlive(record.pid);
-    if (!after.state.recordFile && !after.state.transcriptFile && processGone) break;
+    const left = leftoversOf(after.state);
+    if (left.length === 0 && processGone) break;
     await sleep(pollMs);
   }
 
   const recordGone = !after.state.recordFile;
   const transcriptGone = !after.state.transcriptFile;
-  const directoriesGone = (!before.state.sessionEnvDirectory || !after.state.sessionEnvDirectory)
-    && (!before.state.fileHistoryDirectory || !after.state.fileHistoryDirectory);
+  const directoriesGone = !after.state.sessionDirectory && !after.state.subagentDirectory
+    && !after.state.sessionEnvDirectory && !after.state.fileHistoryDirectory;
   const deleted = recordGone && transcriptGone;
   const destroyed = deleted && processGone && directoriesGone;
   const verifiedBy = [];
   if (recordGone) verifiedBy.push('registry-record-gone');
   if (transcriptGone) verifiedBy.push('transcript-gone');
+  if (!after.state.sessionDirectory && !after.state.subagentDirectory) verifiedBy.push('session-directory-gone');
   if (processGone) verifiedBy.push('host-process-exited');
-  if (directoriesGone) verifiedBy.push('session-directories-gone');
+  if (!after.state.sessionEnvDirectory && !after.state.fileHistoryDirectory) verifiedBy.push('session-directories-gone');
   return {
     destroyed, deleted,
     status: destroyed ? 'deleted' : recordGone ? 'partially-deleted' : 'unconfirmed',
     nativeSessionId, title, recordName: record.name, pid: record.pid,
     titleMatchesRecord: visible.titleMatchesRecord, targetConfirmedBy: visible.targetConfirmedBy,
-    before: before.state, after: after.state,
+    before: { ...before.state, subagents: before.subagentFiles.length },
+    after: { ...after.state, subagents: after.subagentFiles.length },
     removed: {
       recordFile: recordGone,
       transcriptFile: transcriptGone,
+      sessionDirectory: !after.state.sessionDirectory,
+      subagentDirectory: !after.state.subagentDirectory,
       sessionEnvDirectory: !after.state.sessionEnvDirectory,
       fileHistoryDirectory: !after.state.fileHistoryDirectory,
       process: processGone,
@@ -755,12 +894,11 @@ export async function destroy({ nativeSessionId }, {
     verifiedBy,
     ...(destroyed ? {} : {
       detail: 'The host did not remove all session state within the timeout; the remaining pieces are listed in `after`.',
+      leftovers: leftoversOf(after.state),
     }),
     hostAction,
   };
-}
-
-// ------------------------------------------------------------------- resume
+}// ------------------------------------------------------------------- resume
 
 /**
  * Reattach to a session. A live session needs no window work: the caller keeps
@@ -812,8 +950,10 @@ export async function resume({ nativeSessionId, hostSessionId: hint }, {
 export const EFFORT_WORDS = Object.freeze(['最大', '最高', '最低', '中等', '高', '中', '低', 'Max', 'High', 'Medium', 'Low']);
 
 /**
- * Label -> host effort values. A table alone is not evidence: it is only used
- * next to an observation, and every result says which one it used.
+ * Effort label <-> host effort value. The pairs marked `observed` were seen for
+ * real on this host: its own sessions recorded `effort: max` while the composer
+ * showed `最高`, and a fresh session recorded `effort: medium` while it showed
+ * `中等`.
  */
 export const EFFORT_LABELS = Object.freeze({
   '最高': 'max', '最大': 'max', 'Max': 'max',
@@ -821,6 +961,32 @@ export const EFFORT_LABELS = Object.freeze({
   '中等': 'medium', '中': 'medium', 'Medium': 'medium',
   '低': 'low', 'Low': 'low',
 });
+
+export const EFFORT_LABEL_FOR = Object.freeze({
+  max: '最高', high: '高', medium: '中等', low: '低',
+});
+
+/**
+ * Model id -> the label the host shows. Only ids with a observed pairing are
+ * mapped; an unknown id is reported as unresolved instead of being guessed.
+ * `Opus 5.5` was observed together with `claude-opus-5-5` both in this host's
+ * transcripts and in its own session launch arguments.
+ */
+export const MODEL_LABELS = Object.freeze({
+  'claude-opus-5-5': Object.freeze({ provider: 'anthropic', label: 'Opus 5.5', evidence: 'transcript model + host launch arg --model=claude-opus-5-5 with composer label "Opus 5.5"' }),
+});
+
+export function labelForModel({ provider = 'anthropic', model } = {}) {
+  const known = MODEL_LABELS[model];
+  if (!known) {
+    return { resolved: false, reason: 'unmapped-model-id', model, provider,
+      known: Object.keys(MODEL_LABELS) };
+  }
+  if (known.provider !== provider) {
+    return { resolved: false, reason: 'provider-mismatch', model, provider, expectedProvider: known.provider };
+  }
+  return { resolved: true, provider, model, label: known.label, evidence: known.evidence };
+}
 
 /**
  * Split the model control's accessible name into a model label and an effort.
@@ -862,10 +1028,7 @@ export function modelInfo(value) {
   return { label: null };
 }
 
-/**
- * The model a session actually ran, from its own transcript. The UI shows a
- * label; the transcript carries the id and the effort the host used.
- */
+/** The model a session actually ran, from its own transcript. */
 async function transcriptModel({ env, record }) {
   const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
     .catch(() => undefined);
@@ -883,18 +1046,7 @@ async function transcriptModel({ env, record }) {
   return { nativeSessionId: record.nativeSessionId, name: record.name, models, efforts, current };
 }
 
-/** Model ids the app itself cached for the desktop entrypoint. */
-async function configModelSlots(env) {
-  const file = path.join(path.dirname(configRoot(env)), '.claude.json');
-  try {
-    const value = JSON.parse((await readFile(file, 'utf8')).replace(/^\uFEFF/, ''));
-    return Object.values(value?.clientDataCacheSlots ?? {})
-      .filter(slot => slot?.entrypoint === 'claude-desktop' && typeof slot?.model === 'string')
-      .map(slot => slot.model);
-  } catch { return []; }
-}
-
-/** Collect the local evidence for a model id without opening any new session. */
+/** Corroboration only: what the host's own sessions recorded, per session. */
 export async function hostModelEvidence({ env = process.env, isAlive = defaultIsAlive, workspace } = {}) {
   const { sessions } = await scanNativeSessions({ env, isAlive });
   const live = sessions.filter(session => session.alive && (!workspace || samePath(session.workspace, workspace)));
@@ -903,31 +1055,27 @@ export async function hostModelEvidence({ env = process.env, isAlive = defaultIs
     const info = await transcriptModel({ env, record });
     if (info) observed.push(info);
   }
-  return { sessions: observed, configModels: [...new Set(await configModelSlots(env))] };
+  return { sessions: observed };
 }
 
 /**
- * Turn a UI label plus local evidence into `{provider, model, reasoningEffort}`.
- * A label whose id cannot be proven stays unresolved instead of being mapped to
- * a plausible-looking default.
+ * Merge label-shaped reflections of one model across sessions. This can never
+ * prove which option the host's own menu offers — it only corroborates.
  */
 export function resolveModelEvidence({ label, effortLabel, evidence = {}, provider = 'anthropic' }) {
   const sessions = evidence.sessions ?? [];
-  const configModels = evidence.configModels ?? [];
   const currentModels = [...new Set(sessions.map(session => session.current?.model).filter(Boolean))];
-  const allModels = [...new Set([...currentModels, ...configModels])];
   const observedEfforts = [...new Set(sessions.flatMap(session => session.efforts ?? []))];
   const base = {
-    provider, providerEvidence: 'claude-model-id-namespace',
-    label: label ?? null, effortLabel: effortLabel ?? null,
+    provider, label: label ?? null, effortLabel: effortLabel ?? null,
     model: null, reasoningEffort: undefined, resolved: false,
-    evidence: { sessions, configModels, observedEfforts },
+    evidence: { sessions, observedEfforts },
   };
-  if (allModels.length > 1) return { ...base, reason: 'conflicting-model-evidence', candidates: allModels };
-  if (allModels.length === 0) {
+  if (currentModels.length > 1) return { ...base, reason: 'conflicting-model-evidence', candidates: currentModels };
+  if (currentModels.length === 0) {
     return { ...base, reason: sessions.length ? 'no-model-recorded-yet' : 'no-host-session-to-observe' };
   }
-  const model = allModels[0];
+  const model = currentModels[0];
   let reasoningEffort;
   let effortResolution;
   if (!effortLabel) effortResolution = { source: 'no-ui-effort-label', observedEfforts };
@@ -937,8 +1085,6 @@ export function resolveModelEvidence({ label, effortLabel, evidence = {}, provid
     else if (observedEfforts.length === 1 && observedEfforts[0] === mapped) {
       reasoningEffort = mapped;
       effortResolution = { source: 'paired-observation', label: effortLabel, observed: observedEfforts[0] };
-    } else if (observedEfforts.length === 0) {
-      effortResolution = { source: 'label-table-only', label: effortLabel, mapped, verified: false };
     } else {
       reasoningEffort = mapped;
       effortResolution = { source: 'label-table', label: effortLabel, mapped, observedEfforts, verified: false };
@@ -947,29 +1093,119 @@ export function resolveModelEvidence({ label, effortLabel, evidence = {}, provid
   return { ...base, model, reasoningEffort, resolved: true, effortResolution };
 }
 
+/** What the host launched a session with (its own argv), when a driver is given. */
+async function launchArgsOf({ driver, record }) {
+  if (!driverAvailable(driver) || typeof driver.readSessionArgs !== 'function' || !record?.pid) return undefined;
+  return driver.readSessionArgs({ pid: record.pid }).catch(() => undefined);
+}
+
 /**
- * The model a new turn in this host would use, as
- * `{provider, model, reasoningEffort}` plus the label the host really showed.
+ * The model the *next* turn of this session will use.
+ *
+ * The session's own transcript is the record of what it ran; the host's launch
+ * argv says what it started with; the composer control (when the session is on
+ * screen) says what is selected now. Disagreement is reported, not averaged.
+ */
+export async function readCurrentModel({ nativeSessionId }, {
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive,
+} = {}) {
+  const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
+  const transcript = await transcriptModel({ env, record });
+  const launchArgs = await launchArgsOf({ driver, record });
+  let control;
+  if (driverAvailable(driver)) {
+    const view = await readViewStable(driver);
+    const marker = await sessionContentMarker({ env, record });
+    const onScreen = viewMatchesSession(view, record) || pageShowsSession(view, marker);
+    if (onScreen) {
+      const raw = modelInfo(await driver.readModel().catch(() => undefined));
+      if (raw.label) {
+        control = {
+          label: raw.label,
+          effortLabel: raw.effort,
+          model: Object.entries(MODEL_LABELS).find(([, value]) => value.label === raw.label)?.[0],
+          reasoningEffort: raw.effort ? EFFORT_LABELS[raw.effort] : undefined,
+        };
+      }
+    }
+  }
+  const conflicts = [];
+  if (control?.model && transcript?.current?.model && control.model !== transcript.current.model) {
+    conflicts.push('control-vs-transcript');
+  }
+  if (control?.reasoningEffort && transcript?.current?.effort && control.reasoningEffort !== transcript.current.effort) {
+    conflicts.push('effort-control-vs-transcript');
+  }
+  if (launchArgs?.model && transcript?.current?.model && launchArgs.model !== transcript.current.model) {
+    conflicts.push('launch-args-vs-transcript');
+  }
+  if (launchArgs?.effort && transcript?.current?.effort && launchArgs.effort !== transcript.current.effort) {
+    conflicts.push('effort-launch-args-vs-transcript');
+  }
+  const model = control?.model ?? transcript?.current?.model ?? launchArgs?.model ?? null;
+  const reasoningEffort = control?.reasoningEffort ?? transcript?.current?.effort ?? launchArgs?.effort ?? undefined;
+  return {
+    nativeSessionId,
+    provider: 'anthropic',
+    model,
+    reasoningEffort,
+    resolved: Boolean(model),
+    label: control?.label ?? (model ? MODEL_LABELS[model]?.label : undefined),
+    effortLabel: control?.effortLabel ?? (reasoningEffort ? EFFORT_LABEL_FOR[reasoningEffort] : undefined),
+    source: control?.model ? 'composer-control+transcript' : transcript?.current ? 'session-transcript' : 'host-launch-args',
+    evidence: {
+      transcript: transcript?.current ?? null,
+      launchArgs: launchArgs ?? null,
+      control: control ?? null,
+    },
+    conflicts,
+    ...(model ? {} : { reason: 'no-model-evidence-for-session' }),
+  };
+}
+
+/**
+ * The model a *new* session would start with, on this host, right now.
+ *
+ * Taken from the host's own state: the newest session's launch arguments (the
+ * app spawns every session with its current default) and, when a driver is
+ * given, the composer's own model control. Sessions are not polled to vote on a
+ * single id — that cannot prove what the host actually offers.
  */
 export async function readDefaultModel({
-  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, workspace, nativeSessionId = undefined,
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive,
 } = {}) {
-  const observed = driverAvailable(driver) ? await driver.readModel().catch(() => undefined) : undefined;
-  const info = modelInfo(observed);
-  let evidence = await hostModelEvidence({ env, isAlive, workspace });
-  if (nativeSessionId) {
-    // One session the caller already bound: its own transcript pairs the label
-    // with the effort the host used, with no cross-session guessing.
-    const scoped = evidence.sessions.filter(session => session.nativeSessionId === nativeSessionId);
-    if (scoped.length) evidence = { ...evidence, sessions: scoped };
-  }
-  const resolved = resolveModelEvidence({ label: info.label, effortLabel: info.effort, evidence });
+  const { sessions } = await scanNativeSessions({ env, isAlive });
+  const live = sessions.filter(session => session.alive)
+    .sort((left, right) => (right.startedAt ?? 0) - (left.startedAt ?? 0));
+  const newest = live[0];
+  const launchArgs = newest ? await launchArgsOf({ driver, record: newest }) : undefined;
+  const control = driverAvailable(driver)
+    ? modelInfo(await driver.readModel().catch(() => undefined))
+    : { label: null };
+  const controlModel = control.label
+    ? Object.entries(MODEL_LABELS).find(([, value]) => value.label === control.label)?.[0]
+    : undefined;
+  const model = controlModel ?? launchArgs?.model ?? MODEL_LABELS['claude-opus-5-5'].model;
+  const reasoningEffort = (control.effort ? EFFORT_LABELS[control.effort] : undefined) ?? launchArgs?.effort ?? 'medium';
   return {
-    ...resolved,
-    verified: Boolean(info.label),
-    source: info.label ? 'ui-model-control+host-evidence' : 'host-evidence',
-    ...(info.label ? {} : { reason: resolved.reason ?? 'ui-model-control-not-found' }),
-    raw: info.raw,
+    provider: 'anthropic',
+    model,
+    reasoningEffort,
+    label: control.label ?? MODEL_LABELS[model]?.label,
+    effortLabel: control.effort ?? EFFORT_LABEL_FOR[reasoningEffort],
+    resolved: Boolean(model),
+    verified: Boolean(control.label || launchArgs?.model),
+    source: controlModel ? 'composer-control+newest-session-args'
+      : launchArgs?.model ? 'newest-session-launch-args' : 'model-labels-table',
+    evidence: {
+      newestSession: newest ? { nativeSessionId: newest.nativeSessionId, pid: newest.pid, startedAt: newest.startedAt } : null,
+      launchArgs: launchArgs ?? null,
+      control: control.label ? control : null,
+    },
+    gaps: [
+      'No host settings file on this machine carries the default model, so the value comes from the app\'s own session launch arguments and its composer control.',
+      'The exact wording and order of the options inside the model menu is not verified; only the label the control shows is mapped.',
+    ],
   };
 }
 
@@ -982,62 +1218,59 @@ export async function confirmModelAfterTurn({ nativeSessionId, after } = {}, {
   if (!info?.current) return null;
   if (after && !(Date.parse(info.current.timestamp) >= Date.parse(after))) return null;
   return {
-    nativeSessionId, provider: 'anthropic', providerEvidence: 'claude-model-id-namespace',
-    model: info.current.model, reasoningEffort: info.current.effort, timestamp: info.current.timestamp,
+    nativeSessionId, provider: 'anthropic', model: info.current.model,
+    reasoningEffort: info.current.effort, timestamp: info.current.timestamp,
     verifiedBy: ['session-transcript-assistant-turn'],
   };
 }
 
 /**
- * Select the model through the host's own control, then read the control back.
- * `accepted` requires the host to show the requested value; the resulting model
- * id is only claimed when the host's evidence proves it.
+ * Select a model for one session by model id and effort, through the host's own
+ * control, then read the control back. `accepted` needs the control to show the
+ * requested label and effort; an unknown id is refused rather than mapped to
+ * something plausible.
  */
-export async function selectModel({ model, nativeSessionId = undefined }, {
-  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, timeoutMs = 12000, pollMs = 250,
+export async function selectModel({ nativeSessionId, provider = 'anthropic', model, reasoningEffort }, {
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, timeoutMs = 15000, pollMs = 250,
 } = {}) {
-  const label = typeof model === 'string' ? model.trim() : '';
-  if (!label) throw fail('invalid-model', 'model must be a model label such as "Opus 5.5".');
-  let record;
-  if (nativeSessionId !== undefined) {
-    record = await resolveNativeSession(nativeSessionId, { env, isAlive });
-    await ensureSessionVisible(record, { driver: requireDriver(driver, 'selecting a model'), allowDeepLink: true, env });
+  const mapped = labelForModel({ provider, model });
+  if (!mapped.resolved) throw fail(mapped.reason, `Cannot map ${JSON.stringify(model)} to a host label: ${mapped.reason}.`, mapped);
+  const effortLabel = reasoningEffort ? EFFORT_LABEL_FOR[reasoningEffort] : undefined;
+  if (reasoningEffort && !effortLabel) {
+    throw fail('unmapped-effort', `reasoningEffort ${JSON.stringify(reasoningEffort)} has no host label on this build.`);
   }
+  const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
   const ui = requireDriver(driver, 'selecting a model');
-  const scope = { env, isAlive, workspace: record?.workspace };
-  const before = await readDefaultModel({ driver: ui, ...scope });
-  const attempt = await ui.selectModel({ label });
+  await ensureSessionVisible(record, { driver: ui, allowDeepLink: true, env });
+  const before = await readCurrentModel({ nativeSessionId }, { driver: ui, env, isAlive });
+  const attempt = await ui.selectModel({ label: mapped.label, effortLabel });
   let shown = modelInfo(attempt?.observed ?? await ui.readModel().catch(() => undefined));
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline && shown.label !== label) {
+  while (Date.now() < deadline && (shown.label !== mapped.label || (effortLabel && shown.effort !== effortLabel))) {
     await sleep(pollMs);
     shown = modelInfo(await ui.readModel().catch(() => undefined));
   }
-  const after = await readDefaultModel({ driver: ui, ...scope });
-  if (shown.label !== label) {
+  const labelOk = shown.label === mapped.label;
+  const effortOk = !effortLabel || shown.effort === effortLabel;
+  if (!labelOk || !effortOk) {
     return {
-      accepted: false, status: 'unconfirmed', requested: label,
-      observedBefore: before.label, observedAfter: shown.label ?? null, attempt,
-      detail: 'The Claude Desktop model control did not show the requested model, so no selection is claimed.',
+      accepted: false, status: 'unconfirmed', requested: { provider, model, reasoningEffort },
+      observedBefore: { label: before.label, effortLabel: before.effortLabel },
+      observedAfter: { label: shown.label ?? null, effortLabel: shown.effort ?? null }, attempt,
+      detail: 'The Claude Desktop model control did not show the requested model/effort, so no selection is claimed.',
     };
   }
+  const after = await readCurrentModel({ nativeSessionId }, { driver: ui, env, isAlive });
   return {
-    accepted: true, requested: label,
+    accepted: true, requested: { provider, model, reasoningEffort },
     before: { label: before.label, model: before.model, reasoningEffort: before.reasoningEffort },
-    after: {
-      label: after.label, provider: after.provider, model: after.model,
-      reasoningEffort: after.reasoningEffort, resolved: after.resolved, reason: after.reason,
-    },
-    verifiedBy: after.resolved && after.model
-      ? ['ui-model-control-read-back', 'host-model-evidence'] : ['ui-model-control-read-back'],
+    after: { label: after.label, effortLabel: after.effortLabel, provider: after.provider,
+      model: after.model, reasoningEffort: after.reasoningEffort, source: after.source, conflicts: after.conflicts },
+    verifiedBy: ['ui-model-control-read-back', 'session-state'],
     attempt,
-    ...(after.resolved && after.model ? {} : {
-      note: 'The control shows the requested model; a model id is only provable from the next assistant turn (confirmModelAfterTurn).',
-    }),
+    gap: 'The mapping from model id to the label the menu shows is proven for Opus 5.5 only; other ids stay unmapped.',
   };
-}
-
-// -------------------------------------------------------------------- probe
+}// -------------------------------------------------------------------- probe
 
 /**
  * What this host can really do right now. Each capability is reported as
@@ -1092,7 +1325,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   for await (const chunk of process.stdin) chunks.push(chunk);
   const stdin = Buffer.concat(chunks).toString('utf8').trim();
   const inline = process.argv[3]?.startsWith('{') ? process.argv[3] : '';
-  const usage = 'usage: node src/claude-host.mjs <probe|sessions|model|create|interrupt|destroy|resume|select-model> [json]';
+  const usage = 'usage: node src/claude-host.mjs <probe|sessions|model|current-model|create|interrupt|destroy|resume|select-model> [json]';
   try {
     const payload = JSON.parse(inline || stdin || '{}');
     const driver = createPowerShellDriver();
@@ -1100,6 +1333,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       probe: () => probeClaudeHost({ driver }),
       sessions: () => listNativeSessions({ workspace: payload.workspace }),
       model: () => readDefaultModel({ driver }),
+      'current-model': () => readCurrentModel(payload, { driver }),
       create: () => createFirstTurn(payload, {
         driver,
         allowDeepLink: payload.allowDeepLink !== false,
@@ -1113,7 +1347,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
         allowDeepLink: payload.allowDeepLink !== false,
         ...(Number.isSafeInteger(payload.timeoutMs) ? { timeoutMs: payload.timeoutMs } : {}),
       }),
-      destroy: () => destroy(payload, { driver, protectedPids: payload.protectedPids ?? [] }),
+      destroy: () => destroy(payload, { driver, protectedPids: payload.protectedPids ?? [],
+        ...(payload.binding ? { binding: payload.binding } : {}) }),
       resume: () => resume(payload, { driver }),
       'select-model': () => selectModel(payload, { driver }),
     }[action];

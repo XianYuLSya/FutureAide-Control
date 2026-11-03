@@ -343,24 +343,38 @@ try {
       Invoke-Element $composer | Out-Null
       Start-Sleep -Milliseconds 150
       $typed = $false
+      $expected = 0
       $current = Get-ComposerValue $web.Element
       $empty = ($null -eq $current) -or ($current.Trim().Length -eq 0)
       if ($empty -and $payload.prompt) {
         $previous = ''
         try { $previous = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
-        Set-Clipboard -Value ([string]$payload.prompt)
+        $text = [string]$payload.prompt
+        $expected = $text.Length
+        Set-Clipboard -Value $text
         Send-Keys '^v'
-        Start-Sleep -Milliseconds 300
-        if ($null -ne $previous) { try { Set-Clipboard -Value $previous } catch { } }
         $typed = $true
+        # A long message is pasted whole; wait until the composer really holds it
+        # rather than trusting the paste keystroke.
+        $deadline = (Get-Date).AddSeconds(25)
+        while ((Get-Date) -lt $deadline) {
+          Start-Sleep -Milliseconds 250
+          $value = Get-ComposerValue $web.Element
+          if ($null -ne $value -and $value.Length -ge [int]($expected * 0.95)) { break }
+        }
+        if ($null -ne $previous) { try { Set-Clipboard -Value $previous } catch { } }
       }
       $after = Get-ComposerValue $web.Element
       if ($null -ne $after -and $after.Trim().Length -eq 0) { throw 'composer-still-empty' }
+      $composerLength = $(if ($null -ne $after) { $after.Length } else { 0 })
+      if ($expected -gt 0 -and $composerLength -lt [int]($expected * 0.95)) { throw 'composer-paste-incomplete' }
       Send-Keys '{ENTER}'
       Write-Result @{ ok = $true; value = @{
         method = $(if ($typed) { 'clipboard-type-then-enter' } else { 'enter-on-prefilled-composer' })
         typed = $typed
         composerFound = $true
+        composerLength = $(if ($null -ne $after) { $after.Length } else { 0 })
+        expectedLength = $expected
         pageMessages = $signature.messages
         documentName = $signature.documentName
       } }
@@ -393,10 +407,21 @@ try {
       $options = Find-Elements $web.Element ('^' + (Unescape-Pattern $label)) ''
       if ($options.Count -eq 0) { Send-Keys '{ESC}'; throw "model-option-not-found:$label" }
       Invoke-Element $options[0] | Out-Null
-      Start-Sleep -Milliseconds 400
+      Start-Sleep -Milliseconds 500
+      $effortClicked = $null
+      $effortLabel = [string]$payload.effortLabel
+      if ($effortLabel) {
+        $efforts = Find-Elements $web.Element ('^' + (Unescape-Pattern $effortLabel)) ''
+        if ($efforts.Count -gt 0) {
+          $effortClicked = $efforts[0].Current.Name
+          Invoke-Element $efforts[0] | Out-Null
+          Start-Sleep -Milliseconds 500
+        }
+      }
       $after = Find-Elements $web.Element $modelPattern 'Button'
       Write-Result @{ ok = $true; value = @{
         clicked = $label
+        effortClicked = $effortClicked
         observed = $(if ($after.Count -gt 0) { $after[0].Current.Name } else { $null })
       } }
     }
@@ -435,6 +460,18 @@ try {
       $signature = $null
       try { $signature = Get-PageSignature $window } catch { }
       Write-Result @{ ok = $true; value = @{ clicked = $name; signature = $signature } }
+    }
+    'session-args' {
+      $targetPid = [int]$payload.pid
+      if ($targetPid -le 0) { throw 'pid-required' }
+      $proc = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue
+      if (-not $proc) { Write-Result @{ ok = $true; value = @{ pid = $targetPid; found = $false } }; break }
+      $cmd = [string]$proc.CommandLine
+      $model = $null
+      $effort = $null
+      if ($cmd -match '--model=(\S+)') { $model = $matches[1] }
+      if ($cmd -match '--effort=(\S+)') { $effort = $matches[1] }
+      Write-Result @{ ok = $true; value = @{ pid = $targetPid; found = $true; model = $model; effort = $effort } }
     }
     'menu-dump' {
       $button = Get-SessionMenuButton ([string]$payload.title)
@@ -520,7 +557,8 @@ try {
         $strategy = 'sidebar-folder-new-session'
       } elseif ($payload.allowDeepLink) {
         $query = 'claude://code/new?src=external&folder=' + [uri]::EscapeDataString($workspace)
-        if ($prompt) { $query += '&q=' + [uri]::EscapeDataString($prompt) }
+        $prefillViaLink = $(if ($null -ne $payload.prefill) { [bool]$payload.prefill } else { [bool]$prompt })
+        if ($prefillViaLink -and $prompt) { $query += '&q=' + [uri]::EscapeDataString($prompt) }
         $via = Open-DeepLink $query ([string]$payload.launchVia) $window.Pid $window.Path
         Start-Sleep -Milliseconds 2200
         $strategy = 'deep-link-code-new-' + $via
@@ -561,6 +599,7 @@ try {
         navigated = $navigated
         blocked = $blocked
         prefilled = $false
+        prefillViaLink = $(if ($null -ne $prefillViaLink) { $prefillViaLink } else { $false })
         trustClicked = $(if ($trusted) { $trusted } else { $null })
         before = $before
         after = $after

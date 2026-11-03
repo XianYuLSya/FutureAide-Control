@@ -8,7 +8,8 @@ import http from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { createClaudeReportServer, developmentOwnership, startHttpService, REPORT_TOOL_NAMES } from '../src/claude-report-server.mjs';
+import { createClaudeReportServer, createManagementServer, developmentOwnership, startHttpService,
+  trustedContextOf, REPORT_TOOL_NAMES } from '../src/claude-report-server.mjs';
 
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
 const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', via: 'pid' };
@@ -28,8 +29,8 @@ function ownership({ accept = true, reportError } = {}) {
   return { calls, owned };
 }
 
-async function inMemory(resolveOwned, resolveCaller = async () => caller) {
-  const server = createClaudeReportServer({ resolveCaller, resolveOwned });
+async function inMemory(resolveOwned, resolveCaller = async () => caller, management) {
+  const server = createClaudeReportServer({ resolveCaller, resolveOwned, management });
   const client = new Client({ name: 'protocol-test', version: '1.0.0' });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
   await server.connect(serverSide);
@@ -190,6 +191,82 @@ test('an unbound session is adopted on its first list and gets the tools', async
     assert.equal(adopted, 1, 'adoption runs once, then ownership answers');
     assert.equal(service.stats.adopted, 1);
   } finally { await client.close(); await service.close(); }
+});
+
+// Stands in for the shared scoped registrar: one name-addressed tool, plus the
+// caller/trusted thunks the real registrar uses as its owner key.
+const managementRegistrar = seen => ({ server, caller, trusted }) => {
+  seen.push({ caller, trusted });
+  server.registerTool('futureaide_list_agents', { description: 'List this chat\'s subagents.', inputSchema: {} },
+    async () => ({ content: [{ type: 'text', text: '[]' }] }));
+};
+
+test('an owned session carries the management tools next to its own two', async () => {
+  const seen = [];
+  const owned = { agentId: 'agent-test', agentName: '绘图副手', taskId: 7,
+    async ask() { return { accepted: true }; }, async report() { return { accepted: true }; } };
+  const { client, close } = await inMemory(async () => owned, async () => caller, managementRegistrar(seen));
+  try {
+    const { tools } = await client.listTools();
+    assert.deepEqual(tools.map(tool => tool.name).sort(), ['ask_parent', 'futureaide_list_agents', 'report_parent']);
+    assert.equal(seen.length, 1);
+    assert.deepEqual(await seen[0].caller(), caller);
+    assert.deepEqual(await seen[0].trusted(), { nativeSessionId: sessionId,
+      workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, via: 'pid' });
+    const result = await client.callTool({ name: 'futureaide_list_agents', arguments: {} });
+    assert.equal(result.content[0].text, '[]');
+  } finally { await close(); }
+});
+
+test('a verified session that is not owned gets the management tools and no report surface', async () => {
+  const seen = [];
+  const server = createManagementServer({ management: managementRegistrar(seen), caller });
+  const client = new Client({ name: 'management-test', version: '1.0.0' });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  await client.connect(clientSide);
+  try {
+    const { tools } = await client.listTools();
+    assert.deepEqual(tools.map(tool => tool.name), ['futureaide_list_agents']);
+    const refused = await client.callTool({ name: 'report_parent', arguments: { message: 'x' } })
+      .catch(error => ({ isError: true, thrown: String(error?.message ?? error) }));
+    assert.equal(refused.isError, true, 'a parent session has no report surface');
+    assert.deepEqual(await seen[0].trusted(), { nativeSessionId: sessionId,
+      workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, via: 'pid' });
+    assert.equal(client.getInstructions(), undefined, 'no reporting instructions for a parent session');
+  } finally { await client.close(); await server.close(); }
+});
+
+test('the HTTP service gives a verified parent the management tools and an unknown peer none', async () => {
+  const seen = [];
+  const service = await startHttpService({ port: 0, resolveOwned: async () => null,
+    resolveCaller: async () => caller, management: managementRegistrar(seen) });
+  const stranger = await startHttpService({ port: 0, resolveOwned: async () => null,
+    resolveCaller: async () => { throw Object.assign(new Error('nope'), { code: 'caller-unresolved' }); },
+    management: managementRegistrar([]) });
+  const open = async url => {
+    const client = new Client({ name: 'management-http-test', version: '1.0.0' });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    return client;
+  };
+  try {
+    const parent = await open(service.url);
+    assert.deepEqual((await parent.listTools()).tools.map(tool => tool.name), ['futureaide_list_agents']);
+    await parent.close();
+
+    const unknown = await open(stranger.url);
+    assert.deepEqual((await unknown.listTools()).tools, []);
+    await unknown.close();
+    assert.equal(service.stats.unowned >= 1, true);
+  } finally { await service.close(); await stranger.close(); }
+});
+
+test('the trusted context carries only what the connection proved', () => {
+  assert.deepEqual(trustedContextOf(caller), { nativeSessionId: sessionId,
+    workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, via: 'pid' });
+  assert.equal(trustedContextOf({}), undefined);
+  assert.equal(trustedContextOf({ sessionId }), undefined, 'a workspace is required');
+  assert.ok(!('image' in trustedContextOf(caller)) && !('recordFile' in trustedContextOf(caller)));
 });
 
 test('a second binder on the same port is refused while the first keeps serving', async () => {

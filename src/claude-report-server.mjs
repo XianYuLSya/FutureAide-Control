@@ -79,6 +79,17 @@ const nativeToolUseId = extra => {
 };
 
 /**
+ * The private context a verified Claude caller stands for. It is built only from
+ * what the TCP peer proved (native session id and workspace), never from a tool
+ * argument, and it carries no token. The management tools use it as their owner
+ * key, so one Claude session's roster stays its own.
+ */
+export function trustedContextOf(caller) {
+  if (!caller || typeof caller.sessionId !== 'string' || typeof caller.cwd !== 'string') return undefined;
+  return { nativeSessionId: caller.sessionId, workspace: caller.cwd, pid: caller.pid, via: caller.via };
+}
+
+/**
  * Build the MCP server for one already-identified caller.
  * @param {object} options
  * @param {() => Promise<object>} options.resolveCaller Verified caller; bound by
@@ -89,8 +100,11 @@ const nativeToolUseId = extra => {
  *   bound to an owned agent. Submission methods resolve `{accepted:true,...}` or
  *   throw an Error with a `code`; they are supplied by the shared roster/state
  *   machine and are the only place task state is read.
+ * @param {(input: object) => void} [options.management] Registers the shared
+ *   name-addressed management tools on this same server, called with
+ *   `{ server, caller, trusted }`. The caller is the verified one above.
  */
-export function createClaudeReportServer({ resolveCaller, resolveOwned, instructions = INSTRUCTIONS,
+export function createClaudeReportServer({ resolveCaller, resolveOwned, management, instructions = INSTRUCTIONS,
   version = SERVER_VERSION } = {}) {
   if (typeof resolveCaller !== 'function') throw new TypeError('createClaudeReportServer requires resolveCaller');
   if (typeof resolveOwned !== 'function') throw new TypeError('createClaudeReportServer requires resolveOwned');
@@ -155,6 +169,26 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, instruct
     catch (error) { return errorResult(error); }
   });
 
+  // The same server also carries the shared name-addressed management tools when
+  // the host supplies their registrar, so one Claude session drives DSH, Claude
+  // Desktop and Codex Desktop exactly as a Codex chat does. Reports and questions
+  // stay the owned child's own path and are unaffected by that registration.
+  if (typeof management === 'function') {
+    management({ server, caller: async () => resolveCaller(),
+      trusted: async () => trustedContextOf(await resolveCaller()) });
+  }
+  return server;
+}
+
+/**
+ * The surface for a verified Claude session the plugin does not own. It is a
+ * parent in the reverse direction: it manages names through the same tools a Codex
+ * chat uses, but it cannot ask or report here, because only an owned child does.
+ */
+export function createManagementServer({ management, caller, version = SERVER_VERSION } = {}) {
+  if (typeof management !== 'function') throw new TypeError('createManagementServer requires a management registrar');
+  const server = new McpServer({ name: SERVER_NAME, version });
+  management({ server, caller: async () => caller, trusted: async () => trustedContextOf(caller) });
   return server;
 }
 
@@ -171,7 +205,7 @@ export function createUnavailableReportServer({ version = SERVER_VERSION } = {})
 
 /** Run the stdio transport: one process per Claude Desktop session. */
 export async function runStdioService({ resolveOwned, resolveCaller, instructions, identity = {},
-  adopt, log = () => {} } = {}) {
+  adopt, management, log = () => {} } = {}) {
   const resolve = resolveCaller ?? (() => resolveStdioCaller(identity));
   let server;
   try {
@@ -182,8 +216,11 @@ export async function runStdioService({ resolveOwned, resolveCaller, instruction
       if (outcome?.adopted) owned = await resolveOwned(caller, { tool: 'list' }).catch(() => null);
       else log(`first list left unbound (${outcome?.reason ?? 'unknown'})`);
     }
-    server = owned ? createClaudeReportServer({ resolveOwned, instructions, resolveCaller: async () => caller })
-      : createUnavailableReportServer();
+    server = owned ? createClaudeReportServer({ resolveOwned, instructions, management,
+      resolveCaller: async () => caller })
+      : (typeof management === 'function'
+        ? createManagementServer({ management, caller })
+        : createUnavailableReportServer());
     if (!owned) log('this session is not plugin-owned; the report surface lists no tools');
   } catch (error) {
     server = createUnavailableReportServer();
@@ -220,7 +257,7 @@ async function readBody(req, limitBytes = 1024 * 1024) {
  * request, so one shared process cannot leak another session's identity.
  */
 export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1', resolveOwned,
-  resolveCaller, instructions, identity = {}, adopt, rosterId = undefined, log = () => {} } = {}) {
+  resolveCaller, instructions, identity = {}, adopt, management, rosterId = undefined, log = () => {} } = {}) {
   const startedAt = new Date().toISOString();
   const stats = { requests: 0, owned: 0, unowned: 0, adopted: 0, served: 0 };
   // One identity per TCP connection, dropped when that socket closes.
@@ -301,9 +338,12 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     try { body = await readBody(req); }
     catch (error) { sendJson(res, 400, { error: { code: error.code ?? 'invalid-request', message: error.message } }); return; }
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    // Only a verified caller is a parent here; an unidentified peer gets nothing.
     const mcp = owned
-      ? createClaudeReportServer({ resolveCaller: async () => caller, resolveOwned, instructions })
-      : createUnavailableReportServer();
+      ? createClaudeReportServer({ resolveCaller: async () => caller, resolveOwned, instructions, management })
+      : (caller && typeof management === 'function'
+        ? createManagementServer({ management, caller })
+        : createUnavailableReportServer());
     const close = () => { void transport.close().catch(() => {}); void mcp.close().catch(() => {}); };
     res.once('close', close);
     try {
@@ -358,9 +398,9 @@ export function developmentOwnership(sessions, { log = () => {} } = {}) {
  * (another install is serving it); the caller decides whether that is fatal.
  */
 export async function startReportService({ store, port = DEFAULT_PORT, host = '127.0.0.1',
-  env = process.env, log = () => {} } = {}) {
+  env = process.env, management, log = () => {} } = {}) {
   if (!store) throw new TypeError('startReportService requires the shared RosterStore');
-  return startHttpService({ port, host, log,
+  return startHttpService({ port, host, log, management,
     // The health document names the roster it serves, so a caller can prove the
     // service it reached belongs to its own database.
     rosterId: typeof store.identity === 'function' ? store.identity() : undefined,

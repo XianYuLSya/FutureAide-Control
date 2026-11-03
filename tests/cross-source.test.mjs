@@ -5,7 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { claudeBindingStale, claudeNoticeReceipt, createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
-import { ownerIdFor, ownerIdForSource } from '../src/calling-context.mjs';
+import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
+import { claudeTrustedCaller, registerScopedTools, scopedManagement } from '../src/mcp-server.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const THREAD = '11111111-1111-4111-8111-111111111111';
@@ -74,6 +75,39 @@ test('a Claude notice is settled by its native delivery record, never by trailin
   assert.equal(claudeNoticeReceipt([], 'notice-1'), undefined);
   assert.equal(claudeBindingStale(new Error('claude-session-changed')), true);
   assert.equal(claudeBindingStale(new Error('claude-message-empty')), false, 'a message error is not a stale binding');
+});
+
+test('the shared registration mounts the ten management tools with a trusted caller', async () => {
+  const registered = [];
+  const server = { registerTool: (tool, config, handler) => registered.push({ tool, config, handler }) };
+  const seen = [];
+  const service = { status: async extra => { seen.push(extra); return { ready: true }; } };
+  registerScopedTools(server, { service,
+    extraFor: async () => ({ [TRUSTED_CALLER]: { source: 'claude-desktop', nativeSessionId: 'native-1', workspace } }) });
+  const names = registered.map(item => item.tool);
+  assert.deepEqual(names, ['futureaide_status', 'futureaide_create_agent', 'futureaide_send_agent', 'futureaide_answer_agent',
+    'futureaide_list_agents', 'futureaide_wait_agents', 'futureaide_agent_changes', 'futureaide_inspect_agent',
+    'futureaide_cancel_agent', 'futureaide_delete_agent']);
+  assert.equal(names.includes('ask_parent'), false, 'the report surface keeps its own ask/report tools');
+  const status = registered.find(item => item.tool === 'futureaide_status');
+  const result = await status.handler({}, { _meta: { threadId: THREAD } });
+  assert.equal(result.isError, undefined);
+  assert.equal(seen[0][TRUSTED_CALLER].nativeSessionId, 'native-1', 'the handler got the verified caller, not tool args');
+});
+
+test('the management hook builds the trusted context from the connection', async () => {
+  const registered = [];
+  const server = { registerTool: (tool, _config, handler) => registered.push({ tool, handler }) };
+  const received = [];
+  scopedManagement({ service: { status: async extra => { received.push(extra); return { ready: true }; } } })
+    ({ server, caller: async () => ({ sessionId: 'native-9', cwd: workspace, pid: 42 }), trusted: async () => undefined });
+  assert.equal(registered.length, 10);
+  const status = registered.find(item => item.tool === 'futureaide_status');
+  await status.handler({}, {});
+  assert.equal(received[0][TRUSTED_CALLER].nativeSessionId, 'native-9');
+  assert.equal(received[0][TRUSTED_CALLER].source, 'claude-desktop');
+  await assert.rejects(claudeTrustedCaller({ trusted: async () => ({}), caller: async () => undefined }),
+    error => error.code === 'calling-context-unavailable');
 });
 
 test('a verified Claude owner keeps its host session and binding for cold resume', async () => {

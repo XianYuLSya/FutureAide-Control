@@ -18,6 +18,7 @@
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
+import { scopedManagement } from './mcp-server.mjs';
 import { backgroundBatch, pollSleeping, scanSleeping } from './idle-monitor.mjs';
 import { createDirectoryWatchers, monitorDirectories, MONITOR_LEASE, MONITOR_READY_LEASE } from './shared-monitor.mjs';
 import { closeReportService, ensureReportService, reportPort, rosterIdentity } from './report-endpoint.mjs';
@@ -68,7 +69,8 @@ try {
   // FUTUREAIDE_REPORT_PORT, then the default) so an idle managed session always
   // finds it; DSH work alone does not need it. A service answering for another
   // roster is reported and never reused.
-  const reports = await ensureReportService({ store, port: reportPort(config), log: message => trace(`report: ${message}`) });
+  const reports = await ensureReportService({ store, port: reportPort(config),
+    management: scopedManagement({ service }), log: message => trace(`report: ${message}`) });
   if (reports.ready !== true) {
     trace(`tool service not ready: ${reports.reason?.code ?? 'unknown'} roster=${rosterIdentity(store).slice(0, 12)}`);
     process.stderr.write(`[futureaide-monitor] tool service not ready: ${reports.reason?.code ?? 'unknown'}\n`);

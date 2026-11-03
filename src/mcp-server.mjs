@@ -11,33 +11,44 @@ import { createScopedAgents } from './scoped-agents.mjs';
 import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 import { TRUSTED_CALLER } from './calling-context.mjs';
 
-/** Default installed surface: each request is bound to its native calling chat. */
-export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.7' });
-  let servicePromise;
-  const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
-    const value = scopedFactory(config);
-    await value.resume?.();
-    await value.ensureIdleMonitor?.();
-    const monitorHealth = setInterval(() => { void value.ensureIdleMonitor?.().catch(() => {}); }, 30000);
-    monitorHealth.unref();
-    return value;
-  });
-  const name = z.string().min(1).max(80).describe('Subagent name in this Codex chat. Names in other chats are unrelated.');
-  const message = z.string().min(1).max(100000).describe('Task, update, or answer text. Pass it directly; do not create a communication file.');
-  const register = (tool, description, inputSchema, action, readOnly = false, destructive = false) => server.registerTool(tool, {
+const name = z.string().min(1).max(80).describe('Subagent name in this Codex chat. Names in other chats are unrelated.');
+const message = z.string().min(1).max(100000).describe('Task, update, or answer text. Pass it directly; do not create a communication file.');
+
+/**
+ * Wrap one tool registration: resolve the service, hand the handler a trusted
+ * caller context, and keep the existing result/error shape on every surface.
+ * @param {object} server MCP server to register on.
+ * @param {{service: Function|object, extraFor?: Function, diagnostics?: object}} options
+ */
+function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics } = {}) {
+  const resolve = typeof service === 'function' ? service : async () => service;
+  return (tool, description, inputSchema, action, readOnly = false, destructive = false) => server.registerTool(tool, {
     description, inputSchema,
     annotations: { readOnlyHint: readOnly, destructiveHint: destructive, idempotentHint: readOnly, openWorldHint: !readOnly },
   }, async (args, extra) => {
     const finished = diagnostics?.tool(tool, extra);
     try {
-      const result = await action(await service(), args, extra);
+      const trusted = (await extraFor(extra)) ?? extra;
+      const result = await action(await resolve(), args, trusted);
       return { content: [{ type: 'text', text: boundedOutput(result) }],
         ...(result?.error || result?.ready === false || result?.created === false || result?.deleted === false ? { isError: true } : {}) };
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
     } finally { finished?.(); }
   });
+}
+
+/**
+ * The ten name-addressed management tools, registered on any MCP server that has a
+ * service and can supply a trusted caller context: the stdio server for this chat and
+ * the loopback report service for a verified Claude caller. The Codex-side
+ * ask_parent/report_parent are registered by the stdio server alone, so a surface that
+ * provides its own never sees a duplicate name.
+ * @param {object} server MCP server to register on.
+ * @param {{service: Function|object, extraFor?: Function, diagnostics?: object}} options
+ */
+export function registerScopedTools(server, options = {}) {
+  const register = toolRegistrar(server, options);
   register('futureaide_status', 'Check this chat context, the local DSH connection, and per-target readiness in backends (dsh, claude-desktop). The plugin obtains chat and project automatically. A target reports ready:false with a reason when its adapter is missing or its protocols are unfinished; that is not a fallback and no model turn or session is started to find out.', {}, (s, _a, e) => s.status(e), true);
   register('futureaide_create_agent', 'Create a named subagent in the current project, without running a model. target picks the application that runs it, once, at creation: dsh (the default) or claude-desktop; every later call addresses the subagent by name only. A target whose adapter is not installed is refused instead of substituting DSH. once removes session data after an explicitly submitted final report is delivered and the tree settles; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
     name, lifetime: z.enum(['once', 'persistent']),
@@ -57,6 +68,23 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), true);
   register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
   register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing the managed session data of the target it runs on (DSH or Claude Desktop) and the private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  return server;
+}
+
+/** Default installed surface: each request is bound to its native calling chat. */
+export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.7' });
+  let servicePromise;
+  const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
+    const value = scopedFactory(config);
+    await value.resume?.();
+    await value.ensureIdleMonitor?.();
+    const monitorHealth = setInterval(() => { void value.ensureIdleMonitor?.().catch(() => {}); }, 30000);
+    monitorHealth.unref();
+    return value;
+  });
+  registerScopedTools(server, { service, diagnostics });
+  const register = toolRegistrar(server, { service, diagnostics });
   // Codex Desktop side of a cross-application call: the child chat asks or reports
   // to the name that owns it. The caller is its own chat metadata, never a tool
   // argument, so no chat id can be supplied by a model.
@@ -69,6 +97,37 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
   // Restore the shared listener on connection even before the first tool call.
   void service().catch(() => {});
   return server;
+}
+
+/**
+ * The trusted caller context a verified Claude session becomes. The report surface
+ * resolves the TCP peer itself and hands the answer here through its hook; nothing
+ * in it ever comes from a tool argument.
+ */
+export async function claudeTrustedCaller({ trusted, caller, extra } = {}) {
+  const value = (typeof trusted === 'function' ? await trusted(extra) : undefined)
+    ?? (typeof caller === 'function' ? await caller(extra) : undefined);
+  const nativeSessionId = value?.nativeSessionId ?? value?.sessionId ?? value?.session;
+  const workspace = value?.workspace ?? value?.cwd;
+  if (typeof nativeSessionId !== 'string' || !nativeSessionId || typeof workspace !== 'string' || !workspace) {
+    throw Object.assign(new Error('The calling Claude session could not be verified.'),
+      { code: 'calling-context-unavailable' });
+  }
+  return { source: 'claude-desktop', nativeSessionId, workspace,
+    ...(value.pid ? { pid: value.pid } : {}), ...(value.label ? { label: value.label } : {}) };
+}
+
+/**
+ * Hook the loopback report service calls to mount the management tools on its own
+ * MCP server: same names, schemas and errors as the chat surface, with the caller
+ * taken from the verified connection. It adds no service, database or process.
+ * @param {{service: object}} options The monitor's existing service instance.
+ */
+export function scopedManagement({ service } = {}) {
+  return ({ server, caller, trusted } = {}) => registerScopedTools(server, {
+    service,
+    extraFor: async extra => ({ [TRUSTED_CALLER]: await claudeTrustedCaller({ trusted, caller, extra }) }),
+  });
 }
 
 /**

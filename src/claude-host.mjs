@@ -417,6 +417,9 @@ export function createNullDriver(reason = 'ui-driver-unavailable') {
     submit: refuse,
     interrupt: refuse,
     revealSession: refuse,
+    tasksPanel: refuse,
+    taskRows: refuse,
+    taskStop: refuse,
     sessionMenu: refuse,
     deleteSession: refuse,
     readModel: refuse,
@@ -513,6 +516,13 @@ export function createPowerShellDriver({
     async interrupt() { return run('interrupt'); },
     async revealSession({ hostSessionId, title, allowDeepLink = true, launchVia = 'protocol' }) {
       return run('reveal', { hostSessionId, title, allowDeepLink, launchVia });
+    },
+    async tasksPanel({ title, mode = 'open' } = {}) {
+      return run('tasks-panel', { title, mode }, { timeoutMs: Math.max(timeoutMs, 60000) });
+    },
+    async taskRows() { return run('tasks-rows'); },
+    async taskStop({ match = '', index = undefined } = {}) {
+      return run('task-stop', { match, index }, { timeoutMs: Math.max(timeoutMs, 60000) });
     },
     async sessionMenu({ title }) { return run('menu-dump', { title }); },
     async deleteSession({ title, deleteLabel = DEFAULT_DELETE_LABEL, confirmLabels = DEFAULT_DELETE_CONFIRM_LABELS }) {
@@ -881,6 +891,17 @@ export async function interrupt({ nativeSessionId }, {
   const afterwards = await resolveNativeSession(nativeSessionId, { env, isAlive }).catch(() => record);
   const idle = press?.stopButtonFound === false && String(afterwards?.status ?? '').toLowerCase() === 'idle';
   if (idle) {
+    // The turn can already have ended because the stop landed between the press
+    // and this read. The record is written a moment after the press, so one short
+    // settle and a second read is what tells the two cases apart.
+    await sleep(Math.max(pollMs, 250));
+    const settled = await readTranscriptEvents(file);
+    const landed = interruptEvidence(settled.events, since);
+    if (landed) {
+      return { interrupted: true, cancelled: true, status: 'already-stopped', nativeSessionId,
+        method: press?.method, verifiedBy: ['transcript-interrupt-marker', 'host-stop-control-absent'],
+        evidence: landed, revealed: visible.revealed, scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
+    }
     return { interrupted: false, cancelled: true, status: 'idle-no-turn', reason: 'no-running-turn',
       nativeSessionId, method: press?.method,
       verifiedBy: ['host-stop-control-absent', 'registry-idle'], revealed: visible.revealed,
@@ -889,7 +910,99 @@ export async function interrupt({ nativeSessionId }, {
   return { interrupted: false, cancelled: false, status: 'unconfirmed', reason: 'interrupt-marker-not-written',
     nativeSessionId, method: press?.method, revealed: visible.revealed,
     evidence: { since, transcriptFile: file, stopButtonFound: press?.stopButtonFound } };
-}// ------------------------------------------------------------------ destroy
+}// ------------------------------------------------- background tasks (children)
+
+/** The one control a task row offers, and the states it moves through. */
+export const STOP_BUTTON_NAME = /^(停止此任务|Stop this task)$/i;
+export const STOP_BUSY_NAME = /(正在停止|Stopping)/i;
+export const STOP_DONE_NAME = /(已停止|Stopped)/i;
+export const TASKS_PANEL_NAME = /(后台任务|background tasks)/i;
+/** Stopping together with archiving is a different action and is never clicked. */
+export const STOP_ARCHIVE_NAME = /(停止任务并归档|停止全部|Stop task and archive|Stop tasks and archive)/i;
+
+function runningTaskRows(rows = [], targets) {
+  const wanted = Array.isArray(targets) && targets.length
+    ? targets.map(value => String(value).toLowerCase())
+    : undefined;
+  // A row that is already stopping or already stopped is not running, whether the
+  // bridge flags it or its own text says so.
+  return rows
+    .filter(row => row && row.enabled !== false && !row.busy && !row.done)
+    .filter(row => !STOP_BUSY_NAME.test(String(row.rowText ?? '')) && !STOP_DONE_NAME.test(String(row.rowText ?? '')))
+    .filter(row => !wanted || wanted.some(value => `${row.rowText ?? ''} ${row.rowName ?? ''}`.toLowerCase().includes(value)));
+}
+
+/**
+ * Stop the background tasks of one managed session through the host's own panel.
+ *
+ * The panel is a snapshot: it does not refresh itself, so it is closed and
+ * reopened between rounds to see tasks that started meanwhile. Each task row has
+ * one stop control whose accessible name is the same for every row, so a row is
+ * addressed by its own text plus its position, and a batch is never resolved by
+ * clicking the first match. Stopping a child does not finish the tree: the root
+ * still has to be interrupted afterwards, which is stated in the result.
+ */
+export async function stopBackgroundTasks({ nativeSessionId, targets = undefined, rounds = 3 } = {}, {
+  driver = createNullDriver(),
+  env = process.env,
+  isAlive = defaultIsAlive,
+  allowDeepLink = true,
+} = {}) {
+  const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
+  if (!record.alive) {
+    return { nativeSessionId, pid: record.pid, stopped: [], status: 'not-running', reason: 'session-process-gone',
+      rootInterruptRequired: false, verifiedBy: ['host-process-exited'] };
+  }
+  const ui = requireDriver(driver, 'stopping background tasks');
+  const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink, env });
+  const title = visible.title || record.name;
+  const panel = await ui.tasksPanel({ title, mode: 'open' });
+  let rows = Array.isArray(panel?.rows) ? panel.rows : [];
+  const stopped = [];
+  let panelOpened = 1;
+  for (let round = 0; round < Math.max(1, rounds); round += 1) {
+    const running = runningTaskRows(rows, targets);
+    if (!running.length) break;
+    const row = running[0];
+    const attempt = await ui.taskStop({ match: row.rowText, index: row.index })
+      .catch(error => ({ clicked: false, code: error.code, message: error.message }));
+    stopped.push({
+      index: row.index,
+      rowText: row.rowText,
+      rowName: row.rowName,
+      clicked: Boolean(attempt?.clicked),
+      busySeen: Boolean(attempt?.busySeen),
+      doneSeen: Boolean(attempt?.doneSeen),
+      state: attempt?.doneSeen ? 'stopped' : (attempt?.busySeen ? 'stopping' : 'requested'),
+      at: attempt?.at,
+      ...(attempt?.clicked ? {} : { error: { code: attempt?.code ?? 'task-stop-refused', message: attempt?.message } }),
+    });
+    // refresh: the panel only shows tasks that exist when it is opened
+    const again = await ui.tasksPanel({ title, mode: 'refresh' })
+      .catch(() => ({ rows }));
+    rows = Array.isArray(again?.rows) ? again.rows : rows;
+    panelOpened += 1;
+  }
+  const remaining = runningTaskRows(rows, targets);
+  const archiveOnly = remaining.length > 0 && remaining.every(row => STOP_ARCHIVE_NAME.test(String(row.rowText ?? '')));
+  return {
+    nativeSessionId,
+    pid: record.pid,
+    scope: 'session-background-tasks',
+    panel: { opened: Boolean(panel?.opened), entry: panel?.entry, openedTimes: panelOpened },
+    rows: (rows ?? []).map(row => ({ index: row.index, rowText: row.rowText, busy: row.busy, done: row.done,
+      depth: row.depth ?? null })),
+    nestedDetected: (rows ?? []).some(row => Number(row.depth ?? 0) > 0),
+    stopped,
+    remaining: remaining.map(row => ({ index: row.index, rowText: row.rowText })),
+    ...(archiveOnly ? { archiveOnly: true, stoppedNothing: true } : {}),
+    rootInterruptRequired: true,
+    verifiedBy: ['panel-stop-button'],
+    ...INTERRUPT_SCOPE_NOTE,
+  };
+}
+
+// ------------------------------------------------------------------ destroy
 
 /**
  * Everything the host keeps for one session, so a deletion can be verified:
@@ -1874,7 +1987,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   for await (const chunk of process.stdin) chunks.push(chunk);
   const stdin = Buffer.concat(chunks).toString('utf8').trim();
   const inline = process.argv[3]?.startsWith('{') ? process.argv[3] : '';
-  const usage = 'usage: node src/claude-host.mjs <probe|sessions|model|current-model|create|interrupt|destroy|resume|select-model> [json]';
+  const usage = 'usage: node src/claude-host.mjs <probe|sessions|model|current-model|create|interrupt|stop-tasks|destroy|resume|select-model> [json]';
   try {
     const payload = JSON.parse(inline || stdin || '{}');
     const driver = createPowerShellDriver();
@@ -1900,6 +2013,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
       destroy: () => destroy(payload, { driver, protectedPids: payload.protectedPids ?? [],
         ...(payload.binding ? { binding: payload.binding } : {}) }),
       resume: () => resume(payload, { driver }),
+      'stop-tasks': () => stopBackgroundTasks(payload, { driver }),
       'select-model': () => selectModel(payload, { driver }),
     }[action];
     if (!handler) {

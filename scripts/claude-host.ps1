@@ -278,6 +278,78 @@ function Get-ComposerValue($root) {
   } catch { return $null }
 }
 
+function ZH([int[]]$codes) {
+  return (-join ($codes | ForEach-Object { [char]$_ }))
+}
+
+function Get-StopButtonPattern {
+  return ('^(' + (ZH @(0x505C, 0x6B62, 0x6B64, 0x4EFB, 0x52A1)) + '|Stop this task)$')
+}
+
+function Get-StopBusyPattern {
+  return ('(' + (ZH @(0x6B63, 0x5728, 0x505C, 0x6B62)) + '|Stopping)')
+}
+
+function Get-StopDonePattern {
+  return ('(' + (ZH @(0x5DF2, 0x505C, 0x6B62)) + '|Stopped)')
+}
+
+function Get-TasksPanelPattern {
+  return ('(' + (ZH @(0x540E, 0x53F0, 0x4EFB, 0x52A1)) + '|background tasks)')
+}
+
+# Every background task row carries one stop button whose accessible name is the
+# same for all rows, so a row is identified by its own text, never by position.
+function Get-TaskRows {
+  $stopPattern = Get-StopButtonPattern
+  $busyPattern = Get-StopBusyPattern
+  $donePattern = Get-StopDonePattern
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $rows = @()
+  $index = 0
+  foreach ($button in @(Find-Elements $web.Element $stopPattern 'Button')) {
+    $rowElement = $null
+    try { $rowElement = $walker.GetParent($button) } catch { }
+    $depth = 0
+    while ($null -ne $rowElement -and $depth -lt 6 -and
+      $rowElement.Current.ControlType -ne [System.Windows.Automation.ControlType]::ListItem -and
+      $rowElement.Current.ControlType -ne [System.Windows.Automation.ControlType]::DataItem -and
+      $rowElement.Current.ControlType -ne [System.Windows.Automation.ControlType]::Group) {
+      $rowElement = $walker.GetParent($rowElement)
+      $depth += 1
+    }
+    $texts = @()
+    if ($null -ne $rowElement) {
+      if ($rowElement.Current.Name) { $texts += $rowElement.Current.Name }
+      foreach ($node in $rowElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, (Get-Condition))) {
+        $name = $node.Current.Name
+        if ($name -and $name -notmatch $stopPattern) { $texts += $name }
+      }
+    }
+    $rowText = ((@($texts | Select-Object -Unique)) -join ' | ')
+    $rows += [pscustomobject]@{
+      index = $index
+      buttonName = $button.Current.Name
+      rowName = $(if ($null -ne $rowElement) { $rowElement.Current.Name } else { '' })
+      rowText = $rowText
+      depth = $depth
+      busy = ($rowText -match $busyPattern)
+      done = ($rowText -match $donePattern)
+      enabled = $button.Current.IsEnabled
+      Button = $button
+    }
+    $index += 1
+  }
+  return $rows
+}
+
+function Get-TaskRowSummary($rows) {
+  return @($rows | ForEach-Object {
+    @{ index = $_.index; buttonName = $_.buttonName; rowName = $_.rowName; rowText = $_.rowText
+       depth = $_.depth; busy = $_.busy; done = $_.done; enabled = $_.enabled }
+  })
+}
+
 function Get-SessionMenuButton([string]$title) {
   if (-not $title) { throw 'session-title-required' }
   $pattern = '^' + (Unescape-Pattern $title) + '\s*' + [char]0x7684 + [char]0x66F4 + [char]0x591A + [char]0x9009 + [char]0x9879 + '$'
@@ -596,6 +668,95 @@ try {
       Send-Keys '{ESC}'
       Start-Sleep -Milliseconds 200
       Write-Result @{ ok = $true; value = @{ opened = ($items.Count -gt 0); menuButtons = $button.Count; items = $names } }
+    }
+    'tasks-panel' {
+      # The panel is a snapshot: it does not refresh itself, so a task that starts
+      # later only shows up after it is closed and opened again.
+      $title = [string]$payload.title
+      $mode = [string]$payload.mode
+      $attempts = @()
+      if ($mode -eq 'close') {
+        Send-Keys '{ESC}'
+        Start-Sleep -Milliseconds 350
+        Write-Result @{ ok = $true; value = @{ opened = $false; mode = 'close'; rows = @() } }
+        break
+      }
+      if ($mode -eq 'refresh') {
+        Send-Keys '{ESC}'
+        Start-Sleep -Milliseconds 400
+      }
+      $menu = Get-SessionMenuButton $title
+      Focus-Window $window.Element
+      $menuClick = Invoke-ElementByMouse $menu.Element
+      $attempts += ('menu:' + $(if ($menuClick.clicked) { $menuClick.method } else { $menuClick.reason }))
+      Start-Sleep -Milliseconds 800
+      $panelPattern = Get-TasksPanelPattern
+      $entries = @(Get-MenuItems $window.Element | Where-Object { $_.Current.Name -match $panelPattern })
+      if ($entries.Count -eq 0) {
+        $names = @(Get-MenuItems $window.Element | ForEach-Object { $_.Current.Name })
+        Send-Keys '{ESC}'
+        Write-Result @{ ok = $false; code = 'tasks-panel-entry-not-found'
+          message = 'the session menu has no background tasks entry'
+          value = @{ attempts = $attempts; menuItems = $names } }
+        break
+      }
+      $entry = $entries[0]
+      $entryClick = Invoke-Element $entry
+      $attempts += ('entry:' + $entryClick)
+      Start-Sleep -Milliseconds 1000
+      $rows = @(Get-TaskRows)
+      Write-Result @{ ok = $true; value = @{ opened = $true; mode = $(if ($mode) { $mode } else { 'open' })
+        entry = $entry.Current.Name; attempts = $attempts; rows = (Get-TaskRowSummary $rows) } }
+    }
+    'tasks-rows' {
+      $rows = @(Get-TaskRows)
+      Write-Result @{ ok = $true; value = @{ rows = (Get-TaskRowSummary $rows); count = $rows.Count } }
+    }
+    'task-stop' {
+      # One row, chosen by its own text; a name shared by several rows is refused
+      # rather than clicking the first one.
+      $match = [string]$payload.match
+      $index = $payload.index
+      $rows = @(Get-TaskRows)
+      $candidates = @($rows | Where-Object { -not $_.busy -and -not $_.done -and $_.enabled })
+      if ($null -ne $index) { $candidates = @($candidates | Where-Object { $_.index -eq [int]$index }) }
+      if ($match) {
+        $needle = $match.ToLowerInvariant()
+        $candidates = @($candidates | Where-Object { (($_.rowText + ' ' + $_.rowName).ToLowerInvariant()).Contains($needle) })
+      }
+      if ($candidates.Count -eq 0) {
+        Write-Result @{ ok = $false; code = 'task-not-found'; message = ('no running row matches ' + $match)
+          value = @{ rows = (Get-TaskRowSummary $rows) } }
+        break
+      }
+      if ($candidates.Count -gt 1 -and -not $match) {
+        Write-Result @{ ok = $false; code = 'task-ambiguous'; message = 'several running rows and no text match'
+          value = @{ rows = (Get-TaskRowSummary $rows) } }
+        break
+      }
+      $row = $candidates[0]
+      $before = $row.rowText
+      $click = Invoke-ElementByMouse $row.Button
+      $busySeen = $false
+      $doneSeen = $false
+      $after = $before
+      if ($click.clicked) {
+        for ($step = 0; $step -lt 15; $step++) {
+          Start-Sleep -Milliseconds 400
+          $now = @(Get-TaskRows | Where-Object { $_.index -eq $row.index })
+          if ($now.Count -eq 0) { break }
+          $after = $now[0].rowText
+          if ($now[0].busy) { $busySeen = $true }
+          if ($now[0].done) { $doneSeen = $true }
+          if ($doneSeen) { break }
+        }
+      }
+      Write-Result @{ ok = [bool]$click.clicked
+        code = $(if ($click.clicked) { $null } else { 'task-stop-click-unavailable' })
+        message = $(if ($click.clicked) { $null } else { [string]$click.reason })
+        value = @{ index = $row.index; buttonName = $row.buttonName; rowName = $row.rowName
+          before = $before; after = $after; busySeen = $busySeen; doneSeen = $doneSeen
+          method = $click.method; at = (Get-Date).ToUniversalTime().ToString('o') } }
     }
     'session-delete' {
       $title = [string]$payload.title

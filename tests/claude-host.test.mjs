@@ -12,7 +12,7 @@ import {
   createNullDriver, createFirstTurn, interrupt, destroy, resume, readDefaultModel, selectModel,
   probeClaudeHost, parseModelControl, modelInfo, resolveModelEvidence, confirmModelAfterTurn, sessionArtifacts,
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
-  INTERRUPT_MARKER_TOOL, INTERRUPT_MARKERS, INTERRUPT_SCOPE,
+  INTERRUPT_MARKER_TOOL, INTERRUPT_MARKERS, INTERRUPT_SCOPE, stopBackgroundTasks, STOP_ARCHIVE_NAME,
   MODEL_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
   loadModelCatalog, BUILT_IN_MODEL_CATALOG, extractModelSelectorConfigs, sliceBalancedArray,
   extractEmbeddedCatalog, readQuotedLiteral, firstTurnBinding, readTranscriptHead, firstInputOf,
@@ -105,6 +105,9 @@ function uiDriver(behaviour = {}) {
     async deleteSession(input) { calls.push(['deleteSession', input]); return behaviour.deleteSession?.(input) ?? { clicked: '删除会话', confirmed: '删除' }; },
     async readModel() { calls.push('readModel'); return behaviour.readModel?.() ?? { raw: '模型：Opus 5.5 最高 3.5× 或更多用量' }; },
     async selectModel(input) { calls.push(['selectModel', input]); return behaviour.selectModel?.(input) ?? { clicked: input.label, observed: input.label }; },
+    async tasksPanel(input) { calls.push(['tasksPanel', input]); return behaviour.tasksPanel?.(input) ?? { opened: true, entry: 'tasks', rows: [] }; },
+    async taskRows() { calls.push('taskRows'); return { rows: behaviour.rows ?? [] }; },
+    async taskStop(input) { calls.push(['taskStop', input]); return behaviour.taskStop?.(input) ?? { clicked: true, busySeen: true, doneSeen: true }; },
   };
   return driver;
 }
@@ -1126,5 +1129,91 @@ test('a marker twice inside the first input is not a clean ownership proof', asy
     const found = await findCreatedSession({ workspace: CWD, requestId: 'request-twice', bindingNonce: 'fa-twice-20261104' },
       { env: host1.env, isAlive: host1.isAlive });
     assert.equal(found, undefined);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+
+// ------------------------------------------- background task stop (children)
+
+const taskRow = (index, text, extra = {}) => ({ index, rowText: text, rowName: text, depth: 0,
+  busy: false, done: false, enabled: true, buttonName: 'Stop this task', ...extra });
+
+test('the panel is reopened between stops and only running rows are stopped', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  // the panel shows a finished task first; a second task only appears after a refresh
+  const panels = [
+    { opened: true, entry: '后台任务', rows: [taskRow(0, 'already done 已停止', { done: true }), taskRow(1, 'Leaf stop proof 1829')] },
+    { opened: true, entry: '后台任务', rows: [taskRow(0, 'already done 已停止', { done: true }), taskRow(1, 'Leaf stop proof 1829 正在停止')] },
+    { opened: true, entry: '后台任务', rows: [taskRow(0, 'already done 已停止', { done: true })] },
+  ];
+  let opened = 0;
+  const driver = uiDriver({
+    tasksPanel: () => panels[Math.min(opened++, panels.length - 1)],
+    taskStop: input => ({ clicked: true, busySeen: true, doneSeen: true, at: '2026-11-03T18:32:31.522Z',
+      after: input.match + ' 已停止' }),
+  });
+  try {
+    const result = await stopBackgroundTasks({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive });
+    assert.equal(result.scope, 'session-background-tasks');
+    assert.equal(result.rootInterruptRequired, true);
+    assert.deepEqual(result.stopped.map(entry => entry.index), [1], 'the finished row is never clicked');
+    assert.equal(result.stopped[0].state, 'stopped');
+    assert.equal(result.stopped[0].at, '2026-11-03T18:32:31.522Z');
+    assert.deepEqual(result.remaining, []);
+    assert.ok(result.panel.openedTimes >= 2, 'the panel is reopened to see what is left');
+    const stops = driver.calls.filter(call => Array.isArray(call) && call[0] === 'taskStop');
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0][1].match, 'Leaf stop proof 1829', 'a row is addressed by its own text');
+    assert.equal(stops[0][1].index, 1, 'and by position, never by first match');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a target that is not on screen is not invented and the result says so', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({
+    tasksPanel: () => ({ opened: true, rows: [taskRow(0, 'Leaf stop proof 1829')] }),
+  });
+  try {
+    const result = await stopBackgroundTasks({ nativeSessionId: SESSION, targets: ['some other task'] },
+      { env: host1.env, driver, isAlive: host1.isAlive });
+    assert.deepEqual(result.stopped, []);
+    assert.deepEqual(result.remaining, [], 'nothing matched, so nothing is left to stop');
+    assert.equal(driver.calls.some(call => Array.isArray(call) && call[0] === 'taskStop'), false,
+      'no click happens for a task the panel never showed');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('nested rows are reported instead of being claimed as listed', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const flat = uiDriver({ tasksPanel: () => ({ opened: true, rows: [taskRow(0, 'Leaf stop proof 1829')] }) });
+  const nested = uiDriver({ tasksPanel: () => ({ opened: true, rows: [
+    taskRow(0, 'Leaf stop proof 1829'),
+    { ...taskRow(1, 'grandchild work'), depth: 2 }] }) });
+  try {
+    const flatResult = await stopBackgroundTasks({ nativeSessionId: SESSION, targets: ['missing'] },
+      { env: host1.env, driver: flat, isAlive: host1.isAlive });
+    assert.equal(flatResult.nestedDetected, false);
+    const nestedResult = await stopBackgroundTasks({ nativeSessionId: SESSION, targets: ['missing'] },
+      { env: host1.env, driver: nested, isAlive: host1.isAlive });
+    assert.equal(nestedResult.nestedDetected, true, 'indentation is what proves a nested row is visible');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a stop that landed while the host went idle is an interrupt with evidence', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({
+    interrupt: async () => {
+      // the record lands just after the caller gave up polling
+      setTimeout(() => { host1.append(SESSION, [userLine(INTERRUPT_MARKER)]).catch(() => {}); }, 120);
+      return { method: 'stop-button', stopButtonFound: false };
+    },
+  });
+  try {
+    // the registry read after the press says idle, which used to end as a no-op
+    const result = await interrupt({ nativeSessionId: SESSION },
+      { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 60, pollMs: 20 });
+    assert.equal(result.interrupted, true);
+    assert.equal(result.status, 'already-stopped');
+    assert.deepEqual(result.verifiedBy, ['transcript-interrupt-marker', 'host-stop-control-absent']);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

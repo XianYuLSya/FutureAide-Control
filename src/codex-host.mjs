@@ -79,7 +79,8 @@ export async function readDefaultModel({ home, workspace, python, readEffectiveC
     });
     child.stdin.end(JSON.stringify({ home, workspace }));
   });
-  if (!value?.model) throw fail('codex-default-model-unresolved', 'Codex has no explicitly resolved default model; an effective-config reader is required.');
+  if (!value?.model || typeof value.reasoningEffort !== 'string') throw fail('codex-default-model-unresolved',
+    'Codex model and reasoning defaults must both be resolved; an effective-config reader is required when either is implicit.');
   return { ...value, verified: true, resolved: true };
 }
 

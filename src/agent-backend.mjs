@@ -2,9 +2,41 @@
 // target application executes the work. DSH delegates to the existing managed
 // bridge unchanged; Claude Desktop is supplied by its own adapter. A missing
 // adapter is reported as backend-not-ready and is never replaced by the DSH path.
+//
+// Contract (one instance per recorded name; every method async; failures throw an
+// Error with a `code`, they never return a stand-in value):
+//   probe()            {identity, methods, treeProtocol, reportProtocol}
+//   create()           {sessionId, modelRequestsStarted: 0, model?} — reserve a
+//                      logical session with zero model turns; a native session may
+//                      be established by the first deliver and mapped internally.
+//   beginTask(input)   {treeProtocol: 1, reportProtocol: 1, throughSeq?, currentModel?}
+//   observe()          {sessionId, taskId, running, throughSeq, currentModel,
+//                      changes, coverage, questions[{id,state,message}],
+//                      reports[{id,taskId,message,final}], tree{settled,running,nodes}}
+//                      Questions and reports carry the target's stable ids; the
+//                      shared layer owns delivery, backoff and cleanup thresholds.
+//   history(input)     {messages, hasMore, note?, failure?} — already normalized,
+//                      at most maxMessages; the target's own event format never
+//                      leaves the adapter.
+//   answer(input)      {consumedQuestionIds, continuation?} — empty ids is an error.
+//   deliver(input)     {accepted, status, afterSeq?} — one idempotent request;
+//                      acceptance is not model completion.
+//   receipt(input)     {status, afterSeq?, result?} | undefined — undefined means
+//                      no write was ever attempted, never "no native marker found".
+//   turn(input)        {state: 'running'|'ended', correlation?, completionReason?, endSeq?}
+//   models() / model() Catalog of the target's default, and the target's real
+//                      current selection for this session. model() must report
+//                      what the target would actually use; it must not echo an
+//                      assumed default to avoid a missing capability.
+//   selectModel(input) {accepted} — a target that cannot select its model throws
+//                      (e.g. model-selection-unsupported); it never fakes success.
+//   cancel()           {cancelRequested}   destroy() {destroyed, message?}
+//   cursor()           {throughSeq} baseline used only when no observation exists.
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { historyMessages, modelTurnError } from './control.mjs';
+import { dispatchBoundary } from './dispatch.mjs';
 
 export const TARGETS = Object.freeze(['dsh', 'claude-desktop']);
 export const DEFAULT_TARGET = 'dsh';
@@ -91,7 +123,22 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
     async create() { return client.managedCreate(args()); },
     async beginTask(input = {}) { return client.managedBeginTask({ ...args(), ...input }); },
     async observe() { return client.managedStatus(args()); },
-    async history({ targetSessionId } = {}) { return client.managedHistory({ ...args(), targetSessionId }); },
+    // Native events and the request-id boundary are DSH details; the shared layer
+    // only receives normalized messages, the same shape Claude Desktop returns.
+    async history({ targetSessionId, running = false, maxMessages = 20, requestId, afterSeq } = {}) {
+      const raw = await client.managedHistory({ ...args(), targetSessionId });
+      if (!Array.isArray(raw?.events)) throw Object.assign(new Error('The DSH bridge returned invalid session history.'), { code: 'invalid-response' });
+      const page = { records: raw.events.map(event => ({ type: 'event', event })), hasMore: false };
+      let failure;
+      if (typeof requestId === 'string' && Number.isSafeInteger(afterSeq)) {
+        const boundary = dispatchBoundary(page.records, afterSeq, requestId);
+        if (boundary.matched && boundary.endSeq !== undefined) failure = modelTurnError(boundary.completionReason);
+      }
+      const history = historyMessages(page, { sessionId: targetSessionId, running });
+      return { messages: history.messages.slice(-maxMessages),
+        hasMore: history.hasMore || history.messages.length > maxMessages,
+        ...(history.note ? { note: history.note } : {}), ...(failure ? { failure } : {}) };
+    },
     async answer({ answerId, message } = {}) { return client.managedAnswer({ ...args(), answerId, message }); },
     async deliver({ requestId, message } = {}) {
       return control().send({ sessionId: args().sessionId, message, requestId,

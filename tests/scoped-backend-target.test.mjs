@@ -98,7 +98,7 @@ function claudeAdapter(events, { omit = [] } = {}) {
         questions: [], reports: [], changes: [], throughSeq: 1, currentModel: { ...CLAUDE_MODEL },
         tree: { settled: true, running: false, nodes: [] } };
     },
-    async history() { events.push('claude:history'); return { events: [] }; },
+    async history() { events.push('claude:history'); return { messages: [], hasMore: false }; },
     async answer() { events.push('claude:answer'); return { consumedQuestionIds: [] }; },
     async deliver(input) {
       events.push(['claude:deliver', input.requestId]);

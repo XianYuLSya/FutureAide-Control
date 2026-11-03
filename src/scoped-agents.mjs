@@ -3,8 +3,7 @@ import { spawn } from 'node:child_process';
 import { lstat, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createControl, endedState, historyMessages, modelTurnError } from './control.mjs';
-import { dispatchBoundary } from './dispatch.mjs';
+import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
@@ -857,22 +856,17 @@ export function createScopedAgents(config, {
         for (let index = 0; index < nodes.length; index++) {
           const { node } = nodes[index];
           try {
-            const raw = await backend.history({ targetSessionId: node.sessionId });
-            if (!Array.isArray(raw?.events)) throw Object.assign(new Error(`${backend.labels?.bridge ?? `The ${targetOf(record)} backend`} returned invalid session history.`), { code: 'invalid-response' });
-            const page = { records: raw.events.map(event => ({ type: 'event', event })), hasMore: false };
             const dispatch = node.sessionId === record.sessionId ? record.task?.dispatches?.at(-1) : undefined;
-            if (dispatch?.state === 'failed' && !dispatch.failure) {
-              // Upgrade old failed records from this inspection's existing page,
-              // and only when it contains this task's original request.
-              const boundary = dispatchBoundary(page.records, dispatch.afterSeq ?? -1, dispatch.requestId);
-              if (boundary.matched && boundary.endSeq !== undefined) {
-                const failure = modelTurnError(boundary.completionReason);
-                if (failure) { dispatch.failure = failure; store.save(record); }
-              }
-            }
-            const history = historyMessages(page, { sessionId: node.sessionId, running: node.status === 'running' });
-            const selected = { messages: history.messages.slice(-maxMessages), hasMore: history.hasMore || history.messages.length > maxMessages,
-              ...(history.note ? { note: history.note } : {}) };
+            // Upgrade old failed records from this inspection's own page, and only
+            // when it contains this task's original request. The backend reads its
+            // own native history: no target format is parsed in this shared layer.
+            const upgrade = dispatch?.state === 'failed' && !dispatch.failure;
+            const page = await backend.history({ targetSessionId: node.sessionId, running: node.status === 'running',
+              maxMessages, ...(upgrade ? { requestId: dispatch.requestId, afterSeq: dispatch.afterSeq ?? -1 } : {}) });
+            if (!Array.isArray(page?.messages)) throw Object.assign(new Error(`${backend.labels?.bridge ?? `The ${targetOf(record)} backend`} returned invalid session history.`), { code: 'invalid-response' });
+            if (upgrade && page.failure) { dispatch.failure = page.failure; store.save(record); }
+            const selected = { messages: page.messages, hasMore: page.hasMore === true,
+              ...(page.note ? { note: page.note } : {}) };
             Object.assign(tree.nodes[index], selected);
             if (node.sessionId === record.sessionId) rootHistory = selected;
           } catch (error) {

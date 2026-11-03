@@ -1,29 +1,30 @@
 // Claude Desktop descendant tree. The root projection already pairs each
 // successful Agent tool result with the child's native agentId; this module
-// follows exactly those pairs into the child's own native transcript, and never
-// attaches a session by directory proximity, cwd, or a matching title.
+// follows exactly those pairs — plus each child's own native `<agent>.meta.json`
+// (toolUseId / parentAgentId) — into the child's transcript, and never attaches a
+// session by directory proximity, cwd, title, or recency.
 //
-// Nothing new is stored here: every node's incremental cursor rides in the same
-// backend_state row as the root's own observation (`treeState`), which this
-// function returns so the caller can save it unchanged. A node without positive
-// native evidence of a finished turn is never reported as settled, so a running
-// background child blocks a final report and one-shot cleanup instead of the
-// tree looking idle. Nodes already known from earlier observations keep being
-// read: a child that outlives the turn that launched it cannot disappear from
-// the tree.
+// Nothing new is stored: every node's incremental cursor rides in the same
+// backend_state row as the root's own observation (`state`), which this function
+// returns so the caller can save it unchanged. There is no cap on how many
+// descendants are followed: anything not observed is reported unverified, which
+// keeps the tree unsettled, instead of being silently dropped.
+//
+// A node is never called settled on a quiet file or on a guessed timeline. Each
+// node carries the native evidence for its own status: the host's meta `finished`
+// flag, a successful SubagentHandback pair, a returned Agent tool result, or its
+// own recorded turn end.
 import path from 'node:path';
-import { open, readdir, readFile, stat } from 'node:fs/promises';
+import { open, readdir, readFile } from 'node:fs/promises';
 import { CLAUDE_FILE_COVERAGE, emptyClaudeProjection, observeClaudeTranscript } from './claude-observer.mjs';
 import { readClaudeEvents } from './claude-inbox.mjs';
 
 export const CLAUDE_TREE_VERSION = 1;
 /** Task-tree protocol level this adapter observes (see agent-backend.mjs). */
 export const TREE_PROTOCOL = 1;
-export const CLAUDE_TREE_LIMITATION = 'Only a successful Agent/Task tool result that returned a native agentId is followed, and only inside this session\'s own subagents directory. Children whose transcript cannot be located or read stay unverified, which keeps the tree unsettled instead of guessing.';
+export const CLAUDE_TREE_LIMITATION = 'Only a successful Agent/Task tool result that returned a native agentId, or a native agent meta whose toolUseId is an Agent tool_use id observed in its parent, is followed — and only inside this session\'s own subagents directory. A child whose transcript cannot be located, read, or matched to this session stays unverified, which keeps the tree unsettled instead of guessing.';
 const AGENT_TOOLS = new Set(['Agent', 'Task']);
 const STORED_MESSAGES = 20;
-const DEFAULT_MAX_NODES = 32;
-const DEFAULT_MAX_DEPTH = 4;
 const fail = (code, message) => Object.assign(new Error(message), { code });
 
 /** Stable internal node id for a native agentId; never the logical session id. */
@@ -43,68 +44,57 @@ function normalizeState(state) {
 }
 
 /**
- * Read only the head of one native transcript to learn which session id its
- * lines carry and whether they are marked as sidechain. Both are properties of
- * the file that the shared reader filters on, so they are measured, not guessed.
+ * Read only the head of one native transcript to learn which session id and
+ * agentId its lines carry and whether they are marked as sidechain. All three are
+ * properties of the file that the reader filters on, so they are measured, and a
+ * file that names another session or agent is refused rather than followed.
  */
 async function probeTranscript(file, { maxBytes = 131072 } = {}) {
   const handle = await open(file, 'r');
   try {
     const { size } = await handle.stat();
-    if (!size) return { sessionId: undefined, sidechain: false, size };
+    if (!size) return { sessionId: undefined, agentId: undefined, sidechain: false, size };
     const buffer = Buffer.alloc(Math.min(maxBytes, size));
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    let sessionId, sidechainLines = 0, plainLines = 0;
+    let sessionId, agentId, sidechainLines = 0, plainLines = 0;
     for (const line of buffer.subarray(0, bytesRead).toString('utf8').split('\n')) {
       if (!line.trim()) continue;
       let event;
       try { event = JSON.parse(line); } catch { continue; }
       if (sessionId === undefined && typeof event.sessionId === 'string') sessionId = event.sessionId;
+      if (agentId === undefined && typeof event.agentId === 'string') agentId = event.agentId;
       if (!['user', 'assistant', 'system'].includes(event.type)) continue;
       if (event.isSidechain === true) sidechainLines++;
       else plainLines++;
     }
-    return { sessionId, sidechain: sidechainLines > plainLines, size };
+    return { sessionId, agentId, sidechain: sidechainLines > plainLines, size };
   } finally { await handle.close(); }
 }
 
-/** `agent-<agentId>.jsonl` files, only under this session's own directory. */
-async function indexSubagentTranscripts(directory, { maxDepth = DEFAULT_MAX_DEPTH, maxFiles = 64 } = {}) {
+/**
+ * `agent-<agentId>.jsonl` files under this session's own subagents directory
+ * (workflow logs live in its `workflows` subtree, so the whole subtree is walked).
+ * No file-count or depth cap: an unread child must never hide a running one.
+ */
+async function indexSubagentTranscripts(directory) {
   const found = new Map();
-  const walk = async (dir, depth) => {
-    let entries;
-    try { entries = await readdir(dir, { withFileTypes: true }); }
-    catch (error) { if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return; throw error; }
-    for (const entry of entries) {
+  const unindexed = [];
+  const walk = async dir => {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(error => {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return undefined;
+      throw error;
+    });
+    for (const entry of entries ?? []) {
       const file = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (depth < maxDepth && found.size < maxFiles) await walk(file, depth + 1);
-        continue;
-      }
+      if (entry.isDirectory()) { await walk(file); continue; }
       if (!entry.isFile() || !/\.jsonl$/i.test(entry.name)) continue;
       const match = /^agent-(.+)\.jsonl$/i.exec(entry.name);
-      if (!match || found.has(match[1]) || found.size >= maxFiles) continue;
-      found.set(match[1], file);
+      if (!match) { unindexed.push(file); continue; }
+      if (!found.has(match[1])) found.set(match[1], file);
     }
   };
-  await walk(directory, 0);
-  return found;
-}
-
-/**
- * The native `<agent>.meta.json` beside each subagent transcript. Measured on
- * Claude Desktop 2.1.309: {agentType, description, toolUseId, spawnDepth,
- * requestShape, finished}. `toolUseId` is the Agent tool_use the parent emitted,
- * so it cross-checks the pairing, and `finished` is the host's own completion
- * marker — a subagent does not always end its transcript with a stop_reason.
- */
-async function readNativeMeta(entry) {
-  if (!entry.file) return undefined;
-  const metaFile = entry.file.replace(/\.jsonl$/i, '.meta.json');
-  let value;
-  try { value = JSON.parse((await readFile(metaFile, 'utf8')).replace(/^\uFEFF/, '')); }
-  catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
-  return metaShape(value, metaFile);
+  await walk(directory);
+  return { files: found, unindexed };
 }
 
 function metaShape(value, file) {
@@ -119,9 +109,9 @@ function metaShape(value, file) {
 }
 
 /** Every native agent meta in this session's own directory, keyed by agentId. */
-async function indexSubagentMetas(index) {
+async function indexSubagentMetas(files) {
   const metas = new Map();
-  for (const [agentId, file] of index) {
+  for (const [agentId, file] of files) {
     const metaFile = file.replace(/\.jsonl$/i, '.meta.json');
     try { metas.set(agentId, metaShape(JSON.parse((await readFile(metaFile, 'utf8')).replace(/^\uFEFF/, '')), metaFile)); }
     catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -137,22 +127,34 @@ function collectAgentToolIds(projection, previous = []) {
       if (AGENT_TOOLS.has(tool?.name) && typeof tool.id === 'string') ids.add(tool.id);
     }
   }
-  return [...ids].slice(-500);
+  return [...ids].slice(-2000);
 }
 
-/** A subagent that handed its result back is finished, whatever its stop reason. */
+/**
+ * A SubagentHandback that the host reported as successful is finished work. The
+ * observer records only non-error results in successfulTools, so a failed
+ * handback can never end a node.
+ */
 function handedBack(projection) {
-  const last = [...(projection.messages ?? [])].reverse()
-    .find(message => message.role === 'assistant' && message.tools?.length);
-  const handback = last?.tools?.find(tool => tool.name === 'SubagentHandback');
-  return Boolean(handback) && (projection.completedTools ?? []).includes(handback.id);
+  const successful = projection?.successfulTools;
+  if (!Array.isArray(successful) || !successful.length) return false;
+  for (const message of [...(projection.messages ?? [])].reverse()) {
+    if (message.role !== 'assistant' || !message.tools?.length) continue;
+    const handback = message.tools.find(tool => tool.name === 'SubagentHandback');
+    return Boolean(handback) && successful.includes(handback.id);
+  }
+  return false;
 }
 
 function nodeCoverage(entry) {
   if (entry.limited) return { source: entry.limited, complete: false,
     limitation: entry.limited === 'depth-limit'
-      ? 'This child is deeper than the observed depth limit, so its own transcript was not read.'
-      : 'This child was not read because the per-observation node limit was reached.' };
+      ? 'This child is deeper than the requested depth limit, so its own transcript was not read.'
+      : 'This child was not read because the requested node limit was reached.' };
+  if (entry.identityMismatch) return { source: 'agent-identity-mismatch', complete: false,
+    limitation: entry.identityMismatch === 'session'
+      ? 'The transcript names another session id, so it was not read.'
+      : 'The transcript does not name this agentId, so it was not read.' };
   if (!entry.file) return { source: 'missing-agent-transcript', complete: false,
     limitation: 'The Agent result named a native agentId but no transcript for it exists in this session directory.' };
   if (entry.filtered) return { source: 'filtered-agent-transcript', complete: false,
@@ -161,15 +163,15 @@ function nodeCoverage(entry) {
 }
 
 /** Status of one child, from native evidence only; every branch names its proof. */
-function childStatus(entry, { quietPolls }) {
-  if (entry.limited) {
-    return !entry.background && entry.resultSeq !== undefined
-      ? { status: 'ended', evidence: 'parent-agent-tool-result', activity: `not read: ${entry.limited}` }
-      : { status: 'unverified', evidence: entry.limited, activity: `not read: ${entry.limited}` };
+function childStatus(entry) {
+  if (entry.identityMismatch) {
+    return { status: 'unverified', evidence: 'agent-identity-mismatch',
+      activity: 'transcript identity does not match this session and agent' };
   }
-  if (!entry.background && entry.resultSeq !== undefined) {
-    return { status: 'ended', evidence: 'parent-agent-tool-result',
-      activity: entry.resultStatus ? `agent ${entry.resultStatus}` : 'agent result returned' };
+  // Anything not fully observed stays unverified: a shortcut here would let an
+  // unread child hide its own descendants.
+  if (entry.limited) {
+    return { status: 'unverified', evidence: entry.limited, activity: `not read: ${entry.limited}` };
   }
   if (entry.filtered) {
     return { status: 'unverified', evidence: 'filtered-transcript',
@@ -186,6 +188,10 @@ function childStatus(entry, { quietPolls }) {
     return { status: 'ended', evidence: 'agent-meta-finished', endSeq: entry.projection.throughSeq ?? 0,
       activity: entry.meta.agentType ? `finished: ${entry.meta.agentType}` : 'native agent meta reports finished' };
   }
+  if (!entry.background && entry.resultSeq !== undefined) {
+    return { status: 'ended', evidence: 'parent-agent-tool-result',
+      activity: entry.resultStatus ? `agent ${entry.resultStatus}` : 'agent result returned' };
+  }
   const pending = Object.values(entry.projection.pendingTools ?? {});
   if (pending.length) return { status: 'running', evidence: 'pending-tool', activity: `tool: ${pending.at(-1).name}` };
   if (entry.meta?.running === true) {
@@ -197,31 +203,49 @@ function childStatus(entry, { quietPolls }) {
       activity: 'subagent handed its result back' };
   }
   const completed = (entry.projection.completions ?? []).at(-1);
-  if (completed) {
-    if (entry.background && !entry.meta && (entry.quiet ?? 0) < quietPolls) {
-      return { status: 'running', evidence: 'turn-ended-unconfirmed',
-        activity: 'turn ended; waiting for the background child to stay quiet' };
-    }
+  if (completed && !entry.background) {
     return { status: 'ended', evidence: 'own-transcript-turn-end', endSeq: completed.seq,
       activity: `turn-ended: ${completed.reason?.kind ?? 'completed'}` };
+  }
+  if (completed) {
+    // A background child that ended a turn without a handback or a finished meta
+    // has not proven it stopped; no quiet-time inference is used here.
+    return { status: 'running', evidence: 'turn-ended-unconfirmed',
+      activity: 'turn ended without a native finished marker' };
   }
   const last = entry.projection.messages?.at(-1);
   return { status: 'running', evidence: 'no-completed-turn',
     activity: last?.role === 'assistant' ? 'responding' : 'launched; no completed turn yet' };
 }
 
+function trimMessages(projection) {
+  if (!Array.isArray(projection?.messages) || projection.messages.length <= STORED_MESSAGES) return projection;
+  projection.messagesOmitted = (projection.messagesOmitted ?? 0) + projection.messages.length - STORED_MESSAGES;
+  projection.messages = projection.messages.slice(-STORED_MESSAGES);
+  return projection;
+}
+
+function pendingAgentTools(projection) {
+  return Object.values(projection?.pendingTools ?? {}).filter(tool => AGENT_TOOLS.has(tool?.name))
+    .map(tool => tool.id);
+}
+
 /**
- * Read one child transcript incrementally into its own stored projection.
- * The session id and sidechain marker come from the file's own head; if the
- * marker proves useless (nothing passes the reader's filter) it is flipped once.
+ * Read one child transcript incrementally into its own stored projection. The
+ * session id and agentId come from the file's own head and must match; the
+ * sidechain marker is taken from the same sample and flipped once if it proves
+ * useless.
  */
-async function observeChild(entry, { binding, index, readEvents, options }) {
-  if (!entry.file) entry.file = index.get(entry.agentId) ?? undefined;
+async function observeChild(entry, { binding, files, readEvents, options }) {
+  if (!entry.file) entry.file = files.get(entry.agentId) ?? undefined;
   if (!entry.file) return;
   entry.sample ??= await probeTranscript(entry.file);
   entry.meta = await readNativeMeta(entry);
-  if (entry.meta?.description && !entry.name) entry.name = entry.meta.description;
+  if (entry.sample.sessionId !== binding.sessionId) { entry.identityMismatch = 'session'; return; }
+  if (entry.sample.agentId !== entry.agentId) { entry.identityMismatch = 'agent'; return; }
+  entry.identityMismatch = undefined;
   if (entry.sample.sessionId === undefined) return; // empty transcript: nothing to pair yet
+  if (entry.meta?.description && !entry.name) entry.name = entry.meta.description;
   if (entry.sidechain === undefined) entry.sidechain = entry.sample.sidechain;
   const childBinding = { ...binding, sessionId: entry.sample.sessionId, transcriptFile: entry.file };
   const run = async sidechain => {
@@ -242,24 +266,15 @@ async function observeChild(entry, { binding, index, readEvents, options }) {
     seen = await run(entry.sidechain);
   }
   entry.filtered = seen === 0 && entry.projection.throughSeq === 0 && entry.sample.size > 0;
-  try { entry.size = (await stat(entry.file)).size; } catch { entry.size = entry.sample.size; }
-  const previous = entry.lastSize;
-  entry.lastSize = entry.size;
-  if (previous === undefined) entry.quiet = 0;
-  else if (entry.size === previous && (entry.projection.completions ?? []).length) entry.quiet = (entry.quiet ?? 0) + 1;
-  else if (entry.size !== previous) entry.quiet = 0;
 }
 
-function trimMessages(projection) {
-  if (!Array.isArray(projection?.messages) || projection.messages.length <= STORED_MESSAGES) return projection;
-  projection.messagesOmitted = (projection.messagesOmitted ?? 0) + projection.messages.length - STORED_MESSAGES;
-  projection.messages = projection.messages.slice(-STORED_MESSAGES);
-  return projection;
-}
-
-function pendingAgentTools(projection) {
-  return Object.values(projection?.pendingTools ?? {}).filter(tool => AGENT_TOOLS.has(tool?.name))
-    .map(tool => tool.id);
+async function readNativeMeta(entry) {
+  if (!entry.file) return undefined;
+  const metaFile = entry.file.replace(/\.jsonl$/i, '.meta.json');
+  let value;
+  try { value = JSON.parse((await readFile(metaFile, 'utf8')).replace(/^\uFEFF/, '')); }
+  catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+  return metaShape(value, metaFile);
 }
 
 /**
@@ -267,15 +282,16 @@ function pendingAgentTools(projection) {
  * @param {object} binding Root binding (sessionId + transcriptFile) verified by the adapter.
  * @param {object} rootProjection The incremental projection observeClaudeTranscript maintains for the root.
  * @param {object} options logicalSessionId, agentId, name, workspace, state, taskId,
- *   nativeStatus (the native registry status, 'idle' when the session is at rest),
- *   plus readEvents / maxNodes / maxDepth / quietPolls overrides for tests.
+ *   nativeStatus (the native registry status: 'idle' when the session is at rest),
+ *   plus readEvents and the optional maxNodes/maxDepth paging limits for callers
+ *   that deliberately observe a slice. A paged-out node is unverified, never ended.
  * @returns {{tree: object, state: object, histories: object}} tree for the shared FSM,
- *   the treeState to persist in backend_state, and per-node normalized history.
+ *   the state to persist in backend_state, and per-node normalized history.
  */
 export async function observeClaudeTree(binding, rootProjection, {
   logicalSessionId, agentId, name, workspace, state = {}, taskId, nativeStatus,
-  readEvents = readClaudeEvents, maxNodes = DEFAULT_MAX_NODES, maxDepth = DEFAULT_MAX_DEPTH,
-  quietPolls = 1,
+  readEvents = readClaudeEvents, maxNodes = Number.POSITIVE_INFINITY,
+  maxDepth = Number.POSITIVE_INFINITY,
 } = {}) {
   if (typeof logicalSessionId !== 'string' || !logicalSessionId) {
     throw fail('claude-tree-root-required', 'A logical session id is required to name the root of the task tree.');
@@ -283,45 +299,49 @@ export async function observeClaudeTree(binding, rootProjection, {
   if (typeof binding?.transcriptFile !== 'string' || !binding.transcriptFile || typeof binding.sessionId !== 'string') {
     throw fail('claude-tree-binding-required', 'The bound Claude session must carry its native session id and transcript file.');
   }
-  const rootDirectory = path.join(path.dirname(binding.transcriptFile), binding.sessionId);
-  const index = await indexSubagentTranscripts(rootDirectory, { maxFiles: Math.max(8, maxNodes * 2) });
+  const subagentsRoot = path.join(path.dirname(binding.transcriptFile), binding.sessionId, 'subagents');
+  const { files, unindexed } = await indexSubagentTranscripts(subagentsRoot);
   const treeState = normalizeState(state);
   const options = { workspace };
+
   const rootPending = Object.values(rootProjection.pendingTools ?? {});
   const rootCompleted = (rootProjection.completions ?? []).at(-1);
-  const rootRunning = rootPending.length > 0
-    || (typeof nativeStatus === 'string' ? nativeStatus !== 'idle' : !rootCompleted);
+  // The native registry is authoritative about the root turn: after an interrupt
+  // a pending tool result can stay unanswered forever, while registry 'idle' (or a
+  // recorded completion, including the interrupt marker) proves the turn stopped.
+  const rootStopped = typeof nativeStatus === 'string' ? nativeStatus === 'idle' : Boolean(rootCompleted);
   const nodes = [{ sessionId: logicalSessionId, parentSessionId: null,
     name: typeof name === 'string' && name ? name : null, mode: 'root', depth: 0,
     nativeAgentId: agentId ?? null,
-    status: rootRunning ? 'running' : 'ended',
-    activity: rootPending.length ? `tool: ${rootPending.at(-1).name}` : rootProjection.activity ?? 'unknown',
-    changes: (rootProjection.changes ?? []).slice(0, 32), coverage: CLAUDE_FILE_COVERAGE,
+    status: rootStopped ? 'ended' : 'running',
+    activity: rootPending.length && !rootStopped ? `tool: ${rootPending.at(-1).name}` : rootProjection.activity ?? 'unknown',
+    changes: rootProjection.changes ?? [], coverage: CLAUDE_FILE_COVERAGE,
     messages: rootProjection.messages ?? [], lastSeq: rootProjection.throughSeq ?? 0,
     pendingAgentTools: pendingAgentTools(rootProjection) }];
   const order = [];
-  let budget = maxNodes;
+  let budget = Number.isFinite(maxNodes) ? Math.max(0, Math.floor(maxNodes)) : Number.POSITIVE_INFINITY;
   let truncated = 0;
 
   const pushNode = (entry, parentSessionId, depth) => {
     const known = entry ?? { agentId: undefined, projection: emptyClaudeProjection('claude-tree-unknown') };
-    const state = childStatus(known, { quietPolls });
+    const status = childStatus(known);
     nodes.push({ sessionId: claudeNodeId(known.agentId), parentSessionId,
       name: known.name ?? null, mode: known.background ? 'background-subagent' : 'foreground-subagent',
-      depth, nativeAgentId: known.agentId, status: state.status, activity: state.activity,
+      depth, nativeAgentId: known.agentId, status: status.status, activity: status.activity,
       ...(known.meta?.spawnDepth !== undefined ? { nativeDepth: known.meta.spawnDepth } : {}),
       ...(known.meta?.agentType ? { agentType: known.meta.agentType } : {}),
-      changes: (known.projection.changes ?? []).slice(0, 32), coverage: nodeCoverage(known),
+      changes: known.projection.changes ?? [], coverage: nodeCoverage(known),
       messages: known.projection.messages ?? [], lastSeq: known.projection.throughSeq ?? 0,
-      evidence: state.evidence, ...(state.endSeq !== undefined ? { endSeq: state.endSeq } : {}),
+      evidence: status.evidence, ...(status.endSeq !== undefined ? { endSeq: status.endSeq } : {}),
       pendingAgentTools: pendingAgentTools(known.projection), background: known.background === true });
   };
 
   // A node is placed only by an explicit native pair: its own meta.toolUseId is
   // an Agent tool_use id already seen in the parent it names (meta.parentAgentId
   // or the parent session itself), or a successful Agent tool result returned its
-  // agentId. Nothing is attached by directory proximity, cwd, title, or recency.
-  const indexedMetas = await indexSubagentMetas(index);
+  // agentId. A still-pending Agent tool_use is included, so a child that is
+  // already running in the background is never missed while its result is open.
+  const indexedMetas = await indexSubagentMetas(files);
   const rootToolIds = collectAgentToolIds(rootProjection, treeState.rootToolIds ?? []);
   treeState.rootToolIds = rootToolIds;
   nodes[0].agentToolIds = rootToolIds.length;
@@ -345,6 +365,12 @@ export async function observeClaudeTree(binding, rootProjection, {
       let parentSessionId = anchors.map(id => byToolId.get(id)).find(Boolean);
       if (!parentSessionId && typeof meta?.parentAgentId === 'string' && parents.has(meta.parentAgentId)) {
         parentSessionId = claudeNodeId(meta.parentAgentId);
+      }
+      // A meta that declares itself first level of this session, in this session's
+      // own subagents directory, is a root child even when the bounded root
+      // projection has already aged out that Agent tool_use id.
+      if (!parentSessionId && meta && meta.parentAgentId === undefined && meta.spawnDepth === 1) {
+        parentSessionId = logicalSessionId;
       }
       if (!parentSessionId && entry?.parentSessionId && placedDepth.has(entry.parentSessionId)) {
         parentSessionId = entry.parentSessionId;
@@ -371,7 +397,7 @@ export async function observeClaudeTree(binding, rootProjection, {
       else {
         budget--;
         entry.limited = undefined;
-        await observeChild(entry, { binding, index, readEvents, options });
+        await observeChild(entry, { binding, files, readEvents, options });
         // The native request shape decides the completion rule, not our guess.
         if (entry.meta?.requestShape === 'background') entry.background = true;
         else if (entry.meta?.requestShape === 'foreground') entry.background = false;
@@ -397,8 +423,8 @@ export async function observeClaudeTree(binding, rootProjection, {
     pushNode(treeState.nodes[nativeId], parents.get(nativeId), placedDepth.get(claudeNodeId(nativeId)));
     order.push(nativeId);
   }
-  // An agent meta that names no id we observed is never attached; it is reported
-  // instead, and one that is not finished keeps the tree unsettled.
+  // An agent meta that names no id observed in this session is never attached; it
+  // is reported instead, and one that is not finished keeps the tree unsettled.
   const unpaired = [...indexedMetas.keys()].filter(nativeId => !parents.has(nativeId));
   const unpairedRunning = unpaired.filter(nativeId => indexedMetas.get(nativeId)?.finished !== true);
   for (const entry of Object.values(treeState.nodes)) trimMessages(entry.projection);
@@ -422,6 +448,7 @@ export async function observeClaudeTree(binding, rootProjection, {
   return { tree: { version: CLAUDE_TREE_VERSION, settled, running, nodes,
     ...(unverified.length ? { unverified: unverified.map(node => node.sessionId), limitation: CLAUDE_TREE_LIMITATION } : {}),
     ...(unpaired.length ? { unpaired } : {}),
+    ...(unindexed.length ? { unindexed } : {}),
     ...(truncated ? { truncated } : {}) }, state: treeState, histories };
 }
 
@@ -451,15 +478,21 @@ export function claudeTreeNodeMessages(tree, { sessionId, name, parentName } = {
 export function claudeTreeStopEvidence(tree, { afterSeq = 0 } = {}) {
   const nodes = tree?.nodes ?? [];
   const pendingAgentTools = nodes.flatMap(node => node.pendingAgentTools ?? []);
+  // The root's own open Agent tool is covered by the root turn's own proof (the
+  // registry status or the recorded interrupt); only a descendant that still has
+  // an unanswered Agent call is unproven work.
+  const descendantPending = nodes.filter(node => node.parentSessionId)
+    .flatMap(node => node.pendingAgentTools ?? []);
   const evidence = nodes.map(node => ({ sessionId: node.sessionId, parentSessionId: node.parentSessionId,
     name: node.name, status: node.status, evidence: node.evidence ?? (node.parentSessionId ? 'observed' : 'root-observation'),
     endSeq: node.endSeq ?? node.lastSeq ?? 0,
     endedAfterCancel: node.status === 'ended' && Number(node.endSeq ?? node.lastSeq ?? 0) >= afterSeq }));
   const stopped = tree?.running === false && (tree?.unverified ?? []).length === 0
+    && (tree?.unpaired ?? []).length === 0
     && nodes.every(node => node.status === 'ended')
-    && evidence.every(item => item.endedAfterCancel) && pendingAgentTools.length === 0;
-  return { stopped, afterSeq, pendingAgentTools, nodes: evidence,
-    ...(stopped ? {} : { limitation: CLAUDE_TREE_LIMITATION }) };
+    && evidence.every(item => item.endedAfterCancel) && descendantPending.length === 0;
+  return { stopped, afterSeq, pendingAgentTools, ...(descendantPending.length ? { descendantPending } : {}),
+    nodes: evidence, ...(stopped ? {} : { limitation: CLAUDE_TREE_LIMITATION }) };
 }
 
 /** The native files this tree read, so a caller can verify deletion afterwards. */

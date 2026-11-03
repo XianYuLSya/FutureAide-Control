@@ -169,21 +169,35 @@ export function createScopedAgents(config, {
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
     sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
     ...(record.task ? { taskId: record.task.taskId } : {}) });
+  // Handles an adapter needs on the shared side: the target's own state in its own
+  // row (never inside the record the shared layer will save again) and one host
+  // lock per target application, reusing the existing lease table.
+  const adapterDeps = record => {
+    const load = () => store.get(record.agentId) ?? record;
+    const target = targetOf(record);
+    return {
+      load,
+      requestDirectory: () => agentDirectory(load()),
+      readNativeState: () => store.backendState(record.agentId),
+      writeNativeState: value => store.saveBackendState(record.agentId, value),
+      withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
+    };
+  };
   // The chosen backend is rebuilt per operation from the live record, so a new
   // task id or state never hides behind a cached binding. Only the DSH client
   // (one authenticated connection per agent) is kept.
   async function backendFor(record) {
     const target = targetOf(record);
     const load = () => store.get(record.agentId) ?? record;
-    const requestDirectory = () => agentDirectory(load());
+    const deps = adapterDeps(record);
     if (target === 'dsh') {
       if (!clients.has(record.agentId)) clients.set(record.agentId, clientFactory(settings(record)));
       const client = clients.get(record.agentId);
-      return resolveBackend(record, { target, load, dsh: { client, requestDirectory,
+      return resolveBackend(record, { target, load, deps, dsh: { client, requestDirectory: deps.requestDirectory,
         control: () => controlFactory(settings(load()), { client, managed: hostArgs(load()) }),
         hostArgs: () => hostArgs(load()) } });
     }
-    return resolveBackend(record, { target, load, adapters: backendAdapters, dsh: { requestDirectory } });
+    return resolveBackend(record, { target, load, deps, adapters: backendAdapters });
   }
   const forgetBackend = record => clients.delete(record.agentId);
   // A target without a usable adapter is refused before the name is taken, and is
@@ -191,8 +205,7 @@ export function createScopedAgents(config, {
   async function ensureTargetBackend(record) {
     const target = targetOf(record);
     if (target === 'dsh') return target;
-    await resolveBackend(record, { target, load: () => record, adapters: backendAdapters,
-      dsh: { requestDirectory: () => agentDirectory(record) } });
+    await resolveBackend(record, { target, load: () => record, deps: adapterDeps(record), adapters: backendAdapters });
     return target;
   }
 
@@ -760,13 +773,15 @@ export function createScopedAgents(config, {
       // Per-target readiness beside the unchanged DSH fields. Neither entry starts
       // a model turn or a session: the DSH probe is the same one above, and the
       // claude-desktop entry imports its adapter and asks probe() only.
+      const probe = { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
+        lifetime: 'once', target: 'claude-desktop', workspace: owner?.workspace ?? config.workspace,
+        state: 'probing', createdAt: now(), updatedAt: now(), history: [] };
       status.backends = {
         dsh: dshDiagnostics(host, status),
+        // This probe name is not in the roster, so a state write during diagnostics
+        // reports false instead of inventing a row.
         'claude-desktop': await diagnoseTarget('claude-desktop', { adapters: backendAdapters,
-          record: { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
-            lifetime: 'once', target: 'claude-desktop', workspace: owner?.workspace ?? config.workspace,
-            state: 'probing', createdAt: now(), updatedAt: now(), history: [] },
-          requestDirectory: () => path.join(config.stateDirectory, 'status-probe') }),
+          record: probe, deps: adapterDeps(probe) }),
       };
       return status;
     },

@@ -32,6 +32,19 @@
 //                      (e.g. model-selection-unsupported); it never fakes success.
 //   cancel()           {cancelRequested}   destroy() {destroyed, message?}
 //   cursor()           {throughSeq} baseline used only when no observation exists.
+//   history(input)     (above) already normalized, at most maxMessages.
+//
+// Adapter dependencies, supplied by the shared layer and never by a tool
+// argument (all configuration stays inside the plugin):
+//   load()                The live roster record; re-read it, do not cache it.
+//   requestDirectory()    This name's private state directory for receipts.
+//   readNativeState()     The target's stored state (binding, cursor, projection).
+//   writeNativeState(v)   Replace that state in its own row beside the roster;
+//                         false means the name is already gone. Never write into
+//                         the shared record: its next save would overwrite you.
+//   withHostLock(fn,{key}) Serialize host-wide work across names and processes
+//                         through the shared lease table, per target (+ optional
+//                         key); reuses store.locked, no second locking scheme.
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -74,14 +87,14 @@ const reason = error => ({ code: error?.code ?? 'operation-failed', message: Str
  * @param {object} options Injected adapters, a probe record, and the adapter's
  * private request directory. Probe must not write anything.
  */
-export async function diagnoseTarget(target, { adapters = {}, record = {}, requestDirectory = () => '' } = {}) {
+export async function diagnoseTarget(target, { adapters = {}, record = {}, requestDirectory = () => '', deps = {} } = {}) {
   const wanted = normalizeTarget(target);
   let factory;
   try { factory = await adapterFactory(wanted, adapters); }
   catch (error) { return { ready: false, present: true, reason: reason(error) }; }
   if (typeof factory !== 'function') return { ready: false, present: false, reason: reason(backendNotReady(wanted)) };
   let backend;
-  try { backend = await factory(record, { load: () => record, requestDirectory }); }
+  try { backend = await factory(record, { load: () => record, requestDirectory, ...deps }); }
   catch (error) { return { ready: false, present: true, reason: reason(error) }; }
   const missing = BACKEND_METHODS.filter(method => typeof backend?.[method] !== 'function');
   if (missing.length) return { ready: false, present: true, reason: reason(backendNotReady(wanted, missing)) };
@@ -125,7 +138,7 @@ async function adapterFactory(target, adapters = {}) {
  * @param {object} options Target, injected adapters, and the DSH client/control
  * factories already resolved by the caller.
  */
-export async function resolveBackend(record, { target, adapters = {}, dsh, load = () => record } = {}) {
+export async function resolveBackend(record, { target, adapters = {}, dsh, load = () => record, deps = {} } = {}) {
   const wanted = normalizeTarget(target ?? record?.target);
   if (wanted === DEFAULT_TARGET) {
     if (!dsh) throw backendNotReady(DEFAULT_TARGET);
@@ -133,7 +146,7 @@ export async function resolveBackend(record, { target, adapters = {}, dsh, load 
   }
   const factory = await adapterFactory(wanted, adapters);
   if (typeof factory !== 'function') throw backendNotReady(wanted);
-  return assertBackend(await factory(load(), { load, requestDirectory: dsh?.requestDirectory }), wanted);
+  return assertBackend(await factory(load(), { load, ...deps }), wanted);
 }
 
 /**

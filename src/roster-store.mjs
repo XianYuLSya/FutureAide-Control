@@ -14,7 +14,8 @@ export class RosterStore {
       CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(owner,name));
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);`);
   }
 
   owner(id) { const row = this.db.prepare('SELECT body FROM owners WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
@@ -67,13 +68,47 @@ export class RosterStore {
     const latest = this.db.prepare('SELECT status,reason FROM supplements WHERE agent=? AND task=? ORDER BY rowid DESC LIMIT 1').get(agentId, taskId);
     return { ...counts, ...(latest ? { latest: { status: latest.status, ...(latest.reason ? { reason: latest.reason } : {}) } } : {}) };
   }
+  // The executing target's own state (native binding, transcript cursor,
+  // incremental projection, native write attempts) lives in its own row beside
+  // the roster. It must not ride in the agent record: the shared state machine
+  // keeps saving records it loaded earlier, and such a save would overwrite an
+  // adapter's fresh write. This is state, not a second task or notice machine:
+  // dispatch intent, delivery and cleanup stay in the shared tables above.
+  backendState(agentId) {
+    const row = this.db.prepare('SELECT body FROM backend_state WHERE agent=?').get(agentId);
+    return row ? JSON.parse(row.body) : undefined;
+  }
+  /** Upsert one target-state document. False means the name is already gone. */
+  saveBackendState(agentId, value) {
+    return this.db.prepare(`INSERT INTO backend_state(agent,body) SELECT id,? FROM agents WHERE id=?
+      ON CONFLICT(agent) DO UPDATE SET body=excluded.body`).run(JSON.stringify(value), agentId).changes === 1;
+  }
+  deleteBackendState(agentId) { this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(agentId); }
+  /**
+   * Read-only reverse lookup for a reply surface that must identify its caller
+   * from the native session it was invoked in. Only live claude-desktop names
+   * qualify; a closed or other-target name is not the caller.
+   */
+  agentForNativeSession(nativeSessionId) {
+    if (typeof nativeSessionId !== 'string' || !nativeSessionId) return undefined;
+    const row = this.db.prepare(`SELECT a.id AS agentId, a.owner AS ownerId, a.name AS name,
+      json_extract(a.body,'$.target') AS target, json_extract(a.body,'$.state') AS state,
+      json_extract(a.body,'$.sessionId') AS logicalSessionId, b.body AS body
+      FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
+      WHERE json_extract(b.body,'$.binding.sessionId')=?
+        AND json_extract(a.body,'$.target')='claude-desktop'
+        AND coalesce(json_extract(a.body,'$.closed'),0)=0`).get(nativeSessionId);
+    if (!row) return undefined;
+    const binding = JSON.parse(row.body).binding ?? null;
+    return { agentId: row.agentId, ownerId: row.ownerId, name: row.name, target: row.target,
+      state: row.state, logicalSessionId: row.logicalSessionId, nativeSessionId, binding };
+  }
   list(owner) {
     const rows = owner === undefined
       ? this.db.prepare('SELECT body FROM agents ORDER BY name').all()
       : this.db.prepare('SELECT body FROM agents WHERE owner=? ORDER BY name').all(owner);
     return rows.map(row => JSON.parse(row.body));
-  }
-  count(owner) {
+  }  count(owner) {
     return this.db.prepare(owner === undefined ? 'SELECT count(*) AS count FROM agents' : 'SELECT count(*) AS count FROM agents WHERE owner=?')
       .get(...(owner === undefined ? [] : [owner])).count;
   }
@@ -187,7 +222,9 @@ export class RosterStore {
   releaseLease(key, holder) { this.db.prepare('DELETE FROM leases WHERE key=? AND holder=?').run(key, holder); }
   remove(record) {
     this.db.prepare('DELETE FROM supplements WHERE agent=? AND owner=?').run(record.agentId, record.ownerId);
+    this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(record.agentId);
     this.db.prepare('DELETE FROM agents WHERE id=? AND owner=?').run(record.agentId, record.ownerId);
+    // The per-target host lock is shared with other names and is left to its holder.
     this.db.prepare('DELETE FROM leases WHERE key=? OR key=?').run(record.agentId, `worker:${record.agentId}`);
     // Secure-delete overwrites freed database cells; checkpoint removes old WAL copies.
     const checkpoint = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();

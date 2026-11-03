@@ -291,3 +291,58 @@ test('status separates an unfinished adapter from a ready one without using it',
   } finally { g.service.close(); }
 });
 
+test('an adapter keeps its own state row and one host lock without touching the record', async () => {
+  let inside = 0, overlaps = 0;
+  const factory = (record, deps) => {
+    const backend = claudeAdapter([]);
+    backend.record = record;
+    backend.deps = deps;
+    backend.create = async () => {
+      await deps.withHostLock(async () => {
+        inside += 1; if (inside > 1) overlaps += 1;
+        await new Promise(resolve => setTimeout(resolve, 25));
+        deps.writeNativeState({ ...(deps.readNativeState() ?? {}),
+          binding: { sessionId: `native-${record.name}`, pid: 4321 }, cursor: 0, requests: {}, projection: {} });
+        inside -= 1;
+      });
+      return { sessionId: record.sessionId, modelRequestsStarted: 0, model: { ...CLAUDE_MODEL } };
+    };
+    backend.deliver = async input => {
+      const state = deps.readNativeState() ?? {};
+      deps.writeNativeState({ ...state, cursor: (state.cursor ?? 0) + 1,
+        requests: { ...(state.requests ?? {}), [input.requestId]: { attempted: true, stage: 'written' } } });
+      return { accepted: true, status: 'written', afterSeq: 1 };
+    };
+    return backend;
+  };
+  const f = await fixture({ adapters: { 'claude-desktop': factory } });
+  try {
+    await Promise.all([
+      f.service.create({ name: 'a1', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)),
+      f.service.create({ name: 'a2', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)),
+    ]);
+    assert.equal(overlaps, 0, 'withHostLock serialized host work across both names');
+    const first = f.record('a1');
+    assert.deepEqual(f.store.backendState(first.agentId).binding, { sessionId: 'native-a1', pid: 4321 });
+    assert.deepEqual(f.store.backendState(f.record('a2').agentId).binding.sessionId, 'native-a2');
+
+    // The hazard this row exists for: a stale record save must not erase it.
+    const stale = f.store.get(first.agentId);
+    f.store.save({ ...stale, state: 'running' });
+    assert.deepEqual(f.store.backendState(first.agentId).binding, { sessionId: 'native-a1', pid: 4321 });
+
+    const receipt = await f.service.send({ name: 'a1', message: 'read the plan' }, extra(A));
+    assert.equal(receipt.accepted, true);
+    const state = f.store.backendState(first.agentId);
+    assert.equal(state.cursor, 1, 'the adapter read back its own cursor');
+    assert.equal(Object.keys(state.requests).length, 1, 'native write attempts stay beside the roster');
+    assert.equal(state.requests[Object.keys(state.requests)[0]].stage, 'written');
+    assert.equal(f.store.get(first.agentId).binding, undefined, 'the shared record carries no native field');
+    assert.equal(f.store.agentForNativeSession('native-a1').name, 'a1', 'the reply surface finds the caller');
+
+    await f.service.delete({ name: 'a1' }, extra(A));
+    assert.equal(f.store.backendState(first.agentId), undefined);
+    assert.equal(f.store.agentForNativeSession('native-a1'), undefined);
+  } finally { f.service.close(); }
+});
+

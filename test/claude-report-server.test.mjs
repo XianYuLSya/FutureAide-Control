@@ -176,7 +176,7 @@ test('a submission hands the tool, its arguments and any native tool-use id to o
   } finally { await close(); }
 });
 
-test('an unbound session is adopted on its first list and gets the tools', async () => {
+test('listing an unbound session adopts nothing; its submission does', async () => {
   let adopted = 0;
   let bound = false;
   const owned = { agentId: 'agent-x', agentName: '首列表副手', taskId: 3,
@@ -190,9 +190,14 @@ test('an unbound session is adopted on its first list and gets the tools', async
   try {
     await client.connect(new StreamableHTTPClientTransport(new URL(service.url)));
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map(tool => tool.name).sort(), [...REPORT_TOOL_NAMES].sort());
-    assert.equal(adopted, 1, 'adoption runs once, then ownership answers');
-    assert.equal(service.stats.adopted, 1);
+    assert.deepEqual(tools.map(tool => tool.name).sort(), [...REPORT_TOOL_NAMES].sort(),
+      'the static table does not wait for a binding');
+    assert.equal(adopted, 0, 'a listing must never wait on adoption');
+
+    const result = await client.callTool({ name: 'report_parent', arguments: { message: 'late first report', final: true } });
+    assert.notEqual(result.isError, true);
+    assert.equal(parse(result).taskId, 3);
+    assert.equal(adopted, 1, 'the submission adopts once, then ownership answers');
   } finally { await client.close(); await service.close(); }
 });
 

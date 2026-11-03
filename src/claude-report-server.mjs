@@ -127,16 +127,26 @@ export function trustedExtra(extra, caller) {
  *   name-addressed management tools on this same server, called with
  *   `{ server, caller, trusted }`. The caller is the verified one above.
  */
-export function createClaudeReportServer({ resolveCaller, resolveOwned, management, instructions = INSTRUCTIONS,
-  version = SERVER_VERSION } = {}) {
+export function createClaudeReportServer({ resolveCaller, resolveOwned, management, adopt,
+  instructions = INSTRUCTIONS, version = SERVER_VERSION } = {}) {
   if (typeof resolveCaller !== 'function') throw new TypeError('createClaudeReportServer requires resolveCaller');
   if (typeof resolveOwned !== 'function') throw new TypeError('createClaudeReportServer requires resolveOwned');
   const server = new McpServer({ name: SERVER_NAME, version }, { instructions });
 
   const submit = async (kind, { message, final = false, extra }) => {
     const caller = await resolveCaller();
-    const owned = await resolveOwned(caller, { tool: kind, input: { message, final },
+    let owned = await resolveOwned(caller, { tool: kind, input: { message, final },
       toolUseId: nativeToolUseId(extra) });
+    // A listing never waits for a binding, so the only place this matters is a real
+    // submission that arrives before the plugin has bound the session. Prove the
+    // pending creation from the transcript opener here, once, then retry the lookup.
+    if (!owned && typeof adopt === 'function') {
+      const outcome = await adopt(caller).catch(error => ({ adopted: false, reason: error?.code ?? 'adopt-failed' }));
+      if (outcome?.adopted) {
+        owned = await resolveOwned(caller, { tool: kind, input: { message, final },
+          toolUseId: nativeToolUseId(extra) }).catch(() => null);
+      }
+    }
     if (!owned) {
       throw refuse('not-owned-session',
         `Claude session ${caller?.sessionId ?? '(unknown)'} is not bound to a FutureAide-owned agent. `
@@ -221,19 +231,12 @@ export async function runStdioService({ resolveOwned, resolveCaller, instruction
   let server;
   try {
     const caller = await resolve();
-    let owned = typeof resolveOwned === 'function' ? await resolveOwned(caller, { tool: 'list' }) : null;
-    if (!owned && typeof adopt === 'function') {
-      const outcome = await adopt(caller).catch(error => ({ adopted: false, reason: error?.code ?? 'adopt-failed' }));
-      if (outcome?.adopted) owned = await resolveOwned(caller, { tool: 'list' }).catch(() => null);
-      else log(`first list left unbound (${outcome?.reason ?? 'unknown'})`);
-    }
-    // Every verified session gets the same static table: the shared management
-    // tools plus ask/report. Which of them a session may actually use is decided
-    // per call (an unowned session is refused with not-owned-session), so the
-    // surface no longer depends on when a binding lands.
-    server = createClaudeReportServer({ resolveOwned, instructions, management,
+    // No adoption here: the static table does not depend on a binding, and a real
+    // submission still goes through the same call-time gate and adoption.
+    const owned = typeof resolveOwned === 'function' ? await resolveOwned(caller, { tool: 'list' }) : null;
+    server = createClaudeReportServer({ resolveOwned, instructions, management, adopt,
       resolveCaller: async () => caller });
-    if (!owned) log('this session is not plugin-owned; the report surface lists no tools');
+    if (!owned) log('this session is not bound yet; the static tool table is served anyway');
   } catch (error) {
     server = createUnavailableReportServer();
     log(`no verified caller (${error?.code ?? 'caller-unresolved'}); the report surface lists no tools`);
@@ -271,7 +274,7 @@ async function readBody(req, limitBytes = 1024 * 1024) {
 export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1', resolveOwned,
   resolveCaller, instructions, identity = {}, adopt, management, rosterId = undefined, log = () => {} } = {}) {
   const startedAt = new Date().toISOString();
-  const stats = { requests: 0, owned: 0, unowned: 0, adopted: 0, served: 0 };
+  const stats = { requests: 0, owned: 0, unowned: 0, served: 0 };
   // One identity per TCP connection, dropped when that socket closes.
   const identities = new WeakMap();
   let boundPort = port;
@@ -319,30 +322,20 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     const { caller } = await resolution;
     let owned = null;
     if (caller && typeof resolveOwned === 'function') {
+      // One cheap roster read for the health counters. Listing never waits for a
+      // binding and never adopts: the table is static, and a real submission does
+      // the adoption itself.
       try { owned = await resolveOwned(caller, { tool: 'list' }); }
       catch (error) {
         if (!resolution.ownershipNoted) {
           resolution.ownershipNoted = true;
-          log(`owned session ${caller.sessionId} cannot report now (${error?.code ?? 'not-accepted'}): `
+          log(`session ${caller.sessionId} cannot report now (${error?.code ?? 'not-accepted'}): `
             + `${String(error?.message ?? error).slice(0, 200)}`);
         }
       }
-      // The session may ask for tools before the plugin has bound it. Adopt the
-      // pending creation it can prove it belongs to, then re-read ownership for
-      // this same request; the client is never assumed to list again.
-      if (!owned && typeof adopt === 'function') {
-        const outcome = await adopt(caller).catch(error => ({ adopted: false, reason: error?.code ?? 'adopt-failed' }));
-        if (outcome?.adopted) {
-          stats.adopted += 1;
-          if (!resolution.adoptionNoted) {
-            resolution.adoptionNoted = true;
-            log(`first list adopted ${outcome.name ?? outcome.agentId} after ${outcome.waitedMs ?? 0}ms`);
-          }
-          owned = await resolveOwned(caller, { tool: 'list' }).catch(() => null);
-        } else if (!resolution.adoptionNoted) {
-          resolution.adoptionNoted = true;
-          log(`first list left unbound (${outcome?.reason ?? 'unknown'})`);
-        }
+      if (!owned && !resolution.unboundNoted) {
+        resolution.unboundNoted = true;
+        log(`session ${caller.sessionId} is not bound yet; serving the static tool table`);
       }
     }
     if (owned) stats.owned += 1; else stats.unowned += 1;
@@ -355,7 +348,7 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     // so an unowned parent lists ask/report and is refused with not-owned-session
     // when it uses them, and an unverified peer still gets nothing.
     const mcp = caller
-      ? createClaudeReportServer({ resolveCaller: async () => caller, resolveOwned, instructions, management })
+      ? createClaudeReportServer({ resolveCaller: async () => caller, resolveOwned, instructions, management, adopt })
       : createUnavailableReportServer();
     const close = () => { void transport.close().catch(() => {}); void mcp.close().catch(() => {}); };
     res.once('close', close);

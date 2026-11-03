@@ -187,7 +187,7 @@ export async function createClaudeBackend(record, deps = {}) {
         parentSessionId: null, name: current.name, status: 'idle', activity: 'idle', changes: [], coverage: CLAUDE_FILE_COVERAGE }] };
       if (state.binding && !tree) throw failure('tree-protocol-required', 'Claude task-tree observation is not ready.');
       return { sessionId: current.sessionId, taskId: current.task?.taskId, running: tree?.running ?? running,
-        throughSeq: p.throughSeq, currentModel: p.currentModel, activity: p.activity,
+        throughSeq: p.throughSeq, currentModel: p.currentModel, modelSelectionObserved: false, activity: p.activity,
         changes: p.changes, coverage: CLAUDE_FILE_COVERAGE, questions: p.questions, reports: p.reports,
         tree: tree ?? emptyTree };
     },

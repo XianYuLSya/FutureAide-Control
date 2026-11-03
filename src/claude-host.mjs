@@ -31,6 +31,14 @@ import { fileURLToPath } from 'node:url';
 export const NATIVE_HOST = 'claude-desktop';
 /** Exact user message the app appends to a transcript when a turn is stopped. */
 export const INTERRUPT_MARKER = '[Request interrupted by user]';
+export const INTERRUPT_MARKER_TOOL = '[Request interrupted by user for tool use]';
+/**
+ * Every exact sentence the app writes when it stops a turn. Both were observed
+ * on this host: a plain stop writes the first, a stop while a tool was running
+ * writes the second. A record is an interrupt only when one of these is the
+ * whole text of a user-side part.
+ */
+export const INTERRUPT_MARKERS = Object.freeze([INTERRUPT_MARKER, INTERRUPT_MARKER_TOOL]);
 /** Deep-link prompt cap measured in the shipped bundle. */
 export const DEEP_LINK_PROMPT_LIMIT = 14336;
 
@@ -351,8 +359,10 @@ export function interruptEvidence(events, sinceIso) {
     const at = Date.parse(event.timestamp);
     if (!(at >= since)) continue;
     if (event.role !== 'user') continue;
-    if (!(event.textParts ?? []).includes(INTERRUPT_MARKER)) continue;
-    return { type: event.type, uuid: event.uuid, timestamp: event.timestamp, matched: 'exact-text-part' };
+    const parts = event.textParts ?? [];
+    const marker = INTERRUPT_MARKERS.find(candidate => parts.includes(candidate));
+    if (!marker) continue;
+    return { type: event.type, uuid: event.uuid, timestamp: event.timestamp, marker, matched: 'exact-text-part' };
   }
   return undefined;
 }
@@ -781,6 +791,18 @@ export async function createFirstTurn({
 }// ---------------------------------------------------------------- interrupt
 
 /**
+ * What a stop actually covers. The app's stop control ends the current turn of
+ * one session; background children it spawned keep running and hand back on
+ * their own schedule (observed: the child kept heart-beating for ~40s after the
+ * stop). Tree-wide cancellation is therefore never claimed from a stop.
+ */
+export const INTERRUPT_SCOPE = 'session-turn';
+export const INTERRUPT_SCOPE_NOTE = Object.freeze({
+  childrenMayContinue: true,
+  scopeNote: 'This cancels the current turn of one session. A background child task is not stopped by it and may still hand back later; a tree-wide cancel has to be driven separately.',
+});
+
+/**
  * Stop the running turn of one session.
  *
  * Confirmation is the app's own interrupt record: a *user* message whose text is
@@ -799,7 +821,7 @@ export async function interrupt({ nativeSessionId }, {
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
   if (!record.alive) {
     return { interrupted: false, cancelled: true, status: 'not-running', reason: 'session-process-gone',
-      nativeSessionId, verifiedBy: ['host-process-exited'] };
+      nativeSessionId, verifiedBy: ['host-process-exited'], scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
   }
   const ui = requireDriver(driver, 'interrupting a turn');
   const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink, env });
@@ -815,7 +837,8 @@ export async function interrupt({ nativeSessionId }, {
     const evidence = interruptEvidence(now.events, since);
     if (evidence) {
       return { interrupted: true, cancelled: true, status: 'interrupted', nativeSessionId,
-        method: press?.method, verifiedBy: ['transcript-interrupt-marker'], evidence, revealed: visible.revealed };
+        method: press?.method, verifiedBy: ['transcript-interrupt-marker'], evidence, revealed: visible.revealed,
+        scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
     }
     await sleep(pollMs);
   }
@@ -828,7 +851,8 @@ export async function interrupt({ nativeSessionId }, {
   if (idle) {
     return { interrupted: false, cancelled: true, status: 'idle-no-turn', reason: 'no-running-turn',
       nativeSessionId, method: press?.method,
-      verifiedBy: ['host-stop-control-absent', 'registry-idle'], revealed: visible.revealed };
+      verifiedBy: ['host-stop-control-absent', 'registry-idle'], revealed: visible.revealed,
+      scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
   }
   return { interrupted: false, cancelled: false, status: 'unconfirmed', reason: 'interrupt-marker-not-written',
     nativeSessionId, method: press?.method, revealed: visible.revealed,

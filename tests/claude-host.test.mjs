@@ -12,6 +12,7 @@ import {
   createNullDriver, createFirstTurn, interrupt, destroy, resume, readDefaultModel, selectModel,
   probeClaudeHost, parseModelControl, modelInfo, resolveModelEvidence, confirmModelAfterTurn, sessionArtifacts,
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
+  INTERRUPT_MARKER_TOOL, INTERRUPT_MARKERS, INTERRUPT_SCOPE,
   MODEL_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
   loadModelCatalog, BUILT_IN_MODEL_CATALOG, extractModelSelectorConfigs, sliceBalancedArray,
   extractEmbeddedCatalog, readQuotedLiteral, firstTurnBinding, readTranscriptHead, firstInputOf,
@@ -988,5 +989,56 @@ test('an empty composer that only holds a newline does not block the draft read'
     assert.equal(read.reasoningEffort, 'medium');
     assert.equal(read.navigation.navigated, true);
     assert.equal(read.navigation.restored, 'session');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+
+test('a stop during a tool use is recognised by its own exact sentence', () => {
+  const now = Date.now();
+  const since = new Date(now).toISOString();
+  const toolStop = { type: 'user', role: 'user', timestamp: new Date(now + 1000).toISOString(),
+    textParts: [INTERRUPT_MARKER_TOOL] };
+  const evidence = interruptEvidence([toolStop], since);
+  assert.equal(evidence.marker, INTERRUPT_MARKER_TOOL);
+  assert.equal(evidence.matched, 'exact-text-part');
+
+  // The plain sentence and the tool-use sentence are different messages, not a substring match.
+  const plain = { type: 'user', role: 'user', timestamp: new Date(now + 2000).toISOString(), textParts: [INTERRUPT_MARKER] };
+  assert.equal(interruptEvidence([plain], since).marker, INTERRUPT_MARKER);
+  const quoting = { type: 'user', role: 'user', timestamp: new Date(now + 3000).toISOString(),
+    textParts: ['the log showed ' + INTERRUPT_MARKER_TOOL + ' yesterday'] };
+  assert.equal(interruptEvidence([quoting], since), undefined, 'a sentence that merely contains it is not evidence');
+  const assistant = { type: 'assistant', role: 'assistant', timestamp: new Date(now + 4000).toISOString(),
+    textParts: [INTERRUPT_MARKER_TOOL] };
+  assert.equal(interruptEvidence([assistant], since), undefined);
+});
+
+test('interrupt is confirmed by the tool-use stop sentence too', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({ interrupt: async () => {
+    await host1.append(SESSION, [userLine(INTERRUPT_MARKER_TOOL)]);
+    return { method: 'stop-button', stopButtonFound: true };
+  } });
+  try {
+    const result = await interrupt({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 1000, pollMs: 20 });
+    assert.equal(result.interrupted, true);
+    assert.equal(result.evidence.marker, INTERRUPT_MARKER_TOOL);
+    assert.deepEqual(result.verifiedBy, ['transcript-interrupt-marker']);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+
+test('a stop states its scope instead of implying a tree wide cancel', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({ interrupt: async () => {
+    await host1.append(SESSION, [userLine(INTERRUPT_MARKER)]);
+    return { method: 'stop-button', stopButtonFound: true };
+  } });
+  try {
+    const result = await interrupt({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 1000, pollMs: 20 });
+    assert.equal(result.interrupted, true);
+    assert.equal(result.scope, 'session-turn');
+    assert.equal(result.childrenMayContinue, true);
+    assert.match(result.scopeNote, /background child/);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

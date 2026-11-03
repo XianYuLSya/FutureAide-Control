@@ -90,16 +90,17 @@ function currentRecord(binding) {
   return value;
 }
 
-export async function sendClaude(binding, message, { requestId = randomUUID(), timeoutMs = 10000 } = {}) {
+export async function sendClaude(binding, message, { requestId = randomUUID(), timeoutMs = 10000, priority = 'next' } = {}) {
   if (typeof message !== 'string' || !message.trim()) throw new Error('claude-message-empty');
   if (!/^[a-zA-Z0-9-]{1,100}$/.test(requestId)) throw new Error('claude-request-id-invalid');
+  if (!['next', 'now'].includes(priority)) throw new Error('claude-priority-invalid');
   currentRecord(binding);
   const keyName = `${binding.pid}.${createHash('sha256').update(binding.socketPath).digest('hex')}.key`;
   const key = await json(path.join(binding.directory, keyName));
   if (!/^[a-f0-9]{32}$/i.test(key.peerToken ?? '') || (key.procStartFt ?? key.procStart) !== binding.procStart
       || key.pidDomain !== binding.pidDomain) throw new Error('claude-inbox-key-mismatch');
   const body = message.replace(/<\/cross-session-message\b/gi, '<\\/cross-session-message');
-  const frame = { type: 'user', uuid: requestId, priority: 'next', from: 'FutureAide Control',
+  const frame = { type: 'user', uuid: requestId, priority, from: 'FutureAide Control',
     session_id: binding.sessionId, message: { role: 'user',
       content: `<cross-session-message from-name="FutureAide Control">\n[FutureAide request ${requestId}]\n${body}\n</cross-session-message>` } };
   const payload = `${JSON.stringify({ type: 'auth', token: key.peerToken })}\n${JSON.stringify(frame)}\n`;
@@ -130,7 +131,46 @@ export async function sendClaude(binding, message, { requestId = randomUUID(), t
   });
 }
 
-export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576 } = {}) {
+// The observer retains only the small fields needed to pair reports/file writes.
+// It never retains thinking blocks, complete tool output, or code/file contents.
+const textOf = content => typeof content === 'string' ? content : Array.isArray(content)
+  ? content.filter(part => part?.type === 'text').map(part => part.text ?? '').join('\n') : '';
+export function reportReceipt(content, depth = 0) {
+  if (depth > 4) return undefined;
+  if (typeof content === 'string') {
+    try { return reportReceipt(JSON.parse(content), depth + 1); } catch { return undefined; }
+  }
+  if (!content || typeof content !== 'object' || content.isError === true) return undefined;
+  if (content.accepted === true) return { accepted: true, taskId: content.taskId,
+    agentId: content.agentId, kind: content.kind, final: content.final,
+    questionId: content.questionId, receiptId: content.receiptId };
+  const parts = Array.isArray(content) ? content : content.content;
+  for (const part of Array.isArray(parts) ? parts : []) {
+    const found = reportReceipt(part?.type === 'text' ? part.text : part, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function toolInput(input) {
+  const picked = {};
+  for (const key of ['message', 'final', 'file_path', 'path', 'notebook_path', 'description',
+    'name', 'subagent_type', 'run_in_background', 'resume', 'task_id', 'agent_id']) {
+    if (typeof input?.[key] === 'string' || typeof input?.[key] === 'boolean') picked[key] = input[key];
+  }
+  return picked;
+}
+
+function toolMetadata(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  const picked = {};
+  for (const key of ['agentId', 'taskId', 'status', 'isAsync', 'outputFile', 'filePath', 'type']) {
+    if (['string', 'boolean'].includes(typeof value[key])) picked[key] = value[key];
+  }
+  return Object.keys(picked).length ? picked : undefined;
+}
+
+export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576, sidechain = false } = {}) {
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid-transcript-offset');
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new Error('invalid-transcript-page-size');
   const handle = await open(binding.transcriptFile, 'r');
@@ -144,34 +184,48 @@ export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576
     // observer does not reread the same bytes forever; it may choose a larger page.
     if (!complete && bytesRead === maxBytes) throw new Error('claude-transcript-line-exceeds-page');
     const events = [], deliveries = [];
-    for (const line of buffer.subarray(0, complete).toString('utf8').split('\n')) {
+    let badLines = 0, lineStart = 0;
+    while (lineStart < complete) {
+      const lineEnd = buffer.indexOf(10, lineStart);
+      const line = buffer.subarray(lineStart, lineEnd).toString('utf8');
+      const seq = offset + lineEnd + 1;
+      lineStart = lineEnd + 1;
       if (!line.trim()) continue;
-      const event = JSON.parse(line);
+      let event;
+      try { event = JSON.parse(line); } catch { badLines++; continue; }
       if (event.sessionId !== binding.sessionId) continue;
+      if ((event.isSidechain === true) !== sidechain) continue;
       // Busy-session inbox messages are attachments, not user messages. Native
       // source_uuid correlates them without asking the model to echo our marker.
       const attachment = event.attachment;
       if (event.type === 'attachment' && attachment?.type === 'queued_command'
           && attachment.origin?.kind === 'peer' && typeof attachment.source_uuid === 'string') {
         deliveries.push({ requestId: attachment.source_uuid, deliveryId: attachment.delivery_id,
-          stage: 'accepted', timestamp: event.timestamp });
+          stage: 'accepted', timestamp: event.timestamp, seq });
       } else if (event.type === 'queue-operation' && event.operation === 'remove'
           && event.reason === 'absorbed_mid_turn' && typeof event.commandUuid === 'string') {
         deliveries.push({ requestId: event.commandUuid, deliveryId: event.deliveryId,
-          stage: 'inserted', timestamp: event.timestamp });
+          stage: 'inserted', timestamp: event.timestamp, seq });
       } else if (event.type === 'user' && typeof event.uuid === 'string'
           && typeof event.message?.content === 'string') {
         // An idle-session inbox frame retains its UUID as a user message. The
         // caller matches this against its persisted request IDs, never by text.
-        deliveries.push({ requestId: event.uuid, stage: 'inserted', timestamp: event.timestamp });
+        deliveries.push({ requestId: event.uuid, stage: 'inserted', timestamp: event.timestamp, seq });
       }
       if (!['user', 'assistant'].includes(event.type)) continue;
       const content = event.message?.content;
-      events.push({ type: event.type, uuid: event.uuid, timestamp: event.timestamp, model: event.message?.model,
+      events.push({ type: event.type, uuid: event.uuid, parentUuid: event.parentUuid,
+        seq, timestamp: event.timestamp, model: event.message?.model, agentId: event.agentId,
         effort: event.effort ?? event.perTurnEffort, stopReason: event.message?.stop_reason,
-        text: typeof content === 'string' ? content : (content ?? []).filter(c => c.type === 'text').map(c => c.text).join('\n'),
-        tools: Array.isArray(content) ? content.filter(c => c.type === 'tool_use').map(c => ({ id: c.id, name: c.name })) : [] });
+        apiError: event.isApiErrorMessage === true,
+        text: textOf(content).slice(0, 8000),
+        textTruncated: textOf(content).length > 8000,
+        tools: Array.isArray(content) ? content.filter(c => c.type === 'tool_use').map(c => ({ id: c.id, name: c.name,
+          input: toolInput(c.input) })) : [],
+        results: Array.isArray(content) ? content.filter(c => c.type === 'tool_result').map(c => ({ id: c.tool_use_id,
+          isError: c.is_error === true, receipt: c.is_error === true ? undefined : reportReceipt(c.content),
+          metadata: toolMetadata(event.toolUseResult), summary: textOf(c.content).slice(0, 2000) })) : [] });
     }
-    return { events, deliveries, offset: offset + complete, size, hasMore: offset + complete < size };
+    return { events, deliveries, badLines, offset: offset + complete, size, hasMore: offset + complete < size };
   } finally { await handle.close(); }
 }

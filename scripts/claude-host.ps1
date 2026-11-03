@@ -51,6 +51,7 @@ function Add-Win32 {
 [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
 [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, IntPtr dwExtraInfo);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 '@ | Out-Null
 }
 
@@ -64,36 +65,89 @@ function Get-Condition {
 }
 
 function Get-ClaudeWindow {
+  # A Claude process can own several Chrome_WidgetWin_1 windows: the one the user
+  # is looking at, plus hidden ones left over from earlier pages. Picking the
+  # first one read the wrong page's accessibility tree, so the window is chosen
+  # by being the foreground visible window, then the largest visible one.
+  Add-Win32
   $root = [System.Windows.Automation.AutomationElement]::RootElement
-  $procs = @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
+  $foreground = [FutureAideHost.Win32]::GetForegroundWindow()
+  $candidates = @()
+  $procs = @(Get-Process -Name 'claude' -ErrorAction SilentlyContinue)
   foreach ($proc in $procs) {
     $condition = New-Object System.Windows.Automation.PropertyCondition(
       [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc.Id)
-    $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)
-    foreach ($window in $windows) {
+    foreach ($window in $root.FindAll([System.Windows.Automation.TreeScope]::Children, $condition)) {
       if ($window.Current.ClassName -ne 'Chrome_WidgetWin_1') { continue }
-      return [pscustomobject]@{ Element = $window; Pid = $proc.Id; Title = $window.Current.Name; Path = $proc.Path }
+      $handle = [IntPtr]$window.Current.NativeWindowHandle
+      $rect = $window.Current.BoundingRectangle
+      $area = if ($rect.IsEmpty) { 0 } else { $rect.Width * $rect.Height }
+      $candidates += [pscustomobject]@{
+        Element = $window; Pid = $proc.Id; Title = $window.Current.Name; Path = $proc.Path
+        Hwnd = $handle.ToInt64()
+        Foreground = ($handle -eq $foreground)
+        Visible = (-not $rect.IsEmpty) -and ($area -gt 0)
+        Area = $area
+      }
     }
   }
-  throw 'claude-window-not-found'
+  if ($candidates.Count -eq 0) { throw 'claude-window-not-found' }
+  $chosen = $candidates | Sort-Object -Property @{ Expression = 'Foreground'; Descending = $true },
+    @{ Expression = 'Visible'; Descending = $true }, @{ Expression = 'Area'; Descending = $true } | Select-Object -First 1
+  $chosen | Add-Member -NotePropertyName Candidates -NotePropertyValue @($candidates | ForEach-Object {
+    @{ hwnd = $_.Hwnd; pid = $_.Pid; foreground = $_.Foreground; visible = $_.Visible; area = $_.Area; title = $_.Title }
+  }) -Force
+  return $chosen
 }
 
-function Get-WebRoot($window) {
-  $documents = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-      [System.Windows.Automation.ControlType]::Document)))
-  $best = $null
-  $bestCount = -1
-  foreach ($document in $documents) {
-    $count = $document.FindAll([System.Windows.Automation.TreeScope]::Descendants, (Get-Condition)).Count
-    if ($document.Current.AutomationId -eq 'RootWebArea' -and $count -gt $bestCount) {
-      $best = $document
-      $bestCount = $count
+function Get-WebRoot($window, [string]$titleHint = '') {
+  # The window can hold more than one document: the app shell (an empty
+  # RootWebArea) and the page the user is on. The page is the document with a
+  # real subtree and a name; the shell and empty snapshots are reported but not
+  # chosen. A stale tree (only the shell) is retried once after focusing.
+  function Read-Documents {
+    $documents = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+      (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Document)))
+    $list = @()
+    foreach ($document in $documents) {
+      if ($document.Current.AutomationId -ne 'RootWebArea') { continue }
+      $count = $document.FindAll([System.Windows.Automation.TreeScope]::Descendants, (Get-Condition)).Count
+      $list += [pscustomobject]@{ Element = $document; Name = $document.Current.Name; Descendants = $count }
     }
+    return $list
   }
-  if ($null -eq $best -and $documents.Count -gt 0) { $best = $documents.Item(0) }
-  return [pscustomobject]@{ Element = $best; DocumentName = $(if ($null -ne $best) { $best.Current.Name } else { '' }) }
+  $documents = @(Read-Documents)
+  $named = @($documents | Where-Object { $_.Name -and $_.Descendants -gt 2 })
+  $best = $null
+  if ($titleHint) {
+    $best = $named | Where-Object { $_.Name.StartsWith($titleHint) } | Sort-Object Descendants -Descending | Select-Object -First 1
+  }
+  if ($null -eq $best) { $best = $named | Sort-Object Descendants -Descending | Select-Object -First 1 }
+  $refreshed = $false
+  if ($null -eq $best -and $documents.Count -gt 0) {
+    # Only shells or an empty snapshot were readable: focus the window (allowed
+    # refresh, no input) and look once more before reporting staleness.
+    try { Focus-Window $window } catch { }
+    Start-Sleep -Milliseconds 500
+    $documents = @(Read-Documents)
+    $named = @($documents | Where-Object { $_.Name -and $_.Descendants -gt 2 })
+    if ($titleHint) {
+      $best = $named | Where-Object { $_.Name.StartsWith($titleHint) } | Sort-Object Descendants -Descending | Select-Object -First 1
+    }
+    if ($null -eq $best) { $best = $named | Sort-Object Descendants -Descending | Select-Object -First 1 }
+    $refreshed = $true
+  }
+  $summary = @($documents | ForEach-Object { @{ name = $_.Name; descendants = $_.Descendants } })
+  return [pscustomobject]@{
+    Element = $(if ($null -ne $best) { $best.Element } else { $null })
+    DocumentName = $(if ($null -ne $best) { $best.Name } else { '' })
+    DocumentCount = $documents.Count
+    Documents = $summary
+    Refreshed = $refreshed
+    Stale = ($null -eq $best)
+  }
 }
 
 function Find-Elements($root, [string]$pattern, [string]$controlType) {
@@ -299,7 +353,11 @@ try {
       $models = Find-Elements $web.Element $modelPattern 'Button'
       Write-Result @{ ok = $true; value = @{
         available = $true
-        window = @{ pid = $window.Pid; title = $window.Title; executable = $window.Path }
+        window = @{ pid = $window.Pid; title = $window.Title; executable = $window.Path
+          hwnd = $window.Hwnd; foreground = $window.Foreground; visible = $window.Visible
+          candidates = $window.Candidates }
+        documents = $web.Documents
+        stale = $web.Stale
         documentName = $web.DocumentName
         composerFound = ($composers.Count -gt 0)
         modelControlFound = ($models.Count -gt 0)
@@ -323,6 +381,10 @@ try {
         composerFound = ($composers.Count -gt 0)
         modelLabel = $(if ($models.Count -gt 0) { $models[0].Current.Name } else { $null })
         messages = $signature.messages
+        windowHwnd = $window.Hwnd
+        windowForeground = $window.Foreground
+        documents = $web.Documents
+        stale = $web.Stale
         composerLength = $(if ($null -ne $signature.composerValue) { $signature.composerValue.Length } else { 0 })
         # An empty composer still holds a newline; only real text counts as unsent.
         composerTrimmedLength = $(if ($null -ne $signature.composerValue) { $signature.composerValue.Trim().Length } else { 0 })

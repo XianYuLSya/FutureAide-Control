@@ -944,87 +944,262 @@ export async function resume({ nativeSessionId, hostSessionId: hint }, {
     nativeSessionId, hostSessionId, opened };
 }
 
+// ------------------------------------------------------------ model catalog
+
+/**
+ * The model catalogue the application ships with.
+ *
+ * The installed app carries the authoritative id/name pairs and effort options
+ * inside its main bundle (`model_selector_config`, one entry per surface). This
+ * is read straight out of the app's own resources, read-only, so the mapping is
+ * the app's own data instead of a table maintained by hand.
+ */
+const ASAR_HEADER_OFFSET = 16;
+
+function asarHeader(handle) {
+  const head = Buffer.alloc(64);
+  return handle.read(head, 0, 64, 0).then(({ bytesRead }) => {
+    if (bytesRead < ASAR_HEADER_OFFSET + 8) throw fail('asar-truncated', 'The app archive header is unreadable.');
+    const headerSize = head.readUInt32LE(4);
+    const headerLength = head.readUInt32LE(12);
+    const dataBase = 8 + headerSize;
+    const buffer = Buffer.alloc(headerLength);
+    return handle.read(buffer, 0, headerLength, ASAR_HEADER_OFFSET)
+      .then(({ bytesRead: read }) => ({ dataBase, header: JSON.parse(buffer.subarray(0, read).toString('utf8')) }));
+  });
+}
+
+function collectAsarFiles(node, prefix = '', out = []) {
+  for (const [name, entry] of Object.entries(node.files ?? {})) {
+    const filePath = prefix ? `${prefix}/${name}` : name;
+    if (entry.files) collectAsarFiles(entry, filePath, out);
+    else out.push({ path: filePath, offset: Number(entry.offset), size: Number(entry.size) });
+  }
+  return out;
+}
+
+/** Balanced `[...]` starting at `from`, aware of strings and escapes. */
+export function sliceBalancedArray(source, from) {
+  const start = source.indexOf('[', from);
+  if (start < 0) return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index];
+    if (inString) {
+      if (escaped) { escaped = false; continue; }
+      if (character === '\\') { escaped = true; continue; }
+      if (character === '"') inString = false;
+      continue;
+    }
+    if (character === '"') { inString = true; continue; }
+    if (character === '[') depth += 1;
+    else if (character === ']') {
+      depth -= 1;
+      if (depth === 0) return source.slice(start, index + 1);
+    }
+  }
+  return undefined;
+}
+
+/** Every `model_selector_config` array found in a bundle's source. */
+export function extractModelSelectorConfigs(source) {
+  const found = [];
+  const key = '"model_selector_config"';
+  let index = source.indexOf(key);
+  while (index !== -1) {
+    const json = sliceBalancedArray(source, index + key.length);
+    if (json) {
+      try {
+        const parsed = JSON.parse(json);
+        if (Array.isArray(parsed)) found.push(...parsed);
+      } catch { /* a different shape in this build */ }
+    }
+    index = source.indexOf(key, index + key.length);
+  }
+  return found;
+}
+
+function normalizeSurface(entry) {
+  const models = (entry?.models ?? []).map(model => ({
+    id: model.id,
+    name: model.name,
+    shortName: model.short_name,
+    section: model.section,
+    effortOptions: (model.thinking?.effort_options ?? []).map(option => ({
+      id: option.id,
+      name: option.name,
+      recommended: option.badge?.message ?? undefined,
+      tooltip: option.tooltip?.content ?? undefined,
+    })),
+  }));
+  const efforts = models[0]?.effortOptions ?? [];
+  return {
+    surface: entry?.id,
+    models,
+    efforts: efforts.length ? efforts : [{ id: 'medium', name: 'Medium', recommended: 'Recommended' }],
+    byId: new Map(models.map(model => [model.id, model])),
+    byName: new Map(models.map(model => [model.name, model])),
+    recommendedEffort: efforts.find(option => option.recommended)?.id,
+  };
+}
+
+/** The catalogue this build was read with, if the app archive cannot be read. */
+export const BUILT_IN_MODEL_CATALOG = Object.freeze({
+  source: 'built-in-snapshot',
+  surface: 'ccd',
+  selectionSource: 'global_default',
+  models: Object.freeze([
+    { id: 'claude-opus-5-5', name: 'Opus 5.5', section: 'main' },
+    { id: 'claude-sonnet-5-5', name: 'Sonnet 5.5', section: 'main' },
+    { id: 'claude-fable-5-1', name: 'Fable 5.1', section: 'main' },
+    { id: 'claude-haiku-5-5', name: 'Haiku 5.5', section: 'main' },
+    { id: 'claude-haiku-4-5-20251001', name: 'Haiku 4.5', section: 'overflow' },
+    { id: 'claude-sonnet-5', name: 'Sonnet 5', section: 'overflow' },
+    { id: 'claude-opus-5', name: 'Opus 5', section: 'overflow' },
+    { id: 'claude-fable-5', name: 'Fable 5', section: 'overflow' },
+    { id: 'claude-opus-4-8', name: 'Opus 4.8', section: 'overflow' },
+    { id: 'claude-opus-4-7', name: 'Opus 4.7', section: 'overflow' },
+    { id: 'claude-opus-4-6', name: 'Opus 4.6', section: 'overflow' },
+    { id: 'claude-sonnet-4-6', name: 'Sonnet 4.6', section: 'overflow' },
+    { id: 'claude-opus-4-1-20250805', name: 'Opus 4.1', section: 'overflow' },
+  ]),
+  efforts: Object.freeze([
+    { id: 'low', name: 'Low' },
+    { id: 'medium', name: 'Medium', recommended: 'Recommended' },
+    { id: 'high', name: 'High' },
+    { id: 'xhigh', name: 'Extra' },
+    { id: 'max', name: 'Max' },
+  ]),
+});
+
+function snapshotSurface(catalog) {
+  const models = catalog.models.map(model => ({ ...model, effortOptions: [] }));
+  return {
+    surface: catalog.surface,
+    models,
+    efforts: catalog.efforts,
+    byId: new Map(models.map(model => [model.id, model])),
+    byName: new Map(models.map(model => [model.name, model])),
+    recommendedEffort: catalog.efforts.find(option => option.recommended)?.id,
+    selectionSource: catalog.selectionSource,
+  };
+}
+
+/** Where the app archive is, from the running app itself when possible. */
+export async function resolveAppAsar({ driver, env = process.env } = {}) {
+  if (typeof env?.CLAUDE_APP_ASAR === 'string' && env.CLAUDE_APP_ASAR.trim()) {
+    return { asar: path.resolve(env.CLAUDE_APP_ASAR.trim()), source: 'env' };
+  }
+  if (driverAvailable(driver) && typeof driver.probe === 'function') {
+    const probe = await driver.probe().catch(() => undefined);
+    const executable = probe?.window?.executable;
+    if (typeof executable === 'string' && executable.toLowerCase().endsWith('claude.exe')) {
+      const candidate = path.join(path.dirname(executable), '..', 'resources', 'app.asar');
+      const info = await stat(candidate).catch(() => null);
+      if (info?.isFile()) return { asar: path.resolve(candidate), source: 'running-app' };
+    }
+  }
+  return { asar: undefined, source: 'unavailable' };
+}
+
+const catalogCache = new Map();
+
+/**
+ * Read the shipped model catalogue. Falls back to the snapshot this build was
+ * developed against only when the archive cannot be read; the result always says
+ * which one it used.
+ */
+export async function loadModelCatalog({ asar = undefined, driver, env = process.env } = {}) {
+  const resolved = asar ? { asar, source: 'explicit' } : await resolveAppAsar({ driver, env });
+  if (!resolved.asar) {
+    return { ...snapshotSurface(BUILT_IN_MODEL_CATALOG), catalogSource: 'built-in-snapshot', asar: undefined };
+  }
+  const info = await stat(resolved.asar).catch(() => null);
+  if (!info?.isFile()) {
+    return { ...snapshotSurface(BUILT_IN_MODEL_CATALOG), catalogSource: 'built-in-snapshot',
+      asar: resolved.asar, note: 'archive-not-found' };
+  }
+  const cacheKey = `${resolved.asar}:${info.mtimeMs}:${info.size}`;
+  const cached = catalogCache.get(cacheKey);
+  if (cached) return cached;
+  const handle = await open(resolved.asar, 'r').catch(() => null);
+  if (!handle) {
+    return { ...snapshotSurface(BUILT_IN_MODEL_CATALOG), catalogSource: 'built-in-snapshot', asar: resolved.asar };
+  }
+  try {
+    const { dataBase, header } = await asarHeader(handle);
+    const bundles = collectAsarFiles(header).filter(entry => /^\.vite\/build\/index\.chunk-.*\.js$/.test(entry.path));
+    let surface;
+    let selectionSource;
+    let usedBundle;
+    for (const bundle of bundles) {
+      const buffer = Buffer.alloc(bundle.size);
+      await handle.read(buffer, 0, bundle.size, dataBase + bundle.offset);
+      const source = buffer.toString('utf8');
+      const configs = extractModelSelectorConfigs(source);
+      const ccd = configs.find(entry => entry?.id === 'ccd') ?? configs.find(entry => entry?.id === 'cc');
+      if (!ccd) continue;
+      surface = normalizeSurface(ccd);
+      const match = /"selection_source"\s*:\s*"([a-z_]+)"/.exec(source);
+      selectionSource = match?.[1];
+      usedBundle = bundle.path;
+      break;
+    }
+    if (!surface) {
+      return { ...snapshotSurface(BUILT_IN_MODEL_CATALOG), catalogSource: 'built-in-snapshot',
+        asar: resolved.asar, note: 'catalog-not-found-in-archive' };
+    }
+    const result = { ...surface, selectionSource, catalogSource: 'app-asar', asar: resolved.asar, bundle: usedBundle };
+    catalogCache.set(cacheKey, result);
+    return result;
+  } catch (error) {
+    return { ...snapshotSurface(BUILT_IN_MODEL_CATALOG), catalogSource: 'built-in-snapshot',
+      asar: resolved.asar, note: error.code ?? 'archive-read-failed' };
+  } finally { await handle.close(); }
+}
 // ------------------------------------------------------------------- models
 
 /** Effort words the composer's model control appends after the model name. */
 export const EFFORT_WORDS = Object.freeze(['最大', '最高', '最低', '超高', '中等', '高', '中', '低',
-  'XHigh', 'Max', 'High', 'Medium', 'Low']);
+  'Extra', 'XHigh', 'Max', 'High', 'Medium', 'Low']);
 
 /**
- * The effort menu this host shows for a model, as surveyed in the app itself on
- * this machine: low / medium (recommended, preselected) / high / xhigh / max,
- * where max carries the "3.5× or more usage" hint. Ultracode is a separate
- * toggle, not an effort.
+ * The effort scale as the app's own catalogue and menu present it: the shipped
+ * catalogue carries the option ids and names (`low/medium/high/xhigh/max`), and
+ * this build shows them localized. Every label below was seen on this machine's
+ * composer; `medium` is the recommended, preselected option.
  */
-export const EFFORT_MENU = Object.freeze({
-  order: Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']),
-  labels: Object.freeze({ low: '低', medium: '中等', high: '高', xhigh: '超高', max: '最高' }),
-  recommended: Object.freeze({ effort: 'medium', label: '中等' }),
-  usageHintOnMax: '3.5× 或更多',
-  ultracode: 'separate toggle, not an effort',
+export const EFFORT_LABEL_FOR = Object.freeze({
+  low: '低', medium: '中等', high: '高', xhigh: '超高', max: '最高',
 });
 
-/**
- * Effort label <-> host effort value. Every pair here is the host's own menu
- * wording; the value side was seen in this host's session records and launch
- * arguments (`effort: max` with `最高`, `effort: medium` with `中等`).
- */
-export const EFFORT_LABELS = Object.freeze({
-  '最高': 'max', '最大': 'max', 'Max': 'max',
-  '超高': 'xhigh', 'XHigh': 'xhigh',
-  '高': 'high', 'High': 'high',
-  '中等': 'medium', '中': 'medium', 'Medium': 'medium',
-  '低': 'low', 'Low': 'low',
-});
+export const EFFORT_LABELS = Object.freeze(Object.fromEntries(
+  Object.entries(EFFORT_LABEL_FOR).flatMap(([value, label]) => [[label, value], [label.toUpperCase(), value]]),
+));
 
-export const EFFORT_LABEL_FOR = Object.freeze(EFFORT_MENU.labels);
-export const EFFORT_VALUE_FOR_LABEL = EFFORT_LABELS;
-
-/** Is this effort value one the host's effort menu offers? */
-export function isOfferedEffort(value) {
-  return EFFORT_MENU.order.includes(value);
+/** Is this effort value one the app's catalogue offers? */
+export function isOfferedEffort(value, catalog = undefined) {
+  const efforts = catalog?.efforts ?? BUILT_IN_MODEL_CATALOG.efforts;
+  return efforts.some(option => option.id === value);
 }
 
-/**
- * Model id -> the label the host shows. Only ids with a observed pairing are
- * mapped; an unknown id is reported as unresolved instead of being guessed.
- * `Opus 5.5` was observed together with `claude-opus-5-5` both in this host's
- * transcripts and in its own session launch arguments.
- */
-export const MODEL_LABELS = Object.freeze({
-  'claude-opus-5-5': Object.freeze({ provider: 'anthropic', label: 'Opus 5.5', evidence: 'transcript model + host launch arg --model=claude-opus-5-5 with composer label "Opus 5.5"' }),
-});
-
-/**
- * The model menu this host shows, in the app's own order, surveyed directly in
- * the app on this machine: the primary entries, then the entries behind "more".
- * A label listed here is proven to exist as a menu option; that says nothing
- * about its model id, which is only mapped where it was observed.
- */
+/** The model menu as the shipped catalogue arranges it, for callers that need it. */
 export const MODEL_MENU = Object.freeze({
-  primary: Object.freeze(['Opus 5.5', 'Sonnet 5.5', 'Fable 5.1', 'Haiku 5.5']),
-  more: Object.freeze(['Haiku 4.5', 'Sonnet 5', 'Opus 5', 'Fable 5', 'Opus 4.8', 'Opus 4.7', 'Opus 4.6', 'Sonnet 4.6']),
+  primary: Object.freeze(BUILT_IN_MODEL_CATALOG.models.filter(model => model.section === 'main').map(model => model.name)),
+  more: Object.freeze(BUILT_IN_MODEL_CATALOG.models.filter(model => model.section !== 'main').map(model => model.name)),
 });
 
-/** Every model label the host's menu offers, primary entries first. */
-export function offeredModelLabels() {
-  return [...MODEL_MENU.primary, ...MODEL_MENU.more];
+/** Every model label the catalogue offers, primary entries first (snapshot view). */
+export function offeredModelLabels(catalog = undefined) {
+  const models = catalog?.models ?? BUILT_IN_MODEL_CATALOG.models;
+  return [...models].sort((left, right) => (left.section === 'main' ? 0 : 1) - (right.section === 'main' ? 0 : 1))
+    .map(model => model.name);
 }
 
-export function isOfferedModelLabel(label) {
-  return offeredModelLabels().includes(String(label ?? '').trim());
-}
-
-export function labelForModel({ provider = 'anthropic', model } = {}) {
-  const known = MODEL_LABELS[model];
-  if (!known) {
-    return { resolved: false, reason: 'unmapped-model-id', model, provider,
-      known: Object.keys(MODEL_LABELS) };
-  }
-  if (known.provider !== provider) {
-    return { resolved: false, reason: 'provider-mismatch', model, provider, expectedProvider: known.provider };
-  }
-  return { resolved: true, provider, model, label: known.label, evidence: known.evidence };
+export function isOfferedModelLabel(label, catalog = undefined) {
+  return offeredModelLabels(catalog).includes(String(label ?? '').trim());
 }
 
 /**
@@ -1068,6 +1243,20 @@ export function modelInfo(value) {
   return { label: null };
 }
 
+/** Resolve a model id to the name the app's own catalogue gives it. */
+export function labelForModel({ provider = 'anthropic', model } = {}, catalog = undefined) {
+  const models = catalog?.models ?? BUILT_IN_MODEL_CATALOG.models;
+  const known = models.find(entry => entry.id === model);
+  if (!known) {
+    return { resolved: false, reason: 'unmapped-model-id', model, provider, known: models.map(entry => entry.id) };
+  }
+  if (provider !== 'anthropic') {
+    return { resolved: false, reason: 'provider-mismatch', model, provider, expectedProvider: 'anthropic' };
+  }
+  return { resolved: true, provider, model, label: known.name, section: known.section,
+    evidence: 'app catalogue model_selector_config (id/name pair)' };
+}
+
 /** The model a session actually ran, from its own transcript. */
 async function transcriptModel({ env, record }) {
   const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
@@ -1098,10 +1287,7 @@ export async function hostModelEvidence({ env = process.env, isAlive = defaultIs
   return { sessions: observed };
 }
 
-/**
- * Merge label-shaped reflections of one model across sessions. This can never
- * prove which option the host's own menu offers — it only corroborates.
- */
+/** Merge label-shaped reflections of one model across sessions (never a proof). */
 export function resolveModelEvidence({ label, effortLabel, evidence = {}, provider = 'anthropic' }) {
   const sessions = evidence.sessions ?? [];
   const currentModels = [...new Set(sessions.map(session => session.current?.model).filter(Boolean))];
@@ -1140,15 +1326,14 @@ async function launchArgsOf({ driver, record }) {
 }
 
 /**
- * The model the *next* turn of this session will use.
- *
- * The session's own transcript is the record of what it ran; the host's launch
- * argv says what it started with; the composer control (when the session is on
- * screen) says what is selected now. Disagreement is reported, not averaged.
+ * The model the *next* turn of this session will use: the composer control when
+ * the session is on screen, corroborated by what its transcript recorded and what
+ * the host launched it with. Disagreement is reported, not averaged.
  */
 export async function readCurrentModel({ nativeSessionId }, {
-  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive,
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, catalog = undefined, asar = undefined,
 } = {}) {
+  const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
   const transcript = await transcriptModel({ env, record });
   const launchArgs = await launchArgsOf({ driver, record });
@@ -1160,10 +1345,11 @@ export async function readCurrentModel({ nativeSessionId }, {
     if (onScreen) {
       const raw = modelInfo(await driver.readModel().catch(() => undefined));
       if (raw.label) {
+        const known = modelCatalog.models.find(model => model.name === raw.label);
         control = {
           label: raw.label,
           effortLabel: raw.effort,
-          model: Object.entries(MODEL_LABELS).find(([, value]) => value.label === raw.label)?.[0],
+          model: known?.id,
           reasoningEffort: raw.effort ? EFFORT_LABELS[raw.effort] : undefined,
         };
       }
@@ -1190,9 +1376,10 @@ export async function readCurrentModel({ nativeSessionId }, {
     model,
     reasoningEffort,
     resolved: Boolean(model),
-    label: control?.label ?? (model ? MODEL_LABELS[model]?.label : undefined),
+    label: control?.label ?? (model ? modelCatalog.models.find(entry => entry.id === model)?.name : undefined),
     effortLabel: control?.effortLabel ?? (reasoningEffort ? EFFORT_LABEL_FOR[reasoningEffort] : undefined),
     source: control?.model ? 'composer-control+transcript' : transcript?.current ? 'session-transcript' : 'host-launch-args',
+    catalogSource: modelCatalog.catalogSource,
     evidence: {
       transcript: transcript?.current ?? null,
       launchArgs: launchArgs ?? null,
@@ -1204,50 +1391,52 @@ export async function readCurrentModel({ nativeSessionId }, {
 }
 
 /**
- * The model a *new* session would start with, on this host, right now.
+ * The model a *new* session would start with on this host.
  *
- * Taken from the host's own state: the newest session's launch arguments (the
- * app spawns every session with its current default) and, when a driver is
- * given, the composer's own model control. Sessions are not polled to vote on a
- * single id — that cannot prove what the host actually offers.
+ * Read from the composer of the page in front of the user (a fresh draft shows
+ * the current default) and resolved through the app's own catalogue. A session
+ * that happens to be running is never used as a stand-in: its launch arguments
+ * can predate a change of the global default. `selection_source: global_default`
+ * in the shipped config is what makes the control the right source.
  */
 export async function readDefaultModel({
-  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive,
+  driver = createNullDriver(), env = process.env, catalog = undefined, asar = undefined,
 } = {}) {
-  const { sessions } = await scanNativeSessions({ env, isAlive });
-  const live = sessions.filter(session => session.alive)
-    .sort((left, right) => (right.startedAt ?? 0) - (left.startedAt ?? 0));
-  const newest = live[0];
-  const launchArgs = newest ? await launchArgsOf({ driver, record: newest }) : undefined;
+  const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
   const control = driverAvailable(driver)
     ? modelInfo(await driver.readModel().catch(() => undefined))
     : { label: null };
-  const controlModel = control.label
-    ? Object.entries(MODEL_LABELS).find(([, value]) => value.label === control.label)?.[0]
-    : undefined;
-  const model = controlModel ?? launchArgs?.model ?? MODEL_LABELS['claude-opus-5-5'].model;
-  const reasoningEffort = (control.effort ? EFFORT_LABELS[control.effort] : undefined)
-    ?? launchArgs?.effort ?? EFFORT_MENU.recommended.effort;
+  const summary = {
+    surface: modelCatalog.surface,
+    models: modelCatalog.models.map(model => ({ id: model.id, name: model.name, section: model.section })),
+    efforts: modelCatalog.efforts,
+  };
+  if (!control.label) {
+    return {
+      provider: 'anthropic', model: null, reasoningEffort: undefined, label: null, effortLabel: null,
+      resolved: false, verified: false, reason: 'draft-control-required',
+      selectionSource: modelCatalog.selectionSource ?? 'global_default',
+      catalogSource: modelCatalog.catalogSource, evidence: { control: null, catalog: summary },
+      detail: 'The current default is whatever the host shows in a draft composer; open or read that control instead of inferring it from a running session.',
+    };
+  }
+  const known = modelCatalog.models.find(model => model.name === control.label);
+  const reasoningEffort = control.effort ? EFFORT_LABELS[control.effort] : undefined;
   return {
     provider: 'anthropic',
-    model,
+    model: known?.id ?? null,
     reasoningEffort,
-    label: control.label ?? MODEL_LABELS[model]?.label,
-    effortLabel: control.effort ?? EFFORT_LABEL_FOR[reasoningEffort],
-    resolved: Boolean(model),
-    verified: Boolean(control.label || launchArgs?.model),
-    source: controlModel ? 'composer-control+newest-session-args'
-      : launchArgs?.model ? 'newest-session-launch-args' : 'model-labels-table',
-    evidence: {
-      newestSession: newest ? { nativeSessionId: newest.nativeSessionId, pid: newest.pid, startedAt: newest.startedAt } : null,
-      launchArgs: launchArgs ?? null,
-      control: control.label ? control : null,
-      modelMenu: MODEL_MENU,
-      effortMenu: EFFORT_MENU,
-    },
+    label: control.label,
+    effortLabel: control.effort,
+    resolved: Boolean(known?.id),
+    verified: Boolean(known?.id),
+    source: 'draft-control+app-catalog',
+    selectionSource: modelCatalog.selectionSource ?? 'global_default',
+    catalogSource: modelCatalog.catalogSource,
+    ...(known ? {} : { reason: 'label-not-in-catalog', unresolvedLabel: control.label }),
+    evidence: { control: control.raw ? control : null, catalog: summary },
     gaps: [
-      'No host settings file on this machine carries the default model, so the value comes from the app\'s own session launch arguments and its composer control.',
-      `Model ids are mapped for ${Object.keys(MODEL_LABELS).join(', ')} only; the other menu labels (${offeredModelLabels().filter(label => !Object.values(MODEL_LABELS).some(known => known.label === label)).join(', ')}) are known options without a proven id.`,
+      'The label list is the app catalogue (sections main and overflow); a catalogue entry can be hidden from the visible menu, so the control stays the source of the current value.',
     ],
   };
 }
@@ -1268,33 +1457,32 @@ export async function confirmModelAfterTurn({ nativeSessionId, after } = {}, {
 }
 
 /**
- * Select a model for one session by model id and effort, through the host's own
- * control, then read the control back. `accepted` needs the control to show the
- * requested label and effort; an unknown id is refused rather than mapped to
- * something plausible.
+ * Select a model for one session by model id and effort through the host's own
+ * control, then read the control back. The id/name pairs and the allowed effort
+ * ids come from the app's shipped catalogue, so a future model needs no proof
+ * beyond the catalogue entry itself.
  */
 export async function selectModel({ nativeSessionId, provider = 'anthropic', model, reasoningEffort }, {
-  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, timeoutMs = 15000, pollMs = 250,
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, catalog = undefined, asar = undefined,
+  timeoutMs = 15000, pollMs = 250,
 } = {}) {
-  const mapped = labelForModel({ provider, model });
+  const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
+  const mapped = labelForModel({ provider, model }, modelCatalog);
   if (!mapped.resolved) {
     throw fail(mapped.reason,
-      `Cannot map ${JSON.stringify(model)} to a host label: ${mapped.reason}. The host menu offers ${offeredModelLabels().join(', ')}; only labels with a proven id are selectable by id.`,
-      { ...mapped, menu: offeredModelLabels() });
+      `Cannot resolve ${JSON.stringify(model)} through the app catalogue: ${mapped.reason}. Known ids: ${mapped.known?.join(', ')}.`,
+      mapped);
   }
-  const offeredLabel = isOfferedModelLabel(mapped.label);
-  const effortLabel = reasoningEffort ? EFFORT_LABEL_FOR[reasoningEffort] : undefined;
-  if (reasoningEffort && !effortLabel) {
+  if (reasoningEffort && !isOfferedEffort(reasoningEffort, modelCatalog)) {
     throw fail('unmapped-effort',
-      `reasoningEffort ${JSON.stringify(reasoningEffort)} is not on this host's effort menu (${EFFORT_MENU.order.join(' / ')}).`);
+      `reasoningEffort ${JSON.stringify(reasoningEffort)} is not in the app's effort options (${modelCatalog.efforts.map(option => option.id).join(' / ')}).`,
+      { efforts: modelCatalog.efforts });
   }
-  if (reasoningEffort && !isOfferedEffort(reasoningEffort)) {
-    throw fail('unmapped-effort', `reasoningEffort ${JSON.stringify(reasoningEffort)} is not offered by this host.`);
-  }
+  const effortLabel = reasoningEffort ? EFFORT_LABEL_FOR[reasoningEffort] : undefined;
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
   const ui = requireDriver(driver, 'selecting a model');
   await ensureSessionVisible(record, { driver: ui, allowDeepLink: true, env });
-  const before = await readCurrentModel({ nativeSessionId }, { driver: ui, env, isAlive });
+  const before = await readCurrentModel({ nativeSessionId }, { driver: ui, env, isAlive, catalog: modelCatalog });
   const attempt = await ui.selectModel({ label: mapped.label, effortLabel });
   let shown = modelInfo(attempt?.observed ?? await ui.readModel().catch(() => undefined));
   const deadline = Date.now() + timeoutMs;
@@ -1309,19 +1497,19 @@ export async function selectModel({ nativeSessionId, provider = 'anthropic', mod
       accepted: false, status: 'unconfirmed', requested: { provider, model, reasoningEffort },
       observedBefore: { label: before.label, effortLabel: before.effortLabel },
       observedAfter: { label: shown.label ?? null, effortLabel: shown.effort ?? null }, attempt,
+      catalogSource: modelCatalog.catalogSource,
       detail: 'The Claude Desktop model control did not show the requested model/effort, so no selection is claimed.',
     };
   }
-  const after = await readCurrentModel({ nativeSessionId }, { driver: ui, env, isAlive });
+  const after = await readCurrentModel({ nativeSessionId }, { driver: ui, env, isAlive, catalog: modelCatalog });
   return {
     accepted: true, requested: { provider, model, reasoningEffort },
     before: { label: before.label, model: before.model, reasoningEffort: before.reasoningEffort },
     after: { label: after.label, effortLabel: after.effortLabel, provider: after.provider,
       model: after.model, reasoningEffort: after.reasoningEffort, source: after.source, conflicts: after.conflicts },
     verifiedBy: ['ui-model-control-read-back', 'session-state'],
+    catalogSource: modelCatalog.catalogSource,
     attempt,
-    menuLabelOffered: offeredLabel,
-    gap: 'The mapping from model id to the label the menu shows is proven for Opus 5.5 only; the other labels the menu offers stay unmapped until each id is observed.',
   };
 }// -------------------------------------------------------------------- probe
 

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
 import { mkdir, mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   INTERRUPT_MARKER, DEEP_LINK_PROMPT_LIMIT, markerLine, assertBindingNonce, assertRequestId,
@@ -11,7 +12,8 @@ import {
   createNullDriver, createFirstTurn, interrupt, destroy, resume, readDefaultModel, selectModel,
   probeClaudeHost, parseModelControl, modelInfo, resolveModelEvidence, confirmModelAfterTurn, sessionArtifacts,
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
-  MODEL_MENU, EFFORT_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
+  MODEL_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
+  loadModelCatalog, BUILT_IN_MODEL_CATALOG, extractModelSelectorConfigs, sliceBalancedArray,
 } from '../src/claude-host.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -445,31 +447,35 @@ test('resume of a closed session only succeeds when the record comes back', asyn
 
 ﻿// ------------------------------------------------------------------ models
 
-test('the surveyed model and effort menus are the ones this host shows', () => {
+test('the catalogue driven menu is the one this host shows', () => {
   assert.deepEqual(MODEL_MENU.primary, ['Opus 5.5', 'Sonnet 5.5', 'Fable 5.1', 'Haiku 5.5']);
-  assert.equal(offeredModelLabels().length, 12);
+  assert.equal(offeredModelLabels().length, 13);
   assert.equal(isOfferedModelLabel('Opus 4.6'), true);
   assert.equal(isOfferedModelLabel('Opus 5.6'), false);
-  assert.deepEqual(EFFORT_MENU.order, ['low', 'medium', 'high', 'xhigh', 'max']);
-  assert.equal(EFFORT_MENU.labels.xhigh, '超高');
+  assert.deepEqual(BUILT_IN_MODEL_CATALOG.efforts.map(option => option.id), ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(BUILT_IN_MODEL_CATALOG.efforts.find(option => option.recommended)?.id, 'medium');
   assert.equal(EFFORT_LABELS['超高'], 'xhigh');
   assert.equal(EFFORT_LABEL_FOR.max, '最高');
   assert.equal(isOfferedEffort('xhigh'), true);
   assert.equal(isOfferedEffort('turbo'), false);
+  assert.equal(BUILT_IN_MODEL_CATALOG.selectionSource, 'global_default');
   // The menu decorates the recommended entry and the max entry with hints.
   assert.equal(parseModelControl('模型：Opus 5.5 中等（推荐）').effort, '中等');
   assert.equal(parseModelControl('模型：Opus 5.5 中等（推荐）').label, 'Opus 5.5');
   assert.equal(parseModelControl('模型：Opus 5.5 最高 3.5× 或更多').effort, '最高');
 });
 
-test('model ids map to host labels only where a pairing was observed', () => {
-  const mapped = labelForModel({ provider: 'anthropic', model: 'claude-opus-5-5' });
+test('every id in the shipped catalogue maps to its own name', () => {
+  const mapped = labelForModel({ provider: 'anthropic', model: 'claude-sonnet-5-5' });
   assert.equal(mapped.resolved, true);
-  assert.equal(mapped.label, 'Opus 5.5');
-  assert.match(mapped.evidence, /launch arg/);
-  assert.deepEqual(labelForModel({ model: 'claude-frobnicator-9' }),
-    { resolved: false, reason: 'unmapped-model-id', model: 'claude-frobnicator-9', provider: 'anthropic',
-      known: ['claude-opus-5-5'] });
+  assert.equal(mapped.label, 'Sonnet 5.5');
+  assert.equal(mapped.section, 'main');
+  assert.match(mapped.evidence, /model_selector_config/);
+  assert.equal(labelForModel({ model: 'claude-haiku-4-5-20251001' }).label, 'Haiku 4.5');
+  assert.equal(labelForModel({ model: 'claude-opus-4-1-20250805' }).label, 'Opus 4.1');
+  const unknown = labelForModel({ model: 'claude-frobnicator-9' });
+  assert.equal(unknown.reason, 'unmapped-model-id');
+  assert.ok(unknown.known.includes('claude-opus-5-5'), 'the refusal lists the ids the catalogue knows');
   assert.equal(labelForModel({ provider: 'openai', model: 'claude-opus-5-5' }).reason, 'provider-mismatch');
 });
 
@@ -482,24 +488,25 @@ test('the model control name is parsed, not echoed as the model', () => {
   assert.equal(modelInfo(undefined).label, null);
 });
 
-test('the default model comes from the host launch args and the control, not from voting', async () => {
-  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [userLine('hi'), assistantLine('claude-opus-5-5', 'medium')] } });
-  const driver = uiDriver({
-    readSessionArgs: ({ pid }) => ({ pid, found: true, model: 'claude-opus-5-5', effort: 'medium' }),
-    readModel: () => ({ raw: '模型：Opus 5.5 中等' }),
-  });
-  try {
-    const read = await readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive });
-    assert.equal(read.provider, 'anthropic');
-    assert.equal(read.model, 'claude-opus-5-5');
-    assert.equal(read.reasoningEffort, 'medium');
-    assert.equal(read.label, 'Opus 5.5');
-    assert.equal(read.effortLabel, '中等');
-    assert.equal(read.verified, true);
-    assert.equal(read.source, 'composer-control+newest-session-args');
-    assert.equal(read.evidence.launchArgs.effort, 'medium');
-    assert.ok(read.gaps.length >= 1, 'the gaps are stated with the value');
-  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+test('the default model is the draft control resolved through the catalogue', async () => {
+  const driver = uiDriver({ readModel: () => ({ raw: '模型：Sonnet 5.5 高' }) });
+  const read = await readDefaultModel({ driver, catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+  assert.equal(read.provider, 'anthropic');
+  assert.equal(read.model, 'claude-sonnet-5-5');
+  assert.equal(read.reasoningEffort, 'high');
+  assert.equal(read.label, 'Sonnet 5.5');
+  assert.equal(read.effortLabel, '高');
+  assert.equal(read.resolved, true);
+  assert.equal(read.verified, true);
+  assert.equal(read.source, 'draft-control+app-catalog');
+  assert.equal(read.selectionSource, 'global_default');
+  assert.equal(read.evidence.control.raw, '模型：Sonnet 5.5 高');
+  assert.equal(read.evidence.launchArgs, undefined, 'a running session never stands in for the default');
+
+  const blind = await readDefaultModel({ driver: createNullDriver() });
+  assert.equal(blind.resolved, false);
+  assert.equal(blind.reason, 'draft-control-required');
+  assert.match(blind.detail, /draft composer/);
 });
 
 test('a session next-turn model is read from its own transcript and the control', async () => {
@@ -542,7 +549,7 @@ test('a model selection is requested by id and confirmed by the control', async 
     assert.equal(result.accepted, true);
     assert.equal(result.after.label, 'Opus 5.5');
     assert.equal(result.after.reasoningEffort, 'max');
-    assert.ok(result.gap.includes('Opus 5.5'));
+    assert.equal(result.catalogSource, 'built-in-snapshot');
     await assert.rejects(selectModel({ nativeSessionId: SESSION, model: 'claude-frobnicator-9' },
       { driver, env: host1.env, isAlive: host1.isAlive }), { code: 'unmapped-model-id' });
     await assert.rejects(selectModel({ nativeSessionId: SESSION, model: 'claude-opus-5-5', reasoningEffort: 'turbo' },
@@ -764,4 +771,45 @@ test('only an exact interrupt message written after the request counts', () => {
   const evidence = interruptEvidence([real], since);
   assert.equal(evidence.matched, 'exact-text-part');
   assert.equal(evidence.type, 'api-request-blob');
+});
+
+// ---------------------------------------------------- shipped model catalogue
+
+test('the catalogue parser reads the shipped JSON shape without executing it', () => {
+  const bundle = 'var a=1;x={"selection_source":"global_default"}],"model_selector_config":[{"id":"ccd","models":[{"id":"claude-x-1","name":"X 1","section":"main","thinking":{"effort_options":[{"id":"low","name":"Low"},{"id":"medium","name":"Medium","badge":{"message":"Recommended"}}]}}]}],"next":2;';
+  const configs = extractModelSelectorConfigs(bundle);
+  assert.equal(configs.length, 1);
+  assert.equal(configs[0].id, 'ccd');
+  assert.equal(configs[0].models[0].id, 'claude-x-1');
+  assert.equal(configs[0].models[0].thinking.effort_options[1].badge.message, 'Recommended');
+  // Brackets inside strings and escapes must not end the array.
+  const tricky = 'k="model_selector_config":[{"id":"ccd","note":"a ] bracket and \\" quote","models":[]}]';
+  const parsed = JSON.parse(sliceBalancedArray(tricky, tricky.indexOf('"model_selector_config"')));
+  assert.equal(parsed[0].note, 'a ] bracket and " quote');
+  assert.equal(sliceBalancedArray('no array here', 0), undefined);
+});
+
+test('an unreadable archive falls back to the snapshot this build knows', async () => {
+  const catalog = await loadModelCatalog({ asar: path.join(os.tmpdir(), 'definitely-not-an-archive.asar') });
+  assert.equal(catalog.catalogSource, 'built-in-snapshot');
+  assert.equal(catalog.surface, 'ccd');
+  assert.equal(catalog.selectionSource, 'global_default');
+  assert.equal(catalog.models.length, 13);
+  assert.equal(catalog.models.find(model => model.id === 'claude-sonnet-5-5').name, 'Sonnet 5.5');
+  assert.equal(catalog.efforts.find(option => option.id === 'xhigh').name, 'Extra');
+});
+
+test('the installed app archive carries the authoritative catalogue', async t => {
+  const asar = 'C:/Program Files/WindowsApps/Claude_4.4212.0.0_x64__pzs8sxrjxfjjc/app/resources/app.asar';
+  if (!existsSync(asar)) return t.skip('the app archive is not installed on this machine');
+  const catalog = await loadModelCatalog({ asar });
+  assert.equal(catalog.catalogSource, 'app-asar');
+  assert.equal(catalog.surface, 'ccd');
+  assert.equal(catalog.selectionSource, 'global_default');
+  assert.equal(catalog.models.length, 13);
+  assert.deepEqual(catalog.models.filter(model => model.section === 'main').map(model => model.name),
+    ['Opus 5.5', 'Sonnet 5.5', 'Fable 5.1', 'Haiku 5.5']);
+  assert.equal(labelForModel({ model: 'claude-opus-5-5' }, catalog).label, 'Opus 5.5');
+  assert.equal(labelForModel({ model: 'claude-sonnet-5-5' }, catalog).label, 'Sonnet 5.5');
+  assert.deepEqual(catalog.efforts.map(option => option.id), ['low', 'medium', 'high', 'xhigh', 'max']);
 });

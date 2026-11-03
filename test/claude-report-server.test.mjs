@@ -155,6 +155,20 @@ test('the development ownership stub accepts only the pinned session and records
   assert.match(lines.join('\n'), /final=true/);
 });
 
+test('a second binder on the same port is refused while the first keeps serving', async () => {
+  const first = await startHttpService({ port: 0, resolveOwned: async () => null, resolveCaller: async () => caller });
+  try {
+    await assert.rejects(startHttpService({ port: first.port, resolveOwned: async () => null,
+      resolveCaller: async () => caller }), error => {
+      assert.equal(error.code, 'report-port-in-use');
+      assert.match(error.message, /Only one report service may own this port/);
+      return true;
+    });
+    const health = await fetch(`${first.url.replace('/mcp', '/healthz')}`).then(response => response.json());
+    assert.equal(health.ok, true);
+  } finally { await first.close(); }
+});
+
 test('identity is cached per TCP connection while ownership is re-read per request', async () => {
   let resolutions = 0;
   let ownershipChecks = 0;

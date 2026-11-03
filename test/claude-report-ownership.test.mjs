@@ -94,10 +94,12 @@ test('ownership needs the shared store, not a stand-in object', () => {
     /requires the shared RosterStore/);
 });
 
-test('the surface follows a late binding on the same live connection', async () => {
-  // The session is created before the plugin knows its native id, so the first
-  // tools/list may arrive with no binding at all. Writing the binding is enough:
-  // the next list already carries both tools, with no reconnect and no restart.
+test('the surface re-reads ownership on every tools/list (server side only)', async () => {
+  // The session exists before the plugin knows its native id, so the first
+  // tools/list may arrive with no binding. On the server side nothing is cached:
+  // once `binding.sessionId` is written the next list carries both tools. Whether
+  // a Claude client re-asks at all is client behaviour and is settled by one real
+  // G2 run — this test claims nothing about it.
   const store = new RosterStore(':memory:');
   const agentId = 'agent-' + randomUUID().replace(/-/g, '');
   store.insert({ agentId, ownerId: 'owner-late', name: '晚绑定副手', target: 'claude-desktop',

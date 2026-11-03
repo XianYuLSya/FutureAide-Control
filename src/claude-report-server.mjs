@@ -281,8 +281,12 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
   });
 
   await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(port, host, () => { server.off('error', reject); resolve(); });
+    const onError = error => reject(error?.code === 'EADDRINUSE'
+      ? Object.assign(new Error(`Another process already serves ${host}:${port}. Only one report service may own `
+        + 'this port, so the running one keeps serving; do not start a second.'), { code: 'report-port-in-use' })
+      : error);
+    server.once('error', onError);
+    server.listen(port, host, () => { server.off('error', onError); resolve(); });
   });
   boundPort = server.address()?.port ?? port;
   const url = `http://${host}:${boundPort}${HTTP_PATH}`;

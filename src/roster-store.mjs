@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,6 +9,9 @@ const pause = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 export class RosterStore {
   constructor(filename) {
     if (filename !== ':memory:') mkdirSync(path.dirname(filename), { recursive: true });
+    // Canonical absolute location. Its hash is this roster's identity — a public
+    // name for the database, never a credential.
+    this.location = filename === ':memory:' ? ':memory:' : path.resolve(filename);
     this.db = new DatabaseSync(filename);
     this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -180,6 +183,18 @@ export class RosterStore {
   dataVersion() {
     const row = this.db.prepare('PRAGMA data_version').get();
     return row?.data_version ?? row?.DATA_VERSION;
+  }
+  /**
+   * Stable identity of this roster: sha256 of the canonical absolute database
+   * path (case-normalized on Windows). It answers "which database is this service
+   * serving" without carrying a credential, so a listener for another roster can
+   * never be mistaken for ours.
+   */
+  identity() {
+    const location = this.location === ':memory:'
+      ? ':memory:'
+      : (process.platform === 'win32' ? this.location.toLowerCase() : this.location);
+    return createHash('sha256').update(location).digest('hex');
   }
   /** Open claude-desktop bindings only, for the listener's watch set. */
   listClaudeBindings() {

@@ -220,7 +220,7 @@ async function readBody(req, limitBytes = 1024 * 1024) {
  * request, so one shared process cannot leak another session's identity.
  */
 export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1', resolveOwned,
-  resolveCaller, instructions, identity = {}, adopt, log = () => {} } = {}) {
+  resolveCaller, instructions, identity = {}, adopt, rosterId = undefined, log = () => {} } = {}) {
   const startedAt = new Date().toISOString();
   const stats = { requests: 0, owned: 0, unowned: 0, adopted: 0, served: 0 };
   // One identity per TCP connection, dropped when that socket closes.
@@ -231,7 +231,8 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     const path = (req.url ?? '').split('?')[0];
     if (path !== HTTP_PATH) {
       if (path === '/healthz' && req.method === 'GET') {
-        sendJson(res, 200, { ok: true, server: SERVER_NAME, version: SERVER_VERSION, startedAt, stats });
+        sendJson(res, 200, { ok: true, server: SERVER_NAME, version: SERVER_VERSION, startedAt, stats,
+          ...(rosterId === undefined ? {} : { roster: rosterId }) });
         return;
       }
       sendJson(res, 404, { error: { code: 'not-found', message: `Use POST ${HTTP_PATH}.` } });
@@ -360,6 +361,9 @@ export async function startReportService({ store, port = DEFAULT_PORT, host = '1
   env = process.env, log = () => {} } = {}) {
   if (!store) throw new TypeError('startReportService requires the shared RosterStore');
   return startHttpService({ port, host, log,
+    // The health document names the roster it serves, so a caller can prove the
+    // service it reached belongs to its own database.
+    rosterId: typeof store.identity === 'function' ? store.identity() : undefined,
     resolveOwned: createReportOwnership({ store, env }),
     adopt: caller => adoptFirstListBinding({ store, caller, env }) });
 }

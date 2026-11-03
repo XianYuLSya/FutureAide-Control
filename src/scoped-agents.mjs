@@ -10,7 +10,7 @@ import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { readReportStatus, reportPort, reportUrl } from './report-endpoint.mjs';
+import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './report-endpoint.mjs';
 import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
   TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
 
@@ -171,7 +171,7 @@ export function createScopedAgents(config, {
   const adapterDeps = (record, { startReports = true } = {}) => {
     const load = () => store.get(record.agentId) ?? record;
     const target = targetOf(record);
-    const readStatus = () => reportStatusProbe({ port: reportPort() });
+    const readStatus = () => reportStatusProbe({ port: reportPort(config), expectedRoster: rosterIdentity(store) });
     return {
       load,
       requestDirectory: () => agentDirectory(load()),
@@ -183,11 +183,11 @@ export function createScopedAgents(config, {
     };
   };
   async function ensureReportsReady() {
-    const port = reportPort();
+    const port = reportPort(config);
     await ensureMonitor();
     const deadline = Date.now() + reportReadyTimeoutMs;
     for (;;) {
-      const status = await reportStatusProbe({ port });
+      const status = await reportStatusProbe({ port, expectedRoster: rosterIdentity(store) });
       if (status.ready) return { ...status, via: 'monitor' };
       if (Date.now() >= deadline) break;
       await wait(50);

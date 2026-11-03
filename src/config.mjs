@@ -5,7 +5,7 @@ import path from 'node:path';
 export const defaultConfigPath = () => path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'futureaide-control', 'config.json');
 
 const configPath = filename => path.resolve(filename || process.env.DSH_CONTROL_CONFIG || process.env.FUTUREAIDE_CONTROL_CONFIG || defaultConfigPath());
-const transportFields = ['dataRoot', 'dshDataRoot', 'target', 'baseUrl', 'instanceFile', 'preferredInstanceFile', 'timeoutMs', 'hostBridgeFile', 'managedStateDirectory'];
+const transportFields = ['dataRoot', 'dshDataRoot', 'target', 'baseUrl', 'instanceFile', 'preferredInstanceFile', 'timeoutMs', 'hostBridgeFile', 'managedStateDirectory', 'reportPort'];
 const targetFields = ['futureaideSessionId', 'codexThreadId'];
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -13,6 +13,7 @@ export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 function dshConfig(value) {
   if (value.target !== undefined && value.target !== 'dsh') throw new Error('Only target=dsh is supported. Select the DSH data directory or an explicit DSH instance.');
   if (value.managedStateDirectory !== undefined && (typeof value.managedStateDirectory !== 'string' || !path.isAbsolute(value.managedStateDirectory))) throw new Error('The managed host state path must be absolute.');
+  if (value.reportPort !== undefined && (!Number.isInteger(value.reportPort) || value.reportPort < 0 || value.reportPort > 65535)) throw new Error('The loopback report port must be an integer between 0 and 65535.');
   const dataRoot = value.dshDataRoot ?? value.dataRoot ?? process.env.DSH_HOME ?? path.join(homedir(), '.dsh');
   return { ...value, target: 'dsh', dataRoot, dshDataRoot: dataRoot };
 }

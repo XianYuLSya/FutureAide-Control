@@ -1,26 +1,32 @@
 // Readiness link to the loopback tool service that managed Claude sessions call
-// back through. The service itself lives in src/claude-report-server.mjs (owned by
-// the report surface); this module only answers "is it up, and what is its URL"
-// and, in the long-lived plugin process, starts it once.
+// back through. The service itself is src/claude-report-server.mjs (owned by the
+// report surface, tools ask_parent/report_parent only); this module only answers
+// "is OUR roster's service up, and what is its URL".
 //
-// Hosting rule (from that module's own contract): host it in the plugin process
-// that is already up before any managed session starts — never in the shared
-// monitor, which is created for a task and exits when work stops. A session must
-// never be handed a tool endpoint that dies with its task, so the monitor passes
-// hostReportService: false and only reads readiness.
+// Hosting rule: the one shared monitor hosts it (same RosterStore, same process
+// lifetime), never a service per MCP connection. Identity is the roster itself —
+// sha256 of the canonical database path from RosterStore.identity() — so a service
+// that answers but belongs to another roster is reported as foreign and never
+// reused.
 import { DEFAULT_PORT, HTTP_PATH, startReportService } from './claude-report-server.mjs';
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-/** Loopback report port, configured inside the plugin (never a tool argument). */
-export function reportPort(env = process.env) {
+/** Loopback report port: config.reportPort, then FUTUREAIDE_REPORT_PORT, then the default. */
+export function reportPort(config = {}, env = process.env) {
+  if (Number.isInteger(config?.reportPort) && config.reportPort >= 0 && config.reportPort <= 65535) return config.reportPort;
   const raw = env.FUTUREAIDE_REPORT_PORT;
-  if (raw === undefined || raw === '') return DEFAULT_PORT;
-  const value = Number.parseInt(raw, 10);
-  return Number.isInteger(value) && value >= 0 && value <= 65535 ? value : DEFAULT_PORT;
+  if (raw !== undefined && raw !== '') {
+    const value = Number.parseInt(raw, 10);
+    if (Number.isInteger(value) && value >= 0 && value <= 65535) return value;
+  }
+  return DEFAULT_PORT;
 }
 
 export function reportUrl(port) { return `http://127.0.0.1:${port}${HTTP_PATH}`; }
+
+/** Identity of the roster this store serves. */
+export function rosterIdentity(store) { return typeof store?.identity === 'function' ? store.identity() : undefined; }
 
 let hosted;
 
@@ -39,41 +45,55 @@ async function health(port, { fetchImpl = globalThis.fetch, timeoutMs = 500 } = 
 
 /**
  * Read-only readiness. Never starts anything, so a status probe or an adapter's
- * probe() can call it safely.
+ * probe() can call it safely. With `expectedRoster`, a service that answers for a
+ * different roster (or names none) is not ready.
  */
-export async function readReportStatus({ port = reportPort(), fetchImpl } = {}) {
+export async function readReportStatus({ port = reportPort(), expectedRoster, fetchImpl } = {}) {
   const info = await health(port, { fetchImpl });
-  return { port, url: reportUrl(port), ready: Boolean(info),
-    hosting: hosted?.port === port ? 'this-process' : info ? 'another-process' : 'none',
-    ...(info ? { health: info } : {}) };
+  if (!info) return { port, url: reportUrl(port), ready: false, hosting: 'none' };
+  const hosting = hosted?.port === port ? 'this-process' : 'another-process';
+  if (expectedRoster !== undefined && info.roster !== expectedRoster) {
+    return { port, url: reportUrl(port), ready: false, hosting, health: info,
+      reason: { code: 'report-service-foreign-roster', message: `Port ${port} answers for a different roster; it was not reused.` } };
+  }
+  return { port, url: reportUrl(port), ready: true, hosting, health: info };
 }
 
 /**
- * Ensure the loopback tool service is ready: reuse whatever answers the health
- * check, otherwise start it in this process, then wait for the health check with
- * a short deadline.
+ * Ensure OUR roster's tool service is ready: reuse it when the health document
+ * names the same roster, otherwise start it in this process. A foreign service is
+ * reported and left alone.
  * @returns {{port:number,url:string,ready:boolean,started?:boolean,reason?:object}}
  */
 export async function ensureReportService({ store, port = reportPort(), timeoutMs = 1500, fetchImpl, log = () => {} } = {}) {
-  if (await health(port, { fetchImpl })) return { port, url: reportUrl(port), ready: true, started: false };
+  const expectedRoster = rosterIdentity(store);
+  const current = await readReportStatus({ port, expectedRoster, fetchImpl });
+  if (current.ready) return { ...current, started: false };
+  if (current.reason?.code === 'report-service-foreign-roster') {
+    log(`port ${port} is served by another roster; not reused`);
+    return { ...current, started: false };
+  }
   if (hosted?.port !== port) {
     try {
       const service = await startReportService({ store, port, log });
       hosted = { port: service.port ?? port, service };
-      // The listener loop owns this process's lifetime; an HTTP server must not
-      // keep the process alive after that loop ends.
+      // The listener loop owns this process's lifetime; the server must not keep
+      // the process alive after that loop ends.
       try { service.server?.unref?.(); } catch { /* A host that cannot unref still works. */ }
       process.once('exit', () => { void hosted?.service?.close?.(); });
     } catch (error) {
-      // Another process may already own the port; the health check decides.
       log(`report service start failed: ${error?.code ?? ''} ${error?.message ?? error}`);
     }
   }
   const waitingPort = hosted?.port ?? port;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const info = await health(waitingPort, { fetchImpl });
-    if (info) return { port: waitingPort, url: reportUrl(waitingPort), ready: true, started: Boolean(hosted?.port === waitingPort) };
+    const status = await readReportStatus({ port: waitingPort, expectedRoster, fetchImpl });
+    if (status.ready) return { ...status, started: Boolean(hosted?.port === waitingPort) };
+    if (status.reason?.code === 'report-service-foreign-roster') {
+      log(`port ${waitingPort} is served by another roster; not reused`);
+      return { ...status, started: false };
+    }
     if (Date.now() >= deadline) break;
     await pause(50);
   }

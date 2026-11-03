@@ -1583,7 +1583,8 @@ export async function readDefaultModel({
     selectionSource: modelCatalog.selectionSource ?? 'global_default',
   };
   const startView = await readViewStable(ui);
-  const composerLength = Number(startView?.composerLength ?? 0);
+  // The composer always holds a newline; only trimmed text counts as an unsent draft.
+  const composerLength = Number(startView?.composerTrimmedLength ?? startView?.composerLength ?? 0);
   const isDraft = Boolean(startView?.composerFound) && Number(startView?.messages ?? 0) === 0;
 
   let control;

@@ -971,3 +971,22 @@ test('a first record larger than the initial window is read whole, not truncated
     assert.equal(found.firstInput.hasMarker, true);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+test('an empty composer that only holds a newline does not block the draft read', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  try {
+    const driver = pageDriver(
+      { documentName: 'Fixture session - Claude Code', messages: 3, composerLength: 1, composerTrimmedLength: 0, raw: '模型：Opus 5.5 中等' },
+      { open: { documentName: 'New session - Claude Code', messages: 0, raw: '模型：Opus 5.5 中等' },
+        reveal: { documentName: 'Fixture session - Claude Code', messages: 3 } },
+    );
+    const read = await readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive,
+      catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(read.resolved, true);
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.reasoningEffort, 'medium');
+    assert.equal(read.navigation.navigated, true);
+    assert.equal(read.navigation.restored, 'session');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

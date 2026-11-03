@@ -324,6 +324,8 @@ try {
         modelLabel = $(if ($models.Count -gt 0) { $models[0].Current.Name } else { $null })
         messages = $signature.messages
         composerLength = $(if ($null -ne $signature.composerValue) { $signature.composerValue.Length } else { 0 })
+        # An empty composer still holds a newline; only real text counts as unsent.
+        composerTrimmedLength = $(if ($null -ne $signature.composerValue) { $signature.composerValue.Trim().Length } else { 0 })
         trustPrompt = $signature.trustPrompt
         texts = $texts
       } }

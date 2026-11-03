@@ -149,6 +149,7 @@ export function createScopedAgents(config, {
   backendAdapterLoader = undefined,
   hostReportService = true,
   ensureReportReady = ensureReportService,
+  reportReadyTimeoutMs = 2000,
 } = {}) {
   const clients = new Map();
   let monitorUnavailableSince, monitorError;
@@ -163,11 +164,11 @@ export function createScopedAgents(config, {
   // lock per target application, reusing the existing lease table.
   //
   // ensureClaudeReports() makes the loopback tool service ready and returns
-  // {url, ready}; readClaudeReportStatus() only reads readiness/registration, so a
-  // status probe can ask without starting anything. The task-scoped monitor never
-  // hosts the service (hostReportService: false); it reuses whatever the plugin
-  // process started, because a session must not be handed an endpoint that dies
-  // with its task.
+  // {url, ready}: it starts the shared monitor (which hosts the service and stays
+  // up while managed Claude sessions exist) and waits for its health check with a
+  // short deadline, falling back to a service in this process if the monitor never
+  // answers. readClaudeReportStatus() only reads readiness/registration, so a
+  // status probe can ask without starting anything.
   const adapterDeps = (record, { startReports = hostReportService } = {}) => {
     const load = () => store.get(record.agentId) ?? record;
     const target = targetOf(record);
@@ -178,12 +179,23 @@ export function createScopedAgents(config, {
       readNativeState: () => store.backendState(record.agentId),
       writeNativeState: value => store.saveBackendState(record.agentId, value),
       withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
-      ensureClaudeReports: () => (startReports
-        ? ensureReportReady({ store, port: reportPort() })
-        : readStatus()),
+      ensureClaudeReports: () => (startReports ? ensureReportsReady() : readStatus()),
       readClaudeReportStatus: readStatus,
     };
   };
+  async function ensureReportsReady() {
+    const port = reportPort();
+    await ensureMonitor();
+    const deadline = Date.now() + reportReadyTimeoutMs;
+    for (;;) {
+      const status = await readReportStatus({ port });
+      if (status.ready) return { ...status, via: 'monitor' };
+      if (Date.now() >= deadline) break;
+      await wait(50);
+    }
+    const local = await ensureReportReady({ store, port });
+    return { ...local, via: local.ready ? 'process' : 'none' };
+  }
   // The chosen backend is rebuilt per operation from the live record, so a new
   // task id or state never hides behind a cached binding. Only the DSH client
   // (one authenticated connection per agent) is kept.

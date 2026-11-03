@@ -172,6 +172,21 @@ export class RosterStore {
       throw error;
     }
   }
+  /**
+   * WAL-aware commit counter for this connection. It changes when another
+   * connection commits, and does not change for this connection's own writes, so
+   * a listener can tell an external change from the echo of its own poll.
+   */
+  dataVersion() {
+    const row = this.db.prepare('PRAGMA data_version').get();
+    return row?.data_version ?? row?.DATA_VERSION;
+  }
+  /** Open claude-desktop bindings only, for the listener's watch set. */
+  listClaudeBindings() {
+    return this.db.prepare(`SELECT b.body AS body FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
+      WHERE json_extract(a.body,'$.target')='claude-desktop' AND coalesce(json_extract(a.body,'$.closed'),0)=0`)
+      .all().map(row => JSON.parse(row.body)?.binding ?? {});
+  }
   save(record) {
     record.updatedAt = new Date().toISOString();
     // A watcher or sender can wake without the operation lock. Never restore a

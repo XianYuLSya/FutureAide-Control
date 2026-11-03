@@ -136,6 +136,7 @@ async function fixture({ adapters = {}, store, adapterLoader, ensureReportReady 
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
     store: roster, clientFactory: () => dsh.api, controlFactory: dsh.controlFactory, callCodex: calling(events),
     startSharedMonitor: () => true,
+    reportReadyTimeoutMs: 0,
     removeTree: async () => {},
     backendAdapters: adapters,
     // No real loopback server in unit tests: the readiness link is injected and

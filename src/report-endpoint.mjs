@@ -60,6 +60,9 @@ export async function ensureReportService({ store, port = reportPort(), timeoutM
     try {
       const service = await startReportService({ store, port, log });
       hosted = { port: service.port ?? port, service };
+      // The listener loop owns this process's lifetime; an HTTP server must not
+      // keep the process alive after that loop ends.
+      try { service.server?.unref?.(); } catch { /* A host that cannot unref still works. */ }
       process.once('exit', () => { void hosted?.service?.close?.(); });
     } catch (error) {
       // Another process may already own the port; the health check decides.

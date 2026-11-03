@@ -76,6 +76,44 @@ test('a native session resolves to its live claude-desktop name only', () => {
   } finally { store.close(); }
 });
 
+test('the listener can tell an external commit from its own write', async () => {
+  const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const base = path.join(workspace, '.runtime', 'tests');
+  await mkdir(base, { recursive: true });
+  const filename = path.join(await mkdtemp(path.join(base, 'version-')), 'roster.sqlite');
+  const listener = new RosterStore(filename);
+  try {
+    const start = listener.dataVersion();
+    assert.equal(typeof start, 'number');
+    listener.insert(agent({ agentId: 'agent-a', name: 'artist' }));
+    assert.equal(listener.dataVersion(), start, 'own commits do not move this connection’s counter');
+    listener.saveBackendState('agent-a', { cursor: 1 });
+    assert.equal(listener.dataVersion(), start, 'own state writes are silent too');
+
+    // A different connection committing is what a listener must react to.
+    const other = new RosterStore(filename);
+    try {
+      other.insert(agent({ agentId: 'agent-b', name: 'partner', target: 'dsh' }));
+      assert.notEqual(listener.dataVersion(), start, 'an external commit is visible');
+    } finally { other.close(); }
+  } finally { listener.close(); }
+});
+
+test('only open claude-desktop bindings are offered for watching', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    store.insert(agent({ agentId: 'agent-claude', name: 'partner' }));
+    store.saveBackendState('agent-claude', { binding: { sessionId: 'native-c', transcriptFile: 'D:\\claude\\projects\\p\\native-c.jsonl' } });
+    store.insert(agent({ agentId: 'agent-closed', name: 'retired', closed: true }));
+    store.saveBackendState('agent-closed', { binding: { sessionId: 'native-e', transcriptFile: 'D:\\claude\\projects\\p\\native-e.jsonl' } });
+    store.insert(agent({ agentId: 'agent-dsh', name: 'artist', target: 'dsh' }));
+    store.saveBackendState('agent-dsh', { binding: { sessionId: 'native-d', transcriptFile: 'D:\\dsh\\native-d.log' } });
+    store.insert(agent({ agentId: 'agent-nobinding', name: 'blank' }));
+
+    assert.deepEqual(store.listClaudeBindings().map(binding => binding.sessionId), ['native-c']);
+  } finally { store.close(); }
+});
+
 test('target state and the reverse lookup share the roster database across processes', async () => {
   const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const base = path.join(workspace, '.runtime', 'tests');

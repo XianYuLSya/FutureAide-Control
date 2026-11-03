@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { resolve } from 'node:path';
 import { RosterStore } from '../src/roster-store.mjs';
-import { ensureSharedMonitor, monitorAlive, monitorSpawn } from '../src/shared-monitor.mjs';
+import { ensureSharedMonitor, monitorAlive, monitorDirectories, monitorSpawn } from '../src/shared-monitor.mjs';
 
 const LEASE = 'monitor-00000000-0000-4000-8000-000000000000';
 const config = configFile => ({ configFile });
+const normalize = value => resolve(value);
 
 function spawnRecorder(fail = false) {
   const calls = [];
@@ -85,6 +87,25 @@ test('the listener reports a pid only after the operating system confirmed the s
   assert.equal(detached, true);
   assert.throws(() => monitorSpawn('D:/fixture.json', 'agent-1', () => child), /Invalid shared monitor lease/);
   assert.throws(() => monitorSpawn(undefined, LEASE, () => child), /private configuration path/);
+});
+
+test('the watch set covers the DSH host, the Claude registry and every binding', () => {
+  const config = { stateDirectory: 'D:/state', hostBridgeFile: 'D:/state/host-bridge.json' };
+  const directories = monitorDirectories(config, { env: { CLAUDE_CONFIG_DIR: 'D:/claude' }, exists: () => true,
+    bindings: ['D:/claude/projects/p1/session-a.jsonl', 'D:/claude/projects/p2/session-b.jsonl'] });
+  assert.deepEqual(directories, ['D:/state/managed-host', 'D:/claude/sessions',
+    'D:/claude/projects/p1', 'D:/claude/projects/p2'].map(normalize));
+  // The roster directory is never watched: its -shm/-wal churn would echo our own
+  // poll back at us. External commits are read from dataVersion() instead.
+  assert.equal(directories.includes(normalize('D:/state')), false);
+  // A directory that does not exist yet is skipped instead of breaking the watch.
+  const filtered = monitorDirectories(config, { env: { CLAUDE_CONFIG_DIR: 'D:/claude' },
+    exists: directory => !directory.includes('projects'), bindings: ['D:/claude/projects/p1/session-a.jsonl'] });
+  assert.equal(filtered.some(directory => directory.includes('projects')), false);
+  // The managed host directory can be configured explicitly.
+  const explicit = monitorDirectories({ stateDirectory: 'D:/state', managedStateDirectory: 'D:/host' },
+    { env: { CLAUDE_CONFIG_DIR: 'D:/claude' }, exists: () => true });
+  assert.ok(explicit.includes(normalize('D:/host')));
 });
 
 test('a listener is only alive while one holder owns both leases', async () => {

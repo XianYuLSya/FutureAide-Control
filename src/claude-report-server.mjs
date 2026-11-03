@@ -43,6 +43,7 @@ This server exists for one purpose: a Claude Desktop session owned by FutureAide
 
 What reaches the parent:
 - Your ordinary replies, tool use and the end of a turn are never forwarded. Nothing is automatic: a turn that ends without a tool call notifies nobody.
+- This server identifies the session it is connected to, not the agent that writes the call. Only the session's own reports are observed by the main chat, so a sub-agent working inside the task must not use these tools: it reports to its own parent instead.
 - ask_parent(message) asks the parent something you cannot decide yourself: a decision, a permission, or a missing fact. The tool returns accepted for delivery; end your turn and wait. The parent's answer arrives in this session as a new message. Ask once, do not poll, and do not repeat the question.
 - report_parent(message, final=false) submits a progress report. Use it for a milestone or a change of plan the parent must know now, not for every step.
 - report_parent(message, final=true) submits the final deliverable of the current task. Send it once the work is really finished and verified, and include what was done, how it was verified, and what remains.
@@ -202,6 +203,8 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
   resolveCaller, instructions, identity = {}, log = () => {} } = {}) {
   const startedAt = new Date().toISOString();
   const stats = { requests: 0, owned: 0, unowned: 0, served: 0 };
+  // One identity per TCP connection, dropped when that socket closes.
+  const identities = new WeakMap();
   let boundPort = port;
 
   const server = http.createServer(async (req, res) => {
@@ -219,19 +222,41 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
       return;
     }
     stats.requests += 1;
-    // Identity and ownership decide which surface answers: the owned one, or a
-    // connected surface with no tools. Neither path tells the caller who it is
-    // thought to be, and a refusal never becomes a working tool.
-    let caller = null;
+    // Identity is resolved once per TCP connection and cached until that socket
+    // closes: the peer cannot change mid-connection, and the lookup costs a
+    // netstat read. Ownership is still re-read on every request, because a task
+    // can be cancelled or finished between two calls on the same connection.
+    let resolution = identities.get(req.socket);
+    if (!resolution) {
+      resolution = (async () => {
+        try {
+          // The default resolver reads the request socket; an injected resolver
+          // gets the same context so it can be verified or replaced without a
+          // second path.
+          const value = await (resolveCaller ?? (() => resolveSocketCaller(req.socket,
+            { serverPort: boundPort, ...identity })))({ req, socket: req.socket, serverPort: boundPort });
+          log(`connection from ${value?.image ?? 'unknown-image'} pid=${value?.pid ?? '?'} `
+            + `session=${value?.sessionId ?? '?'} via ${value?.via ?? '?'}`);
+          return { caller: value ?? null };
+        } catch (error) {
+          log(`unidentified connection (${error?.code ?? 'caller-unresolved'}): ${String(error?.message ?? error).slice(0, 200)}`);
+          return { caller: null, failure: error?.code ?? 'caller-unresolved' };
+        }
+      })();
+      identities.set(req.socket, resolution);
+      req.socket.once('close', () => identities.delete(req.socket));
+    }
+    const { caller } = await resolution;
     let owned = null;
-    try {
-      // The default resolver reads the request socket; an injected resolver gets
-      // the same context so it can be verified or replaced without a second path.
-      caller = await (resolveCaller ?? (() => resolveSocketCaller(req.socket, { serverPort: boundPort, ...identity })))(
-        { req, socket: req.socket, serverPort: boundPort });
-      if (caller && typeof resolveOwned === 'function') owned = await resolveOwned(caller, { tool: 'list' });
-    } catch (error) {
-      log(`not an owned session (${error?.code ?? 'caller-unresolved'}): ${String(error?.message ?? error).slice(0, 200)}`);
+    if (caller && typeof resolveOwned === 'function') {
+      try { owned = await resolveOwned(caller, { tool: 'list' }); }
+      catch (error) {
+        if (!resolution.ownershipNoted) {
+          resolution.ownershipNoted = true;
+          log(`owned session ${caller.sessionId} cannot report now (${error?.code ?? 'not-accepted'}): `
+            + `${String(error?.message ?? error).slice(0, 200)}`);
+        }
+      }
     }
     if (owned) stats.owned += 1; else stats.unowned += 1;
     let body;
@@ -284,11 +309,13 @@ export function developmentOwnership(sessions, { log = () => {} } = {}) {
 }
 
 /**
- * The production wiring: the shared monitor process owns this service, so no Node
- * process is started per Claude session. The monitor is the one process that
- * already holds the roster, lives exactly while a task is in flight, and needs no
- * extra configuration file. Returns the running service, or throws when the port
- * is taken; the caller decides whether that is fatal.
+ * The production wiring. Host it in the plugin's own long-lived process — the one
+ * that is already up before any Claude session starts and stays up while managed
+ * sessions idle — never in the shared monitor, which is created for a task and
+ * exits when work stops. The roster is the same SQLite database the plugin
+ * process already holds; the service adds no file, lock or process of its own.
+ * Throws when the port is taken (another install is serving it); the caller
+ * decides whether that is fatal.
  */
 export async function startReportService({ store, port = DEFAULT_PORT, host = '127.0.0.1', log = () => {} } = {}) {
   if (!store) throw new TypeError('startReportService requires the shared RosterStore');

@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { createStartTimeCache, resolveSessionOwner, tcpOwnerPid } from '../src/claude-caller-identity.mjs';
+import { createStartTimeCache, processImageName, resolveSessionOwner, tcpOwnerPid } from '../src/claude-caller-identity.mjs';
 import { startHttpService } from '../src/claude-report-server.mjs';
 
 const startTimeCache = createStartTimeCache();
@@ -106,10 +106,12 @@ async function main() {
       const clientPid = await tcpOwnerPid({ clientPort: socket.remotePort, serverPort });
       const owner = await resolveSessionOwner(clientPid, identityOptions);
       resolutions.push({ clientPort: socket.remotePort, serverPort, clientPid,
+        image: clientPid ? await processImageName(clientPid) : null,
         sessionId: owner?.record?.sessionId ?? null, depth: owner?.depth ?? null,
         refusal: owner?.refusal ? { code: owner.refusal.code, chain: owner.refusal.chain } : null });
       if (!owner || owner.refusal) throw Object.assign(new Error(owner?.refusal?.code ?? 'caller-unresolved'), { code: 'caller-unresolved' });
-      return { pid: owner.pid, sessionId: owner.record.sessionId, cwd: owner.record.cwd, via: 'pid' };
+      return { pid: owner.pid, sessionId: owner.record.sessionId, cwd: owner.record.cwd, via: 'pid',
+        image: await processImageName(owner.pid) };
     },
     log: message => process.stderr.write(`[probe service] ${message}\n`),
   });

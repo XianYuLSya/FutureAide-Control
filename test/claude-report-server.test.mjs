@@ -4,6 +4,7 @@
 // loopback probe in scripts/claude-report-probe.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -152,6 +153,45 @@ test('the development ownership stub accepts only the pinned session and records
   assert.equal(await resolveOwned({ sessionId: '3725418e-ac07-45d6-877b-2ab22ef89017' }), null);
   assert.equal(await resolveOwned(undefined), null);
   assert.match(lines.join('\n'), /final=true/);
+});
+
+test('identity is cached per TCP connection while ownership is re-read per request', async () => {
+  let resolutions = 0;
+  let ownershipChecks = 0;
+  const lines = [];
+  const service = await startHttpService({ port: 0,
+    resolveOwned: async () => { ownershipChecks += 1; return { agentId: 'agent-x', taskId: 3,
+      async ask() { return { accepted: true }; }, async report() { return { accepted: true }; } }; },
+    resolveCaller: async () => { resolutions += 1; return { ...caller, image: 'claude.exe' }; },
+    log: line => lines.push(line) });
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+  const post = (agent, options = {}) => new Promise((resolve, reject) => {
+    const request = http.request({ port: service.port, method: 'POST', path: '/mcp', agent,
+      headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body),
+        accept: 'application/json, text/event-stream' } }, response => {
+      response.on('data', () => {});
+      response.on('end', () => resolve(response.statusCode));
+    });
+    request.once('error', reject);
+    request.end(body);
+  });
+  const keepAlive = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  const oneShot = new http.Agent({ keepAlive: false });
+  try {
+    for (let index = 0; index < 3; index += 1) assert.equal(await post(keepAlive), 200);
+    assert.equal(resolutions, 1, 'three requests on one socket cost one identity lookup');
+    assert.equal(ownershipChecks, 3, 'the running task is re-read every request');
+    assert.equal(lines.filter(line => line.startsWith('connection from')).length, 1);
+    assert.match(lines.join('\n'), /claude\.exe pid=50124/);
+
+    // A fresh connection is a fresh peer and is resolved again.
+    await post(oneShot);
+    assert.equal(resolutions, 2);
+  } finally {
+    keepAlive.destroy();
+    oneShot.destroy();
+    await service.close();
+  }
 });
 
 test('the shared loopback HTTP service answers an owned session and lists nothing for others', async () => {

@@ -156,9 +156,12 @@ test('a socket caller resolves through the TCP peer and reports how it was found
     },
     readRecord: async pid => (pid === 50124 ? record : null),
     startTime: async () => record.procStart, isAlive: live,
+    // The image name is diagnosis only; it is read once per connection and never
+    // part of the decision.
+    image: async pid => (pid === 50124 ? 'claude.exe' : null),
   });
   assert.deepEqual(caller, { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow',
-    name: 'FutureAide 插件生命周期测试', procStart: '134381970992798945', via: 'pid' });
+    name: 'FutureAide 插件生命周期测试', procStart: '134381970992798945', via: 'pid', image: 'claude.exe' });
 });
 
 test('an unmappable peer is refused with a code and no fallback identity', async () => {

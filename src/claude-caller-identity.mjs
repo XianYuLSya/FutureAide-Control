@@ -65,6 +65,22 @@ export async function parentProcessId(pid) {
   } catch { return null; }
 }
 
+/**
+ * Image name of the peer process, kept for diagnosis only: the identity decision
+ * never reads it, but a live run has to show that the request came from the
+ * session's own `claude.exe` rather than from the Desktop shell that hosts the
+ * window. `tasklist` costs about 50 ms and is only read once per connection.
+ */
+export async function processImageName(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    const { stdout } = await exec('tasklist.exe', ['/fi', `PID eq ${pid}`, '/fo', 'csv', '/nh'],
+      { encoding: 'utf8', windowsHide: true, timeout: PROMPT_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+    const match = /^"([^"]+)"/.exec(stdout.trim());
+    return match ? match[1] : null;
+  } catch { return null; }
+}
+
 /** `netstat -ano -p TCP` rows, parsed into the fields identity needs. */
 export function parseTcpConnections(text) {
   const rows = [];
@@ -190,10 +206,11 @@ export async function readSessionRecord(pid, { env = process.env } = {}) {
   } catch { return null; }
 }
 
-const callerOf = ({ record, pid, depth }) => ({
+const callerOf = ({ record, pid, depth }, image) => ({
   pid, sessionId: record.sessionId, cwd: record.cwd,
   name: typeof record.name === 'string' ? record.name : undefined,
   procStart: String(record.procStart), via: depth === 0 ? 'pid' : 'parent-pid',
+  ...(image ? { image } : {}),
 });
 
 const refuse = (code, message) => fail(code, message);
@@ -202,15 +219,17 @@ const notSession = (detail) => refuse('caller-unresolved',
   + 'Report and question tools are only available to plugin-owned sessions; no argument can supply an identity.');
 
 /** Identity for the stdio transport: the process that spawned this server. */
-export async function resolveStdioCaller({ parentPid = process.ppid, ...options } = {}) {
+export async function resolveStdioCaller({ parentPid = process.ppid, image = processImageName, ...options } = {}) {
   const owner = await resolveSessionOwner(parentPid, options);
   if (!owner) throw notSession('no verified session record for the parent process');
   if (owner.refusal) throw notSession(owner.refusal.code);
-  return callerOf(owner);
+  return callerOf(owner, await image(owner.pid));
 }
 
 /** Identity for the loopback HTTP transport: the TCP peer's owning process. */
-export async function resolveSocketCaller(socket, { serverPort, tcpOwner = tcpOwnerPid, ...options } = {}) {
+export async function resolveSocketCaller(socket, {
+  serverPort, tcpOwner = tcpOwnerPid, image = processImageName, ...options
+} = {}) {
   const clientPort = socket?.remotePort;
   const localPort = Number.isSafeInteger(serverPort) ? serverPort : socket?.localPort;
   const pid = await tcpOwner({ clientPort, serverPort: localPort });
@@ -218,5 +237,5 @@ export async function resolveSocketCaller(socket, { serverPort, tcpOwner = tcpOw
   const owner = await resolveSessionOwner(pid, options);
   if (!owner) throw notSession('the TCP peer is not a Claude Desktop session');
   if (owner.refusal) throw notSession(owner.refusal.code);
-  return callerOf(owner);
+  return callerOf(owner, await image(owner.pid));
 }

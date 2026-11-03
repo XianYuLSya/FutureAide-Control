@@ -94,6 +94,34 @@ test('ownership needs the shared store, not a stand-in object', () => {
     /requires the shared RosterStore/);
 });
 
+test('the surface follows a late binding on the same live connection', async () => {
+  // The session is created before the plugin knows its native id, so the first
+  // tools/list may arrive with no binding at all. Writing the binding is enough:
+  // the next list already carries both tools, with no reconnect and no restart.
+  const store = new RosterStore(':memory:');
+  const agentId = 'agent-' + randomUUID().replace(/-/g, '');
+  store.insert({ agentId, ownerId: 'owner-late', name: '晚绑定副手', target: 'claude-desktop',
+    state: 'creating', closed: false, sessionId: 'logical-late',
+    task: { taskId: 9, state: 'running', reports: [] } });
+  const caller = { pid: 50124, sessionId, via: 'pid' };
+  const service = await startHttpService({ port: 0, resolveOwned: createReportOwnership({ store }),
+    resolveCaller: async () => caller });
+  const client = new Client({ name: 'late-binding-test', version: '1.0.0' });
+  await client.connect(new StreamableHTTPClientTransport(new URL(service.url)));
+  try {
+    assert.deepEqual((await client.listTools()).tools, [], 'an unbound session gets no tool');
+    store.saveBackendState(agentId, { binding: { sessionId }, cursor: { throughSeq: 0 } });
+    const after = await client.listTools();
+    assert.deepEqual(after.tools.map(tool => tool.name).sort(), ['ask_parent', 'report_parent']);
+    const result = await client.callTool({ name: 'ask_parent', arguments: { message: 'now?' } });
+    assert.equal(JSON.parse(result.content[0].text).taskId, 9);
+    assert.equal(service.stats.unowned >= 1 && service.stats.owned >= 1, true);
+  } finally {
+    await client.close();
+    await service.close();
+  }
+});
+
 test('the HTTP service with real ownership answers the owned session and lists nothing for others', async () => {
   const { store, agentId } = fixture();
   const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', via: 'pid' };

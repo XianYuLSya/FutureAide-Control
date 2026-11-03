@@ -1,56 +1,126 @@
-// G2 evidence pairing: a tool_use only counts when its tool_result is successful.
+// G2 evidence: a pair counts only when the tool name is an exact registered MCP
+// name, the native result is successful, its body (however nested) says
+// accepted:true, and the receipt carries the task under test.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pairReports } from '../scripts/claude-report-g2-evidence.mjs';
+import { pairReports, parseAcceptedReceipt, REPORT_TOOL_ALLOWLIST } from '../scripts/claude-report-g2-evidence.mjs';
 
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
 const line = value => JSON.stringify({ sessionId, ...value }) + '\n';
+const REPORT = 'mcp__futureaide-report__report_parent';
+const ASK = 'mcp__futureaide-report__ask_parent';
+const receipt = (overrides = {}) => JSON.stringify({ accepted: true, kind: 'report', taskId: 7,
+  agentId: 'agent-7f3a', final: true, receiptId: 'accept-0123456789abcdef', ...overrides });
+const use = (id, name, input = { message: 'done', final: true }) => ({ type: 'tool_use', id, name, input });
+const result = (id, content, isError = false) => ({ type: 'tool_result', tool_use_id: id, is_error: isError, content });
 
-test('only tool_use paired with a successful tool_result counts as delivered', () => {
-  const body = line({ type: 'assistant', timestamp: 't1', message: { content: [
-    { type: 'text', text: 'Reporting.' },
-    { type: 'tool_use', id: 'toolu_ok', name: 'report_parent', input: { message: 'done', final: true } },
-  ] } })
-  + line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_bad', name: 'ask_parent', input: { message: '?' } }] } })
-  + line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_orphan', name: 'report_parent', input: { message: 'x' } }] } })
-  + line({ type: 'assistant', isSidechain: true, message: { content: [
-    { type: 'tool_use', id: 'toolu_side', name: 'report_parent', input: { message: 'child' } }] } })
-  + line({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_other', name: 'Read', input: {} }] } })
-  + line({ type: 'user', message: { content: [
-    { type: 'tool_result', tool_use_id: 'toolu_ok', is_error: false, content: [{ type: 'text', text: '{"accepted":true}' }] },
-  ] } })
-  + line({ type: 'user', message: { content: [
-    { type: 'tool_result', tool_use_id: 'toolu_bad', is_error: true, content: 'refused' }] } })
-  + line({ type: 'user', message: { content: [
-    { type: 'tool_result', tool_use_id: 'toolu_other', is_error: false, content: 'file' }] } });
-
-  const result = pairReports(body);
-  assert.equal(result.sessionId, sessionId);
-  assert.equal(result.sidechainUses, 1);
-  assert.deepEqual(result.counts, { toolUses: 3, delivered: 1, failed: 1, unanswered: 1 });
-  assert.deepEqual(result.unanswered, ['toolu_orphan']);
-  assert.equal(result.g2Satisfied, true);
-  const delivered = result.pairs.find(pair => pair.toolUseId === 'toolu_ok');
-  assert.equal(delivered.name, 'report_parent');
-  assert.deepEqual(delivered.input, { message: 'done', final: true });
-  assert.equal(delivered.result.isError, false);
+test('a successful registered call whose receipt matches the task is the only pass', () => {
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: receipt() }])] } });
+  const value = pairReports(body, { taskId: 7 });
+  assert.equal(value.expectedTaskId, 7);
+  assert.deepEqual(value.counts, { toolUses: 1, delivered: 1, refused: 0, notAccepted: 0,
+    taskMismatch: 0, unknownTask: 0, unanswered: 0 });
+  assert.equal(value.g2Satisfied, true);
+  const [pair] = value.pairs;
+  assert.equal(pair.kind, 'report');
+  assert.equal(pair.receipt.taskId, 7);
+  assert.equal(pair.receipt.agentId, 'agent-7f3a');
+  assert.equal(pair.status, 'delivered');
 });
 
-test('a failed or missing result never satisfies G2', () => {
-  const failed = pairReports(line({ type: 'assistant', message: { content: [
-    { type: 'tool_use', id: 'toolu_1', name: 'report_parent', input: { message: 'x' } }] } })
-  + line({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_1', is_error: true }] } }));
-  assert.equal(failed.g2Satisfied, false);
-  assert.equal(failed.counts.failed, 1);
-
-  const missing = pairReports(line({ type: 'assistant', message: { content: [
-    { type: 'tool_use', id: 'toolu_2', name: 'ask_parent', input: { message: 'x' } }] } }));
-  assert.equal(missing.g2Satisfied, false);
-  assert.deepEqual(missing.unanswered, ['toolu_2']);
+test('the underscore spelling of the same registered name also counts', () => {
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', 'mcp__futureaide_report__ask_parent', { message: 'which?' })] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: receipt({ kind: 'question' }) }])] } });
+  const value = pairReports(body, { taskId: 7 });
+  assert.equal(value.pairs[0].kind, 'question');
+  assert.equal(value.g2Satisfied, true);
 });
 
-test('a broken transcript line is counted and skipped, not silently trusted', () => {
-  const result = pairReports(`${line({ type: 'assistant', message: { content: 'plain text' } })}{not json}\n`);
-  assert.equal(result.badLines, 1);
-  assert.equal(result.counts.toolUses, 0);
+test('a bare or look-alike tool name is reported, never counted', () => {
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', 'report_parent')] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: receipt() }])] } })
+    + line({ type: 'assistant', message: { content: [use('toolu_2', 'mcp__other-server__report_parent')] } })
+    + line({ type: 'user', message: { content: [result('toolu_2', [{ type: 'text', text: receipt() }])] } });
+  const value = pairReports(body, { taskId: 7 });
+  assert.equal(value.counts.toolUses, 0);
+  assert.equal(value.g2Satisfied, false);
+  assert.deepEqual(value.lookalikeTools.sort(), ['mcp__other-server__report_parent', 'report_parent']);
+});
+
+test('a native refusal never counts, even if the body echoes accepted', () => {
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: receipt() }], true)] } });
+  const value = pairReports(body, { taskId: 7 });
+  assert.equal(value.pairs[0].status, 'refused');
+  assert.equal(value.counts.refused, 1);
+  assert.equal(value.g2Satisfied, false);
+});
+
+test('a successful call with a refusal body is not a report', () => {
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text',
+      text: JSON.stringify({ error: { code: 'task-cancelled', message: 'stop' } }) }])] } })
+    + line({ type: 'assistant', message: { content: [use('toolu_2', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_2', [{ type: 'text', text: 'Report recorded.' }])] } });
+  const value = pairReports(body, { taskId: 7 });
+  assert.deepEqual(value.pairs.map(pair => pair.status), ['not-accepted', 'not-accepted']);
+  assert.equal(value.counts.notAccepted, 2);
+  assert.equal(value.g2Satisfied, false);
+});
+
+test('a receipt for another task is a late old result and is separated', () => {
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: receipt({ taskId: 8 }) }])] } });
+  const value = pairReports(body, { taskId: 7 });
+  assert.equal(value.pairs[0].status, 'task-mismatch');
+  assert.equal(value.counts.taskMismatch, 1);
+  assert.equal(value.g2Satisfied, false);
+});
+
+test('an MCP-nested content body is unwrapped before the receipt is judged', () => {
+  const nested = JSON.stringify({ content: [{ type: 'text', text: receipt() }] });
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: nested }])] } });
+  const value = pairReports(body, { taskId: 7 });
+  assert.equal(value.pairs[0].status, 'delivered');
+  assert.equal(value.g2Satisfied, true);
+});
+
+test('without a task under test nothing claims a pass', () => {
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: receipt() }])] } });
+  const value = pairReports(body);
+  assert.equal(value.pairs[0].status, 'unknown-task');
+  assert.equal(value.counts.unknownTask, 1);
+  assert.equal(value.g2Satisfied, false);
+});
+
+test('sidechain uses, unrelated tools and broken lines are not evidence', () => {
+  const body = line({ type: 'assistant', isSidechain: true, message: { content: [use('toolu_side', REPORT)] } })
+    + line({ type: 'assistant', message: { content: [use('toolu_read', 'Read', { file_path: 'x' })] } })
+    + line({ type: 'user', message: { content: [result('toolu_read', 'file body')] } })
+    + '{not json}\n';
+  const value = pairReports(body, { taskId: 7 });
+  assert.equal(value.sidechainUses, 1);
+  assert.equal(value.counts.toolUses, 0);
+  assert.equal(value.badLines, 1);
+  assert.equal(value.g2Satisfied, false);
+});
+
+test('a leading byte-order mark does not swallow the first record', () => {
+  const body = '\uFEFF' + line({ type: 'assistant', message: { content: [use('toolu_1', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: receipt() }])] } });
+  const value = pairReports(body, { taskId: 7 });
+  assert.equal(value.badLines, 0);
+  assert.equal(value.g2Satisfied, true);
+});
+
+test('the receipt parser rejects errors and accepts fenced or plain JSON', () => {
+  assert.deepEqual(parseAcceptedReceipt('```json\n' + receipt() + '\n```'), { accepted: true, taskId: 7,
+    agentId: 'agent-7f3a', kind: 'report', final: true, receiptId: 'accept-0123456789abcdef' });
+  assert.equal(parseAcceptedReceipt({ isError: true, content: receipt() }), undefined);
+  assert.equal(parseAcceptedReceipt('{"accepted":false}'), undefined);
+  assert.equal(parseAcceptedReceipt('all good'), undefined);
+  assert.ok(REPORT_TOOL_ALLOWLIST.every(name => name.startsWith('mcp__')));
 });

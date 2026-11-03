@@ -2,17 +2,19 @@
 // really reached the plugin.
 //
 // G2 is only satisfied by a pair that clears every step:
-//   1. the tool_use name is one exact registered MCP name (allowlist above; a bare
+//   1. the tool_use name is one exact registered MCP name (allowlist below; a bare
 //      `report_parent` or any other suffix is reported, never counted);
 //   2. its tool_result has is_error false;
-//   3. the result body — including an MCP-nested `content` array — parses to a
-//      receipt with accepted:true;
-//   4. that receipt carries the task id under test.
+//   3. the result body parses to a receipt with accepted:true — judged by the very
+//      parser the runtime uses (`reportReceipt` from claude-inbox.mjs), so evidence
+//      and runtime cannot drift apart;
+//   4. that receipt carries the task under test (and the agent id, when the roster
+//      names it).
 // A refusal, a successful call whose body is not accepted:true, a receipt for
 // another task, or a missing result never counts.
 //
 // Read-only. It starts, resumes, modifies and cleans nothing, and reads only the
-// given transcript plus, optionally, the shared roster for the task id.
+// given transcript plus, optionally, the shared roster.
 //
 //   node scripts/claude-report-g2-evidence.mjs <transcript.jsonl> --task 7 [--out evidence.json]
 //   node scripts/claude-report-g2-evidence.mjs <transcript.jsonl> --roster <roster.sqlite> [--out ...]
@@ -20,6 +22,7 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { reportReceipt } from '../src/claude-inbox.mjs';
 
 /**
  * Exact registered names. `mcp__<config key>__<tool>` is how Claude namespaces an
@@ -45,66 +48,22 @@ const textOf = content => {
 };
 
 function kindOf(name) {
-  if (name.endsWith('__ask_parent') || name === 'ask_parent') return 'question';
-  if (name.endsWith('__report_parent') || name === 'report_parent') return 'report';
-  return undefined;
-}
-
-/**
- * Find an accepted receipt inside a tool result body. The body may be a JSON
- * string, a text part, a `content` array from the MCP result, or a nested
- * `structuredContent`/`result` object; anything that is itself an error or that
- * never says accepted:true yields undefined.
- */
-export function parseAcceptedReceipt(content, depth = 0) {
-  if (depth > 12) return undefined;
-  if (typeof content === 'string') {
-    const text = content.trim();
-    if (!text) return undefined;
-    for (const candidate of [text, text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')]) {
-      try {
-        const found = parseAcceptedReceipt(JSON.parse(candidate), depth + 1);
-        if (found) return found;
-      } catch { /* plain text is not a receipt */ }
-    }
-    return undefined;
-  }
-  if (Array.isArray(content)) {
-    for (const part of content) {
-      const found = parseAcceptedReceipt(part, depth + 1);
-      if (found) return found;
-    }
-    return undefined;
-  }
-  if (!content || typeof content !== 'object') return undefined;
-  if (content.isError === true || content.is_error === true) return undefined;
-  if (content.accepted === true) {
-    return { accepted: true, taskId: content.taskId, agentId: content.agentId,
-      kind: content.kind, final: content.final, receiptId: content.receiptId };
-  }
-  if (content.type === 'text' && typeof content.text === 'string') {
-    const found = parseAcceptedReceipt(content.text, depth + 1);
-    if (found) return found;
-  }
-  for (const key of ['content', 'result', 'structuredContent']) {
-    if (content[key] !== undefined) {
-      const found = parseAcceptedReceipt(content[key], depth + 1);
-      if (found) return found;
-    }
-  }
+  if (name.endsWith('__ask_parent')) return 'question';
+  if (name.endsWith('__report_parent')) return 'report';
   return undefined;
 }
 
 /**
  * Pair recognized report tool calls with their results.
  * @param {string} body Raw JSONL text.
- * @param {object} [options] `taskId` under test and an allowlist override.
+ * @param {object} [options] `taskId`/`agentId` under test and an allowlist override.
  * @returns {object} Pairs with a per-pair status and counts; `g2Satisfied` is true
  *   only for a delivered pair.
  */
-export function pairReports(body, { taskId, allowlist = REPORT_TOOL_ALLOWLIST } = {}) {
+export function pairReports(body, { taskId, agentId, allowlist = REPORT_TOOL_ALLOWLIST } = {}) {
   const allowed = new Set(allowlist);
   const expectedTask = taskId === undefined || taskId === null ? undefined : taskId;
+  const expectedAgent = typeof agentId === 'string' && agentId ? agentId : undefined;
   const uses = new Map();
   const results = new Map();
   const lookalikes = new Set();
@@ -137,68 +96,79 @@ export function pairReports(body, { taskId, allowlist = REPORT_TOOL_ALLOWLIST } 
     }
   }
   const pairs = [...uses.values()].map(use => {
-    const { content: _content, ...resultView } = results.get(use.toolUseId) ?? {};
-    const result = results.get(use.toolUseId) ?? null;
-    const receipt = result && result.isError ? undefined : parseAcceptedReceipt(result?.content ?? result?.text);
+    const full = results.get(use.toolUseId) ?? null;
+    const { content: _content, ...resultView } = full ?? {};
+    // One parser for evidence and runtime: a body earns nothing unless the runtime
+    // parser itself accepts it.
+    const receipt = full && !full.isError ? reportReceipt(full.content) : undefined;
     let status;
-    if (!result) status = 'unanswered';
-    else if (result.isError) status = 'refused';
+    if (!full) status = 'unanswered';
+    else if (full.isError) status = 'refused';
     else if (!receipt) status = 'not-accepted';
     else if (expectedTask === undefined) status = 'unknown-task';
     else if (receipt.taskId !== expectedTask) status = 'task-mismatch';
+    else if (expectedAgent && receipt.agentId && receipt.agentId !== expectedAgent) status = 'agent-mismatch';
     else status = 'delivered';
-    return { ...use, result: result ? resultView : null, receipt, status, delivered: status === 'delivered' };
+    return { ...use, result: full ? resultView : null, receipt: receipt ?? null, status, delivered: status === 'delivered' };
   });
   const count = status => pairs.filter(pair => pair.status === status).length;
   return {
     sessionId, lines, badLines, sidechainUses, pairs,
     expectedTaskId: expectedTask ?? null,
+    expectedAgentId: expectedAgent ?? null,
     lookalikeTools: [...lookalikes],
     counts: {
       toolUses: pairs.length, delivered: count('delivered'), refused: count('refused'),
       notAccepted: count('not-accepted'), taskMismatch: count('task-mismatch'),
-      unknownTask: count('unknown-task'), unanswered: count('unanswered'),
+      agentMismatch: count('agent-mismatch'), unknownTask: count('unknown-task'),
+      unanswered: count('unanswered'),
     },
     unanswered: pairs.filter(pair => pair.status === 'unanswered').map(pair => pair.toolUseId),
     g2Satisfied: count('delivered') > 0,
   };
 }
 
-async function taskIdFromRoster(rosterPath, sessionId) {
-  if (!rosterPath || !sessionId) return undefined;
+async function bindingFromRoster(rosterPath, sessionId) {
+  if (!rosterPath || !sessionId) return {};
   const { RosterStore } = await import('../src/roster-store.mjs');
   const store = new RosterStore(rosterPath);
   const agent = store.agentForNativeSession(sessionId);
   if (!agent) throw new Error(`No claude-desktop name is bound to session ${sessionId} in ${rosterPath}.`);
-  return store.get(agent.agentId)?.task?.taskId;
+  return { agentId: agent.agentId, taskId: store.get(agent.agentId)?.task?.taskId };
 }
 
 async function main(argv = process.argv.slice(2)) {
   const files = [];
   const allow = [];
   let taskId;
+  let agentId;
   let rosterPath;
   let out;
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === '--task') taskId = Number.parseInt(argv[++index], 10);
+    else if (value === '--agent') agentId = argv[++index];
     else if (value === '--roster') rosterPath = argv[++index];
     else if (value === '--out') out = argv[++index];
     else if (value === '--allow') allow.push(argv[++index]);
     else if (value.startsWith('--')) throw new Error(`Unknown option ${value}`);
     else files.push(value);
   }
-  if (files.length !== 1) throw new Error('usage: claude-report-g2-evidence.mjs <transcript.jsonl> [--task <id>] [--roster <sqlite>] [--allow <name>] [--out <file>]');
+  if (files.length !== 1) throw new Error('usage: claude-report-g2-evidence.mjs <transcript.jsonl> [--task <id>] [--agent <id>] [--roster <sqlite>] [--allow <name>] [--out <file>]');
   const transcript = path.resolve(files[0]);
-  const first = pairReports(await readFile(transcript, 'utf8'), { taskId, allowlist: [...REPORT_TOOL_ALLOWLIST, ...allow] });
-  const resolvedTask = taskId ?? await taskIdFromRoster(rosterPath, first.sessionId);
-  const result = resolvedTask === taskId
+  const body = await readFile(transcript, 'utf8');
+  const allowlist = [...REPORT_TOOL_ALLOWLIST, ...allow];
+  const first = pairReports(body, { taskId, agentId, allowlist });
+  const bound = (taskId === undefined || agentId === undefined) ? await bindingFromRoster(rosterPath, first.sessionId) : {};
+  const resolved = { taskId: taskId ?? bound.taskId, agentId: agentId ?? bound.agentId };
+  const result = resolved.taskId === taskId && resolved.agentId === agentId
     ? first
-    : pairReports(await readFile(transcript, 'utf8'), { taskId: resolvedTask, allowlist: [...REPORT_TOOL_ALLOWLIST, ...allow] });
-  const evidence = { transcript, at: new Date().toISOString(), allowlist: [...REPORT_TOOL_ALLOWLIST, ...allow], ...result };
+    : pairReports(body, { taskId: resolved.taskId, agentId: resolved.agentId, allowlist });
+  const evidence = { transcript, at: new Date().toISOString(), allowlist, ...result };
   if (out) await writeFile(out, JSON.stringify(evidence, null, 2));
-  console.log(JSON.stringify({ transcript, sessionId: result.sessionId, taskId: result.expectedTaskId,
-    counts: result.counts, g2Satisfied: result.g2Satisfied, unanswered: result.unanswered,
+  console.log(JSON.stringify({ transcript, sessionId: result.sessionId,
+    taskId: result.expectedTaskId, agentId: result.expectedAgentId, counts: result.counts,
+    g2Satisfied: result.g2Satisfied, unanswered: result.unanswered,
     lookalikeTools: result.lookalikeTools,
     reason: result.g2Satisfied ? 'a successful tool_result carried accepted:true for this task'
       : result.expectedTaskId === null ? 'no task id under test; pass --task or --roster'

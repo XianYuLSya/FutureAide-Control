@@ -3,7 +3,8 @@
 // accepted:true, and the receipt carries the task under test.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { pairReports, parseAcceptedReceipt, REPORT_TOOL_ALLOWLIST } from '../scripts/claude-report-g2-evidence.mjs';
+import { pairReports, REPORT_TOOL_ALLOWLIST } from '../scripts/claude-report-g2-evidence.mjs';
+import { reportReceipt } from '../src/claude-inbox.mjs';
 
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
 const line = value => JSON.stringify({ sessionId, ...value }) + '\n';
@@ -20,7 +21,7 @@ test('a successful registered call whose receipt matches the task is the only pa
   const value = pairReports(body, { taskId: 7 });
   assert.equal(value.expectedTaskId, 7);
   assert.deepEqual(value.counts, { toolUses: 1, delivered: 1, refused: 0, notAccepted: 0,
-    taskMismatch: 0, unknownTask: 0, unanswered: 0 });
+    taskMismatch: 0, agentMismatch: 0, unknownTask: 0, unanswered: 0 });
   assert.equal(value.g2Satisfied, true);
   const [pair] = value.pairs;
   assert.equal(pair.kind, 'report');
@@ -116,11 +117,25 @@ test('a leading byte-order mark does not swallow the first record', () => {
   assert.equal(value.g2Satisfied, true);
 });
 
-test('the receipt parser rejects errors and accepts fenced or plain JSON', () => {
-  assert.deepEqual(parseAcceptedReceipt('```json\n' + receipt() + '\n```'), { accepted: true, taskId: 7,
-    agentId: 'agent-7f3a', kind: 'report', final: true, receiptId: 'accept-0123456789abcdef' });
-  assert.equal(parseAcceptedReceipt({ isError: true, content: receipt() }), undefined);
-  assert.equal(parseAcceptedReceipt('{"accepted":false}'), undefined);
-  assert.equal(parseAcceptedReceipt('all good'), undefined);
+test('a receipt from another agent id is separated when the roster names one', () => {
+  const body = line({ type: 'assistant', message: { content: [use('toolu_1', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_1', [{ type: 'text', text: receipt({ agentId: 'agent-other' }) }])] } })
+    + line({ type: 'assistant', message: { content: [use('toolu_2', REPORT)] } })
+    + line({ type: 'user', message: { content: [result('toolu_2', [{ type: 'text', text: receipt({ agentId: 'agent-7f3a' }) }])] } });
+  const mismatched = pairReports(body, { taskId: 7, agentId: 'agent-7f3a' });
+  assert.deepEqual(mismatched.pairs.map(pair => pair.status), ['agent-mismatch', 'delivered']);
+  assert.equal(mismatched.counts.agentMismatch, 1);
+  assert.equal(mismatched.g2Satisfied, true);
+});
+
+test('the evidence accepts exactly what the runtime parser accepts', () => {
+  assert.deepEqual(reportReceipt({ content: [{ type: 'text', text: receipt() }] }),
+    { accepted: true, taskId: 7, agentId: 'agent-7f3a', kind: 'report', final: true,
+      questionId: undefined, receiptId: 'accept-0123456789abcdef' });
+  // The wire format is plain JSON text; a Markdown fence is not something the
+  // runtime parses, so it must not pass here either.
+  assert.equal(reportReceipt({ content: [{ type: 'text', text: '```json\n' + receipt() + '\n```' }] }), undefined);
+  assert.equal(reportReceipt({ content: [{ type: 'text', text: '{"error":{"code":"task-cancelled"}}' }] }), undefined);
+  assert.equal(reportReceipt({ content: [{ type: 'text', text: 'all good' }] }), undefined);
   assert.ok(REPORT_TOOL_ALLOWLIST.every(name => name.startsWith('mcp__')));
 });

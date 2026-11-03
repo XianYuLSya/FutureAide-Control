@@ -11,7 +11,7 @@ import { callingThread, ownerIdFor, resolveCallingContext, threadFromResult } fr
 import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { ensureIdleMonitor, idleSignal } from './idle-monitor.mjs';
-import { DSH_HOST_METHODS, normalizeTarget, resolveBackend, targetOf } from './agent-backend.mjs';
+import { diagnoseTarget, DSH_HOST_METHODS, normalizeTarget, resolveBackend, targetOf } from './agent-backend.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
@@ -234,6 +234,20 @@ export function createScopedAgents(config, {
     }
     record.host ??= stable;
     return backend;
+  }
+
+  // DSH readiness for status, derived from the one host probe status already made.
+  function dshDiagnostics(host, status) {
+    if (!host) return { ready: false, connected: false, treeProtocol: null, reportProtocol: null,
+      reason: safeError(status.hostError ?? { message: 'The DSH host is not reachable.' }) };
+    const connected = status.dshConnected === true;
+    const entry = { ready: connected && host.treeProtocol === TREE_PROTOCOL && host.reportProtocol === REPORT_PROTOCOL,
+      connected, treeProtocol: host.treeProtocol ?? null, reportProtocol: host.reportProtocol ?? null,
+      ...(connected ? {} : { missing: METHODS.filter(method => !host.methods?.includes(method)) }) };
+    if (!connected) entry.reason = { code: 'managed-host-required', message: 'Install the current managed DSH bridge.' };
+    else if (entry.treeProtocol !== TREE_PROTOCOL) entry.reason = safeError(treeProtocolError());
+    else if (entry.reportProtocol !== REPORT_PROTOCOL) entry.reason = safeError(reportProtocolError());
+    return entry;
   }
 
   async function ensureWorker(record, { wake = false } = {}) {
@@ -727,13 +741,15 @@ export function createScopedAgents(config, {
     store,
     async status(extra) {
       const status = { toolsLoaded: true, contextVerified: false, dshConnected: false, returnChannel: 'not-checked' };
+      let owner;
       try {
-        const owner = await context(extra);
+        owner = await context(extra);
         Object.assign(status, { contextVerified: true, workspace: owner.workspace, returnChannel: 'chat-verified',
           agents: typeof store.count === 'function' ? store.count(owner.ownerId) : store.list(owner.ownerId).length });
       } catch (error) { status.contextError = safeError(error); }
+      let host;
       try {
-        const host = await clientFactory(config).hostStatus();
+        host = await clientFactory(config).hostStatus();
         status.dshConnected = METHODS.every(method => host.methods?.includes(method));
         status.treeProtocolReady = host.treeProtocol === TREE_PROTOCOL;
         status.reportProtocolReady = host.reportProtocol === REPORT_PROTOCOL;
@@ -741,6 +757,17 @@ export function createScopedAgents(config, {
         else if (!status.treeProtocolReady) status.hostError = safeError(treeProtocolError());
       } catch (error) { status.hostError = safeError(error); }
       status.ready = status.contextVerified && status.dshConnected && status.treeProtocolReady === true && status.reportProtocolReady === true;
+      // Per-target readiness beside the unchanged DSH fields. Neither entry starts
+      // a model turn or a session: the DSH probe is the same one above, and the
+      // claude-desktop entry imports its adapter and asks probe() only.
+      status.backends = {
+        dsh: dshDiagnostics(host, status),
+        'claude-desktop': await diagnoseTarget('claude-desktop', { adapters: backendAdapters,
+          record: { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
+            lifetime: 'once', target: 'claude-desktop', workspace: owner?.workspace ?? config.workspace,
+            state: 'probing', createdAt: now(), updatedAt: now(), history: [] },
+          requestDirectory: () => path.join(config.stateDirectory, 'status-probe') }),
+      };
       return status;
     },
     async create({ name, lifetime, target }, extra) {

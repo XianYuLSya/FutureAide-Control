@@ -235,3 +235,59 @@ test('an adapter that only covers part of the contract is refused with the missi
   } finally { f.service.close(); }
 });
 
+test('status keeps every DSH field and refuses to look ready without a claude adapter', async () => {
+  const f = await fixture();
+  try {
+    const status = await f.service.status(extra(A));
+    // The 0.5.7 fields stay exactly as they were.
+    assert.equal(status.toolsLoaded, true);
+    assert.equal(status.contextVerified, true);
+    assert.equal(status.dshConnected, true);
+    assert.equal(status.treeProtocolReady, true);
+    assert.equal(status.reportProtocolReady, true);
+    assert.equal(status.returnChannel, 'chat-verified');
+    assert.equal(status.ready, true);
+    // The new per-target section tells the truth about the missing adapter.
+    assert.equal(status.backends.dsh.ready, true);
+    assert.equal(status.backends.dsh.connected, true);
+    assert.equal(status.backends.dsh.treeProtocol, 1);
+    assert.equal(status.backends.dsh.reportProtocol, 1);
+    assert.deepEqual(status.backends.dsh.reason, undefined);
+    assert.equal(status.backends['claude-desktop'].ready, false);
+    assert.equal(status.backends['claude-desktop'].present, false);
+    assert.equal(status.backends['claude-desktop'].reason.code, 'backend-not-ready');
+    // Diagnostics start no model turn and no session.
+    assert.ok(!f.events.includes('managedCreate'));
+    assert.ok(!f.events.includes('managedBeginTask'));
+    assert.ok(!f.events.some(event => Array.isArray(event) && event[0] === 'send'));
+    assert.equal(f.store.count(ownerIdFor(A)), 0);
+  } finally { f.service.close(); }
+});
+
+test('status separates an unfinished adapter from a ready one without using it', async () => {
+  const unfinished = [];
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...claudeAdapter(unfinished),
+    async probe() { unfinished.push('claude:probe'); return { identity: { application: 'claude-desktop', dataRoot: '/fixture/claude' },
+      methods: [], treeProtocol: undefined, reportProtocol: 1 }; } }) } });
+  try {
+    const status = await f.service.status(extra(A));
+    assert.equal(status.backends['claude-desktop'].ready, false);
+    assert.equal(status.backends['claude-desktop'].present, true);
+    assert.equal(status.backends['claude-desktop'].reason.code, 'tree-protocol-required');
+    assert.equal(status.backends['claude-desktop'].treeProtocol, null);
+    assert.equal(status.ready, true, 'the DSH path stays the default and unchanged');
+    assert.deepEqual(unfinished, ['claude:probe'], 'diagnostics only probed; no create, deliver or session');
+  } finally { f.service.close(); }
+
+  const ready = [];
+  const g = await fixture({ adapters: { 'claude-desktop': record => { const backend = claudeAdapter(ready); backend.record = record; return backend; } } });
+  try {
+    const status = await g.service.status(extra(A));
+    assert.equal(status.backends['claude-desktop'].ready, true);
+    assert.equal(status.backends['claude-desktop'].treeProtocol, 1);
+    assert.equal(status.backends['claude-desktop'].reportProtocol, 1);
+    assert.deepEqual(ready, ['claude:probe'], 'a ready adapter is still not created, dispatched or answered');
+    assert.equal(g.store.count(ownerIdFor(A)), 0);
+  } finally { g.service.close(); }
+});
+

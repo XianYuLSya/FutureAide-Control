@@ -63,6 +63,40 @@ export function normalizeTarget(value) {
 }
 export function targetOf(record) { return normalizeTarget(record?.target); }
 
+const reason = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 400) });
+
+/**
+ * Readiness of one target without starting a model or a session: import the
+ * adapter, check the whole contract, then call probe() only. An adapter that is
+ * absent, incomplete, or reports unfinished protocols is ready:false with the
+ * concrete reason; nothing here ever answers for another target.
+ * @param {string} target TARGETS entry.
+ * @param {object} options Injected adapters, a probe record, and the adapter's
+ * private request directory. Probe must not write anything.
+ */
+export async function diagnoseTarget(target, { adapters = {}, record = {}, requestDirectory = () => '' } = {}) {
+  const wanted = normalizeTarget(target);
+  let factory;
+  try { factory = await adapterFactory(wanted, adapters); }
+  catch (error) { return { ready: false, present: true, reason: reason(error) }; }
+  if (typeof factory !== 'function') return { ready: false, present: false, reason: reason(backendNotReady(wanted)) };
+  let backend;
+  try { backend = await factory(record, { load: () => record, requestDirectory }); }
+  catch (error) { return { ready: false, present: true, reason: reason(error) }; }
+  const missing = BACKEND_METHODS.filter(method => typeof backend?.[method] !== 'function');
+  if (missing.length) return { ready: false, present: true, reason: reason(backendNotReady(wanted, missing)) };
+  let probe;
+  try { probe = await backend.probe(); }
+  catch (error) { return { ready: false, present: true, reason: reason(error) }; }
+  const capabilities = { methods: probe?.methods ?? [], treeProtocol: probe?.treeProtocol ?? null,
+    reportProtocol: probe?.reportProtocol ?? null };
+  if (capabilities.treeProtocol !== 1) return { ready: false, present: true, ...capabilities,
+    reason: { code: 'tree-protocol-required', message: `The ${wanted} adapter has not completed its task-tree protocol. No subagent can be created on it yet.` } };
+  if (capabilities.reportProtocol !== 1) return { ready: false, present: true, ...capabilities,
+    reason: { code: 'report-protocol-required', message: `The ${wanted} adapter has not completed its explicit-report protocol. No subagent can be created on it yet.` } };
+  return { ready: true, present: true, ...capabilities };
+}
+
 /** Refuse a backend that cannot honor the whole contract instead of degrading quietly. */
 export function assertBackend(backend, target) {
   const missing = BACKEND_METHODS.filter(method => typeof backend?.[method] !== 'function');

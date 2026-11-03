@@ -37,7 +37,7 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
     } finally { finished?.(); }
   });
-  register('futureaide_status', 'Check this chat context and the local DSH connection. The plugin obtains chat and project automatically.', {}, (s, _a, e) => s.status(e), true);
+  register('futureaide_status', 'Check this chat context, the local DSH connection, and per-target readiness in backends (dsh, claude-desktop). The plugin obtains chat and project automatically. A target reports ready:false with a reason when its adapter is missing or its protocols are unfinished; that is not a fallback and no model turn or session is started to find out.', {}, (s, _a, e) => s.status(e), true);
   register('futureaide_create_agent', 'Create a named subagent in the current project, without running a model. target picks the application that runs it, once, at creation: dsh (the default) or claude-desktop; every later call addresses the subagent by name only. A target whose adapter is not installed is refused instead of substituting DSH. once removes session data after an explicitly submitted final report is delivered and the tree settles; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
     name, lifetime: z.enum(['once', 'persistent']),
     target: z.enum(['dsh', 'claude-desktop']).optional().describe('Execution target bound to this name. Defaults to dsh. A target that is unavailable here fails explicitly; it never falls back to another backend.'),

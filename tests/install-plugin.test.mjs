@@ -18,7 +18,14 @@ async function json(filename, value) {
   await writeFile(filename, JSON.stringify(value));
 }
 
-test('installation binds an absolute runtime and preserves unrelated Codex configuration', async () => {
+test('installation binds an absolute runtime and preserves unrelated Codex configuration', async t => {
+  // installPlugin resolves dshHome as `dshHome || DSH_HOME || saved …`, and the
+  // "reuse the saved configuration" half below omits dshHome on purpose. A
+  // DSH_HOME inherited from this machine would otherwise be written into the
+  // fixture config, so the fixture keeps to its own explicit D: paths.
+  const inheritedDshHome = process.env.DSH_HOME;
+  delete process.env.DSH_HOME;
+  t.after(() => { if (inheritedDshHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = inheritedDshHome; });
   const temp = await fixture();
   const sourceRoot = path.join(temp, 'package');
   const codexHome = path.join(temp, 'codex');

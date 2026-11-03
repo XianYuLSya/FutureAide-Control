@@ -342,7 +342,10 @@ test('a root interrupt with a stale pending tool still stops the tree', async t 
   assert.equal(tree.nodes[0].status, 'ended', 'registry idle is authoritative for the root turn');
   assert.equal(tree.running, false);
   assert.equal(tree.settled, true);
-  assert.deepEqual(tree.nodes[0].pendingAgentTools, ['toolu_a']);
+  // The stale call predates the interrupt, so it is no longer open work — while
+  // the observer still remembers it as an Agent call of this task.
+  assert.deepEqual(tree.nodes[0].pendingAgentTools, []);
+  assert.deepEqual(Object.keys(projection.agentTools), ['toolu_a']);
   assert.equal(claudeTreeStopEvidence(tree, { afterSeq: 0 }).stopped, true);
 });
 
@@ -364,6 +367,51 @@ test('state defaults to a fresh tree and cancelClaudeTree only reports proven st
   const late = await cancelClaudeTree(f.binding, projection, treeOptions(f, { state: cancelled.state, afterSeq: 10 ** 9 }));
   assert.equal(late.stopped, false);
   assert.ok(late.evidence.limitation);
+});
+
+test('agentTools keeps every child even after the message window is trimmed', async t => {
+  const f = await fixture(t);
+  const parts = [];
+  for (let index = 0; index < 40; index++) {
+    const agentId = `trim${index}`;
+    await writeFile(f.subagent(agentId), reply(f.sessionId, `reply ${index}`, { stopReason: 'end_turn', sidechain: true, agentId }));
+    await writeFile(f.meta(agentId), JSON.stringify({ toolUseId: `toolu_trim${index}`, spawnDepth: 1, finished: true }));
+    parts.push(...launched(`toolu_trim${index}`, `child ${index}`, { agentId, background: false }));
+  }
+  await f.writeRoot([...parts, reply(f.sessionId, 'done', { stopReason: 'end_turn' })]);
+  const projection = await rootProjection(f);
+  assert.equal(Object.keys(projection.agentTools).length, 40);
+  // The bounded message window is what the observer trims; the agent ids stay.
+  projection.messages = [];
+  projection.messagesOmitted = 400;
+  const { tree } = await observeClaudeTree(f.binding, projection, treeOptions(f));
+  assert.equal(tree.nodes.length, 41);
+  assert.equal(tree.settled, true);
+});
+
+test('an interrupted child stops counting as running and still pairs its late result', async t => {
+  const f = await fixture(t);
+  const child = f.subagent('b1');
+  await writeFile(child,
+    assistant(f.sessionId, [toolUse('toolu_w', 'Write', { file_path: 'late.txt', content: 'x' })], { sidechain: true, agentId: 'b1' })
+    + line({ type: 'user', sessionId: f.sessionId, isSidechain: true, agentId: 'b1', timestamp: 'time',
+      message: { role: 'user', content: '[Request interrupted by user]' } }));
+  await f.writeRoot([...launched('toolu_a', 'interrupted child', { agentId: 'b1' }),
+    reply(f.sessionId, 'launched', { stopReason: 'end_turn' })]);
+  let projection = await rootProjection(f);
+  let result = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'idle' }));
+  assert.equal(result.tree.nodes[1].status, 'ended');
+  assert.equal(result.tree.nodes[1].evidence, 'agent-interrupted');
+  assert.equal(result.tree.settled, true);
+  assert.equal(result.tree.running, false);
+
+  // A result that arrives after the interrupt must still be attributed.
+  await appendFile(child, toolResult(f.sessionId, 'toolu_w', { sidechain: true, agentId: 'b1' }));
+  projection = await rootProjection(f);
+  result = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'idle', state: result.state }));
+  assert.equal(result.tree.nodes[1].status, 'ended');
+  assert.ok(result.tree.nodes[1].changes.some(change => change.path.endsWith('late.txt')));
+  assert.equal(result.tree.settled, true);
 });
 
 test('an unbound root is refused instead of producing an empty tree', async () => {

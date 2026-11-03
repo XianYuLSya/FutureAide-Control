@@ -119,15 +119,28 @@ async function indexSubagentMetas(files) {
   return metas;
 }
 
-/** Agent/Task tool_use ids this node emitted; the native pairing anchor. */
+/**
+ * Agent/Task tool_use ids this node emitted; the native pairing anchor. The
+ * observer keeps every one of them in agentTools, so a session with many
+ * children cannot lose a node to the bounded message window.
+ */
 function collectAgentToolIds(projection, previous = []) {
   const ids = new Set(previous);
+  for (const toolId of Object.keys(projection?.agentTools ?? {})) {
+    if (typeof toolId === 'string' && toolId) ids.add(toolId);
+  }
   for (const message of projection?.messages ?? []) {
     for (const tool of message.tools ?? []) {
       if (AGENT_TOOLS.has(tool?.name) && typeof tool.id === 'string') ids.add(tool.id);
     }
   }
-  return [...ids].slice(-2000);
+  return [...ids];
+}
+
+/** Calls left open after the turn's own interrupt are not evidence of work. */
+function openTools(projection) {
+  const interruptSeq = projection?.lastInterruptSeq ?? 0;
+  return Object.values(projection?.pendingTools ?? {}).filter(tool => (tool.seq ?? 0) > interruptSeq);
 }
 
 /**
@@ -192,8 +205,14 @@ function childStatus(entry) {
     return { status: 'ended', evidence: 'parent-agent-tool-result',
       activity: entry.resultStatus ? `agent ${entry.resultStatus}` : 'agent result returned' };
   }
-  const pending = Object.values(entry.projection.pendingTools ?? {});
+  const pending = openTools(entry.projection);
   if (pending.length) return { status: 'running', evidence: 'pending-tool', activity: `tool: ${pending.at(-1).name}` };
+  // The app's own interrupt record is stronger than an unfinished meta: the agent
+  // stopped there, and any result that arrives later still pairs by tool id.
+  if ((entry.projection.lastInterruptSeq ?? 0) > 0) {
+    return { status: 'ended', evidence: 'agent-interrupted', endSeq: entry.projection.lastInterruptSeq,
+      activity: 'the app recorded an interrupt in this agent\'s transcript' };
+  }
   if (entry.meta?.running === true) {
     return { status: 'running', evidence: 'agent-meta-running',
       activity: 'native agent meta still reports an unfinished subagent' };
@@ -226,8 +245,7 @@ function trimMessages(projection) {
 }
 
 function pendingAgentTools(projection) {
-  return Object.values(projection?.pendingTools ?? {}).filter(tool => AGENT_TOOLS.has(tool?.name))
-    .map(tool => tool.id);
+  return openTools(projection).filter(tool => AGENT_TOOLS.has(tool?.name)).map(tool => tool.id);
 }
 
 /**
@@ -304,7 +322,7 @@ export async function observeClaudeTree(binding, rootProjection, {
   const treeState = normalizeState(state);
   const options = { workspace };
 
-  const rootPending = Object.values(rootProjection.pendingTools ?? {});
+  const rootPending = openTools(rootProjection);
   const rootCompleted = (rootProjection.completions ?? []).at(-1);
   // The native registry is authoritative about the root turn: after an interrupt
   // a pending tool result can stay unanswered forever, while registry 'idle' (or a

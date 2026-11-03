@@ -5,7 +5,9 @@ import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
-import { callingThread, ownerIdFor, resolveCallingContext, threadFromResult } from './calling-context.mjs';
+import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
+import { bindClaude, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
+import { resolveNativeSession } from './claude-host.mjs';
 import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
@@ -148,6 +150,7 @@ export function createScopedAgents(config, {
   backendAdapters = {},
   backendAdapterLoader = undefined,
   reportStatusProbe = readReportStatus,
+  codexReportReady = undefined,
   reportReadyTimeoutMs = 2000,
 } = {}) {
   const clients = new Map();
@@ -180,6 +183,8 @@ export function createScopedAgents(config, {
       withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
       ensureClaudeReports: () => (startReports ? ensureReportsReady() : readStatus()),
       readClaudeReportStatus: readStatus,
+      ensureCodexReports: () => beginCodexReports(record),
+      readCodexReportState: () => readCodexReportState(load()),
     };
   };
   async function ensureReportsReady() {
@@ -240,18 +245,85 @@ export function createScopedAgents(config, {
           { code: 'report-service-unavailable', ...(endpoint?.reason ? { detail: endpoint.reason } : {}) });
       }
     }
+    // A Codex Desktop name is useless without its own ask/report tool surface.
+    if (target === 'codex-desktop') {
+      const endpoint = await deps.ensureCodexReports();
+      if (endpoint?.ready !== true) {
+        throw Object.assign(new Error('The Codex Desktop tool service is not ready; no subagent was created.'),
+          { code: 'codex-report-service-unavailable', ...(endpoint?.reason ? { detail: endpoint.reason } : {}) });
+      }
+    }
     return target;
   }
 
   async function context(extra) {
-    const threadId = callingThread(extra);
-    const ownerId = ownerIdFor(threadId);
-    return store.saveOwner(await resolveCallingContext(extra, { knownOwner: store.owner(ownerId), callCodex }));
+    // The owner comes from a verified caller (Codex chat metadata or a verified
+    // Claude native session); owner ids are namespaced by source, so the same name
+    // in two applications never collides.
+    const caller = trustedCaller(extra);
+    const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+    return store.saveOwner(await resolveCallingContext(extra, { knownOwner: store.owner(ownerId), callCodex, verifyClaude }));
   }
   function named(owner, name) {
     const record = store.named(owner.ownerId, assertName(name));
     if (!record) throw Object.assign(new Error(`No subagent named “${name}” exists in this chat.`), { code: 'agent-not-found' });
     return record;
+  }
+
+  /** A Claude caller is checked against the native registry before it becomes an owner. */
+  async function verifyClaude(caller) {
+    const session = await resolveNativeSession(caller.nativeSessionId,
+      { ...(caller.workspace ? { workspace: caller.workspace } : {}) });
+    return { pid: session?.pid, workspace: session?.cwd ?? session?.workspace ?? caller.workspace };
+  }
+
+  /**
+   * Codex-side explicit ask/report arrive through the shared submission queue. The
+   * adapter surfaces them as its own questions/reports; the one state machine owns
+   * delivery, so no second task or notice machine exists.
+   */
+  function readCodexReportState(record) {
+    if (!record?.task) return { questions: [], reports: [] };
+    const pending = store.pendingSubmissions(record.agentId, record.task.taskId);
+    return {
+      questions: pending.filter(item => item.kind === 'ask').map(item => ({ id: `submission:${item.id}`, state: 'pending', message: item.message })),
+      reports: pending.filter(item => item.kind === 'report').map(item => ({ id: `submission:${item.id}`,
+        taskId: record.task.taskId, message: item.message, final: item.final, createdAt: item.created })),
+    };
+  }
+  async function beginCodexReports(record) {
+    return typeof codexReportReady === 'function' ? codexReportReady(record)
+      : { ready: false, reason: { code: 'codex-report-service-unavailable', message: 'This build has no Codex tool service.' } };
+  }
+
+  /**
+   * Fold pending explicit submissions into the task: a report becomes a task
+   * report, an ask becomes a pending question. The row is consumed first, so two
+   * concurrent polls can never process the same submission twice.
+   */
+  function absorbSubmissions(record) {
+    const pending = store.pendingSubmissions(record.agentId, record.task.taskId);
+    if (!pending.length) return;
+    let changed = false;
+    for (const item of pending) {
+      if (!store.consumeSubmission(item.id)) continue;
+      changed = true;
+      if (item.kind === 'report') {
+        record.task.reports ??= [];
+        if (!record.task.reports.some(report => report.id === `submission:${item.id}`)) {
+          record.task.reports.push({ id: `submission:${item.id}`, taskId: record.task.taskId,
+            message: item.message, final: item.final, createdAt: item.created, delivery: { state: 'pending' } });
+        }
+      } else {
+        record.observation ??= {};
+        record.observation.questions ??= [];
+        if (!record.observation.questions.some(question => question.id === `submission:${item.id}`)) {
+          record.observation.questions.push({ id: `submission:${item.id}`, state: 'pending', message: item.message });
+        }
+        record.state = 'awaiting_input';
+      }
+    }
+    if (changed) store.save(record);
   }
   async function withName(extra, name, action, options) {
     const owner = await context(extra);
@@ -438,14 +510,23 @@ export function createScopedAgents(config, {
     notice.attempts = (notice.attempts ?? 0) + 1;
     notice.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(notice.attempts, 5));
     const marker = `<!-- futureaide-control:${notice.id} -->`;
+    const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
     if (notice.state === 'unknown' || notice.state === 'sending') {
       try {
-        const history = await callCodex(owner.threadId, 'read_thread', {
-          threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
-        });
-        if (!history?.isError && JSON.stringify(history).includes(marker)) {
-          Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
-        } else notice.state = 'unknown';
+        if (claude) {
+          // written/unknown is never acceptance: only the native transcript
+          // showing our marker proves the session received it.
+          const page = await readClaudeEvents(await claudeNoticeBinding(owner), { offset: 0 });
+          const seen = (page.events ?? []).some(event => typeof event.text === 'string' && event.text.includes(marker));
+          Object.assign(notice, seen ? { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined } : { state: 'unknown' });
+        } else {
+          const history = await callCodex(owner.threadId, 'read_thread', {
+            threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
+          });
+          if (!history?.isError && JSON.stringify(history).includes(marker)) {
+            Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
+          } else notice.state = 'unknown';
+        }
       } catch { notice.state = 'unknown'; }
       store.save(record);
       return;
@@ -453,19 +534,39 @@ export function createScopedAgents(config, {
     // A newly confirmed channel rejection must not rewrite an older ambiguous
     // delivery: the read-back branch above remains its only recovery path.
     if (record.callbackBlocked) { notice.state = 'blocked'; store.save(record); return; }
-    try { await verifyOwner(owner); }
+    try { await (claude ? claudeNoticeBinding(owner) : verifyOwner(owner)); }
     catch (error) { Object.assign(notice, { state: 'pending', error: safeError(error) }); store.save(record); return; }
     // A previous attempt may have reached the desktop. Never send a second copy blindly.
     Object.assign(notice, { state: 'sending', attemptedAt: now() });
     store.save(record);
     try {
-      const result = await callCodex(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
-      const unavailable = result?.isError && JSON.stringify(result).includes('direct app-server input is not allowed for multi-agent v2 sub-agents');
-      if (unavailable) record.callbackBlocked = true;
-      Object.assign(notice, unavailable ? { state: 'blocked', error: { code: 'native-callback-unavailable' } } : result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
-        : { state: 'delivered', deliveredAt: now(), error: undefined });
+      if (claude) {
+        // The Claude inbox answers 'written' when the channel accepted the text,
+        // which is not that the session read it: stay unknown until the read-back
+        // branch finds the marker. A definite channel failure stays 'pending'.
+        const sent = await sendClaude(await claudeNoticeBinding(owner), `${text}\n\n${marker}`, { requestId: notice.id });
+        if (sent?.status === 'failed') Object.assign(notice, { state: 'pending', error: { message: 'The Claude inbox rejected this notice before acceptance.' } });
+        else Object.assign(notice, { state: 'unknown', error: undefined });
+      } else {
+        const result = await callCodex(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
+        const unavailable = result?.isError && JSON.stringify(result).includes('direct app-server input is not allowed for multi-agent v2 sub-agents');
+        if (unavailable) record.callbackBlocked = true;
+        Object.assign(notice, unavailable ? { state: 'blocked', error: { code: 'native-callback-unavailable' } } : result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
+          : { state: 'delivered', deliveredAt: now(), error: undefined });
+      }
     } catch (error) { Object.assign(notice, { state: 'unknown', error: safeError(error) }); }
     store.save(record);
+  }
+
+  /** Rebind the Claude session that owns this name by its stable native id. */  async function claudeNoticeBinding(owner) {
+    if (!owner?.nativeSessionId) throw Object.assign(new Error('This owner has no native Claude session to answer.'),
+      { code: 'callback-target-missing' });
+    const wanted = String(owner.nativeSessionId).toLowerCase();
+    const { sessions } = await discoverClaude();
+    const session = (sessions ?? []).find(item => String(item.sessionId).toLowerCase() === wanted);
+    if (!session) throw Object.assign(new Error('The Claude session that owns this name is not running.'),
+      { code: 'callback-target-missing' });
+    return bindClaude({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
   }
 
   async function prepare(record) {
@@ -714,6 +815,9 @@ export function createScopedAgents(config, {
     if (record.closed || record.state === 'cleanup_failed' || record.state === 'idle') return publicResult(record);
     const task = record.task;
     try {
+      // Explicit ask/report that a Codex-side tool wrote into the shared queue join
+      // the same task as questions/reports before anything else looks at them.
+      if (task) absorbSubmissions(record);
       if (task?.cancelRequested && !task.cancelVerified) {
         const result = await (await checkHost(record)).cancel();
         if (result.cancelRequested === true) { store.confirmCancel(record); task.cancelAccepted = true; task.cancelVerified = true; store.save(record); }
@@ -848,8 +952,13 @@ export function createScopedAgents(config, {
       if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
       const backendTarget = normalizeTarget(target);
       const owner = await context(extra);
+      // A cross-application call: when the caller's own native session is already a
+      // managed name, the new name is its child and follows that owner tree.
+      const caller = trustedCaller(extra);
+      const parent = caller ? store.agentForNativeSession(caller.nativeSessionId) : undefined;
       const record = { agentId: uid('agent'), ownerId: owner.ownerId, sessionId: uid('session-codex'), name, lifetime,
-        target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [] };
+        target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
+        ...(parent ? { parentAgentId: parent.agentId } : {}) };
       await ensureTargetBackend(record);
       store.insert(record); // The database's (owner,name) constraint arbitrates parallel creation.
       return store.locked(record.agentId, async () => {
@@ -997,6 +1106,31 @@ export function createScopedAgents(config, {
       }
     },
     async delete({ name }, extra) { return withName(extra, name, record => clearRecord(record)); },
+    /**
+     * Explicit ask/report from a managed Codex Desktop child, called from that
+     * child's own chat. The caller is found from its chat metadata (never a tool
+     * argument) through the binding its backend recorded, and the submission joins
+     * the same task so the one state machine delivers it to the parent.
+     */
+    async submitToParent({ kind, message, final = false }, extra) {
+      textMessage(message);
+      if (!['ask', 'report'].includes(kind)) throw new Error('kind must be ask or report.');
+      const threadId = callingThread(extra);
+      const bound = store.agentForCodexThread(threadId);
+      const record = bound ? store.get(bound.agentId) : undefined;
+      if (!record || record.closed || !record.task) {
+        throw Object.assign(new Error('This chat is not bound to a managed subagent with a current task.'),
+          { code: 'submission-not-owned' });
+      }
+      if (record.task.reports?.some(report => report.final)) {
+        throw Object.assign(new Error('This task already submitted its final report.'), { code: 'final-already-submitted' });
+      }
+      const id = uid('submission');
+      store.enqueueSubmission({ id, ownerId: record.ownerId, agentId: record.agentId,
+        taskId: record.task.taskId, kind, message, final: final === true });
+      await ensureWorker(record, { wake: true });
+      return { accepted: true, name: record.name, taskId: record.task.taskId, submissionId: id, kind };
+    },
     async wait({ names, timeoutSeconds = 0 } = {}, extra) {
       if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 45) throw new Error('Wait between 0 and 45 seconds.');
       const owner = await context(extra);

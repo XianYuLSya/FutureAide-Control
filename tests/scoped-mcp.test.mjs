@@ -28,7 +28,7 @@ test('installed MCP exposes only name-addressed tools and forwards trusted reque
   await server.connect(b); await client.connect(a);
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 10);
+    assert.equal(tools.length, 12, 'ten name-addressed tools plus the Codex-side ask_parent/report_parent');
     assert.ok(!tools.some(tool => /spawn_agent|register_peer|create_session|profile_create/.test(tool.name)));
     for (const tool of tools) {
       const fields = Object.keys(tool.inputSchema.properties ?? {});

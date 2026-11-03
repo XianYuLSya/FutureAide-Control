@@ -9,6 +9,7 @@ import { createPeers } from './peers.mjs';
 import { CODEX_THREAD_ID } from './codex-target.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
 import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
+import { TRUSTED_CALLER } from './calling-context.mjs';
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
@@ -56,9 +57,37 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), true);
   register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
   register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing the managed session data of the target it runs on (DSH or Claude Desktop) and the private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  // Codex Desktop side of a cross-application call: the child chat asks or reports
+  // to the name that owns it. The caller is its own chat metadata, never a tool
+  // argument, so no chat id can be supplied by a model.
+  const parentMessage = z.string().min(1).max(100000).describe('Message for the managed parent of this chat. Pass it directly; never a chat id, path, or internal number.');
+  register('ask_parent', 'Ask the parent of this managed Codex subagent a question. The caller is identified from this chat itself, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer.', { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
+  register('report_parent', 'Submit an explicit report from this managed Codex subagent to its parent. The caller is identified from this chat itself. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true.', {
+    message: parentMessage,
+    final: z.boolean().optional().describe('Submit as the final report. Omitting it submits a progress report and keeps the task open.'),
+  }, (s, a, e) => s.submitToParent({ kind: 'report', message: a.message, final: a.final === true }, e));
   // Restore the shared listener on connection even before the first tool call.
   void service().catch(() => {});
   return server;
+}
+
+/**
+ * Entry the HTTP side (owned by the report surface) uses for a verified Claude
+ * caller: one service instance over the same roster, plus the trusted-caller
+ * context its tools pass to the shared state machine. The caller record is never
+ * derived from tool arguments.
+ * @param {{configPath?: string, caller: {nativeSessionId: string, workspace: string, source?: string}}} options
+ */
+export async function createScopedServiceForCaller({ configPath, caller } = {}) {
+  if (!caller || typeof caller.nativeSessionId !== 'string' || typeof caller.workspace !== 'string') {
+    throw new Error('A verified native session and its workspace are required.');
+  }
+  const config = await loadConfig(configPath);
+  const service = createScopedAgents(config);
+  await service.resume?.();
+  const extra = { [TRUSTED_CALLER]: { source: caller.source ?? 'claude-desktop',
+    nativeSessionId: caller.nativeSessionId, workspace: caller.workspace, label: caller.label } };
+  return { service, extra, close: () => service.close() };
 }
 
 /**

@@ -1,0 +1,78 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdir, mkdtemp } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createScopedAgents } from '../src/scoped-agents.mjs';
+import { RosterStore } from '../src/roster-store.mjs';
+import { ownerIdFor, ownerIdForSource } from '../src/calling-context.mjs';
+
+const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const THREAD = '11111111-1111-4111-8111-111111111111';
+const OTHER = '22222222-2222-4222-8222-222222222222';
+const extra = threadId => ({ _meta: { threadId } });
+
+async function fixture() {
+  const base = path.join(workspace, '.runtime', 'tests');
+  await mkdir(base, { recursive: true });
+  const stateDirectory = await mkdtemp(path.join(base, 'cross-'));
+  const store = new RosterStore(':memory:');
+  const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
+    store,
+    clientFactory: () => { throw new Error('no DSH host is needed for these cases'); },
+    callCodex: async (threadId, tool) => (tool === 'read_thread'
+      ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } }
+      : { accepted: true }),
+    startSharedMonitor: () => true,
+    removeTree: async () => {},
+  });
+  return { service, store };
+}
+
+test('owner ids are namespaced per source and never collide', () => {
+  assert.equal(ownerIdForSource('codex-desktop', THREAD), ownerIdFor(THREAD), 'the Codex owner id is unchanged');
+  assert.notEqual(ownerIdForSource('claude-desktop', THREAD), ownerIdForSource('codex-desktop', THREAD));
+  assert.equal(ownerIdForSource('claude-desktop', THREAD.toUpperCase()), ownerIdForSource('claude-desktop', THREAD),
+    'a native session id is case-insensitive');
+  assert.notEqual(ownerIdForSource('claude-desktop', THREAD), ownerIdForSource('claude-desktop', OTHER));
+});
+
+test('a Codex child can submit an explicit report only for its own bound task', async () => {
+  const { service, store } = await fixture();
+  try {
+    const ownerId = ownerIdFor(THREAD);
+    const record = { agentId: 'agent-' + 'b'.repeat(32), ownerId, sessionId: 'session-child', name: 'child',
+      lifetime: 'persistent', target: 'codex-desktop', workspace, state: 'running', created: true,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), history: [],
+      task: { taskId: 'task-child', message: 'work', state: 'running', startedAt: new Date().toISOString(), dispatches: [], answers: [] } };
+    store.insert(record);
+    store.saveBackendState(record.agentId, { binding: { threadId: THREAD, sessionId: 'native-child' } });
+
+    const accepted = await service.submitToParent({ kind: 'report', message: 'done reviewing', final: true }, extra(THREAD));
+    assert.equal(accepted.accepted, true);
+    assert.equal(accepted.taskId, 'task-child');
+    const pending = store.pendingSubmissions(record.agentId, 'task-child');
+    assert.deepEqual(pending.map(item => [item.kind, item.message, item.final]), [['report', 'done reviewing', true]]);
+    assert.equal(store.consumeSubmission(pending[0].id), true);
+    assert.equal(store.consumeSubmission(pending[0].id), false, 'a submission is consumed once');
+
+    // A chat that is not bound to a managed name cannot report for it.
+    const foreign = await service.submitToParent({ kind: 'report', message: 'nope' }, extra(OTHER))
+      .then(() => null, error => error);
+    assert.equal(foreign.code, 'submission-not-owned');
+    assert.equal(store.agentForCodexThread(OTHER), undefined);
+  } finally { service.close(); }
+});
+
+test('a name created by a managed parent records its parent and an unmanaged caller does not', async () => {
+  const { service, store } = await fixture();
+  try {
+    const parent = { agentId: 'agent-' + 'c'.repeat(32), ownerId: 'owner-parent', sessionId: 'session-parent',
+      name: 'parent', lifetime: 'persistent', target: 'claude-desktop', workspace, state: 'idle', created: true,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), history: [] };
+    store.insert(parent);
+    store.saveBackendState(parent.agentId, { binding: { sessionId: 'native-parent', transcriptFile: 'D:\\claude\\p.jsonl' } });
+    assert.equal(store.agentForNativeSession('native-parent').agentId, parent.agentId);
+  } finally { service.close(); }
+});
+

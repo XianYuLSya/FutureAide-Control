@@ -18,14 +18,20 @@ export class RosterStore {
       CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(owner,name));
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS submissions (id TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL,
+        task TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, final INTEGER NOT NULL,
+        created TEXT NOT NULL, state TEXT NOT NULL, consumed TEXT);`);
   }
 
   owner(id) { const row = this.db.prepare('SELECT body FROM owners WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
   saveOwner(owner) {
     this.db.prepare('INSERT OR IGNORE INTO owners(id,body) VALUES (?,?)').run(owner.ownerId, JSON.stringify(owner));
     const saved = this.owner(owner.ownerId);
-    if (saved.threadId !== owner.threadId || saved.workspace !== owner.workspace) throw new Error('This chat is already bound to another project.');
+    // Both sources bind one owner to one chat/session and one project.
+    const sameCaller = (saved.threadId ?? null) === (owner.threadId ?? null)
+      && (saved.nativeSessionId ?? null) === (owner.nativeSessionId ?? null);
+    if (!sameCaller || saved.workspace !== owner.workspace) throw new Error('This chat is already bound to another project.');
     return saved;
   }
   get(id) { const row = this.db.prepare('SELECT body FROM agents WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
@@ -106,12 +112,36 @@ export class RosterStore {
     return { agentId: row.agentId, ownerId: row.ownerId, name: row.name, target: row.target,
       state: row.state, logicalSessionId: row.logicalSessionId, nativeSessionId, binding };
   }
+  /**
+   * The same reverse lookup for a Codex Desktop child: its own chat id is the
+   * binding its backend records, and only a live codex-desktop name qualifies.
+   */
+  agentForCodexThread(threadId) {
+    if (typeof threadId !== 'string' || !threadId) return undefined;
+    const wanted = threadId.toLowerCase();
+    const row = this.db.prepare(`SELECT a.id AS agentId, a.owner AS ownerId, a.name AS name,
+      json_extract(a.body,'$.target') AS target, json_extract(a.body,'$.state') AS state,
+      json_extract(a.body,'$.sessionId') AS logicalSessionId, b.body AS body
+      FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
+      WHERE json_extract(a.body,'$.target')='codex-desktop'
+        AND coalesce(json_extract(a.body,'$.closed'),0)=0`).all()
+      .find(candidate => {
+        const binding = JSON.parse(candidate.body)?.binding ?? {};
+        return [binding.threadId, binding.sessionId, binding.nativeSessionId]
+          .filter(value => typeof value === 'string')
+          .some(value => value.toLowerCase() === wanted);
+      });
+    if (!row) return undefined;
+    return { agentId: row.agentId, ownerId: row.ownerId, name: row.name, target: row.target,
+      state: row.state, logicalSessionId: row.logicalSessionId, binding: JSON.parse(row.body).binding ?? null };
+  }
   list(owner) {
     const rows = owner === undefined
       ? this.db.prepare('SELECT body FROM agents ORDER BY name').all()
       : this.db.prepare('SELECT body FROM agents WHERE owner=? ORDER BY name').all(owner);
     return rows.map(row => JSON.parse(row.body));
-  }  count(owner) {
+  }
+  count(owner) {
     return this.db.prepare(owner === undefined ? 'SELECT count(*) AS count FROM agents' : 'SELECT count(*) AS count FROM agents WHERE owner=?')
       .get(...(owner === undefined ? [] : [owner])).count;
   }
@@ -260,9 +290,34 @@ export class RosterStore {
   }
   renewLease(key, holder, leaseMs) { return this.db.prepare('UPDATE leases SET expires=? WHERE key=? AND holder=?').run(Date.now() + leaseMs, key, holder).changes > 0; }
   releaseLease(key, holder) { this.db.prepare('DELETE FROM leases WHERE key=? AND holder=?').run(key, holder); }
+  /**
+   * Raw submissions an explicit Codex ask_parent/report_parent left behind. They
+   * are consumed by the same scoped state machine during a poll — this table is a
+   * durable inbox, not a second task or notice machine, and ordinary final text
+   * from a native turn is never recorded here.
+   */
+  enqueueSubmission({ id, ownerId, agentId, taskId, kind, message, final = false, created = new Date().toISOString() }) {
+    if (!['ask', 'report'].includes(kind)) throw new Error('A submission must be an ask or a report.');
+    return this.db.prepare(`INSERT OR IGNORE INTO submissions(id,owner,agent,task,kind,message,final,created,state)
+      VALUES (?,?,?,?,?,?,?,?,'pending')`)
+      .run(id, ownerId, agentId, taskId, kind, message, final ? 1 : 0, created).changes === 1;
+  }
+  pendingSubmissions(agentId, taskId) {
+    return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created FROM submissions
+      WHERE agent=? AND task=? AND state='pending' ORDER BY created`)
+      .all(agentId, taskId)
+      .map(row => ({ id: row.id, ownerId: row.owner, agentId: row.agent, taskId: row.task,
+        kind: row.kind, message: row.message, final: row.final === 1, created: row.created }));
+  }
+  /** Consume once: false means another poll already took it. */
+  consumeSubmission(id) {
+    return this.db.prepare(`UPDATE submissions SET state='consumed', consumed=? WHERE id=? AND state='pending'`)
+      .run(new Date().toISOString(), id).changes === 1;
+  }
   remove(record) {
     this.db.prepare('DELETE FROM supplements WHERE agent=? AND owner=?').run(record.agentId, record.ownerId);
     this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(record.agentId);
+    this.db.prepare('DELETE FROM submissions WHERE agent=?').run(record.agentId);
     this.db.prepare('DELETE FROM agents WHERE id=? AND owner=?').run(record.agentId, record.ownerId);
     // The per-target host lock is shared with other names and is left to its holder.
     this.db.prepare('DELETE FROM leases WHERE key=? OR key=?').run(record.agentId, `worker:${record.agentId}`);

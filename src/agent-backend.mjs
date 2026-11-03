@@ -62,7 +62,7 @@ import path from 'node:path';
 import { historyMessages, modelTurnError } from './control.mjs';
 import { dispatchBoundary } from './dispatch.mjs';
 
-export const TARGETS = Object.freeze(['dsh', 'claude-desktop']);
+export const TARGETS = Object.freeze(['dsh', 'claude-desktop', 'codex-desktop']);
 export const DEFAULT_TARGET = 'dsh';
 // Older roster records carry no target and keep the DSH behavior they were
 // created with. Native identifiers stay internal: the contract only ever moves
@@ -89,7 +89,7 @@ export function targetOf(record) { return normalizeTarget(record?.target); }
 
 // Display name of the application behind a target, used in user-facing text.
 // DSH keeps its historical wording; an unknown target falls back to its id.
-export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'claude-desktop': 'Claude Desktop' });
+export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'claude-desktop': 'Claude Desktop', 'codex-desktop': 'Codex Desktop' });
 export function hostLabel(record) {
   const target = targetOf(record);
   return TARGET_LABELS[target] ?? target;

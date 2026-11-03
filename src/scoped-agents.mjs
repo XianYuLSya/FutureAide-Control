@@ -136,6 +136,26 @@ function publicResult(record, { fullResult = false } = {}) {
   };
 }
 
+/**
+ * Native receipt for a Claude notice. Our request id survives as the queue,
+ * attachment or user uuid, so the delivery record — not the transcript text — is
+ * the evidence: the reader truncates text at 8k, which would drop the trailing
+ * marker of a long report.
+ * @param {Array<{requestId: string, stage: string, seq?: number}>} deliveries
+ * @param {string} requestId
+ */
+export function claudeNoticeReceipt(deliveries, requestId) {
+  if (!Array.isArray(deliveries) || typeof requestId !== 'string') return undefined;
+  return deliveries.find(item => item?.requestId === requestId && ['accepted', 'inserted'].includes(item.stage));
+}
+
+const CLAUDE_STALE_BINDING = ['claude-session-changed', 'claude-process-replaced', 'claude-inbox-key-mismatch',
+  'claude-binding-mismatch', 'claude-transcript-unresolved', 'claude-binding-invalid', 'claude-transcript-replaced'];
+
+/** A cached Claude transport binding the session has outgrown: refresh it once. */
+export const claudeBindingStale = error =>
+  CLAUDE_STALE_BINDING.some(code => String(error?.message ?? error ?? '').includes(code));
+
 /** Name-addressed operations; owner and native identifiers never come from tool arguments. */
 export function createScopedAgents(config, {
   store = new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
@@ -245,12 +265,14 @@ export function createScopedAgents(config, {
           { code: 'report-service-unavailable', ...(endpoint?.reason ? { detail: endpoint.reason } : {}) });
       }
     }
-    // A Codex Desktop name is useless without its own ask/report tool surface.
+    // A Codex Desktop name is useless without its own ask/report tool surface, and
+    // an online endpoint alone does not mean those tools are registered.
     if (target === 'codex-desktop') {
       const endpoint = await deps.ensureCodexReports();
       if (endpoint?.ready !== true) {
+        const reason = endpoint?.reason ?? { code: 'codex-tools-not-registered' };
         throw Object.assign(new Error('The Codex Desktop tool service is not ready; no subagent was created.'),
-          { code: 'codex-report-service-unavailable', ...(endpoint?.reason ? { detail: endpoint.reason } : {}) });
+          { code: reason.code ?? 'codex-tools-not-registered', detail: reason, registered: endpoint?.registered === true });
       }
     }
     return target;
@@ -292,8 +314,15 @@ export function createScopedAgents(config, {
     };
   }
   async function beginCodexReports(record) {
-    return typeof codexReportReady === 'function' ? codexReportReady(record)
-      : { ready: false, reason: { code: 'codex-report-service-unavailable', message: 'This build has no Codex tool service.' } };
+    // A healthy loopback endpoint is not proof that the Codex MCP server registered
+    // ask_parent/report_parent. Only an explicit registration check from the Codex
+    // adapter may report ready; without one the target stays explicitly unready.
+    if (typeof codexReportReady !== 'function') {
+      return { ready: false, registered: false,
+        reason: { code: 'codex-tools-not-registered', message: 'This build does not register the Codex-side ask/report tools yet.' } };
+    }
+    const value = await codexReportReady(record);
+    return { registered: false, ...value };
   }
 
   /**
@@ -514,11 +543,13 @@ export function createScopedAgents(config, {
     if (notice.state === 'unknown' || notice.state === 'sending') {
       try {
         if (claude) {
-          // written/unknown is never acceptance: only the native transcript
-          // showing our marker proves the session received it.
-          const page = await readClaudeEvents(await claudeNoticeBinding(owner), { offset: 0 });
-          const seen = (page.events ?? []).some(event => typeof event.text === 'string' && event.text.includes(marker));
-          Object.assign(notice, seen ? { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined } : { state: 'unknown' });
+          // The native receipt is the request id itself: our envelope uuid survives
+          // as the queue/attachment/user uuid. Transcript text is truncated at 8k,
+          // so a long report's trailing marker is never reliable — deliveries are.
+          const settled = claudeNoticeReceipt((await readClaudeEvents(await claudeNoticeBinding(owner), { offset: 0 })).deliveries, notice.id);
+          Object.assign(notice, settled
+            ? { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined }
+            : { state: 'unknown' });
         } else {
           const history = await callCodex(owner.threadId, 'read_thread', {
             threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
@@ -543,8 +574,16 @@ export function createScopedAgents(config, {
       if (claude) {
         // The Claude inbox answers 'written' when the channel accepted the text,
         // which is not that the session read it: stay unknown until the read-back
-        // branch finds the marker. A definite channel failure stays 'pending'.
-        const sent = await sendClaude(await claudeNoticeBinding(owner), `${text}\n\n${marker}`, { requestId: notice.id });
+        // branch finds our request id in the native deliveries. A definite channel
+        // failure stays 'pending'. The cached binding is reused; only a binding the
+        // session outgrew is refreshed, and the parent session is never replaced.
+        const send = binding => sendClaude(binding, `${text}\n\n${marker}`, { requestId: notice.id });
+        let sent;
+        try { sent = await send(await claudeNoticeBinding(owner)); }
+        catch (error) {
+          if (!claudeBindingStale(error)) throw error;
+          sent = await send(await refreshClaudeBinding(owner));
+        }
         if (sent?.status === 'failed') Object.assign(notice, { state: 'pending', error: { message: 'The Claude inbox rejected this notice before acceptance.' } });
         else Object.assign(notice, { state: 'unknown', error: undefined });
       } else {
@@ -558,7 +597,18 @@ export function createScopedAgents(config, {
     store.save(record);
   }
 
-  /** Rebind the Claude session that owns this name by its stable native id. */  async function claudeNoticeBinding(owner) {
+  /**
+   * Transport binding for the Claude session that owns this name. A saved binding
+   * is re-validated natively by sendClaude/readClaudeEvents on every use, so the
+   * normal path runs no discovery and no rebind, and a cold process resumes straight
+   * from the roster.
+   */
+  async function claudeNoticeBinding(owner) {
+    const cached = owner?.binding;
+    if (cached?.socketPath && cached?.recordFile && cached?.transcriptFile) return cached;
+    return refreshClaudeBinding(owner);
+  }
+  async function refreshClaudeBinding(owner) {
     if (!owner?.nativeSessionId) throw Object.assign(new Error('This owner has no native Claude session to answer.'),
       { code: 'callback-target-missing' });
     const wanted = String(owner.nativeSessionId).toLowerCase();
@@ -566,7 +616,11 @@ export function createScopedAgents(config, {
     const session = (sessions ?? []).find(item => String(item.sessionId).toLowerCase() === wanted);
     if (!session) throw Object.assign(new Error('The Claude session that owns this name is not running.'),
       { code: 'callback-target-missing' });
-    return bindClaude({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
+    // Same native session, same parent context: only the transport binding is
+    // refreshed, never the conversation it belongs to.
+    const binding = await bindClaude({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
+    store.saveOwner({ ...(store.owner(owner.ownerId) ?? owner), hostSessionId: owner.nativeSessionId, binding });
+    return binding;
   }
 
   async function prepare(record) {

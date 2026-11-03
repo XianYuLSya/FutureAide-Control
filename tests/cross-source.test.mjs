@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createScopedAgents } from '../src/scoped-agents.mjs';
+import { claudeBindingStale, claudeNoticeReceipt, createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor, ownerIdForSource } from '../src/calling-context.mjs';
 
@@ -62,6 +62,33 @@ test('a Codex child can submit an explicit report only for its own bound task', 
     assert.equal(foreign.code, 'submission-not-owned');
     assert.equal(store.agentForCodexThread(OTHER), undefined);
   } finally { service.close(); }
+});
+
+test('a Claude notice is settled by its native delivery record, never by trailing text', async () => {
+  assert.equal(claudeNoticeReceipt([{ requestId: 'notice-1', stage: 'accepted' }], 'notice-1').stage, 'accepted');
+  assert.equal(claudeNoticeReceipt([{ requestId: 'notice-1', stage: 'inserted' }], 'notice-1').stage, 'inserted');
+  assert.equal(claudeNoticeReceipt([{ requestId: 'notice-2', stage: 'inserted' }], 'notice-1'), undefined,
+    'another request id is not our receipt');
+  // A long report is truncated by the reader, so a page whose text happens to hold
+  // the marker with no delivery record proves nothing.
+  assert.equal(claudeNoticeReceipt([], 'notice-1'), undefined);
+  assert.equal(claudeBindingStale(new Error('claude-session-changed')), true);
+  assert.equal(claudeBindingStale(new Error('claude-message-empty')), false, 'a message error is not a stale binding');
+});
+
+test('a verified Claude owner keeps its host session and binding for cold resume', async () => {
+  const { store } = await fixture();
+  try {
+    const binding = { pid: 4242, sessionId: 'native-parent', socketPath: '\\\\.\\pipe\\claude-inbox', recordFile: 'D:\\claude\\4242.json',
+      transcriptFile: 'D:\\claude\\projects\\p\\native-parent.jsonl', procStart: '123', pidDomain: 'win32:host' };
+    const owner = { ownerId: ownerIdForSource('claude-desktop', 'native-parent'), source: 'claude-desktop',
+      nativeSessionId: 'native-parent', hostSessionId: 'native-parent', workspace, binding, createdAt: new Date().toISOString() };
+    store.saveOwner(owner);
+    const saved = store.owner(owner.ownerId);
+    assert.equal(saved.hostSessionId, 'native-parent');
+    assert.equal(saved.binding.socketPath, binding.socketPath, 'the transport binding survives a cold start');
+    assert.equal(store.saveOwner({ ...saved }).binding.pid, 4242);
+  } finally { store.close(); }
 });
 
 test('a name created by a managed parent records its parent and an unmanaged caller does not', async () => {

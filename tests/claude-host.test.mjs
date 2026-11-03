@@ -14,7 +14,7 @@ import {
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
   MODEL_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
   loadModelCatalog, BUILT_IN_MODEL_CATALOG, extractModelSelectorConfigs, sliceBalancedArray,
-  extractEmbeddedCatalog, readQuotedLiteral,
+  extractEmbeddedCatalog, readQuotedLiteral, firstTurnBinding, readTranscriptHead, firstInputOf,
 } from '../src/claude-host.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -77,6 +77,8 @@ async function host({ sessions = [], alive = new Set([50124]), transcriptLines =
 let stamp = 0;
 const userLine = text => ({ type: 'user', uuid: `u-${++stamp}`, timestamp: new Date(Date.now() + stamp * 1000).toISOString(),
   message: { role: 'user', content: text } });
+const enqueueLine = text => ({ type: 'queue-operation', operation: 'enqueue',
+  timestamp: new Date(Date.now() + (++stamp) * 1000).toISOString(), content: text });
 const assistantLine = (model, effort) => ({ type: 'assistant', uuid: `a-${++stamp}`,
   timestamp: new Date(Date.now() + stamp * 1000).toISOString(), effort,
   message: { role: 'assistant', model, content: [{ type: 'text', text: 'ok' }] } });
@@ -174,7 +176,7 @@ test('a session counts as created only when a new record registers and the marke
   const host1 = await host({ sessions: [] });
   const driver = uiDriver({
     openNewSession: async () => {
-      await host1.write(record(), [userLine('do the thing'), userLine(markerLine('request-abc', 'fa-life-20261103-1630'))]);
+      await host1.write(record(), [enqueueLine(`do the thing\n\n${markerLine('request-abc', 'fa-life-20261103-1630')}`)]);
       return { strategy: 'deep-link-code-new', prefilled: true };
     },
   });
@@ -185,7 +187,8 @@ test('a session counts as created only when a new record registers and the marke
     assert.equal(result.nativeSessionId, SESSION);
     assert.equal(result.pid, 50124);
     assert.equal(result.workspace, CWD);
-    assert.deepEqual(result.verifiedBy, ['native-record-created', 'transcript-marker-once']);
+    assert.deepEqual(result.verifiedBy, ['native-record-created', 'first-input-marker-once']);
+    assert.equal(result.submittedBy, 'enqueue', 'the opener is the native enqueue record');
     assert.equal(result.marker, '[FutureAide Control request request-abc · binding fa-life-20261103-1630]');
     assert.equal(result.model, undefined);
     assert.equal(driver.calls.filter(call => Array.isArray(call) && call[0] === 'submit').length, 1,
@@ -228,7 +231,7 @@ test('a session created in another workspace or another time is not the new sess
 
 test('a repeated request reuses the delivered session instead of creating a second one', async () => {
   const host1 = await host({ sessions: [record()], transcriptLines: {
-    [SESSION]: [userLine('do the thing'), userLine(markerLine('request-abc', 'fa-life-20261103-1630'))],
+    [SESSION]: [enqueueLine(`do the thing\n\n${markerLine('request-abc', 'fa-life-20261103-1630')}`)],
   } });
   try {
     const result = await createFirstTurn({ workspace: CWD, requestId: 'request-abc', message: 'do the thing',
@@ -685,7 +688,7 @@ test('a host that shows the derived title is deleted through that title', async 
 
 test('findCreatedSession locates the session by the unique marker only', async () => {
   const host1 = await host({ sessions: [record()], transcriptLines: {
-    [SESSION]: [userLine('do the thing'), userLine(markerLine('request-abc', 'fa-life-20261103-1630'))],
+    [SESSION]: [enqueueLine(`do the thing\n\n${markerLine('request-abc', 'fa-life-20261103-1630')}`)],
   } });
   try {
     const found = await findCreatedSession({ workspace: CWD, requestId: 'request-abc', bindingNonce: 'fa-life-20261103-1630' },
@@ -693,7 +696,9 @@ test('findCreatedSession locates the session by the unique marker only', async (
     assert.equal(found.nativeSessionId, SESSION);
     assert.equal(found.hostSessionId, 'local_4a23e095-8206-44dc-af92-46c5f48c2d25');
     assert.equal(found.workspace, CWD);
-    assert.deepEqual(found.verifiedBy, ['transcript-marker-once']);
+    assert.deepEqual(found.verifiedBy, ['first-input-marker-once']);
+    assert.equal(found.submittedBy, 'enqueue');
+    assert.equal(found.firstInput.hasMarker, true);
 
     const wrongNonce = await findCreatedSession({ workspace: CWD, requestId: 'request-abc', bindingNonce: 'fa-life-other-nonce' },
       { env: host1.env, isAlive: host1.isAlive });
@@ -710,7 +715,7 @@ test('the binding is persisted through onBound the moment the session is identif
   const bound = [];
   let resolvedBeforeReturn = false;
   const driver = uiDriver({ openNewSession: async () => {
-    await host1.write(record(), [userLine('work'), userLine(markerLine('request-bound', 'fa-bound-20261104'))]);
+    await host1.write(record(), [enqueueLine(`work\n\n${markerLine('request-bound', 'fa-bound-20261104')}`)]);
     return { strategy: 'deep-link-code-new-protocol', prefilled: true };
   } });
   try {
@@ -732,7 +737,7 @@ test('the binding is persisted through onBound the moment the session is identif
 test('a failing onBound is surfaced instead of being swallowed', async () => {
   const host1 = await host({ sessions: [] });
   const driver = uiDriver({ openNewSession: async () => {
-    await host1.write(record(), [userLine('work'), userLine(markerLine('request-bound2', 'fa-bound-20261104b'))]);
+    await host1.write(record(), [enqueueLine(`work\n\n${markerLine('request-bound2', 'fa-bound-20261104b')}`)]);
     return { strategy: 'deep-link-code-new-protocol', prefilled: true };
   } });
   try {
@@ -751,7 +756,7 @@ test('a first message longer than the deep-link limit is filled through the comp
   const host1 = await host({ sessions: [] });
   const driver = uiDriver({ openNewSession: async input => {
     host1.lastLaunch = input;
-    await host1.write(record(), [userLine(long), userLine(markerLine('request-long', 'fa-long-20261104'))]);
+    await host1.write(record(), [enqueueLine(`${long}\n\n${markerLine('request-long', 'fa-long-20261104')}`)]);
     return { strategy: 'deep-link-code-new-protocol', prefilled: false, navigated: true };
   } });
   try {
@@ -923,5 +928,46 @@ test('a read-only default read never navigates the window', async () => {
     assert.equal(read.reason, 'draft-not-shown');
     assert.equal(read.navigation.navigated, false);
     assert.equal(driver.calls.some(call => Array.isArray(call) && call[0] === 'openNewSession'), false);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+// ------------------------------------------------ the head is where the first turn is
+
+test('a first turn is still found after the transcript grows past the old tail window', async () => {
+  const host1 = await host({ sessions: [] });
+  try {
+    const marker = markerLine('request-huge', 'fa-huge-20261104');
+    await host1.write(record(), [enqueueLine(`long task\n\n${marker}`)]);
+    const file = await findTranscript({ env: host1.env, nativeSessionId: SESSION, workspace: CWD });
+    const filler = 'x'.repeat(2000);
+    const lines = [];
+    for (let index = 0; index < 4800; index += 1) {
+      lines.push(JSON.stringify({ type: 'assistant', timestamp: new Date().toISOString(),
+        message: { role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: `${index}-${filler}` }] } }));
+    }
+    await writeFile(file, (await readFile(file, 'utf8')) + lines.join('\n') + '\n');
+    assert.ok((await readFile(file)).length > 8 * 1024 * 1024, 'the transcript is larger than the old tail window');
+    const found = await findCreatedSession({ workspace: CWD, requestId: 'request-huge', bindingNonce: 'fa-huge-20261104' },
+      { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(found.nativeSessionId, SESSION);
+    assert.equal(found.submittedBy, 'enqueue');
+    assert.equal(found.firstInput.hasMarker, true);
+    const binding = await firstTurnBinding({ env: host1.env, record: await resolveNativeSession(SESSION, { env: host1.env, isAlive: host1.isAlive }), marker });
+    assert.equal(binding.complete, true);
+    assert.equal(binding.markerCount, 1);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a first record larger than the initial window is read whole, not truncated', async () => {
+  const host1 = await host({ sessions: [] });
+  try {
+    const marker = markerLine('request-big', 'fa-big-20261104');
+    const big = 'y'.repeat(1_500_000);
+    await host1.write(record(), [enqueueLine(`${big}\n\n${marker}`)]);
+    const found = await findCreatedSession({ workspace: CWD, requestId: 'request-big', bindingNonce: 'fa-big-20261104' },
+      { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(found.nativeSessionId, SESSION);
+    assert.ok(found.firstInput.length > 1_500_000, 'the whole opener was read, not a prefix');
+    assert.equal(found.firstInput.hasMarker, true);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

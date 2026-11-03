@@ -212,29 +212,126 @@ export async function readTranscriptEvents(file, { maxBytes = TRANSCRIPT_TAIL_BY
       let event;
       try { event = JSON.parse(line); } catch { continue; }
       if (!event || typeof event !== 'object') continue;
-      const content = event.message?.content;
-      const parts = Array.isArray(content) ? content : [];
-      // A string content is one text part; an array contributes each text part.
-      // Interrupt detection compares these exactly, so the shape matters.
-      const textParts = typeof content === 'string' ? [content.trim()]
-        : parts.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text.trim());
-      events.push({
-        type: event.type,
-        uuid: event.uuid,
-        timestamp: event.timestamp,
-        role: event.message?.role,
-        model: event.message?.model,
-        effort: event.effort ?? event.perTurnEffort,
-        stopReason: event.message?.stop_reason,
-        textParts,
-        text: typeof content === 'string' ? content
-          : (textParts.length ? textParts.join('\n') : ''),
-      });
+      events.push(normalizeEvent(event));
     }
     return { file, events, size, partial: start > 0 };
   } finally { await handle.close(); }
 }
 
+const HEAD_INITIAL_BYTES = 1024 * 1024;
+const HEAD_MAX_BYTES = 16 * 1024 * 1024;
+
+/** One transcript record in the shape the readers use. */
+function normalizeEvent(event) {
+  const content = event.message?.content;
+  const parts = Array.isArray(content) ? content : [];
+  const textParts = typeof content === 'string' ? [content.trim()]
+    : parts.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text.trim());
+  const enqueueText = event.type === 'queue-operation' && typeof event.content === 'string' ? event.content : undefined;
+  return {
+    type: event.type,
+    operation: event.operation,
+    uuid: event.uuid,
+    timestamp: event.timestamp,
+    role: event.message?.role,
+    model: event.message?.model,
+    effort: event.effort ?? event.perTurnEffort,
+    stopReason: event.message?.stop_reason,
+    textParts,
+    text: typeof content === 'string' ? content : (textParts.length ? textParts.join('\n') : ''),
+    enqueueText,
+  };
+}
+
+/**
+ * The first record the user actually put into the session: the native enqueue
+ * (`queue-operation` with the message text) or the user message itself.
+ */
+export function firstInputOf(events) {
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (event.type === 'queue-operation' && typeof event.enqueueText === 'string' && event.enqueueText.trim()) {
+      return { index, kind: 'enqueue', text: event.enqueueText, timestamp: event.timestamp };
+    }
+    if (event.type === 'user' && event.role === 'user' && typeof event.text === 'string' && event.text.trim()) {
+      return { index, kind: 'user', text: event.text, timestamp: event.timestamp };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The opening of a transcript: whole records only, from the first bytes.
+ *
+ * A first turn is written at the top of the file, so a session whose transcript
+ * has grown past any tail window still carries it in its head. The window starts
+ * at 1 MiB (a 100k first message fits comfortably) and grows only while the
+ * first record is still cut off, up to 16 MiB; if even that is not enough the
+ * result says `truncated` instead of pretending the record is absent.
+ */
+export async function readTranscriptHead(file, { initialBytes = HEAD_INITIAL_BYTES, maxBytes = HEAD_MAX_BYTES } = {}) {
+  const handle = await open(file, 'r').catch(() => null);
+  if (!handle) return { file, events: [], size: 0, truncated: false, bytesRead: 0 };
+  try {
+    const { size } = await handle.stat();
+    let window = Math.min(initialBytes, Math.max(size, 1));
+    for (;;) {
+      const buffer = Buffer.alloc(window);
+      const { bytesRead } = await handle.read(buffer, 0, window, 0);
+      const text = buffer.subarray(0, bytesRead).toString('utf8');
+      const complete = bytesRead >= size;
+      const whole = complete ? text : text.slice(0, text.lastIndexOf('\n') + 1);
+      const events = [];
+      for (const line of whole.split('\n')) {
+        if (!line.trim()) continue;
+        try { events.push(normalizeEvent(JSON.parse(line))); } catch { /* partial or foreign line */ }
+      }
+      const firstInput = firstInputOf(events);
+      if (firstInput || complete || window >= maxBytes || window >= size) {
+        return { file, events, size, bytesRead, truncated: !complete && window >= maxBytes, firstInput };
+      }
+      window = Math.min(window * 2, maxBytes, size);
+    }
+  } finally { await handle.close(); }
+}
+
+/**
+ * Whether this session's first turn is the request this caller is looking for.
+ *
+ * The opener is matched against the exact request+binding marker, so a native
+ * enqueue that already carries it counts as the first turn having been
+ * submitted — which is what lets a binding be persisted before the assistant
+ * has answered anything.
+ */
+export async function firstTurnBinding({ env = process.env, record, marker, deep = false }) {
+  const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
+    .catch(() => undefined);
+  if (!file) return { file: undefined, firstInput: undefined, markerCount: 0, complete: false };
+  const head = await readTranscriptHead(file);
+  const inputs = head.events
+    .filter(event => event.type === 'user' || event.type === 'queue-operation')
+    .map(event => event.enqueueText ?? event.text ?? '')
+    .filter(text => text.length > 0);
+  const markerCount = inputs.filter(text => text.includes(marker)).length;
+  let deepCount;
+  if (deep) {
+    const { events } = await readTranscriptEvents(file);
+    deepCount = events
+      .filter(event => event.role === 'user' || event.type === 'queue-operation')
+      .map(event => event.text ?? '')
+      .filter(text => text.includes(marker)).length;
+  }
+  const firstInput = head.firstInput
+    ? { ...head.firstInput, length: head.firstInput.text.length, hasMarker: head.firstInput.text.includes(marker) }
+    : undefined;
+  return {
+    file,
+    firstInput,
+    markerCount,
+    complete: !head.truncated,
+    ...(deep ? { deepCount } : {}),
+  };
+}
 function userText(event) { return event?.role === 'user' || event?.type === 'user' ? event.text ?? '' : ''; }
 
 /** How many user messages carry this marker line (0, 1, or more). */
@@ -493,14 +590,6 @@ export function bindingOf(record) {
   };
 }
 
-async function markerCountInSession({ env, record, marker }) {
-  const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
-    .catch(() => undefined);
-  if (!file) return { file: undefined, count: 0 };
-  const { events } = await readTranscriptEvents(file);
-  return { file, count: countMarker(events, marker) };
-}
-
 /**
  * Read-only: the session that already received this request's first turn.
  *
@@ -519,8 +608,8 @@ export async function findCreatedSession({ workspace, requestId, bindingNonce },
   const candidates = sessions.filter(session => samePath(session.workspace, directory));
   const matches = [];
   for (const record of candidates) {
-    const { file, count } = await markerCountInSession({ env, record, marker });
-    if (count > 0) matches.push({ record, file, count });
+    const binding = await firstTurnBinding({ env, record, marker });
+    if (binding.firstInput?.hasMarker) matches.push({ record, binding });
   }
   if (matches.length > 1) {
     throw fail('ambiguous-created-session',
@@ -528,17 +617,20 @@ export async function findCreatedSession({ workspace, requestId, bindingNonce },
       { candidates: matches.map(match => match.record.nativeSessionId) });
   }
   if (!matches.length) return undefined;
-  const [{ record, file, count }] = matches;
-  if (count !== 1) {
-    throw fail('marker-not-unique', `The request marker appears ${count} times in session ${record.nativeSessionId}.`);
+  const [{ record, binding }] = matches;
+  if (binding.markerCount !== 1) {
+    throw fail('marker-not-unique',
+      `The request marker appears ${binding.markerCount} times in the opening of session ${record.nativeSessionId}.`,
+      { nativeSessionId: record.nativeSessionId, firstInput: binding.firstInput });
   }
   return {
     ...bindingOf(record),
     requestId: request,
     bindingNonce: nonce,
-    transcriptFile: file,
-    aliases: record.name,
-    verifiedBy: ['transcript-marker-once'],
+    transcriptFile: binding.file,
+    submittedBy: binding.firstInput?.kind,
+    firstInput: binding.firstInput,
+    verifiedBy: ['first-input-marker-once'],
   };
 }
 
@@ -642,9 +734,11 @@ export async function createFirstTurn({
     }
     if (fresh.length === 1) {
       const record = fresh[0];
-      const { file, count } = await markerCountInSession({ env, record, marker });
-      observed = { record, file, count };
-      if (count === 1) {
+      const binding = await firstTurnBinding({ env, record, marker });
+      const count = binding.markerCount;
+      const file = binding.file;
+      observed = { record, file, count, binding };
+      if (binding.firstInput?.hasMarker && count === 1) {
         if (!bound && typeof onBound === 'function') {
           bound = true;
           try { await onBound(bindingOf(record)); }
@@ -657,7 +751,9 @@ export async function createFirstTurn({
           requestId: request,
           bindingNonce: nonce,
           marker,
-          verifiedBy: ['native-record-created', 'transcript-marker-once'],
+          submittedBy: binding.firstInput?.kind,
+          firstInput: binding.firstInput,
+          verifiedBy: ['native-record-created', 'first-input-marker-once'],
           strategy: launch?.strategy,
           submit: submitted?.method,
           submitDetail: submitted,
@@ -678,7 +774,8 @@ export async function createFirstTurn({
     reason: observed ? `transcript-marker-count-${observed.count}` : 'no-native-session-registered',
     requestId: request, bindingNonce: nonce, workspace: directory,
     evidence: { launch, submitted,
-      session: observed ? { nativeSessionId: observed.record.nativeSessionId, markerCount: observed.count } : undefined },
+      session: observed ? { nativeSessionId: observed.record.nativeSessionId, markerCount: observed.count,
+        firstInput: observed.binding?.firstInput, complete: observed.binding?.complete } : undefined },
     startedAt, elapsedMs: Date.now() - Date.parse(startedAt),
   };
 }// ---------------------------------------------------------------- interrupt

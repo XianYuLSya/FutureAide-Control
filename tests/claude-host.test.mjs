@@ -1668,3 +1668,26 @@ test('the same marker in two new sessions is ambiguous', async () => {
     assert.equal(result.candidates.length, 2);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+test('a marker already written twice is uncertain, never a fresh start', async () => {
+  const host1 = await host({ sessions: [] });
+  const marker = markerLine('request-swallow', 'fa-swallow-20261104');
+  // the same request marker sits in the opening and again in a later input
+  await host1.write(record(), [enqueueLine(`work\n\n${marker}`), userLine(`another copy\n\n${marker}`)]);
+  let submitted = false;
+  const driver = uiDriver({ submit: async () => { submitted = true; return { method: 'enter-on-prefilled-composer' }; } });
+  try {
+    await assert.rejects(
+      createFirstTurn({ workspace: CWD, requestId: 'request-swallow', message: 'work', bindingNonce: 'fa-swallow-20261104' },
+        { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 500, pollMs: 20 }),
+      error => {
+        assert.equal(error.code, 'marker-not-unique');
+        assert.equal(error.uncertain, true, 'the request may already be delivered');
+        assert.equal(error.attempted, true);
+        assert.equal(error.retryable, false, 'the same nonce must not be submitted again');
+        return true;
+      });
+    assert.equal(submitted, false, 'nothing is sent while the earlier delivery is uncertain');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

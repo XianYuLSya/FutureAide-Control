@@ -756,8 +756,21 @@ export async function createFirstTurn({
   }
   const payload = `${text}\n\n${marker}`;
 
-  const reused = await findCreatedSession({ workspace: directory, requestId: request, bindingNonce: nonce }, { env, isAlive })
-    .catch(() => undefined);
+  // Looking for an earlier delivery of this exact request is not a lookup that may
+  // fail quietly: a marker already written somewhere, or several candidates, is
+  // written evidence that this request may have been delivered, so the answer is
+  // uncertain and the caller must keep its attempt instead of sending again under
+  // the same nonce. Any other read failure is passed on as it is, marked retryable,
+  // rather than being turned into "nothing was found".
+  let reused;
+  try {
+    reused = await findCreatedSession({ workspace: directory, requestId: request, bindingNonce: nonce }, { env, isAlive });
+  } catch (error) {
+    const carriesEvidence = error?.code === 'marker-not-unique' || error?.code === 'ambiguous-created-session';
+    throw Object.assign(error, carriesEvidence
+      ? { uncertain: true, retryable: false, attempted: true }
+      : { uncertain: false, retryable: true, attempted: false });
+  }
   if (reused) {
     return { created: false, reused: true, status: 'already-delivered', ...reused, workspace: directory };
   }

@@ -1689,13 +1689,52 @@ async function readModelHistory({ env, record, driver }) {
  * only — a past turn cannot prove the next one. A control that differs from the
  * transcript is a normal selection change, and the control wins.
  */
-export async function readCurrentModel({ nativeSessionId }, {
+export async function readCurrentModel({ nativeSessionId, workspace = undefined, folderLabel = undefined }, {
   driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, catalog = undefined, asar = undefined,
+  batch = true, allowDeepLink = true,
 } = {}) {
   const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
   const ui = requireDriver(driver, 'reading the current model');
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
-  const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink: true, env });
+  // The session's own control is all this needs, so it is taken in the same single
+  // bridge call as the default read. Identity comes from the document title the
+  // snapshot reports; anything unclear falls back to the step-by-step path, which
+  // also confirms by page content.
+  if (batch !== false && typeof ui.modelSnapshot === 'function') {
+    const snapshot = await ui.modelSnapshot({ title: record.name, workspace: workspace ?? record.workspace,
+      folderLabel: folderLabel ?? (record.workspace ? path.basename(record.workspace) : undefined), wantDefault: false })
+      .catch(() => undefined);
+    const control = describeControl(modelCatalog, snapshot?.current?.raw ?? null);
+    const titleMatches = Boolean(snapshot?.documentName && displayTitle(snapshot.documentName) === record.name);
+    if (control.label && titleMatches) {
+      const history = await readModelHistory({ env, record, driver });
+      const historyDiffers = Boolean((history.transcript?.model && control.model && history.transcript.model !== control.model))
+        || Boolean((history.transcript?.effort && control.reasoningEffort && history.transcript.effort !== control.reasoningEffort))
+        || Boolean((history.launchArgs?.model && control.model && history.launchArgs.model !== control.model));
+      return {
+        nativeSessionId,
+        provider: control.provider ?? 'anthropic',
+        model: control.model,
+        reasoningEffort: control.reasoningEffort ?? undefined,
+        resolved: control.resolved,
+        status: control.resolved ? 'read' : 'unmapped',
+        label: control.label,
+        effortLabel: control.effortLabel,
+        source: 'composer-control',
+        targetConfirmedBy: 'document-title',
+        verifiedBy: ['session-model-control'],
+        catalogSource: modelCatalog.catalogSource,
+        evidence: { control, history, documentName: snapshot.documentName },
+        historyDiffers,
+        singleCall: true,
+        ...(control.resolved ? {} : { reason: 'label-not-in-catalog', unresolvedLabel: control.label, unresolvedEffort: control.effortLabel }),
+        ...(historyDiffers ? {
+          note: 'The control differs from what this session ran before; that is a selection change, and the control is the current value.',
+        } : {}),
+      };
+    }
+  }
+  const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink, env });
   const raw = modelInfo(await ui.readModel());
   const history = await readModelHistory({ env, record, driver });
   if (!raw.label) {

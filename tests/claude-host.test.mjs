@@ -1285,3 +1285,39 @@ test('a driver without the single call still reads the default the long way', as
     assert.equal(read.singleCall, undefined, 'the step-by-step path does not claim a single call');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+test('the current model comes from the same single call and asks for no default', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const documentName = `${record().name} - Claude Code`;
+  const driver = uiDriver({
+    modelSnapshot: () => ({ documentName, current: { raw: '模型：Opus 5.5 最高' }, default: null, notes: [] }),
+  });
+  try {
+    const read = await readCurrentModel({ nativeSessionId: SESSION },
+      { env: host1.env, driver, isAlive: host1.isAlive, catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.reasoningEffort, 'max');
+    assert.equal(read.singleCall, true);
+    assert.equal(read.targetConfirmedBy, 'document-title');
+    const snapshots = driver.calls.filter(call => Array.isArray(call) && call[0] === 'modelSnapshot');
+    assert.equal(snapshots.length, 1);
+    assert.equal(snapshots[0][1].wantDefault, false, 'reading the current model never opens a draft');
+    assert.equal(driver.calls.some(call => Array.isArray(call) && call[0] === 'revealSession'), false);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('an unconfirmed page identity falls back to the confirming path', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({
+    modelSnapshot: () => ({ documentName: 'Some other session - Claude Code', current: { raw: '模型：Opus 5.5 最高' }, default: null, notes: [] }),
+  });
+  try {
+    const read = await readCurrentModel({ nativeSessionId: SESSION },
+      { env: host1.env, driver, isAlive: host1.isAlive, catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.singleCall, undefined, 'the fallback does not claim one call');
+    assert.equal(driver.calls.includes('readModel'), true, 'the step-by-step path reads the control itself');
+    assert.equal(driver.calls.includes('view'), true, 'and confirms the page it is reading from');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

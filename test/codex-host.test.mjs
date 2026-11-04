@@ -49,7 +49,26 @@ test('first native creation uses verified anchor and exact saved workspace, neve
   assert.equal(result.nativeSessionId, 'new'); assert.deepEqual(calls.map(c => c.name), ['list_projects', 'create_thread']);
   assert.equal(calls[1].args.target.projectId, 'project');
   assert.equal(calls[1].id, 'anchor');
-  await assert.rejects(host.destroy({ nativeSessionId: 'new' }), { code: 'codex-native-delete-unavailable' });
+  await assert.rejects(host.destroy({ nativeSessionId: 'new' }), { code: 'codex-delete-owner-mismatch' });
+});
+
+test('native delete validates managed root, deletes descendants first and confirms native records are gone', async () => {
+  const rows = new Map([
+    ['root', { id: 'root', originator: 'Codex Desktop', thread_source: 'agent_created_thread', cwd: 'D:/work/p' }],
+    ['child', { id: 'child', originator: 'Codex Desktop' }],
+    ['user', { id: 'user', originator: 'Codex Desktop', thread_source: 'user', cwd: 'D:/work/p' }],
+  ]), calls = [];
+  const host = createCodexHost({ readNativeThread: id => rows.get(id),
+    readNativeChildren: id => id === 'root' && rows.has('child') ? [rows.get('child')] : [],
+    nativeRequest: async (method, params) => { calls.push([method, params.threadId]); rows.delete(params.threadId); return { deleted: true }; } });
+  await assert.rejects(host.destroy({ nativeSessionId: 'user', workspace: 'D:/work/p', ownedNodeIds: ['user'] }), { code: 'codex-delete-owner-mismatch' });
+  await assert.rejects(host.destroy({ nativeSessionId: 'root', workspace: 'D:/work/p', ownedNodeIds: ['root'] }), { code: 'codex-delete-owner-mismatch' });
+  assert.equal(calls.length, 0);
+  const input = { nativeSessionId: 'root', workspace: 'D:/work/p', ownedNodeIds: ['root', 'child'] };
+  assert.deepEqual(await host.destroy(input), { destroyed: true });
+  assert.deepEqual(calls, [['thread/delete', 'child'], ['thread/delete', 'root']]);
+  assert.deepEqual(await host.destroy(input), { destroyed: true });
+  assert.equal(calls.length, 2); assert.equal(rows.has('user'), true);
 });
 
 test('desktop bridge shares discovery and handshake, changes caller metadata, and never replays a failed call', async () => {

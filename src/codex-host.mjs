@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { discoverCodexBridge } from './codex-notify.mjs';
-import { readCodexSessionModel, interruptCodexSession } from './codex-ipc.mjs';
+import { readCodexSessionModel, interruptCodexSession, requestCodexNative } from './codex-ipc.mjs';
 
 const fail = (code, message) => Object.assign(new Error(message), { code });
 const samePath = (a, b) => typeof a === 'string' && typeof b === 'string'
@@ -300,16 +300,19 @@ export function createCodexHost(options = {}) {
   const invoke = options.invoke ?? invokeDesktopTool;
   const read = options.readNativeThread ?? (id => readNativeThread(home, id));
   const children = options.readNativeChildren ?? (id => readNativeChildren(home, id));
+  const nativeRequest = options.nativeRequest ?? requestCodexNative;
   return {
     async probe() {
       await (options.discover ?? discoverCodexBridge)();
       await stat(path.join(home, 'state_5.sqlite'));
       const missing = [];
       if (!options.contextThreadId && !options.anchorResolver && !options.createViaUi) missing.push('native-first-create-without-codex-anchor');
-      if (!options.destroyViaUi) missing.push('native-owned-tree-delete');
+      try { await nativeRequest('config/read', { includeLayers: false, cwd: options.workspace ?? process.cwd() }); }
+      catch { if (!options.destroyViaUi) missing.push('native-owned-tree-delete'); }
       return { identity: { application: 'codex-desktop', home }, missing };
     },
-    readDefaultModel: input => readDefaultModel({ home, ...input, readEffectiveConfig: options.readEffectiveConfig,
+    readDefaultModel: input => readDefaultModel({ home, ...input, readEffectiveConfig: options.readEffectiveConfig
+      ?? (({ workspace }) => nativeRequest('config/read', { includeLayers: false, cwd: workspace })),
       python: options.python, profile: options.profile }),
     readCurrentModel: id => (options.readSessionModel ?? readCodexSessionModel)(id),
     async createFirstTurn(input) {
@@ -369,8 +372,29 @@ export function createCodexHost(options = {}) {
       catch (error) { if (!options.interruptViaUi) throw error; return options.interruptViaUi({ nativeSessionId, ownedNodeIds }); }
     },
     async destroy(input) {
-      if (!options.destroyViaUi) throw fail('codex-native-delete-unavailable', 'Native Desktop deletion has not been connected; the managed record is retained.');
-      return options.destroyViaUi(input);
+      if (options.destroyViaUi) return options.destroyViaUi(input);
+      const { nativeSessionId, workspace, ownedNodeIds = [] } = input;
+      if (!ownedNodeIds.includes(nativeSessionId)) throw fail('codex-delete-owner-mismatch', 'Native deletion requires the shared managed root binding.');
+      const root = read(nativeSessionId);
+      if (!root) return { destroyed: ownedNodeIds.every(id => !read(id)) };
+      if (root.originator !== 'Codex Desktop' || root.thread_source !== 'agent_created_thread' || !samePath(root.cwd, workspace)) {
+        throw fail('codex-delete-owner-mismatch', 'The deletion target is not the independently created managed Desktop chat.');
+      }
+      const rows = [], visited = new Set();
+      function visit(row) {
+        if (visited.has(row.id)) return;
+        visited.add(row.id);
+        if (!ownedNodeIds.includes(row.id) || row.originator !== 'Codex Desktop') throw fail('codex-delete-owner-mismatch', 'The native tree changed after its managed ownership snapshot.');
+        for (const child of children(row.id)) visit(child);
+        rows.push(row); // descendants before root; a partial failure retains the root binding
+      }
+      visit(root);
+      if (ownedNodeIds.some(id => !visited.has(id) && read(id))) throw fail('codex-delete-owner-mismatch', 'An owned node is no longer a native descendant.');
+      for (const row of rows) {
+        await nativeRequest('thread/delete', { threadId: row.id });
+        if (read(row.id)) return { destroyed: false, message: 'Native deletion did not remove the thread record.' };
+      }
+      return { destroyed: true };
     },
     async findCreatedSession(input) {
       if (options.findCreatedSession) return options.findCreatedSession(input);

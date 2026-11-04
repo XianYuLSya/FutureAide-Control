@@ -14,6 +14,7 @@ import {
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
   INTERRUPT_MARKER_TOOL, INTERRUPT_MARKERS, INTERRUPT_SCOPE, stopBackgroundTasks, STOP_ARCHIVE_NAME,
   readModelSnapshot, describeControl, readStoredSession, sessionStoreRoot,
+  classifySessionMenu, SESSION_LIST_MENU_NAME,
   MODEL_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
   loadModelCatalog, BUILT_IN_MODEL_CATALOG, extractModelSelectorConfigs, sliceBalancedArray,
   extractEmbeddedCatalog, readQuotedLiteral, firstTurnBinding, readTranscriptHead, firstInputOf,
@@ -1405,4 +1406,56 @@ test('the application archive is located once per process, not once per read', a
     assert.equal(first.asar, path.resolve(path.join(appDir, 'resources', 'app.asar')));
     assert.equal(second.asar, first.asar);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+
+// ------------------------------- the row menu is not the session menu
+
+test('the row menu items are recognised as the wrong target', () => {
+  // exactly the items the real row menu showed
+  const wrong = classifySessionMenu(['打开方式', '置顶', '标记未读', '重命名', '分叉', '移至分区', '归档', '删除']);
+  assert.equal(wrong.kind, 'session-list');
+  assert.ok(wrong.listItems.length >= 2);
+  const right = classifySessionMenu(['后台任务', '查看更改', '删除会话']);
+  assert.equal(right.kind, 'session');
+  assert.equal(right.tasksEntry, '后台任务');
+  assert.equal(classifySessionMenu([]).kind, 'unknown');
+});
+
+test('a wrong menu is reported with its items instead of clicking something', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({
+    tasksPanel: () => {
+      throw Object.assign(new Error('the opened menu belongs to the session row'), { code: 'session-menu-wrong-target',
+        detail: { value: { wrongMenuItems: ['置顶', '归档'], menuItems: ['打开方式', '置顶', '标记未读', '重命名', '分叉', '移至分区', '归档', '删除'] } } });
+    },
+  });
+  try {
+    await assert.rejects(
+      stopBackgroundTasks({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive }),
+      error => {
+        assert.equal(error.code, 'session-menu-wrong-target');
+        const items = error.detail?.value?.menuItems ?? [];
+        assert.equal(classifySessionMenu(items).kind, 'session-list');
+        return true;
+      });
+    assert.equal(driver.calls.some(call => Array.isArray(call) && call[0] === 'taskStop'), false,
+      'no task row is clicked through the wrong menu');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a stop reports which control it pressed', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({ interrupt: async () => {
+    await host1.append(SESSION, [userLine(INTERRUPT_MARKER)]);
+    return { method: 'stop-button:mouse', stopButtonFound: true, stopButtonName: '停止',
+      ancestry: ['ControlType.Pane', 'ControlType.Group'] };
+  } });
+  try {
+    const result = await interrupt({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 500, pollMs: 20 });
+    assert.equal(result.interrupted, true);
+    assert.equal(result.stopControl.name, '停止');
+    assert.equal(result.stopControl.method, 'stop-button:mouse');
+    assert.deepEqual(result.stopControl.ancestry, ['ControlType.Pane', 'ControlType.Group']);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

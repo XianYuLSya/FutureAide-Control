@@ -364,15 +364,56 @@ function Get-TaskRowSummary($rows) {
   })
 }
 
-function Get-SessionMenuButton([string]$title) {
+# The same session shows a more-options control twice: one in the page header and
+# one on the session row in the sidebar. They open different menus. The header one
+# carries the session actions (background tasks, diff, model); the row one carries
+# list actions (open in, pin, mark unread, rename, fork, move, archive, delete).
+# The caller therefore says which one it wants and it is chosen by ancestry, never
+# by position.
+function Get-AncestryTypes($element, [int]$max = 8) {
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $types = @()
+  $node = $element
+  for ($step = 0; $step -lt $max; $step++) {
+    try { $node = $walker.GetParent($node) } catch { break }
+    if ($null -eq $node) { break }
+    $types += [string]$node.Current.ControlType.ProgrammaticName
+    if ($node.Current.ControlType -eq [System.Windows.Automation.ControlType]::Document) { break }
+  }
+  return $types
+}
+
+function Test-InSidebarNav($element) {
+  foreach ($type in (Get-AncestryTypes $element)) {
+    if ($type -match "ListItem|TreeItem|DataItem|Navigation|List$|Tree$") { return $true }
+  }
+  return $false
+}
+
+function Get-SessionListMenuPattern {
+  $open = ZH @(0x6253, 0x5F00, 0x65B9, 0x5F0F)
+  $pin = ZH @(0x7F6E, 0x9876)
+  $unread = ZH @(0x6807, 0x8BB0, 0x672A, 0x8BFB)
+  $rename = ZH @(0x91CD, 0x547D, 0x540D)
+  $fork = ZH @(0x5206, 0x53C9)
+  $move = ZH @(0x79FB, 0x81F3)
+  $archive = ZH @(0x5F52, 0x6863)
+  return ("^(" + $open + "|" + $pin + "|" + $unread + "|" + $rename + "|" + $fork + "|" + $move + "|" + $archive +
+    "|Open in|Pin|Mark as unread|Rename|Fork|Move to|Archive)")
+}
+function Get-SessionMenuButton([string]$title, [string]$scope = 'header') {
   if (-not $title) { throw 'session-title-required' }
   $pattern = '^' + (Unescape-Pattern $title) + '\s*' + [char]0x7684 + [char]0x66F4 + [char]0x591A + [char]0x9009 + [char]0x9879 + '$'
   $buttons = @(Find-Elements $web.Element $pattern 'Button')
   if ($buttons.Count -eq 0) { throw 'session-menu-button-not-found' }
-  # The same session can show this control twice (page header and sidebar entry);
-  # both belong to the session the title names, so the last one is used and the
-  # count is reported.
-  return [pscustomobject]@{ Element = $buttons[-1]; Count = $buttons.Count }
+  $scoped = @($buttons | Where-Object {
+    $inSidebar = Test-InSidebarNav $_
+    if ($scope -eq 'row') { $inSidebar } else { -not $inSidebar }
+  })
+  if ($scoped.Count -eq 0) { throw ('session-menu-button-not-found:' + $scope + ' (candidates=' + $buttons.Count + ')') }
+  if ($scoped.Count -gt 1) { throw ('session-menu-ambiguous:' + $scope + ' (candidates=' + $scoped.Count + ')') }
+  return [pscustomobject]@{ Element = $scoped[0]; Count = $buttons.Count; Scope = $scope
+    Ancestry = (Get-AncestryTypes $scoped[0]) }
 }
 
 function Get-TrustPattern {
@@ -558,17 +599,31 @@ try {
     }
     'interrupt' {
       Focus-Window $window.Element
-      $stops = Find-Elements $web.Element $stopPattern 'Button'
+      # Only the page stop control counts; a sidebar entry is not it, and two of
+      # them in page scope is a state this driver refuses to guess about.
+      $stops = @(Find-Elements $web.Element $stopPattern 'Button' | Where-Object { -not (Test-InSidebarNav $_) })
       $method = $null
-      if ($stops.Count -gt 0) {
-        try { Invoke-Element $stops[0] | Out-Null; $method = 'stop-button' } catch { $method = $null }
+      $clickedName = $null
+      $ancestry = @()
+      if ($stops.Count -gt 1) {
+        Write-Result @{ ok = $false; code = 'stop-control-ambiguous'
+          message = 'more than one stop control is in page scope'
+          value = @{ stopButtons = @($stops | ForEach-Object { $_.Current.Name }) } }
+        break
+      }
+      if ($stops.Count -eq 1) {
+        $clickedName = $stops[0].Current.Name
+        $ancestry = (Get-AncestryTypes $stops[0])
+        $click = Invoke-ElementByMouse $stops[0]
+        if ($click.clicked) { $method = ('stop-button:' + [string]$click.method) }
       }
       if (-not $method) {
         Send-Keys '{ESC}'
         $method = 'escape'
       }
       Start-Sleep -Milliseconds 400
-      Write-Result @{ ok = $true; value = @{ method = $method; stopButtonFound = ($stops.Count -gt 0) } }
+      Write-Result @{ ok = $true; value = @{ method = $method; stopButtonFound = ($stops.Count -gt 0)
+        stopButtonName = $clickedName; ancestry = $ancestry } }
     }
     'model-read' {
       $models = Find-Elements $web.Element $modelPattern 'Button'
@@ -779,19 +834,35 @@ try {
         Send-Keys '{ESC}'
         Start-Sleep -Milliseconds 400
       }
-      $menu = Get-SessionMenuButton $title
+      $menu = Get-SessionMenuButton $title 'header'
       Focus-Window $window.Element
       $menuClick = Invoke-ElementByMouse $menu.Element
       $attempts += ('menu:' + $(if ($menuClick.clicked) { $menuClick.method } else { $menuClick.reason }))
-      Start-Sleep -Milliseconds 800
       $panelPattern = Get-TasksPanelPattern
-      $entries = @(Get-MenuItems $window.Element | Where-Object { $_.Current.Name -match $panelPattern })
-      if ($entries.Count -eq 0) {
+      $listPattern = Get-SessionListMenuPattern
+      $names = @()
+      for ($tick = 0; $tick -lt 10; $tick++) {
+        Start-Sleep -Milliseconds 200
         $names = @(Get-MenuItems $window.Element | ForEach-Object { $_.Current.Name })
+        if ($names.Count -gt 0) { break }
+      }
+      $wrong = @($names | Where-Object { $_ -match $listPattern })
+      $entries = @(Get-MenuItems $window.Element | Where-Object { $_.Current.Name -match $panelPattern })
+      if ($wrong.Count -ge 2 -and $entries.Count -eq 0) {
+        # This is the session row menu, which is a different control with a
+        # different set of actions. Report it instead of picking another item.
+        Send-Keys '{ESC}'
+        Write-Result @{ ok = $false; code = 'session-menu-wrong-target'
+          message = 'the opened menu belongs to the session row in the sidebar, not to the session header'
+          value = @{ wrongMenuItems = $wrong; menuItems = $names; ancestry = $menu.Ancestry; scope = 'header'
+            candidates = $menu.Count } }
+        break
+      }
+      if ($entries.Count -eq 0) {
         Send-Keys '{ESC}'
         Write-Result @{ ok = $false; code = 'tasks-panel-entry-not-found'
           message = 'the session menu has no background tasks entry'
-          value = @{ attempts = $attempts; menuItems = $names } }
+          value = @{ attempts = $attempts; menuItems = $names; ancestry = $menu.Ancestry } }
         break
       }
       $entry = $entries[0]
@@ -856,7 +927,8 @@ try {
       $title = [string]$payload.title
       $deleteLabel = [string]$payload.deleteLabel
       if (-not $deleteLabel) { throw 'delete-label-required' }
-      $button = Get-SessionMenuButton $title
+      # Delete is a list action, so this one opens the session row menu on purpose.
+      $button = Get-SessionMenuButton $title 'row'
       Focus-Window $window.Element
       $null = Invoke-ElementByMouse $button.Element
       Start-Sleep -Milliseconds 900

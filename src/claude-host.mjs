@@ -884,6 +884,7 @@ export async function interrupt({ nativeSessionId }, {
     if (evidence) {
       return { interrupted: true, cancelled: true, status: 'interrupted', nativeSessionId,
         method: press?.method, verifiedBy: ['transcript-interrupt-marker'], evidence, revealed: visible.revealed,
+        stopControl: { method: press?.method, name: press?.stopButtonName ?? null, ancestry: press?.ancestry ?? null },
         scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
     }
     await sleep(pollMs);
@@ -909,10 +910,12 @@ export async function interrupt({ nativeSessionId }, {
     return { interrupted: false, cancelled: true, status: 'idle-no-turn', reason: 'no-running-turn',
       nativeSessionId, method: press?.method,
       verifiedBy: ['host-stop-control-absent', 'registry-idle'], revealed: visible.revealed,
+      stopControl: { method: press?.method, name: press?.stopButtonName ?? null, ancestry: press?.ancestry ?? null },
       scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
   }
   return { interrupted: false, cancelled: false, status: 'unconfirmed', reason: 'interrupt-marker-not-written',
     nativeSessionId, method: press?.method, revealed: visible.revealed,
+    stopControl: { method: press?.method, name: press?.stopButtonName ?? null, ancestry: press?.ancestry ?? null },
     evidence: { since, transcriptFile: file, stopButtonFound: press?.stopButtonFound } };
 }// ------------------------------------------------- background tasks (children)
 
@@ -922,6 +925,24 @@ export const STOP_BUSY_NAME = /(正在停止|Stopping)/i;
 export const STOP_DONE_NAME = /(已停止|Stopped)/i;
 export const TASKS_PANEL_NAME = /(后台任务|background tasks)/i;
 /** Stopping together with archiving is a different action and is never clicked. */
+/**
+ * The session row in the sidebar has its own menu: open in, pin, mark unread,
+ * rename, fork, move, archive, delete. Recognising it by its items is how a caller
+ * that opened the wrong more-options control says so instead of clicking an item
+ * from the wrong menu.
+ */
+export const SESSION_LIST_MENU_NAME = /^(打开方式|置顶|标记未读|重命名|分叉|移至|归档|Open in|Pin|Mark as unread|Rename|Fork|Move to|Archive)/i;
+
+/** Which menu a list of item names belongs to, judged by the names alone. */
+export function classifySessionMenu(items = []) {
+  const names = items.filter(name => typeof name === "string" && name.trim());
+  const list = names.filter(name => SESSION_LIST_MENU_NAME.test(name));
+  const tasks = names.filter(name => TASKS_PANEL_NAME.test(name));
+  if (tasks.length) return { kind: "session", tasksEntry: tasks[0], listItems: list, items: names };
+  if (list.length >= 2) return { kind: "session-list", listItems: list, items: names };
+  return { kind: "unknown", listItems: list, items: names };
+}
+
 export const STOP_ARCHIVE_NAME = /(停止任务并归档|停止全部|Stop task and archive|Stop tasks and archive)/i;
 
 function runningTaskRows(rows = [], targets) {

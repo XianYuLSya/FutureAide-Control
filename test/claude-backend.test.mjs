@@ -293,8 +293,9 @@ test('cancel interrupts the root first, then stops the running child tasks', asy
   assert.deepEqual(order, ['interrupt-root', `stop-tasks:${f.sessionId}`]);
   assert.equal(result.cancelRequested, true);
   assert.equal(result.treeSettled, true, 'settle comes from the same observer');
-  assert.deepEqual(result.cancelRounds[1], { round: 1, action: 'stop-tasks', requested: ['a1'],
-    clicked: 1, rows: 1, remaining: 0 });
+  assert.deepEqual({ ...result.cancelRounds[1], detail: undefined }, { round: 1, action: 'stop-tasks',
+    requested: ['a1'], clicked: 1, accepted: 1, rows: 1, remaining: 0, detail: undefined });
+  assert.equal(result.cancelRounds[1].detail[0].state, null);
 });
 
 test('an idle root with a running child still stops the child tasks', async () => {
@@ -381,6 +382,22 @@ test('an unobservable session never counts as a stopped tree', async () => {
   assert.equal(result.cancelPending, true);
 });
 
+test('a stop the host reports by state counts even when clicked is false', async () => {
+  const f = await setup();
+  let tree = cancelTree([runningChild('leaf one', 'a1')]);
+  const adapter = await bound(f, cancelDeps(f, { current: () => tree,
+    host: { interrupt: async () => ({ interrupted: false, status: 'not-running' }),
+      stopBackgroundTasks: async () => {
+        tree = { settled: true, running: false, nodes: tree.nodes.map(node => ({ ...node, status: 'ended' })) };
+        return { stopped: [{ index: 0, rowText: 'leaf one', clicked: false, state: 'requested' }], remaining: [] };
+      } } }));
+  await f.setStatus('idle');
+  const result = await adapter.cancel();
+  assert.equal(result.cancelRequested, true, 'the host own row state is proof the press went through');
+  const stopRound = result.cancelRounds.find(entry => entry.action === 'stop-tasks');
+  assert.equal(stopRound.accepted, 1);
+  assert.equal(stopRound.clicked, 0);
+});
 test('a stop that clicked nothing is not an accepted cancel', async () => {
   const f = await setup();
   const tree = cancelTree([runningChild('leaf one', 'a1')]);

@@ -397,7 +397,8 @@ export async function createClaudeBackend(record, deps = {}) {
           if (native.status !== 'idle') {
             const interrupted = await lockedHost(() => host.interrupt({ nativeSessionId: state.binding.sessionId }, hostOptions()));
             rounds.push({ round, action: 'interrupt-root', status: native.status,
-              interrupted: interrupted?.interrupted === true });
+              interrupted: interrupted?.interrupted === true,
+              ...(interrupted?.reason ? { reason: interrupted.reason } : {}) });
           }
           observed = await refresh({ fresh: true });
           const targets = (treeModule?.claudeTreeStopTargets?.(observed.tree) ?? [])
@@ -411,10 +412,17 @@ export async function createClaudeBackend(record, deps = {}) {
             const stop = await lockedHost(() => host.stopBackgroundTasks({
               nativeSessionId: state.binding.sessionId }, hostOptions()));
             const rows = stop?.stopped ?? [];
+            // The host's own per-row outcome is the evidence: `clicked` is one way
+            // it reports a press, and its state says the press went through.
+            const accepted = rows.filter(row => row?.clicked === true
+              || ['stopped', 'stopping', 'requested'].includes(row?.state));
             rounds.push({ round, action: 'stop-tasks', requested: targets,
               ...(stop?.status ? { status: stop.status } : {}),
               clicked: rows.filter(row => row?.clicked === true).length,
-              rows: rows.length, remaining: (stop?.remaining ?? []).length });
+              accepted: accepted.length, rows: rows.length, remaining: (stop?.remaining ?? []).length,
+              ...(rows.length ? { detail: rows.slice(0, 8).map(row => ({ index: row?.index,
+                rowText: row?.rowText ?? null, clicked: row?.clicked === true, state: row?.state ?? null,
+                ...(row?.error ? { error: row.error } : {}) })) } : {}) });
           }
           observed = await refresh({ fresh: true });
         } catch (error) {
@@ -430,11 +438,11 @@ export async function createClaudeBackend(record, deps = {}) {
       }
       const settled = observed?.tree?.settled === true;
       const interrupted = rounds.some(entry => entry.interrupted === true);
-      const clicked = rounds.some(entry => (entry.clicked ?? 0) > 0);
+      const acceptedRound = rounds.some(entry => (entry.accepted ?? 0) > 0);
       const remainingTasks = (treeModule?.claudeTreeStopTargets?.(observed?.tree) ?? [])
         .filter(target => typeof target.taskId === 'string' && target.status !== 'ended')
         .map(target => target.taskId);
-      const requested = settled || interrupted || clicked;
+      const requested = settled || interrupted || acceptedRound;
       const cancelPending = !settled
         && (observed?.tree?.running === true || remainingTasks.length > 0 || unavailable);
       return { cancelRequested: requested, cancelPending,

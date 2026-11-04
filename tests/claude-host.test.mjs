@@ -1386,3 +1386,23 @@ test('a missing record falls back to the window, and the store can be skipped on
     assert.ok(driver.calls.length > 0, 'source ui always asks the window');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+test('the application archive is located once per process, not once per read', async () => {
+  const dir = await scratch();
+  const appDir = path.join(dir, 'app');
+  await mkdir(path.join(appDir, 'resources'), { recursive: true });
+  await writeFile(path.join(appDir, 'resources', 'app.asar'), 'not a real archive');
+  let probes = 0;
+  const driver = {
+    kind: 'fake-uia', available: true,
+    async probe() { probes += 1; return { available: true, window: { executable: path.join(appDir, 'Claude.exe') } }; },
+  };
+  try {
+    const first = await loadModelCatalog({ driver, env: {} });
+    const second = await loadModelCatalog({ driver, env: {} });
+    assert.equal(probes, 1, 'the second read reuses the remembered archive');
+    assert.equal(first.asar, path.resolve(path.join(appDir, 'resources', 'app.asar')));
+    assert.equal(second.asar, first.asar);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

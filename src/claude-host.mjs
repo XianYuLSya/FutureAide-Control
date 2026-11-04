@@ -1421,9 +1421,24 @@ function snapshotSurface(catalog) {
 }
 
 /** Where the app archive is, from the running app itself when possible. */
+/**
+ * The archive found once stays found.
+ *
+ * Resolving it means asking the window where the running executable lives, which
+ * costs a bridge start. That answer only changes when the application is updated,
+ * which the file timestamp accounts for, so it is remembered per process and
+ * checked with a stat before it is reused.
+ */
+let knownAsar;
+
 export async function resolveAppAsar({ driver, env = process.env } = {}) {
   if (typeof env?.CLAUDE_APP_ASAR === 'string' && env.CLAUDE_APP_ASAR.trim()) {
     return { asar: path.resolve(env.CLAUDE_APP_ASAR.trim()), source: 'env' };
+  }
+  if (knownAsar) {
+    const info = await stat(knownAsar).catch(() => null);
+    if (info?.isFile()) return { asar: knownAsar, source: 'remembered-app' };
+    knownAsar = undefined;
   }
   if (driverAvailable(driver) && typeof driver.probe === 'function') {
     const probe = await driver.probe().catch(() => undefined);
@@ -1434,7 +1449,7 @@ export async function resolveAppAsar({ driver, env = process.env } = {}) {
       for (const candidate of [path.join(path.dirname(executable), 'resources', 'app.asar'),
         path.join(path.dirname(executable), '..', 'resources', 'app.asar')]) {
         const info = await stat(candidate).catch(() => null);
-        if (info?.isFile()) return { asar: path.resolve(candidate), source: 'running-app' };
+        if (info?.isFile()) { knownAsar = path.resolve(candidate); return { asar: knownAsar, source: 'running-app' }; }
       }
     }
   }

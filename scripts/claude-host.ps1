@@ -294,6 +294,20 @@ function Get-StopDonePattern {
   return ('(' + (ZH @(0x5DF2, 0x505C, 0x6B62)) + '|Stopped)')
 }
 
+# Wait until the page really shows what the caller is waiting for. Polling a
+# visible state is both faster (it returns as soon as it is true) and safer (it
+# reports when it never became true) than a fixed sleep.
+function Wait-PageState($window, [scriptblock]$test, [int]$timeoutMs = 2500, [int]$stepMs = 150) {
+  $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+  $signature = $null
+  while ((Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds $stepMs
+    $signature = Get-PageSignature $window
+    if (& $test $signature) { return @{ matched = $true; signature = $signature } }
+  }
+  return @{ matched = $false; signature = $signature }
+}
+
 function Get-TasksPanelPattern {
   return ('(' + (ZH @(0x540E, 0x53F0, 0x4EFB, 0x52A1)) + '|background tasks)')
 }
@@ -601,20 +615,18 @@ try {
             Focus-Window $window.Element
             $click = Invoke-ElementByMouse $anchors[0]
             if ($click.clicked) {
-              Start-Sleep -Milliseconds 1500
-              $probe = Get-PageSignature $window
-              $opened = ($probe.hasComposer -and $probe.messages -eq 0)
-              if ($opened) { $notes += 'draft:sidebar' }
+              $wait = Wait-PageState $window { param($sig) $sig.hasComposer -and $sig.messages -eq 0 } 2500
+              $opened = [bool]$wait.matched
+              if ($opened) { $notes += 'draft:sidebar' } else { $notes += 'draft-not-shown-after-sidebar' }
             } else { $notes += ('sidebar-click-unavailable:' + [string]$click.reason) }
           }
           if (-not $opened -and $workspace) {
             try {
               $query = 'claude://code/new?src=external&folder=' + [uri]::EscapeDataString($workspace)
               $via = Open-DeepLink $query 'protocol' $window.Pid $window.Path
-              Start-Sleep -Milliseconds 1800
-              $probe = Get-PageSignature $window
-              $opened = ($probe.hasComposer -and $probe.messages -eq 0)
-              if ($opened) { $notes += ('draft:deep-link-' + [string]$via) }
+              $wait = Wait-PageState $window { param($sig) $sig.hasComposer -and $sig.messages -eq 0 } 2500
+              $opened = [bool]$wait.matched
+              if ($opened) { $notes += ('draft:deep-link-' + [string]$via) } else { $notes += 'draft-not-shown-after-link' }
             } catch { $notes += 'deep-link-refused' }
           }
           if ($opened) {
@@ -627,9 +639,8 @@ try {
               if ($entries.Count -gt 0) {
                 $restoreClick = Invoke-ElementByMouse $entries[0]
                 if ($restoreClick.clicked) {
-                  Start-Sleep -Milliseconds 1000
-                  $back = Get-PageSignature $window
-                  if ($back.documentName.StartsWith($restoreTitle)) { $navigation.restored = 'session' }
+                  $back = Wait-PageState $window { param($sig) $sig.documentName.StartsWith($restoreTitle) } 2000
+                  if ($back.matched) { $navigation.restored = 'session' }
                   else { $notes += 'restore-unconfirmed' }
                 } else { $notes += ('restore-click-unavailable:' + [string]$restoreClick.reason) }
               } else { $notes += 'restore-entry-not-found' }

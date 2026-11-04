@@ -381,6 +381,17 @@ function Get-TaskRows {
   $regions = @(Find-Elements $web.Element $regionPattern 'Group')
   if ($regions.Count -eq 0) { $regions = @(Find-Elements $web.Element $regionPattern '') }
   foreach ($region in $regions) {
+    # A finished Agent can still own background shell tasks. The native panel
+    # nests those behind its running-task count rather than giving the Agent a
+    # Stop button. Expand only those task groups before reading stop controls.
+    $taskCountPattern = '^\d+\s*(' + (ZH @(0x4E2A,0x4EFB,0x52A1)) + '|tasks?).*\d+\s*(' + (ZH @(0x4E2A,0x6B63,0x5728,0x8FD0,0x884C)) + '|running)'
+    foreach ($item in @(Find-Elements $region '' 'ListItem')) {
+      if (@(Find-Elements $item $stopPattern 'Button').Count -gt 0) { continue }
+      foreach ($toggle in @(Find-Elements $item $taskCountPattern 'Button')) {
+        Invoke-ElementByMouse $toggle | Out-Null
+        Start-Sleep -Milliseconds 200
+      }
+    }
     foreach ($item in @(Find-Elements $region '' 'ListItem')) {
       $itemName = [string]$item.Current.Name
       $title = $null

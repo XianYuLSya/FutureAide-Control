@@ -119,7 +119,7 @@ export async function createClaudeBackend(record, deps = {}) {
       const result = await treeModule.observeClaudeTree(state.binding, state.projection, {
         logicalSessionId: current.sessionId, agentId: current.agentId, name: current.name,
         workspace: current.workspace, taskId: current.task?.taskId,
-        nativeStatus: native.status, state: state.treeState ?? {} });
+        nativeStatus: native.status, state: state.treeState ?? {}, backgroundTaskStates: state.backgroundTaskStates ?? [] });
       tree = result.tree;
       state.treeState = result.state;
       state.histories = result.histories;
@@ -434,6 +434,16 @@ export async function createClaudeBackend(record, deps = {}) {
             const stop = await lockedHost(() => host.stopBackgroundTasks({
               nativeSessionId: state.binding.sessionId }, hostOptions()));
             const rows = stop?.stopped ?? [];
+            if (Array.isArray(stop?.backgroundTaskStates) && stop.backgroundTaskStates.length) {
+              const currentState = stateForTask();
+              const owned = new Set(targets);
+              const confirmed = stop.backgroundTaskStates.filter(item => owned.has(item.taskId)
+                && ['completed', 'failed', 'stopped'].includes(item.status) && item.evidence === 'native-task-panel');
+              if (confirmed.length) {
+                currentState.backgroundTaskStates = [...(currentState.backgroundTaskStates ?? []), ...confirmed];
+                save(currentState);
+              }
+            }
             // Only the host's own click confirmation counts. `state` is filled in
             // with 'requested' even when the press failed, so it is reported for
             // diagnosis and never read as success.

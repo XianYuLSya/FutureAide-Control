@@ -31,7 +31,7 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
       const trusted = (await extraFor(extra)) ?? extra;
       const result = await action(await resolve(), args, trusted);
       return { content: [{ type: 'text', text: boundedOutput(result) }],
-        ...(result?.error || result?.ready === false || result?.created === false || result?.deleted === false ? { isError: true } : {}) };
+        ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
     } finally { finished?.(); }
@@ -67,7 +67,7 @@ export function registerScopedTools(server, options = {}) {
     name, max_messages: z.number().int().min(1).max(100).optional(),
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), true);
   register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
-  register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing the managed session data of the target it runs on (DSH or Claude Desktop) and the private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing the managed session data of its target (DSH, Claude Desktop or Codex Desktop) and the private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
   return server;
 }
 

@@ -75,3 +75,22 @@ test('creation advertises one optional target and never repeats it on later call
     assert.equal(calls.length, 2);
   } finally { await client.close(); await server.close(); }
 });
+
+test('queued desktop deletion is accepted while a cleanup error stays visible', async () => {
+  let response = { name: 'cleanup', deleted: false, queued: true, state: 'cleaning' };
+  const service = { async resume() {}, async delete() { return response; } };
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const server = makeScopedServer({ configPath: path.join(root, 'clean', 'scoped-mcp-config-absent.json'), scopedFactory: () => service });
+  const client = new Client({ name: 'scoped-test', version: '1.0.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(b); await client.connect(a);
+  try {
+    const queued = await client.callTool({ name: 'futureaide_delete_agent', arguments: { name: 'cleanup' } });
+    assert.notEqual(queued.isError, true, 'durable cleanup acceptance must not invite a retry');
+    assert.deepEqual(JSON.parse(queued.content[0].text), response);
+    response = { ...response, error: { code: 'child-cleanup-failed', message: 'A child still needs cleanup.' } };
+    const failed = await client.callTool({ name: 'futureaide_delete_agent', arguments: { name: 'cleanup' } });
+    assert.equal(failed.isError, true, 'queued intent must not hide a real cleanup failure');
+    assert.equal(JSON.parse(failed.content[0].text).error.code, 'child-cleanup-failed');
+  } finally { await client.close(); await server.close(); }
+});

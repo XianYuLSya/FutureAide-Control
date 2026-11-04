@@ -17,6 +17,7 @@ import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './repor
 import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
   TARGET_LABELS, TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
+import { FINAL_REPORT_REMINDER } from './report-contract.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
@@ -264,6 +265,25 @@ export async function findClaudeReceipt(binding, notice) {
     cursor = next;
   }
   return undefined;
+}
+
+/**
+ * Whether a turn that just ended owes its agent one reminder that no final report
+ * arrived. Only a task created with the marker is reminded, so a task already waiting
+ * when this rule shipped is never woken by it, and a reminder already sent is never
+ * repeated.
+ * @param {{terminal?: string, task?: object, view?: object, target?: string, supplements?: Array<object>}} input
+ * @returns {boolean} True when exactly one reminder should be dispatched now.
+ */
+export function finalReminderDue({ terminal, task, view, target, supplements } = {}) {
+  if (terminal !== undefined) return false;
+  if (task?.finalReminder !== 'armed') return false;
+  const final = [...(task.reports ?? []), ...(view?.reports ?? [])].some(report => report.final === true);
+  if (final) return false;
+  // Desktop targets deliver input through their own durable queue; this reminder is
+  // only wired for DSH, which reads a supplement on its next step.
+  if (target !== 'dsh') return false;
+  return !(supplements ?? []).some(item => item.task === task.taskId && !['accepted', 'blocked'].includes(item.status));
 }
 
 const RETRY_CAP_MS = 30000;
@@ -972,11 +992,13 @@ export function createScopedAgents(config, {
     store.save(record);
   }
 
-  async function sendDispatch(record, message, kind = 'task', answerIds = [], requestId = uid('request'), observed) {
+  async function sendDispatch(record, message, kind = 'task', answerIds = [], requestId = uid('request'), observed, extra = {}) {
     const task = record.task;
     const baseline = Number.isSafeInteger(observed?.throughSeq)
       ? observed : await (await backendFor(record)).cursor();
-    const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now() };
+    // `extra` is written with the dispatch, before the first save, so a reminder is
+    // recognisable as one even if the process dies on the way to the native send.
+    const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now(), ...extra };
     task.dispatches.push(dispatch);
     record.state = 'running'; task.state = 'running';
     store.save(record); // The intent survives a caller or worker exiting during the write.
@@ -1621,7 +1643,11 @@ export function createScopedAgents(config, {
             endSeq: result.endSeq, failure: modelTurnError(result.completionReason) });
         }
       }
-      const outstanding = task.dispatches.some(dispatch => !['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state));
+      // A reminder is best-effort: its own dispatch never decides how the task ended,
+      // and an undecided outcome for it is not work the task is still waiting on. A
+      // reminder that did arrive starts a turn, which view.running already reports.
+      const outstanding = task.dispatches.some(dispatch => !['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)
+        && !(dispatch.reminder && ['unknown', 'failed'].includes(dispatch.state)));
       if (task.cancelRequested && !view.running && treeSettled(record, view)) {
         for (const dispatch of task.dispatches) if (!['completed', 'cancelled', 'failed'].includes(dispatch.state)) dispatch.state = 'cancelled';
       } else if (outstanding || view.running || task.cancelRequested) {
@@ -1644,10 +1670,24 @@ export function createScopedAgents(config, {
         waitForTree(record, view);
         return await finishReports(record, view);
       }
-      const finalDispatch = task.dispatches.at(-1);
+      // How the task ended is decided by its own dispatches; the reminder rides along.
+      const finalDispatch = task.dispatches.filter(dispatch => !dispatch.reminder).at(-1);
       const terminal = task.cancelRequested || rootSummary(view)?.state === 'cancelled' ? 'cancelled'
         : rootSummary(view)?.state === 'failed' || finalDispatch?.state === 'failed' ? 'failed'
           : finalDispatch?.state === 'cancelled' ? 'cancelled' : undefined;
+      // A turn that ends with the answer only in ordinary text leaves the caller with
+      // nothing, so the agent is told once. The marker is persisted before the send:
+      // a crash between the two sends nothing twice, and the reminder's own turn
+      // decides the next state instead of this one settling the task.
+      if (finalReminderDue({ terminal, task, view, target: targetOf(record), supplements: store.supplements(record.agentId) })) {
+        task.finalReminder = 'sent';
+        store.save(record);
+        // A failed or undecided reminder is not the task's outcome: it is marked as a
+        // reminder, so the next poll settles normally instead of failing the turn.
+        await sendDispatch(record, FINAL_REPORT_REMINDER, 'supplement', [], undefined, view, { reminder: true });
+        record.state = task.state = 'running';
+        return publicResult(record);
+      }
       record.state = task.state = terminal ?? 'awaiting_report';
       return await finishReports(record, view);
     } catch (error) {
@@ -1771,7 +1811,11 @@ export function createScopedAgents(config, {
         } else {
           if (record.task) store.appendHistory(record.agentId, { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
             coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) });
-          record.task = { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [] };
+          // finalReminder marks this task as one that may be reminded once when a turn
+          // ends without a final report. Tasks created before this rule carry no
+          // marker, so a sleeping awaiting_report from an older version stays quiet.
+          record.task = { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [],
+            finalReminder: 'armed' };
           record.state = 'running'; record.observation = undefined; record.error = undefined;
           record.nextAttemptAt = undefined; record.retryAttempts = 0; store.save(record);
           if (targetOf(record) !== 'dsh') {

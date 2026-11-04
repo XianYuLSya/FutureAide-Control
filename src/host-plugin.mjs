@@ -78,6 +78,13 @@ export const inject = ['connection', 'webServer', 'agents', 'sessions'];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
 
+// DSH's own question tool opens a prompt in the DSH window, which the chat that
+// dispatched the task never sees: the agent waits and the caller is never asked.
+// Managed agents ask through ask_parent instead.
+const ASK_USER_TOOL_NAMES = Object.freeze(['ask_user_question', 'request_user_input']);
+export const ROOT_QUESTION_REFUSAL = 'The user does not see this question. Use ask_parent for a decision you need.';
+export const CHILD_QUESTION_REFUSAL = 'The user does not see this question. Send it to your parent with send_message.';
+
 /**
  * Every DSH internal this plugin borrows, taken from the calls in this file rather
  * than from memory: DSH 0.2.2 renamed one of them and only a real host showed it.
@@ -226,6 +233,12 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         await installDelegation(agent.ctx, agent, record);
         runtime.managedAgents.set(agent, record);
         agent.ctx.on('tools/result', (exec, result) => runtime.observeManagedDescendant(agent, exec, result));
+        // A descendant's scope may not chain to the root agent's, so the same refusal
+        // is installed where the descendant's own tool calls are checked.
+        const tools = agent.ctx.get('tools');
+        if (typeof tools?.guard === 'function') {
+          tools.guard(exec => ASK_USER_TOOL_NAMES.includes(exec.name) && exec.agent === agent ? CHILD_QUESTION_REFUSAL : undefined);
+        }
         return;
       }
     }
@@ -373,6 +386,12 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     const binding = fresh ? { agent, record } : previous;
     bindings.set(key, binding);
     binding.guard = exec => {
+      // Before the ownership check: DSH evaluates guards along the agent scope chain,
+      // so this one may also see a descendant's call, and a descendant has no
+      // ask_parent tool of its own.
+      if (ASK_USER_TOOL_NAMES.includes(exec.name)) {
+        return exec.agent === agent ? ROOT_QUESTION_REFUSAL : CHILD_QUESTION_REFUSAL;
+      }
       if (exec.agent !== agent) return undefined;
       if (record.closing || record.cancelled) return 'The controlling agent has stopped this task.';
       if (record.questions.some(question => question.state === 'pending') && exec.name !== 'ask_parent') {

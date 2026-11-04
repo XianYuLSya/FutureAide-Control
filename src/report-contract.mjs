@@ -21,3 +21,12 @@ export const FINAL_REPORT_CONTRACT = 'Write a final report for a controlling age
 /** How a question is written, so it can be answered without reading the work. */
 export const QUESTION_CONTRACT = 'State the decision you need, the options and your recommendation in a few lines, '
   + 'so it can be answered without reading your work.';
+
+/**
+ * Sent once when a managed DSH agent's turn ends without a final report: the caller
+ * never sees ordinary reply text, so the agent has to be told that the turn changed
+ * nothing for it.
+ */
+export const FINAL_REPORT_REMINDER = 'Your turn ended without a final report, so the controlling agent has not received your result. '
+  + 'If the task is done, submit it now with report_parent and final: true. If work remains, continue it. '
+  + 'If you need a decision, use ask_parent.';

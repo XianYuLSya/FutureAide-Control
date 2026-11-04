@@ -6,7 +6,10 @@ export function canSleep(record, queued, treeSettled) {
       || record.closed || !task || !view || view.stale || view.running === true || !treeSettled(record, view)) return false;
   if ((task.cancelRequested && !(task.cancelVerified && task.cancelTreeSettled)) || (task.answers ?? []).some(answer => !answer.dispatched)) return false;
   if ((view.reports ?? []).some(report => !(task.reports ?? []).some(saved => saved.id === report.id))) return false;
-  if ((task.dispatches ?? []).some(dispatch => !['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state))) return false;
+  // A best-effort reminder never keeps a settled task awake: an undecided or failed
+  // one is not work the task still owes, exactly as the poll loop treats it.
+  if ((task.dispatches ?? []).some(dispatch => !['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)
+    && !(dispatch.reminder && ['unknown', 'failed'].includes(dispatch.state)))) return false;
   if (queued.some(item => item.task === task.taskId && item.status !== 'blocked')) return false;
   if (['failed', 'cancelled'].includes(record.state) && !hasPendingDelivery(record)) return false;
   // A written notice whose receipt has not been read back yet keeps this name awake:

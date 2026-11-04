@@ -72,6 +72,8 @@
 //                         lists carry taskId (the backend filters by it).
 //                         -> {questions:[{id,taskId,state,message,createdAt}],
 //                         reports:[{id,taskId,message,final,createdAt}]}; read-only.
+//                         Consumption belongs to the shared state machine, which owns
+//                         the one queue; a backend never marks a submission consumed.
 //   anchorResolver()      Bridge anchor for the child: a Codex chat this roster already
 //                         verified, preferring the same workspace. The object
 //                         {threadId, ownerId, workspace} is the contract (hosts extract

@@ -178,10 +178,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 ## 本机验证现状（开发树，2026-11-04）
 
-- **已通过**：Claude Desktop 全链路（create／send → `ask_parent` → `answer` → Write → `final` 返根 → `once` 原生删除，产物保留）；原生子孙取消（G5 单节点）；真实 Claude → Codex 创建；普通 final 静默（不误报）；Windows 长路径 f05 断线后按原 `requestId` 恢复原请求。
-- **正在实测**：上述链路后半段（问答／文件变更／final／once）的完整回归。
-- **未验证**：整树取消、反向派发／取消／删除的端到端。
-- **状态**：正式安装未切换，仍为 0.5.7；未宣告完整对标。
+- **已通过 · 正向（Claude Desktop）**：create／send → `ask_parent` → `answer` → Write → `final` 返根 → `once` 原生删除，产物保留。
+- **已通过 · 取消**：child Stop 单节点，以及 **native full2 整树停止**。
+- **已通过 · 反向（Claude → Codex Desktop，Bidir 全链路）**：Claude 侧真实 MCP 创建 Codex 代理（零模型）→ 普通回复停在 `awaiting_report` 且 root 自动通知 0 → 同任务补充 → Codex `ask` → Claude `answer` → Codex 原生 `apply_patch` 产出 49 字节精确文件 → 显式 `final` 到 Claude → `once` 原生 `thread/delete`（root 核对 SQLite 记录与原 rollout 均不存在）→ Claude `final` 返 root → parent `idle`。子被移除后 parent 的 `childSnapshots` 仍保留文件归属与历史。证据：`.runtime/codex-desktop-probe/bidirectional-20261104T054315-b1cb9d/{verdict,final-1793774300891}.json`。
+- **已通过 · 恢复**：Windows 长路径 f05 断线后按原 `requestId` 恢复原请求，原任务未重发（期间修复 f05 扩展路径比较、`8d06fa9` 非法 notice ID 映射与「只对确定的 prewrite 失败恢复」）。
+- **下一步**：接入正式入口并做实际 MCP 检查；**正式安装尚未切换**，仍为 0.5.7，未宣告完整对标。
 
 ## 维护与兼容
 

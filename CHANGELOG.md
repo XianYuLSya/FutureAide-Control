@@ -9,7 +9,7 @@
 - 模型在每次输入派出时跟随各宿主的当前默认设置，不逐条改写名单记录；一次性代理的 `once` 使用宿主原生删除，项目产物保留。
 - 共享监控改为单进程按需保活，支持同名并行 inflight、异步首派/补充/取消/删除意图、退避与可见错误；新增跨源任务树结算与清理快照。
 
-本机验证（Claude Desktop）：create／send → `ask_parent` → `answer` → Write → `final` 返根 → `once` 原生删除已通过；原生子孙取消单节点通过；真实 Claude → Codex 创建与普通 final 静默通过；Windows 长路径 f05 断线后按原 `requestId` 恢复。整树取消、反向派发/取消/删除端到端、以及上述链路后半段回归仍在实测；**正式安装与发布仍为 0.5.7，安装器仍只准备 Codex 插件与 DSH 桥接，Claude bootstrap 与 Codex 注册尚未纳入一键安装。**
+本机验证（2026-11-04）：正向 Claude Desktop 全链路（create／send → `ask_parent` → `answer` → Write → `final` 返根 → `once` 原生删除、产物保留）通过；取消含 child 单节点与 **native full2 整树停止** 通过；**反向 Bidir 全链路通过**——Claude 侧真实 MCP 创建 Codex 代理（零模型）→ 普通回复 `awaiting_report` 且 root 自动通知 0 → 同任务补充 → Codex `ask`／Claude `answer` → 原生 `apply_patch` 49 字节精确产物 → 显式 `final` → `once` 原生 `thread/delete`（root 核对 SQLite 与原 rollout 均不存在）→ Claude `final` 返 root → parent `idle`；子移除后 parent `childSnapshots` 保留文件归属与历史（证据 `.runtime/codex-desktop-probe/bidirectional-20261104T054315-b1cb9d/`）。Windows 长路径 f05 断线后按原 `requestId` 恢复、原任务未重发（修复 f05 扩展路径比较、`8d06fa9` 非法 notice ID 映射与仅对确定 prewrite 失败恢复）。下一步接入正式入口并做实际 MCP 检查；**正式安装与发布仍为 0.5.7，安装器仍只准备 Codex 插件与 DSH 桥接，Claude bootstrap 与 Codex 注册尚未纳入一键安装。**
 
 ## 0.5.7 — 2026-11-01 · 默认模型跟随与派单去重
 

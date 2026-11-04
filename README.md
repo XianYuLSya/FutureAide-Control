@@ -1,18 +1,32 @@
-![FutureAide Control — DSH Control](assets/banner.svg)
+![FutureAide Control](assets/banner.svg)
 
-# FutureAide Control · DSH Control
+# FutureAide Control
 
-让 Codex 按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务。每个 Codex 聊天有自己的代理名单，插件自动绑定项目路径、会话身份和回包目标。
+让 Codex 和 Claude Desktop 按名字调用 DSH、Claude Desktop 或 Codex Desktop 子代理，在当前项目中完成画图、写代码和文档等任务。插件自动识别当前聊天和项目；每个调用方有自己的名单。
 
-> **开发树说明（非发布版）**：本分支基于 0.5.7 增加 `claude-desktop` 与 `codex-desktop` 两种目标，目标由创建时的可选 `target` 选择（默认 `dsh`，旧调用与旧行为不变）。**正式安装仍是 0.5.7**，本文其余内容对三种目标同样适用；未通过验收前不宣告完整对标。
+> **本机版本（2026-11-04）**：基于干净 0.5.7 重做，三种目标已接入本机正式安装并通过下文记录的实际调用。公开仓库的已发布版本仍为原 0.5.7；本轮没有对外发布。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
 
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
-- **直接交流**：DSH 的问题回到原聊天，Codex 按名字回答；由助手显式调用 `report_parent` 决定何时回包，正文只转发它提交的内容。
-- **多层分工**：DSH 助手可继续安排下属，Codex 仍只按顶层名字联系；顶层主动提交最终交付后，等待整棵树收尾再回包。
+- **直接交流**：助手用 `ask_parent` 提问，父级按名字回答；显式 `report_parent` 决定何时回包，正文只转发它提交的内容。
+- **多层分工**：助手可安排原生下属，受管 Claude 与 Codex 也可用同一套工具跨应用分工；顶层最终交付等待整棵树收尾。
 - **随时监工**：列表显示各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
 - **管理生命周期**：一次性任务显式 final 报告送达且整树收尾后清除会话；长期代理保留上下文，按名字继续使用。
 
-0.5 的默认入口是 Codex Desktop 插件，无需填写内部 ID 或创建传信 txt。0.5.7 让托管代理的每次新派单、补充和回答接续跟随 DSH 当前默认供应商、模型与推理档位，不再被创建时的旧配置锁住；实际模型相同就跳过重复选模，并复用本次绑定状态中的会话游标。保留模型失败原因显示、定点读取、闲置释放与原请求恢复。版本变化见 [CHANGELOG](CHANGELOG.md)。
+无需填写项目路径、内部 ID 或创建传信 txt。每次新派单、补充与回答接续跟随所选应用的当前默认模型和推理档位；同一输入的后台恢复保留原模型与请求身份。版本变化见 [CHANGELOG](CHANGELOG.md)。
+
+## 调用 Claude Desktop，与调用 DSH 同一流程
+
+当前机器已经接好正式入口。保持目标桌面应用运行，先用 `futureaide_status({})` 查看对应 `backends` 是否就绪，然后创建并派单：
+
+```text
+futureaide_create_agent({name: "方案搭档", lifetime: "persistent", target: "claude-desktop"})
+futureaide_send_agent({name: "方案搭档", message: "阅读当前项目，检查方案并提出改进；需要确认就 ask_parent，完成后 report_parent(final:true)。"})
+futureaide_list_agents({})
+```
+
+Claude 在自己的项目会话中工作；提问和显式报告回到创建它的聊天。父级用 `futureaide_answer_agent` 回答、`futureaide_agent_changes` 看文件、`futureaide_inspect_agent` 看上下文。Claude 需要 Codex 帮忙时，在自己的会话调用 `futureaide_create_agent({name, lifetime, target:"codex-desktop"})`，其余操作完全相同；省略 `target` 就调用 DSH。
+
+`once` 在成功 final 送达且整树收尾后自动删除会话，保留项目产物；`persistent` 留下同一上下文供下一项任务使用。按名字取消保留上下文，按名字删除清理它拥有的整棵会话树。桌面调用的 `queued:true` 表示已持久保存，后续由监控推进，调用方无需重复发送。
 
 ## 安装
 
@@ -115,7 +129,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 
 | 工具 | 用途 |
 |---|---|
-| `futureaide_status` | 检查当前聊天绑定与 DSH 桥接 |
+| `futureaide_status` | 检查当前调用方与项目，以及三种后端各自是否就绪 |
 | `futureaide_create_agent` | 创建一次性或长期子代理；可选 `target`：`dsh`（默认）/`claude-desktop`/`codex-desktop` |
 | `futureaide_send_agent` | 发任务、运行中补充；等待回答时也可直接答复 |
 | `futureaide_answer_agent` | 回答当前待答问题 |
@@ -123,8 +137,8 @@ futureaide_inspect_agent({name: "设计团队长"})
 | `futureaide_wait_agents` | 按需等一个或多个名字，单次最多 45 秒 |
 | `futureaide_agent_changes` | 看具体修改路径和可得的内容差异 |
 | `futureaide_inspect_agent` | 深入查看上下文、工具及任务历史 |
-| `futureaide_cancel_agent` | 停止当前任务并清除未执行输入 |
-| `futureaide_delete_agent` | 关闭代理并清除其会话数据 |
+| `futureaide_cancel_agent` | 停止当前任务及所属后代，清除未执行输入，保留上下文 |
+| `futureaide_delete_agent` | 关闭代理及所属后代，清除会话数据，保留项目产物 |
 
 受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。
 
@@ -132,7 +146,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 
 桌面目标的首次派发、忙时补充、取消与删除同样是**持久排队意图**：受理后不重发；执行者或监听器中断后按原 `requestId` 恢复原请求，已发出的不重放。
 
-任务树已静止且没有执行中或排队输入的等待代理可休眠其独立监工，列表显示 `monitor: sleeping`；发送或回答会唤醒它。共享监听器通常在宿主持久记录变化时唤醒，约每 30 秒补扫并处理待投递报告或问题。若所有插件连接及监听器均关闭，下次连接时恢复检查。
+一个共享监控进程推进各名字的任务。任务树已静止且没有执行中或排队输入的等待代理显示 `monitor: sleeping`；发送或回答会唤醒它。监听器通常在宿主持久记录变化时唤醒，约每 30 秒补扫并处理待投递报告或问题。若所有插件连接及监听器均关闭，下次连接时恢复检查。Claude 子代理已结束而后台命令仍运行时，任务树继续显示运行中，取消也会停止该后台任务。
 
 取消请求优先送到所属代理，即使普通监工操作正忙也不必等待其释放操作锁。返回 `accepted` 表示请求已被宿主接受；通过列表确认任务树停止，取消不会撤销已经发生的操作。若自动清理已经开始，取消返回未接受。
 
@@ -152,7 +166,7 @@ DSH 助手可以继续调用其原生子代理，形成多层任务树；Codex �
 
 ## 连接与结果
 
-插件使用本机 MCP 与 DSH 桥接。任务回执、问题、答案及待回包结果持久保存；连接恢复后按原任务继续，不新建代理顶替。发送情况不明时先核对原生证据，回包情况不明时核对原聊天，不盲目发送第二份。
+插件使用本机 MCP 与目标应用的桌面接入。任务回执、问题、答案及待回包结果持久保存；连接恢复后按原任务继续，不新建代理顶替。发送情况不明时先核对原生证据，回包情况不明时核对原聊天，不盲目发送第二份。
 
 `delivery_pending` 表示工作已完成、结果正在等待交付；此时一次性会话尚未删除。已持久保存且具备交付条件的显式报告可在 DSH 暂时离线时继续交付。旧版本自动生成的结果缓存不会被转换成报告或触发自动清理。插件工具被客户端卸载或尚未加载时，需要重新启用或重新加载插件连接；未恢复时再重启 Codex。
 
@@ -174,19 +188,23 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 后台 worker 异步启动失败的修补是另一个独立缺陷。安装配置下，新启动的 MCP 进程会在 `.runtime/diagnostics/` 记录精简生命周期日志，包含进程、工具名和聊天身份，不包含任务正文、结果或凭据。
 
-**安装范围**：`install.ps1` 目前只准备 Codex 插件与本机 DSH 主机桥接，是**唯一的自动安装入口**。Claude 项目的 bootstrap 与 Codex Desktop 注册属于开发期能力，**尚未纳入一键安装**；不要假设运行 `install.ps1` 后桌面目标会自动可用。正式 0.5.7 仍是当前安装版本，暂无切换 D 盘配置的动作。
+**安装范围**：`install.ps1` 目前只准备 Codex 插件与本机 DSH 主机桥接。Claude 项目的 bootstrap 与 Codex Desktop 注册尚未纳入一键安装；新机器安装后需分别配置。本机已完成三目标正式接入：Codex 的 `futureaide` 与 Claude 项目的 `futureaide-report` 都指向同一正式目录和状态库，旧开发注册已退役。日常调用不需要重新运行安装器。
 
-## 本机验证现状（开发树，2026-11-04）
+## 本机验证现状（2026-11-04）
 
 - **已通过 · 正向（Claude Desktop）**：create／send → `ask_parent` → `answer` → Write → `final` 返根 → `once` 原生删除，产物保留。
 - **已通过 · 取消**：child Stop 单节点，以及 **native full2 整树停止**。
 - **已通过 · 反向（Claude → Codex Desktop，Bidir 全链路）**：Claude 侧真实 MCP 创建 Codex 代理（零模型）→ 普通回复停在 `awaiting_report` 且 root 自动通知 0 → 同任务补充 → Codex `ask` → Claude `answer` → Codex 原生 `apply_patch` 产出 49 字节精确文件 → 显式 `final` 到 Claude → `once` 原生 `thread/delete`（root 核对 SQLite 记录与原 rollout 均不存在）→ Claude `final` 返 root → parent `idle`。子被移除后 parent 的 `childSnapshots` 仍保留文件归属与历史。证据：`.runtime/codex-desktop-probe/bidirectional-20261104T054315-b1cb9d/{verdict,final-1793774300891}.json`。
 - **已通过 · 恢复**：Windows 长路径 f05 断线后按原 `requestId` 恢复原请求，原任务未重发（期间修复 f05 扩展路径比较、`8d06fa9` 非法 notice ID 映射与「只对确定的 prewrite 失败恢复」）。
-- **下一步**：接入正式入口并做实际 MCP 检查；**正式安装尚未切换**，仍为 0.5.7，未宣告完整对标。
+- **已通过 · 正式入口**：本聊天实际加载 12 个工具，创建公开接受三种目标，三目标 `status` 就绪。正式名单原有 123 条绑定在切换时保留；没有将开发状态库覆盖到正式库。
+- **已通过 · 长期复用与默认模型**：同一 Claude 会话跨任务记住口令并写出 27 字节精确产物；会话原选最高档，下一次输入实际跟随应用默认中档。取消后也在原会话继续任务。
+- **已通过 · 公共取消**：真实 Claude → Codex → DSH 受管树停止；取消的一次性子会话保留供查看。修复已结束 Agent 下仍运行的后台 shell 后，公共取消在 600 秒命令自然结束前收到原生 `stopped` 通知，进程消失且整树停止。证据：正式安装 `.runtime/formal-acceptance-20261104/shell-public-cancel-passed.json`。
+- **性能实测**：真实 `status` 暖调用 9933ms → 37ms；list 51ms、零模型 create 556ms、send 入队 20ms。4 个任务运行、39 个休眠的同机测量中，共享监控单核 CPU 94.7% → 30.1%，health 16ms；这些数值分别描述各自测量条件。
+- **未实机验证**：整应用退出并重新打开后的自动恢复；现有恢复证据覆盖插件连接、监控和同一原始请求。能力核对结合实现、针对测试与上述实际链路，未逐条重跑全部矩阵项目。
 
 ## 维护与兼容
 
-默认名字式工具依赖本机 Codex Desktop 的可信聊天上下文和回传通道。其他 MCP 客户端，以及仅有 DSH web/tui profile 的环境，需要相应适配；它们不具备这里描述的默认接入体验。
+名字式工具依赖已接入的 Codex 或 Claude Desktop 会话上下文和回传通道。其他 MCP 客户端，以及仅有 DSH web/tui profile 的环境，需要相应适配。
 
 原生会话清理支持上述 DSH 版本的 JSONL 会话、项目索引和派生缓存；不支持的存储后端会返回清理失败。整树清理支持本机原生 one-shot / continuable 下属；外部托管的下属会明确报告不支持自动清理。文件观测会注明覆盖范围；当前派单接口使用文字，图片附件尚不是一等输入参数。
 

@@ -1081,18 +1081,51 @@ try {
       $title = [string]$payload.title
       $deleteLabel = [string]$payload.deleteLabel
       if (-not $deleteLabel) { throw 'delete-label-required' }
-      # Delete is a list action, so this one opens the session row menu on purpose.
-      $button = Get-SessionMenuButton $title 'row'
-      Focus-Window $window.Element
-      $null = Invoke-ElementByMouse $button.Element
-      Start-Sleep -Milliseconds 900
-      $items = @(Get-MenuItems $window.Element)
-      $menuNames = @($items | ForEach-Object { $_.Current.Name })
-      $target = $items | Where-Object { $_.Current.Name -eq $deleteLabel } | Select-Object -First 1
+      # The delete action lives in a menu, but which control opens that menu differs
+      # between a session page and the sidebar: this build shows the title control,
+      # the row control and the header options control. Instead of assuming one,
+      # each candidate is opened and the menu is asked whether it holds the delete
+      # item; the first menu that does is used, and the others are reported.
+      $candidates = @()
+      $optionPattern = '^(' + (Unescape-Pattern $title) + '\s*' + [char]0x7684 + [char]0x66F4 + [char]0x591A + [char]0x9009 + [char]0x9879 + '$)'
+      $candidates += @(Find-Elements $web.Element $optionPattern 'Button')
+      $header = Get-HeaderOptionsButton
+      if ($null -ne $header) { $candidates += $header.Element }
+      if ($candidates.Count -eq 0) { throw 'session-menu-button-not-found' }
+      $attempts = @()
+      $target = $null
+      $menuNames = @()
+      $usedAncestry = @()
+      $seen = @{}
+      foreach ($candidate in $candidates) {
+        $key = [string]$candidate.Current.Name + '|' + (($candidate.Current.BoundingRectangle | Out-String).Trim())
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        Focus-Window $window.Element
+        $open = Invoke-ElementByMouse $candidate
+        if (-not $open.clicked) { $attempts += (@{ candidate = $candidate.Current.Name; result = 'click-unavailable:' + [string]$open.reason }); continue }
+        $menuItems = @()
+        for ($tick = 0; $tick -lt 12; $tick++) {
+          Start-Sleep -Milliseconds 200
+          $menuItems = @(Get-MenuItems $window.Element)
+          if ($menuItems.Count -gt 0) { break }
+        }
+        $menuNames = @($menuItems | ForEach-Object { $_.Current.Name })
+        $found = $menuItems | Where-Object { $_.Current.Name -eq $deleteLabel } | Select-Object -First 1
+        $attempts += (@{ candidate = $candidate.Current.Name; items = ($menuNames -join ' | '); hasDelete = ($null -ne $found) })
+        if ($null -ne $found) {
+          $target = $found
+          $usedAncestry = (Get-AncestryTypes $candidate)
+          break
+        }
+        Send-Keys '{ESC}'
+        Start-Sleep -Milliseconds 350
+      }
       if ($null -eq $target) {
         Send-Keys '{ESC}'
         Write-Result @{ ok = $false; code = 'delete-item-not-found'
-          message = ('no menu item named ' + $deleteLabel + '; menu items: ' + ($menuNames -join ' | ')) }
+          message = ('no menu opened from this session holds ' + $deleteLabel + '; last menu items: ' + ($menuNames -join ' | '))
+          value = @{ attempts = $attempts; candidates = $candidates.Count; menuItems = $menuNames } }
         break
       }
       $deleteClickedAt = Invoke-ElementByMouse $target

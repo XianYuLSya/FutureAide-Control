@@ -26,7 +26,14 @@ export async function createClaudeBackend(record, deps = {}) {
   const driver = deps.driver ?? host.createPowerShellDriver();
   const load = deps.load ?? (() => record);
   const readState = () => deps.readNativeState?.() ?? { requests: {} };
+  // The shared service opts in only for an adapter owned by one locked poll or
+  // operation. Direct/long-lived adapter callers continue to read fresh state.
+  let observation;
+  let firstModelSelection;
+  const invalidateObservation = () => { observation = undefined; };
+  const invalidateInput = () => { invalidateObservation(); firstModelSelection = undefined; };
   const save = value => {
+    invalidateObservation();
     if (deps.writeNativeState?.(value) === false) throw failure('agent-not-found', 'This managed Claude agent was removed.');
     return value;
   };
@@ -91,11 +98,12 @@ export async function createClaudeBackend(record, deps = {}) {
       name: found.name, hostSessionId: found.hostSessionId };
   }
 
-  async function refresh({ resume = false } = {}) {
+  async function refresh({ resume = false, fresh = false } = {}) {
+    if (deps.reuseObservation === true && !resume && !fresh && observation) return observation;
     const current = load();
     const state = stateForTask();
     state.projection ??= emptyClaudeProjection(current.task?.taskId);
-    if (!state.binding) return { state, native: undefined, running: false };
+    if (!state.binding) return observation = { state, native: undefined, running: false };
     const native = await nativeSession(state, { resume });
     const observed = await observeTranscript(state.binding, state.projection, {
       workspace: current.workspace, agentId: current.agentId, requestIds: Object.keys(state.requests) });
@@ -116,7 +124,7 @@ export async function createClaudeBackend(record, deps = {}) {
       state.histories = result.histories;
     }
     save(state);
-    return { state, native, running, tree, hasMore: observed.hasMore };
+    return observation = { state, native, running, tree, hasMore: observed.hasMore };
   }
 
   function receiptFrom(state, requestId) {
@@ -144,8 +152,13 @@ export async function createClaudeBackend(record, deps = {}) {
     return save(state);
   }
 
+  async function firstDefaultModel() {
+    if (deps.reuseObservation !== true) return lockedHost(() => host.readDefaultModel(hostOptions()));
+    return firstModelSelection ??= lockedHost(() => host.readDefaultModel(hostOptions()));
+  }
+
   async function currentModel(state) {
-    if (!state.binding) return lockedHost(() => host.readDefaultModel(hostOptions()));
+    if (!state.binding) return firstDefaultModel();
     if (typeof host.readCurrentModel !== 'function') {
       throw failure('model-observation-unsupported', 'The host adapter cannot read the session’s next model selection yet.');
     }
@@ -167,6 +180,7 @@ export async function createClaudeBackend(record, deps = {}) {
       return { sessionId: load().sessionId, modelRequestsStarted: 0 };
     },
     async beginTask() {
+      invalidateInput();
       const current = load();
       let state = stateForTask();
       if (state.binding) ({ state } = await refresh({ resume: true }));
@@ -184,7 +198,7 @@ export async function createClaudeBackend(record, deps = {}) {
     },
     async observe() {
       const current = load();
-      const { state, running, tree } = await refresh();
+      const { state, running, tree } = await refresh({ fresh: true });
       const p = state.projection;
       const emptyTree = { settled: true, running: false, nodes: [{ sessionId: current.sessionId,
         parentSessionId: null, name: current.name, status: 'idle', activity: 'idle', changes: [], coverage: CLAUDE_FILE_COVERAGE }] };
@@ -203,6 +217,7 @@ export async function createClaudeBackend(record, deps = {}) {
       return { messages: history.messages.slice(-maxMessages), hasMore: history.hasMore || history.messages.length > maxMessages };
     },
     async answer({ answerId, message }) {
+      invalidateInput();
       const { state } = await refresh();
       const previous = state.answers?.[answerId];
       if (previous) return previous;
@@ -216,6 +231,7 @@ export async function createClaudeBackend(record, deps = {}) {
       return result;
     },
     async deliver({ requestId, message }) {
+      invalidateInput();
       await requireReports();
       const current = load();
       let state = stateForTask();
@@ -235,13 +251,21 @@ export async function createClaudeBackend(record, deps = {}) {
           + '完成当前任务并验证后调用 report_parent(message, final=true)，提问后结束本轮等待回答。\n\n' + message;
         let created;
         try {
-          created = await lockedHost(() => {
-            request.attempted = true; request.status = 'unknown'; save(state);
-            return host.createFirstTurn({ workspace: current.workspace, requestId, message: prompt, bindingNonce },
-              { ...hostOptions(), onBound: native => rememberBinding(state, native) });
-          });
-        } catch (error) { throw failure(error.code ?? 'claude-create-unconfirmed', error.message,
-          request.attempted ? { uncertain: true } : { retryableRead: true }); }
+          created = await host.createFirstTurn({ workspace: current.workspace, requestId, message: prompt, bindingNonce },
+            { ...hostOptions(), withUiLock: lockedHost,
+              onBeforeSubmit: () => { request.attempted = true; request.status = 'unknown'; save(state); },
+              onBound: native => rememberBinding(state, native) });
+        } catch (error) {
+          if (!request.attempted) {
+            request.status = 'retryable'; request.error = error.code ?? error.message; save(state);
+          }
+          throw failure(error.code ?? 'claude-create-unconfirmed', error.message,
+            request.attempted ? { uncertain: true } : { retryableRead: true });
+        }
+        if (created?.attempted === false && !request.attempted) {
+          request.status = 'retryable'; request.error = created.reason ?? 'claude-create-not-submitted'; save(state);
+          throw failure(request.error, 'Claude Desktop has not submitted the first message.', { retryableRead: true });
+        }
         if (!created?.nativeSessionId || (!created.created && !created.reused)) {
           return { accepted: false, status: 'unknown', afterSeq: request.afterSeq };
         }
@@ -307,7 +331,11 @@ export async function createClaudeBackend(record, deps = {}) {
       return claudeTurn(state.projection, requestId, { running: tree?.running ?? running, afterSeq });
     },
     async models() {
-      const value = await lockedHost(() => host.readDefaultModel(hostOptions()));
+      // A new session has no independent selection. beginTask/models/model in
+      // the same first dispatch can share one live default read. Each later
+      // input still reads the host default again.
+      const value = stateForTask().binding ? await lockedHost(() => host.readDefaultModel(hostOptions()))
+        : await firstDefaultModel();
       if (!value?.model || value.resolved === false || value.verified === false) {
         throw failure('claude-default-model-unresolved', 'Claude Desktop’s current default model could not be read.');
       }
@@ -318,6 +346,7 @@ export async function createClaudeBackend(record, deps = {}) {
     },
     async model() { return currentModel(stateForTask()); },
     async selectModel(input) {
+      invalidateInput();
       const state = stateForTask();
       return lockedHost(() => host.selectModel({ ...input,
         ...(state.binding ? { nativeSessionId: state.binding.sessionId } : {}) }, hostOptions()));
@@ -329,6 +358,7 @@ export async function createClaudeBackend(record, deps = {}) {
     // says the request reached the host; whether the tree really stopped is this
     // same observer's verdict, never the adapter's guess.
     async cancel() {
+      invalidateObservation();
       const state = await recoverFirstBinding(stateForTask());
       if (!state.binding) {
         const attempted = Object.values(state.requests ?? {}).some(request => request.attempted);
@@ -345,7 +375,7 @@ export async function createClaudeBackend(record, deps = {}) {
             rounds.push({ round, action: 'interrupt-root', status: native.status,
               interrupted: interrupted?.interrupted === true });
           }
-          observed = await refresh();
+          observed = await refresh({ fresh: true });
           const targets = (treeModule?.claudeTreeStopTargets?.(observed.tree) ?? [])
             .filter(target => typeof target.taskId === 'string' && target.status !== 'ended')
             .map(target => target.taskId);
@@ -362,7 +392,7 @@ export async function createClaudeBackend(record, deps = {}) {
               clicked: rows.filter(row => row?.clicked === true).length,
               rows: rows.length, remaining: (stop?.remaining ?? []).length });
           }
-          observed = await refresh();
+          observed = await refresh({ fresh: true });
         } catch (error) {
           if (error.code !== 'claude-session-unavailable') throw error;
           // An unobservable session is not an empty tree: a child can outlive the
@@ -391,6 +421,7 @@ export async function createClaudeBackend(record, deps = {}) {
         ...(canStopTasks ? {} : { stopTasksUnsupported: true }) };
     },
     async destroy() {
+      invalidateObservation();
       const state = await recoverFirstBinding(stateForTask());
       const attempted = Object.values(state.requests ?? {}).some(request => request.attempted);
       if (!state.binding) return { destroyed: !attempted,

@@ -20,7 +20,7 @@ async function setup() {
   const record = { agentId: 'owned', sessionId: 'logical', name: 'helper', workspace: directory, target: 'claude-desktop',
     task: { taskId: 'task-1' } };
   let saved;
-  const counters = { created: 0, sent: 0, reportsStarted: 0, locks: 0 };
+  const counters = { created: 0, sent: 0, reportsStarted: 0, locks: 0, defaults: 0 };
   const model = { provider: 'anthropic', model: 'claude-opus-5-5', reasoningEffort: 'max', verified: true, resolved: true };
   const append = events => appendFile(transcriptFile, events.map(e => JSON.stringify({ sessionId: sid, ...e })).join('\n') + '\n');
   const binding = { pid: process.pid, sessionId: sid, workspace: directory, procStart: 'fixture-start', recordFile,
@@ -37,10 +37,13 @@ async function setup() {
       tree: { settled: true, running: false, nodes: [{ sessionId: options.logicalSessionId,
         parentSessionId: null, status: 'idle', changes: projection.changes }] }, state: {}, histories: {} }) },
     host: {
-      readDefaultModel: async () => model, readCurrentModel: async () => model,
+      readDefaultModel: async () => { counters.defaults++; return model; }, readCurrentModel: async () => model,
       createFirstTurn: async (input, options) => {
-        counters.created++;
-        await append([{ type: 'user', uuid: randomUUID(), message: { content: input.message + '\n' + markerLine(input.requestId, input.bindingNonce) } }]);
+        await (options.withUiLock ?? (action => action()))(async () => {
+          await options.onBeforeSubmit?.();
+          counters.created++;
+          await append([{ type: 'user', uuid: randomUUID(), message: { content: input.message + '\n' + markerLine(input.requestId, input.bindingNonce) } }]);
+        });
         const result = { created: true, nativeSessionId: sid, pid: process.pid, hostSessionId: native.hostSessionId };
         await options.onBound(result);
         return result;
@@ -150,6 +153,65 @@ test('a failed receipt save after a native write cannot cause a resend', async (
   assert.equal((await recovered.receipt({ requestId: 'followup' })).status, 'unknown');
   await recovered.deliver({ requestId: 'followup', message: 'More' });
   assert.equal(f.counters.sent, 1);
+});
+
+test('a proven pre-submit block keeps the original request retryable', async () => {
+  const f = await setup();
+  const blocked = await createClaudeBackend(f.record, { ...f.deps, host: { ...f.deps.host,
+    createFirstTurn: async () => ({ created: false, attempted: false, reason: 'workspace-trust-prompt' }) } });
+  await assert.rejects(blocked.deliver({ requestId: 'first', message: 'First' }), {
+    code: 'workspace-trust-prompt', retryableRead: true,
+  });
+  assert.equal(f.getState().requests.first.attempted, false);
+  assert.equal((await blocked.receipt({ requestId: 'first' })).status, 'retryable');
+  assert.equal((await f.adapter.deliver({ requestId: 'first', message: 'First' })).accepted, true);
+  assert.equal(f.counters.created, 1);
+});
+
+test('a timeout after submit retains unknown ownership and cannot resend', async () => {
+  const f = await setup();
+  let submissions = 0;
+  const adapter = await createClaudeBackend(f.record, { ...f.deps, host: { ...f.deps.host,
+    createFirstTurn: async (_input, options) => {
+      await options.onBeforeSubmit(); submissions++;
+      return { created: false, status: 'unconfirmed', reason: 'no-native-session-registered' };
+    }, findCreatedSession: async () => undefined } });
+  assert.equal((await adapter.deliver({ requestId: 'first', message: 'First' })).status, 'unknown');
+  assert.equal((await adapter.receipt({ requestId: 'first' })).status, 'unknown');
+  await adapter.deliver({ requestId: 'first', message: 'First' });
+  assert.equal(submissions, 1);
+  assert.equal((await adapter.destroy()).destroyed, false);
+});
+
+test('one operation reuses an observation and refreshes after native changes', async () => {
+  const f = await setup();
+  let reads = 0;
+  const adapter = await createClaudeBackend(f.record, { ...f.deps, reuseObservation: true,
+    tree: { ...f.deps.tree, observeClaudeTree: async (...args) => {
+      reads++; return f.deps.tree.observeClaudeTree(...args);
+    } }, host: { ...f.deps.host, selectModel: async () => ({ selected: true }) } });
+  await adapter.beginTask();
+  await adapter.models();
+  await adapter.model();
+  assert.equal(f.counters.defaults, 1, 'one first dispatch shares one live default selection');
+  await adapter.deliver({ requestId: 'first', message: 'First' });
+  await adapter.models();
+  assert.equal(f.counters.defaults, 2, 'the next input reads the current host default again');
+  await adapter.observe();
+  const before = reads;
+  await adapter.receipt({ requestId: 'first' });
+  await adapter.turn({ requestId: 'first' });
+  await adapter.history();
+  await adapter.cursor();
+  assert.equal(reads, before, 'receipt/turn/history/cursor share the locked operation observation');
+  await f.append([{ type: 'assistant', uuid: 'done', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Done' }] } }]);
+  await adapter.observe();
+  assert.equal(reads, before + 1, 'the next explicit observation reads new native state');
+  await adapter.selectModel({ model: 'claude-opus-5-5' });
+  await adapter.receipt({ requestId: 'first' });
+  assert.equal(reads, before + 2, 'model mutation invalidates an earlier observation');
+  await adapter.deliver({ requestId: 'followup', message: 'More' });
+  assert.equal(reads, before + 3, 'a native write always observes its own delivery anew');
 });
 
 // ------------------------------------------------------------------ cancel

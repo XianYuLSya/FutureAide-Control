@@ -12,7 +12,7 @@ import { readCodexSessionModel, interruptCodexSession, requestCodexNative } from
 
 const fail = (code, message) => Object.assign(new Error(message), { code });
 const samePath = (a, b) => typeof a === 'string' && typeof b === 'string'
-  && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+  && path.toNamespacedPath(path.resolve(a)).toLowerCase() === path.toNamespacedPath(path.resolve(b)).toLowerCase();
 export const CODEX_FILE_COVERAGE = { source: 'codex-native-file-change', complete: false,
   note: 'Native file-change items are attributed; arbitrary shell writes are not inferred.' };
 export const markerLine = (requestId, nonce) => `[FutureAide dispatch ${JSON.stringify([requestId, nonce])}]`;

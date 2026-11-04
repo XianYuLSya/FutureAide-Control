@@ -68,7 +68,7 @@ test('registration matches exact build and roster with either config environment
 
 test('native delete validates managed root, deletes descendants first and confirms native records are gone', async () => {
   const rows = new Map([
-    ['root', { id: 'root', originator: 'Codex Desktop', thread_source: 'agent_created_thread', cwd: 'D:/work/p' }],
+    ['root', { id: 'root', originator: 'Codex Desktop', thread_source: 'agent_created_thread', cwd: path.toNamespacedPath('D:/work/p') }],
     ['child', { id: 'child', originator: 'Codex Desktop' }],
     ['user', { id: 'user', originator: 'Codex Desktop', thread_source: 'user', cwd: 'D:/work/p' }],
   ]), calls = [];
@@ -83,6 +83,14 @@ test('native delete validates managed root, deletes descendants first and confir
   assert.deepEqual(calls, [['thread/delete', 'child'], ['thread/delete', 'root']]);
   assert.deepEqual(await host.destroy(input), { destroyed: true });
   assert.equal(calls.length, 2); assert.equal(rows.has('user'), true);
+});
+
+test('native observation accepts Windows extended workspace spelling without changing ownership', async () => {
+  const root = { id: 'root', originator: 'Codex Desktop', cwd: path.toNamespacedPath('D:/work/p') };
+  const host = createCodexHost({ readNativeThread: () => root, readNativeChildren: () => [],
+    readTranscript: async () => ({ projection: emptyProjection(), hasMore: false }) });
+  assert.equal((await host.observe({ nativeSessionId: 'root', workspace: 'D:/work/p' })).tree.settled, true);
+  await assert.rejects(host.observe({ nativeSessionId: 'root', workspace: 'D:/work/other' }), { code: 'codex-native-binding-invalid' });
 });
 
 test('desktop bridge shares discovery and handshake, changes caller metadata, and never replays a failed call', async () => {

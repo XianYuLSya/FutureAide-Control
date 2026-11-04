@@ -345,36 +345,72 @@ export function createScopedAgents(config, {
         taskId: record.task.taskId, message: item.message, final: item.final, createdAt: item.created })),
     };
   }
+  /**
+   * Position of a record in the managed graph: root/child/grand. It comes from the
+   * saved parentAgentId edges, never from a name lookup, so same-named records at
+   * different depths are reported separately.
+   */
+  function managedPath(record) {
+    const names = [];
+    const seen = new Set();
+    let current = record;
+    while (current && !seen.has(current.agentId)) {
+      seen.add(current.agentId);
+      names.unshift(current.name);
+      current = current.parentAgentId ? store.get(current.parentAgentId) : undefined;
+    }
+    return names.join('/');
+  }
+
   /** Read-only Codex tool registration, for status: it never starts a session. */
   async function readCodexToolsStatus(record) {
     if (typeof codexToolsStatus !== 'function') return { registered: false };
     try { return (await codexToolsStatus(record)) ?? { registered: false }; }
     catch (error) { return { registered: false, reason: safeError(error) }; }
   }
-  function codexToolsDiagnostics(value) {
-    const registered = value?.registered === true && Array.isArray(value.tools)
+  /** Both tool names, proven by whichever evidence the adapter has. */
+  function provenRegistration(value) {
+    return value?.registered === true && Array.isArray(value.tools)
       && ['ask_parent', 'report_parent'].every(tool => value.tools.includes(tool));
+  }
+  function codexToolsDiagnostics(value) {
+    const registered = provenRegistration(value);
     return { ready: registered, present: true, registered,
       ...(registered ? {} : { reason: value?.reason ?? { code: 'codex-tools-not-registered',
         message: 'No verified native Codex session reported the ask/report tools yet.' } }) };
   }
+  /**
+   * Post-start proof. Before a create the first native session does not exist, so only
+   * the registration config and the current MCP schema can be required; once the
+   * session exists its own tool list decides, and a session that proves the tools are
+   * absent fails the name explicitly instead of running blind.
+   */
+  async function verifyCodexTools(record) {
+    if (targetOf(record) !== 'codex-desktop' || typeof codexToolsStatus !== 'function') return;
+    const value = await readCodexToolsStatus(record);
+    if (value?.registered === true || value?.evidence !== 'session') return;
+    throw Object.assign(new Error('The new Codex session did not report the ask/report tools.'),
+      { code: 'codex-tools-not-registered', detail: value?.reason });
+  }
   async function beginCodexReports(record) {
-    // A healthy endpoint is not a registration. Only the adapter's probe of a real new
-    // native Codex session may say ready, and it must name both tools; anything else —
-    // including ready:true from an HTTP check — is explicitly not ready.
+    // Two honest stages, so creation is not deadlocked by its own readiness proof.
+    // Create only needs the ask/report registration to be configured and startable in
+    // this project (the adapter proves the registration config and the current MCP
+    // schema); the first native session does not exist yet. That session then has to
+    // show both tools itself, and verifyCodexTools() fails the name if it does not.
     if (typeof codexReportReady !== 'function') {
-      return { ready: false, registered: false,
+      return { ready: false, configured: false, registered: false,
         reason: { code: 'codex-tools-not-registered', message: 'This build does not register the Codex-side ask/report tools yet.' } };
     }
-    const value = (await codexReportReady(record)) ?? {};
-    const registered = value.registered === true && Array.isArray(value.tools)
-      && ['ask_parent', 'report_parent'].every(tool => value.tools.includes(tool));
-    if (value.ready === true && !registered) {
-      return { ...value, ready: false, registered: false,
-        reason: { code: 'codex-tools-not-registered',
-          message: 'The endpoint answered, but no new native Codex session reported the ask/report tools.' } };
+    const value = (await codexReportReady(record, { phase: 'preflight' })) ?? {};
+    const registered = provenRegistration(value);
+    const configured = value.configured === true || registered;
+    if (value.ready !== true || !configured) {
+      return { ...value, ready: false, configured, registered,
+        reason: value.reason ?? { code: 'codex-tools-not-registered',
+          message: 'The Codex-side ask/report registration is not configured for this project.' } };
     }
-    return { ...value, registered };
+    return { ...value, ready: true, configured, registered };
   }
 
   /**
@@ -680,6 +716,9 @@ export function createScopedAgents(config, {
     store.save(record);
     const created = await backend.create();
     if (created.sessionId !== record.sessionId || created.modelRequestsStarted !== 0) throw new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the requested empty subagent.`);
+    // The session exists now, so the Codex target proves its tools for real instead of
+    // trusting the preflight registration config.
+    await verifyCodexTools(record);
     // The model is resolved from the live host default when the first input is
     // sent; creation must not add a second catalog round-trip or pin a stale model.
     record.model = created.model;
@@ -1195,7 +1234,31 @@ export function createScopedAgents(config, {
         const nodes = ownedTree(record, inspectionView).nodes;
         let rootHistory, rootError;
         const backend = await backendFor(record);
-        for (let index = 0; index < nodes.length; index++) {
+        // Cross-application descendants: each is inspected through its own backend and
+        // tagged with its managed path (root/child/grand), never resolved by name, so
+        // same-named records at different depths stay distinct.
+        const descendants = [];
+        for (const child of store.descendantsOf([record.agentId])) {
+          const agentPath = managedPath(child);
+          const entry = { agentPath, name: child.name, target: targetOf(child), state: child.state };
+          try {
+            const childView = await observe(child);
+            store.save(child);
+            const childBackend = await backendFor(child);
+            const childNodes = ownedTree(child, childView).nodes.length ? ownedTree(child, childView).nodes
+              : [{ node: { sessionId: child.sessionId, parentSessionId: null, status: childView.status } }];
+            const sessions = [];
+            for (const { node } of childNodes) {
+              try {
+                const page = await childBackend.history({ targetSessionId: node.sessionId,
+                  running: node.status === 'running', maxMessages });
+                sessions.push({ sessionId: node.sessionId, status: node.status, messages: page?.messages ?? [],
+                  hasMore: page?.hasMore === true, ...(page?.note ? { note: page.note } : {}) });
+              } catch (error) { sessions.push({ sessionId: node.sessionId, status: node.status, error: safeError(error) }); }
+            }
+            descendants.push({ ...entry, sessions });
+          } catch (error) { descendants.push({ ...entry, error: safeError(error) }); }
+        }        for (let index = 0; index < nodes.length; index++) {
           const { node } = nodes[index];
           try {
             const dispatch = node.sessionId === record.sessionId ? record.task?.dispatches?.at(-1) : undefined;
@@ -1218,7 +1281,14 @@ export function createScopedAgents(config, {
         }
         return { ...publicResult(record), ...(rootHistory ?? {}), ...(rootError ? { error: rootError } : {}),
           reports: { ...publicResult(record).reports, items: (record.task?.reports ?? []).map(report => ({ message: report.message, final: report.final, delivery: report.delivery.state })) },
-          tree, inspectionIncomplete: tree.nodes.some(node => node.error !== undefined),
+          tree,
+          // Descendants on another application are inspected through their own
+          // backend and reported by their position in the managed graph, so a direct
+          // child and a same-named grandchild never shadow each other and no internal
+          // binding is exposed.
+          ...(descendants.length ? { descendants } : {}),
+          inspectionIncomplete: tree.nodes.some(node => node.error !== undefined)
+            || descendants.some(item => item.error || item.sessions?.some(page => page.error)),
           historyCount: record.history.length,
           history: record.history.slice(-20).reverse().map((task, index) => ({ task: index + 1, message: compactText(task.message, 240),
             state: task.state, startedAt: task.startedAt, finishedAt: task.finishedAt })) };

@@ -13,7 +13,7 @@ import {
   probeClaudeHost, parseModelControl, modelInfo, resolveModelEvidence, confirmModelAfterTurn, sessionArtifacts,
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
   INTERRUPT_MARKER_TOOL, INTERRUPT_MARKERS, INTERRUPT_SCOPE, stopBackgroundTasks, STOP_ARCHIVE_NAME,
-  readModelSnapshot, describeControl,
+  readModelSnapshot, describeControl, readStoredSession, sessionStoreRoot,
   MODEL_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
   loadModelCatalog, BUILT_IN_MODEL_CATALOG, extractModelSelectorConfigs, sliceBalancedArray,
   extractEmbeddedCatalog, readQuotedLiteral, firstTurnBinding, readTranscriptHead, firstInputOf,
@@ -1319,5 +1319,70 @@ test('an unconfirmed page identity falls back to the confirming path', async () 
     assert.equal(read.singleCall, undefined, 'the fallback does not claim one call');
     assert.equal(driver.calls.includes('readModel'), true, 'the step-by-step path reads the control itself');
     assert.equal(driver.calls.includes('view'), true, 'and confirms the page it is reading from');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+
+// ------------------------------------- the app's own session record (no window)
+
+async function sessionStore(dir, hostSessionId, record) {
+  const folder = path.join(dir, 'userdata', 'claude-code-sessions', 'acct', 'org');
+  await mkdir(folder, { recursive: true });
+  await writeFile(path.join(folder, 'local_' + String(hostSessionId).replace(/^local_/, '') + '.json'),
+    JSON.stringify(record));
+  return path.join(dir, 'userdata');
+}
+
+test('the current model comes from the session record without touching the window', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const userData = await sessionStore(host1.dir, record().hostSessionId, { sessionId: SESSION, cliSessionId: SESSION,
+    model: 'claude-opus-5-5', effort: 'max', title: 'Fixture session', lastTurnEdgeAt: 1793769913649 });
+  const driver = uiDriver({});
+  try {
+    const read = await readCurrentModel({ nativeSessionId: SESSION }, { env: { ...host1.env, CLAUDE_DESKTOP_USER_DATA: userData },
+      driver, isAlive: host1.isAlive, catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(read.source, 'session-store');
+    assert.equal(read.windowTouched, false);
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.reasoningEffort, 'max');
+    assert.equal(read.label, 'Opus 5.5');
+    assert.equal(read.effortLabel, '最高');
+    assert.equal(read.targetConfirmedBy, 'session-record-native-id');
+    assert.deepEqual(read.verifiedBy, ['session-store', 'native-session-id']);
+    assert.equal(read.historyDiffers, false);
+    assert.deepEqual(driver.calls, [], 'a file read needs no bridge call at all');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a record about another session is not used and the window is read instead', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const userData = await sessionStore(host1.dir, record().hostSessionId, { sessionId: 'some-other-session',
+    model: 'claude-sonnet-5-5', effort: 'low' });
+  const driver = uiDriver({ modelSnapshot: () => ({ documentName: 'Fixture session - Claude Code',
+    current: { raw: '模型：Opus 5.5 最高' }, default: null, notes: [] }) });
+  try {
+    const read = await readCurrentModel({ nativeSessionId: SESSION }, { env: { ...host1.env, CLAUDE_DESKTOP_USER_DATA: userData },
+      driver, isAlive: host1.isAlive, catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(read.source, 'composer-control');
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.reasoningEffort, 'max');
+    assert.ok(driver.calls.length > 0, 'the window was consulted because the record did not match');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a missing record falls back to the window, and the store can be skipped on demand', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const userData = await sessionStore(host1.dir, 'local_other', { sessionId: SESSION, model: 'claude-opus-5-5', effort: 'max' });
+  const driver = uiDriver({ modelSnapshot: () => ({ documentName: 'Fixture session - Claude Code',
+    current: { raw: '模型：Opus 5.5 最高' }, default: null, notes: [] }) });
+  try {
+    const env = { ...host1.env, CLAUDE_DESKTOP_USER_DATA: userData };
+    const catalog = await loadModelCatalog({ asar: 'missing.asar' });
+    const fromWindow = await readCurrentModel({ nativeSessionId: SESSION }, { env, driver, isAlive: host1.isAlive, catalog });
+    assert.equal(fromWindow.source, 'composer-control', 'the record belongs to another host session id');
+    driver.calls.length = 0;
+    const forced = await readCurrentModel({ nativeSessionId: SESSION, source: 'ui' }, { env, driver, isAlive: host1.isAlive, catalog });
+    assert.equal(forced.source, 'composer-control');
+    assert.ok(driver.calls.length > 0, 'source ui always asks the window');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

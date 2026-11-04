@@ -1689,13 +1689,102 @@ async function readModelHistory({ env, record, driver }) {
  * only — a past turn cannot prove the next one. A control that differs from the
  * transcript is a normal selection change, and the control wins.
  */
-export async function readCurrentModel({ nativeSessionId, workspace = undefined, folderLabel = undefined }, {
+/** Where the running app keeps its own state, including each session record. */
+export function sessionStoreRoot({ env = process.env } = {}) {
+  if (typeof env.CLAUDE_DESKTOP_USER_DATA === "string" && env.CLAUDE_DESKTOP_USER_DATA) return env.CLAUDE_DESKTOP_USER_DATA;
+  const local = env.LOCALAPPDATA || (env.USERPROFILE ? path.join(env.USERPROFILE, "AppData", "Local") : undefined);
+  if (!local) return undefined;
+  return path.join(local, "Claude-Data", "claude_pzs8sxrjxfjjc");
+}
+
+/**
+ * The app own record for one session.
+ *
+ * The desktop app persists each session as
+ * claude-code-sessions/<account>/<org>/local_<hostSessionId>.json under its user
+ * data directory, with the model and effort that session is set to. Reading it is
+ * a file read: no window is opened, nothing is clicked and no turn is spent. The
+ * record also carries the native session id, which is what proves the file is
+ * about the session the caller asked for.
+ */
+export async function readStoredSession({ env = process.env, hostSessionId, nativeSessionId, userData = undefined } = {}) {
+  if (!hostSessionId) return { found: false, reason: "host-session-id-missing" };
+  const root = userData ?? sessionStoreRoot({ env });
+  if (!root) return { found: false, reason: "user-data-unknown" };
+  const base = path.join(root, "claude-code-sessions");
+  // the registry already carries the local_ prefix; the file name has exactly one
+  const wanted = "local_" + String(hostSessionId).replace(/^local_/, "") + ".json";
+  for (const account of await readdir(base, { withFileTypes: true }).catch(() => [])) {
+    if (!account.isDirectory()) continue;
+    const accountDir = path.join(base, account.name);
+    for (const org of await readdir(accountDir, { withFileTypes: true }).catch(() => [])) {
+      if (!org.isDirectory()) continue;
+      const file = path.join(accountDir, org.name, wanted);
+      const raw = await readFile(file, "utf8").catch(() => undefined);
+      if (!raw) continue;
+      let record;
+      try { record = JSON.parse(raw); } catch { continue; }
+      const info = await stat(file).catch(() => undefined);
+      const identityIds = [record.sessionId, record.cliSessionId].filter(value => typeof value === "string");
+      const identity = !nativeSessionId ? "host-session-id"
+        : (identityIds.includes(nativeSessionId) ? "native-session-id" : (identityIds.length ? "mismatch" : "host-session-id"));
+      return { found: true, file, root, record, persistedAt: info?.mtime?.toISOString(), identity, identityIds };
+    }
+  }
+  return { found: false, reason: "session-record-missing", root };
+}
+
+export async function readCurrentModel({ nativeSessionId, workspace = undefined, folderLabel = undefined, source = "auto" }, {
   driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, catalog = undefined, asar = undefined,
   batch = true, allowDeepLink = true,
 } = {}) {
   const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
-  const ui = requireDriver(driver, 'reading the current model');
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
+  // The app own per-session record answers this without touching the window.
+  if (source !== "ui") {
+    const stored = await readStoredSession({ env, hostSessionId: record.hostSessionId, nativeSessionId: record.nativeSessionId });
+    if (stored.found && stored.identity !== "mismatch" && typeof stored.record.model === "string") {
+      const known = modelCatalog.models.find(model => model.id === stored.record.model);
+      const effort = typeof stored.record.effort === "string" ? stored.record.effort : undefined;
+      const file = await findTranscript({ env, nativeSessionId: record.nativeSessionId, workspace: record.workspace })
+        .catch(() => undefined);
+      let transcriptModel;
+      let transcriptEffort;
+      if (file) {
+        const { events } = await readTranscriptEvents(file);
+        const last = [...events].reverse().find(event => event.role === "assistant" && event.model);
+        transcriptModel = last?.model;
+        transcriptEffort = last?.effort;
+      }
+      const historyDiffers = Boolean(transcriptModel && transcriptModel !== stored.record.model)
+        || Boolean(transcriptEffort && effort && transcriptEffort !== effort);
+      return {
+        nativeSessionId,
+        provider: "anthropic",
+        model: stored.record.model,
+        reasoningEffort: effort,
+        resolved: Boolean(known),
+        status: known ? "read" : "unmapped",
+        label: known?.name ?? null,
+        effortLabel: effort ? (EFFORT_LABEL_FOR[effort] ?? null) : null,
+        source: "session-store",
+        windowTouched: false,
+        targetConfirmedBy: stored.identity === "native-session-id" ? "session-record-native-id" : "session-record",
+        verifiedBy: ["session-store", ...(stored.identity === "native-session-id" ? ["native-session-id"] : [])],
+        persistedAt: stored.persistedAt,
+        sessionStoreFile: stored.file,
+        lastTurnEdgeAt: stored.record.lastTurnEdgeAt ?? null,
+        title: (stored.record.title ?? "").trim() || null,
+        catalogSource: modelCatalog.catalogSource,
+        evidence: { control: null, store: { model: stored.record.model, effort, identity: stored.identity }, history: { transcriptModel, transcriptEffort } },
+        historyDiffers,
+        ...(known ? {} : { reason: "model-id-not-in-catalog", unresolvedModel: stored.record.model }),
+        ...(historyDiffers ? { note: "The stored record differs from what this session last ran; the record is the current setting, the transcript is history." } : {}),
+        detail: "Read from the app own per-session record, so the window was not touched. Pass source ui to confirm against the composer control.",
+      };
+    }
+  }
+  const ui = requireDriver(driver, "reading the current model");
   // The session's own control is all this needs, so it is taken in the same single
   // bridge call as the default read. Identity comes from the document title the
   // snapshot reports; anything unclear falls back to the step-by-step path, which

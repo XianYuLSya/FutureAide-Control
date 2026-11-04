@@ -462,7 +462,11 @@ export async function observeClaudeTree(binding, rootProjection, {
   // An agent meta that names no id observed in this session is never attached; it
   // is reported instead, and one that is not finished keeps the tree unsettled.
   const unpaired = [...indexedMetas.keys()].filter(nativeId => !parents.has(nativeId));
-  const unpairedRunning = unpaired.filter(nativeId => indexedMetas.get(nativeId)?.finished !== true);
+  // A task the host stopped has no inished, but it is not running either.
+  const unpairedRunning = unpaired.filter(nativeId => {
+    const meta = indexedMetas.get(nativeId);
+    return meta?.finished !== true && meta?.stoppedByUser !== true;
+  });
   for (const entry of Object.values(treeState.nodes)) trimMessages(entry.projection);
 
   treeState.root = { sessionId: binding.sessionId, transcriptFile: binding.transcriptFile };

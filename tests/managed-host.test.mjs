@@ -115,6 +115,33 @@ test('explicit reports persist across reload and final seals reporting', async (
   await assert.rejects(reloaded.managedDestroy({ ...input, reportProtocol: undefined }), error => error.controlCode === 'managed-report-protocol-required');
 });
 
+test('a final is refused while a steer input still waits for the model’s next step', async () => {
+  const f = await fixture(), input = identity(f.workspace), host = f.create();
+  await host.managedCreate(input);
+  await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  const agent = f.live.get(input.sessionId), report = agent.definitions.get('report_parent');
+  let ended = 0;
+  const exec = { agent, concludeTurn: () => { ended++; } };
+  agent.inbox.nextStep.push({ id: 'steer-1', content: 'new input' });
+  await assert.rejects(report.execute({ message: 'delivery', final: true }, exec), error => {
+    assert.equal(error.controlCode, undefined, 'the model receives a plain error, not a protocol refusal');
+    assert.match(error.message, /new input/i);
+    assert.match(error.message, /before submitting this final report/i);
+    return true;
+  });
+  assert.deepEqual((await host.managedStatus({ ...input, taskId: 'task-a' })).reports, [], 'the refused final was not recorded');
+  assert.equal(ended, 0, 'the turn is not concluded while the input is unread');
+  await report.execute({ message: 'progress' }, exec);
+  assert.deepEqual((await host.managedStatus({ ...input, taskId: 'task-a' })).reports.map(item => item.final), [false],
+    'a non-final progress report is unaffected');
+  agent.inbox.nextStep.length = 0;
+  agent.inbox.nextTurn.push({ id: 'queued' });
+  await report.execute({ message: 'delivery', final: true }, exec);
+  assert.equal(ended, 1);
+  assert.deepEqual((await host.managedStatus({ ...input, taskId: 'task-a' })).reports.map(item => [item.message, item.final]),
+    [['progress', false], ['delivery', true]], 'an input that only waits for the next turn never blocks a final');
+});
+
 test('tree completion waits for a task turn and descendant result before returning the final root turn', async () => {
   const f = await fixture(), host = f.create(), input = identity(f.workspace);
   await host.managedCreate(input);

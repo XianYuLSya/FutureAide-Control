@@ -25,6 +25,19 @@ test('default loader connects the real Codex adapter without an injected factory
   assert.equal(probe.reportProtocol, 1);
 });
 
+test('a supplement steers the model on its next step while every other delivery stays queued', async () => {
+  const sends = [];
+  const backend = await resolveBackend({ target: 'dsh', workspace }, {
+    dsh: { client: {}, control: () => ({ async send(input) { sends.push(input); return { accepted: true, afterSeq: 1 }; } }) },
+  });
+  await backend.deliver({ requestId: 'request-supplement', message: 'new input', kind: 'supplement' });
+  await backend.deliver({ requestId: 'request-task', message: 'work', kind: 'task' });
+  await backend.deliver({ requestId: 'request-answer', message: 'Answer: yes', kind: 'answer' });
+  await backend.deliver({ requestId: 'request-bare', message: 'no kind' });
+  assert.deepEqual(sends.map(input => [input.requestId, input.mode]),
+    [['request-supplement', 'steer'], ['request-task', 'queue'], ['request-answer', 'queue'], ['request-bare', 'queue']]);
+});
+
 async function rejection(promise) {
   try { await promise; } catch (error) { return error; }
   return assert.fail('expected a refusal');

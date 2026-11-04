@@ -240,9 +240,12 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
         ...(history.note ? { note: history.note } : {}), ...(failure ? { failure } : {}) };
     },
     async answer({ answerId, message } = {}) { return client.managedAnswer({ ...args(), answerId, message }); },
-    async deliver({ requestId, message } = {}) {
+    async deliver({ requestId, message, kind } = {}) {
+      // A supplement has to be read on the model's next step. A queued input waits for
+      // the current turn to end, and by then the model has usually submitted its final
+      // report already, which seals the task and strands the input forever.
       return control().send({ sessionId: args().sessionId, message, requestId,
-        background: false, suppressCallback: true, mode: 'queue' });
+        background: false, suppressCallback: true, mode: kind === 'supplement' ? 'steer' : 'queue' });
     },
     async receipt({ requestId } = {}) {
       if (typeof requestId !== 'string' || !requestId) return undefined;

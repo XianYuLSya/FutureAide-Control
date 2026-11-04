@@ -1016,9 +1016,28 @@ test('busy supplements persist independently and are dispatched in order to the 
   release(); await held;
   await f.service.poll(record.agentId);
   assert.deepEqual(f.sends.map(item => item.message), ['initial', 'first', 'second']);
+  assert.deepEqual(f.sends.map(item => item.mode), ['queue', 'steer', 'steer'], 'a drained supplement is steered as well');
   assert.equal(new Set(f.sends.map(item => item.requestId)).size, 3);
   assert.equal(f.store.supplements(record.agentId).length, 0);
   f.service.close();
+});
+
+test('a supplement sent while the task runs is steered into the running turn', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'long work' }, extra(A));
+    assert.deepEqual(f.sends.map(item => [item.message, item.mode]), [['long work', 'queue']]);
+    const supplement = await f.service.send({ name: 'artist', message: 'new input' }, extra(A));
+    assert.equal(supplement.accepted, true, 'the running task admits the input without ending its turn');
+    assert.equal(supplement.state, 'running');
+    assert.deepEqual(f.sends.map(item => [item.message, item.mode]), [['long work', 'queue'], ['new input', 'steer']],
+      'the supplement reaches the model on its next step instead of waiting for the turn to end');
+    const dispatch = f.record().task.dispatches.at(-1);
+    assert.equal(dispatch.kind, 'supplement');
+    assert.equal(dispatch.accepted, true);
+    assert.equal(dispatch.state, 'running');
+  } finally { f.service.close(); }
 });
 
 test('busy after entering the operation is not mistaken for a lock timeout', async () => {

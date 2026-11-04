@@ -312,6 +312,14 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         if (typeof args?.message !== 'string' || !args.message.trim() || args.message.length > 100000 || (args.final !== undefined && typeof args.final !== 'boolean')) reject('invalid-report');
         const reports = record.reports ??= [];
         if (reports.some(report => report.taskId === record.taskId && report.final)) reject('managed-report-finalized');
+        // A steer input becomes visible on the model's next step, so a final submitted
+        // now would be recorded and seal the task before the model ever read it. This
+        // error is the tool result: the model reads the waiting input on that same
+        // next step, then may report. Only nextStep counts here — nextTurn is read
+        // after the turn ends, so refusing a final for it would gain nothing.
+        if (args.final === true && agent.inbox?.nextStep?.length > 0) {
+          throw new Error('New input from the controlling agent arrived while you were working. Read it before submitting this final report.');
+        }
         const report = { id: `report-${randomUUID()}`, taskId: record.taskId, message: args.message, final: args.final === true, createdAt: new Date().toISOString() };
         reports.push(report);
         try { await persist(record); } catch (error) { reports.splice(reports.indexOf(report), 1); throw error; }

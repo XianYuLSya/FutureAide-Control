@@ -997,11 +997,17 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
   const panel = await ui.tasksPanel({ title, mode: 'open' });
   let rows = rowsOf(panel?.rows);
   const stopped = [];
+  // A panel that has not refreshed yet still shows a row as stoppable, so a row
+  // that was already asked to stop is never asked twice.
+  const attempted = new Set();
   let panelOpened = 1;
   for (let round = 0; round < Math.max(1, rounds); round += 1) {
-    const running = runningTaskRows(rows, targets);
+    const running = runningTaskRows(rows, targets)
+      .filter(row => !attempted.has(row.index) && !attempted.has(row.title));
     if (!running.length) break;
     const row = running[0];
+    attempted.add(row.index);
+    if (row.title) attempted.add(row.title);
     const attempt = await ui.taskStop({ match: row.rowText, index: row.index })
       .catch(error => ({ clicked: false, code: error.code, message: error.message }));
     stopped.push({
@@ -2082,9 +2088,14 @@ export async function readDefaultModel({
     };
     if (launch?.blocked === 'workspace-trust-prompt' || draftView?.trustPrompt) {
       const restored = await restore();
+      // A trust question is a definite stop, not an unknown outcome: nothing was
+      // typed, nothing was sent, and the same call can be repeated once the
+      // question is answered, so the caller can see and retry it.
       throw fail('workspace-trust-prompt',
         'Opening a draft for that folder asks the host\'s workspace-trust question; it is not answered on the caller\'s behalf.',
-        { launch, restored });
+        { launch, restored, attempted: false, retryable: true, visible: true,
+          reason: 'workspace-trust-prompt',
+          detail: 'The draft was opened and left untouched; answer the trust question in the window and call again.' });
     }
     const draftReady = Boolean(draftView?.hasComposer ?? draftView?.composerFound)
       && Number(draftView?.messages ?? 0) === 0;

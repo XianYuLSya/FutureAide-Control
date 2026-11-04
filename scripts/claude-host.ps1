@@ -314,88 +314,60 @@ function Get-TasksPanelPattern {
 
 # Every background task row carries one stop button whose accessible name is the
 # same for all rows, so a row is identified by its own text, never by position.
+# Rows are the list items of the background tasks region. A row exists whether or
+# not it can still be stopped, so a finished row is still addressable and reportable:
+# the stop control only exists on a row that is still running. The row title is the
+# name of the row group; the list item name adds the duration and the task count.
 function Get-TaskRows {
-  # Rows live inside the background tasks region; anything outside it is not one.
   $stopPattern = Get-StopButtonPattern
   $regionPattern = Get-TasksRegionPattern
   $busyPattern = Get-StopBusyPattern
   $donePattern = Get-StopDonePattern
-  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
   $rows = @()
   $index = 0
-  $rowButtons = @(Find-Elements $web.Element $stopPattern 'Button')
-  $regions = @(Find-Elements $web.Element $regionPattern '')
-  if ($regions.Count -ge 1) {
-    $inside = @()
-    foreach ($region in $regions) {
-      $inside += @(Find-Elements $region $stopPattern 'Button')
-    }
-    if ($inside.Count -gt 0) { $rowButtons = $inside }
-  }
-  foreach ($button in $rowButtons) {
-    $rowElement = $null
-    try { $rowElement = $walker.GetParent($button) } catch { }
-    $depth = 0
-    while ($null -ne $rowElement -and $depth -lt 6 -and
-      $rowElement.Current.ControlType -ne [System.Windows.Automation.ControlType]::ListItem -and
-      $rowElement.Current.ControlType -ne [System.Windows.Automation.ControlType]::DataItem -and
-      $rowElement.Current.ControlType -ne [System.Windows.Automation.ControlType]::Group) {
-      $rowElement = $walker.GetParent($rowElement)
-      $depth += 1
-    }
-    $texts = @()
-    if ($null -ne $rowElement) {
-      if ($rowElement.Current.Name) { $texts += $rowElement.Current.Name }
-      foreach ($node in $rowElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, (Get-Condition))) {
-        $name = $node.Current.Name
-        if ($name -and $name -notmatch $stopPattern) { $texts += $name }
+  $regions = @(Find-Elements $web.Element $regionPattern 'Group')
+  if ($regions.Count -eq 0) { $regions = @(Find-Elements $web.Element $regionPattern '') }
+  foreach ($region in $regions) {
+    foreach ($item in @(Find-Elements $region '' 'ListItem')) {
+      $itemName = [string]$item.Current.Name
+      $title = $null
+      $groups = @(Find-Elements $item '' 'Group')
+      if ($groups.Count -ge 1) { $title = [string]$groups[0].Current.Name }
+      if (-not $title) {
+        # The item name is the title followed by duration and task count; strip them
+        # using the same words the panel shows.
+        $suffix = '(\s*\d+\s*(' + (ZH @(0x5206, 0x949F)) + '|' + (ZH @(0x79D2)) + '|' + (ZH @(0x4E2A, 0x4EFB, 0x52A1)) + '|min|sec|s).*)$'
+        $title = ($itemName -replace $suffix, '').Trim()
       }
-    }
-    $listItemName = $null
-    $listItem = $null
-    $cursor = $button
-    for ($up = 0; $up -lt 6; $up++) {
-      try { $cursor = $walker.GetParent($cursor) } catch { break }
-      if ($null -eq $cursor) { break }
-      if ($cursor.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem) {
-        $listItem = $cursor
-        $listItemName = [string]$cursor.Current.Name
-        break
+      $stops = @(Find-Elements $item $stopPattern 'Button')
+      $others = @(Find-Elements $item '' 'Button' | Where-Object { $_.Current.Name -notmatch $stopPattern })
+      $detail = $(if ($others.Count -ge 1) { [string]$others[0].Current.Name } else { $itemName })
+      $rows += [pscustomobject]@{
+        index = $index
+        title = $title
+        rowName = $itemName
+        rowText = (($title + ' | ' + $detail).Trim())
+        detail = $detail
+        depth = 0
+        running = ($stops.Count -ge 1)
+        busy = ($itemName -match $busyPattern)
+        done = ($itemName -match $donePattern)
+        enabled = ($stops.Count -ge 1)
+        buttonName = $(if ($stops.Count -ge 1) { [string]$stops[0].Current.Name } else { $null })
+        Button = $(if ($stops.Count -ge 1) { $stops[0] } else { $null })
       }
+      $index += 1
     }
-    if ($null -ne $listItem) {
-      # The row is the list item; its own text is what names it.
-      $rowElement = $listItem
-      $texts = @()
-      if ($listItem.Current.Name) { $texts += [string]$listItem.Current.Name }
-      foreach ($node in $listItem.FindAll([System.Windows.Automation.TreeScope]::Descendants, (Get-Condition))) {
-        $nodeName = $node.Current.Name
-        if ($nodeName -and $nodeName -notmatch $stopPattern) { $texts += $nodeName }
-      }
-    }
-    if ($listItemName -and ($texts -notcontains $listItemName)) { $texts = @($listItemName) + $texts }
-    $rowText = ((@($texts | Select-Object -Unique)) -join ' | ')
-    if (-not $rowText) { $rowText = [string]$listItemName }
-    $rows += [pscustomobject]@{
-      index = $index
-      buttonName = $button.Current.Name
-      rowName = $(if ($null -ne $rowElement) { $rowElement.Current.Name } else { '' })
-      rowText = $rowText
-      depth = $depth
-      busy = ($rowText -match $busyPattern)
-      done = ($rowText -match $donePattern)
-      enabled = $button.Current.IsEnabled
-      Button = $button
-    }
-    $index += 1
+    if ($rows.Count -gt 0) { break }
   }
   return $rows
 }
 
 function Get-TaskRowSummary($rows) {
   return @($rows | ForEach-Object {
-    @{ index = $_.index; buttonName = $_.buttonName; rowName = $_.rowName; rowText = $_.rowText
-       depth = $_.depth; busy = $_.busy; done = $_.done; enabled = $_.enabled }
+    @{ index = $_.index; title = $_.title; rowName = $_.rowName; rowText = $_.rowText; detail = $_.detail
+       depth = $_.depth; running = $_.running; busy = $_.busy; done = $_.done; enabled = $_.enabled
+       buttonName = $_.buttonName }
   })
 }
 

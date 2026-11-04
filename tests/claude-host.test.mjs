@@ -1489,3 +1489,48 @@ test('an idle session without a stop control says children may still be running'
     assert.match(result.note, /task panel/);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+test('finished rows are read and reported but never stopped', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  // the real panel: history rows without a stop control, one row still running
+  const rows = [
+    { index: 0, title: 'Cancel child A', rowText: 'Cancel child A | Cancel child A 11分钟 06秒', running: false, enabled: false, done: true },
+    { index: 1, title: 'Cancel child B', rowText: 'Cancel child B | Cancel child B 5分钟 27秒', running: false, enabled: false, done: false },
+    { index: 2, title: 'Leaf stop proof 1829', rowText: 'Leaf stop proof 1829 | leaf running', running: true, enabled: true, done: false },
+  ];
+  const driver = uiDriver({
+    tasksPanel: () => ({ opened: true, entry: '后台任务 1', rows }),
+    taskStop: () => ({ clicked: true, busySeen: true, doneSeen: true }),
+  });
+  try {
+    const result = await stopBackgroundTasks({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive });
+    assert.equal(result.panel.entryCount, 1);
+    assert.deepEqual(result.stopped.map(entry => entry.index), [2], 'only the row with a stop control is stopped');
+    assert.equal(result.stopped[0].rowText.includes('Leaf stop proof 1829'), true, 'a row is named by its title');
+    const stops = driver.calls.filter(call => Array.isArray(call) && call[0] === 'taskStop');
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0][1].index, 2);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a workspace trust question is a visible retryable stop, not an unknown', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = pageDriver(
+    { documentName: 'Fixture session - Claude Code', messages: 4, composerLength: 1, composerTrimmedLength: 0 },
+    { open: { documentName: 'New session - Claude Code', messages: 0, trustPrompt: true }, reveal: { documentName: 'Fixture session - Claude Code', messages: 4 } },
+  );
+  try {
+    await assert.rejects(
+      readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive, batch: false,
+        catalog: await loadModelCatalog({ asar: 'missing.asar' }) }),
+      error => {
+        assert.equal(error.code, 'workspace-trust-prompt');
+        assert.equal(error.attempted, false);
+        assert.equal(error.retryable, true);
+        assert.equal(error.visible, true);
+        assert.equal(error.reason, 'workspace-trust-prompt');
+        return true;
+      });
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

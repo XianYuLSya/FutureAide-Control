@@ -4,6 +4,8 @@
 
 让 Codex 按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务。每个 Codex 聊天有自己的代理名单，插件自动绑定项目路径、会话身份和回包目标。
 
+> **开发树说明（非发布版）**：本分支基于 0.5.7 增加 `claude-desktop` 与 `codex-desktop` 两种目标，目标由创建时的可选 `target` 选择（默认 `dsh`，旧调用与旧行为不变）。**正式安装仍是 0.5.7**，本文其余内容对三种目标同样适用；未通过验收前不宣告完整对标。
+
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：DSH 的问题回到原聊天，Codex 按名字回答；由助手显式调用 `report_parent` 决定何时回包，正文只转发它提交的内容。
 - **多层分工**：DSH 助手可继续安排下属，Codex 仍只按顶层名字联系；顶层主动提交最终交付后，等待整棵树收尾再回包。
@@ -42,7 +44,7 @@ futureaide_status({})
 
 从 0.4 升级到 0.5 前，先让正在运行的任务完成。需要保留在途任务升级时，还须按原任务身份切换后台 `scoped-worker`；仅重新加载 MCP 不会替换已经启动的监工进程，也不要重新派发任务来代替迁移。
 
-宿主只支持 DSH。未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；不再发现或连接旧 FutureAide 应用，不读取其 shell、端口或启动日志，也不使用旧应用环境变量覆盖宿主。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
+宿主目标由 `target` 决定：`dsh`（默认）、`claude-desktop`、`codex-desktop`。DSH 路径未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；桌面目标使用已由宿主打开的应用会话，每个目标单独发现与校验，不读取账号凭据、不启动独立 CLI 顶替桌面。旧 FutureAide 应用的 shell、端口、启动日志与环境变量覆盖一律不使用。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
 
 维护 CLI 默认使用此安装目录的 `.runtime/config.json`；`--config` 和配置环境变量可显式选择其他配置。桌面桥接若已绑定不同凭据或托管状态目录，安装会报告冲突并保留原绑定；只有确定要迁移时才使用 `desktop-host-install --rebind` 或 `connect-desktop.ps1 -Rebind`。
 
@@ -114,7 +116,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 | 工具 | 用途 |
 |---|---|
 | `futureaide_status` | 检查当前聊天绑定与 DSH 桥接 |
-| `futureaide_create_agent` | 创建一次性或长期子代理 |
+| `futureaide_create_agent` | 创建一次性或长期子代理；可选 `target`：`dsh`（默认）/`claude-desktop`/`codex-desktop` |
 | `futureaide_send_agent` | 发任务、运行中补充；等待回答时也可直接答复 |
 | `futureaide_answer_agent` | 回答当前待答问题 |
 | `futureaide_list_agents` | 查看本聊天名单、任务、活动、问题和修改摘要 |
@@ -124,7 +126,11 @@ futureaide_inspect_agent({name: "设计团队长"})
 | `futureaide_cancel_agent` | 停止当前任务并清除未执行输入 |
 | `futureaide_delete_agent` | 关闭代理并清除其会话数据 |
 
-发送任务或补充消息返回精简受理回执；需要任务树、文件变更或历史时，按需使用列表、变更或查看工具。`queued: true` 表示已在本地保存（普通监工忙时进入持久队列），不得重发；`retrying: true` 表示原请求正等待后台恢复，调用方无需重发；`unknown` 表示原生写入结果不明，重试前先核对原回执和原收件人，绝不盲目重复；`accepted: true` 只表示 DSH 已受理，不代表任务完成或要求已落实。列表展示队列状态。
+受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。
+
+发送任务或补充消息返回精简受理回执；需要任务树、文件变更或历史时，按需使用列表、变更或查看工具。`queued: true` 表示已在本地保存（普通监工忙时进入持久队列），不得重发；`retrying: true` 表示原请求正等待后台恢复，调用方无需重发；`unknown` 表示原生写入结果不明，重试前先核对原回执和原收件人，绝不盲目重复；`accepted: true` 只表示目标宿主已受理，不代表任务完成或要求已落实。列表展示队列状态。
+
+桌面目标的首次派发、忙时补充、取消与删除同样是**持久排队意图**：受理后不重发；执行者或监听器中断后按原 `requestId` 恢复原请求，已发出的不重放。
 
 任务树已静止且没有执行中或排队输入的等待代理可休眠其独立监工，列表显示 `monitor: sleeping`；发送或回答会唤醒它。共享监听器通常在宿主持久记录变化时唤醒，约每 30 秒补扫并处理待投递报告或问题。若所有插件连接及监听器均关闭，下次连接时恢复检查。
 
@@ -167,6 +173,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 本次多聊天断连已通过逐进程审计确认来自外部定时清理器：它将暂时无 CPU/I/O 活动的后台 MCP 误判为残留并终止。MCP 没有窗口、等待请求时不活动，都不表示连接已无用。若运行类似进程清理工具，应保留存活 Codex 进程树内的工具，仅清理能确认失去所属关系的残留；停止误杀后，还需在 Codex 设置重载已关闭的 MCP 连接。该外部清理器不属于本插件，其他 Transport closed 仍应依据各自日志判断。
 
 后台 worker 异步启动失败的修补是另一个独立缺陷。安装配置下，新启动的 MCP 进程会在 `.runtime/diagnostics/` 记录精简生命周期日志，包含进程、工具名和聊天身份，不包含任务正文、结果或凭据。
+
+**安装范围**：`install.ps1` 目前只准备 Codex 插件与本机 DSH 主机桥接，是**唯一的自动安装入口**。Claude 项目的 bootstrap 与 Codex Desktop 注册属于开发期能力，**尚未纳入一键安装**；不要假设运行 `install.ps1` 后桌面目标会自动可用。正式 0.5.7 仍是当前安装版本，暂无切换 D 盘配置的动作。
+
+## 本机验证现状（开发树，2026-11-04）
+
+- **已通过**：Claude Desktop 全链路（create／send → `ask_parent` → `answer` → Write → `final` 返根 → `once` 原生删除，产物保留）；原生子孙取消（G5 单节点）；真实 Claude → Codex 创建；普通 final 静默（不误报）；Windows 长路径 f05 断线后按原 `requestId` 恢复原请求。
+- **正在实测**：上述链路后半段（问答／文件变更／final／once）的完整回归。
+- **未验证**：整树取消、反向派发／取消／删除的端到端。
+- **状态**：正式安装未切换，仍为 0.5.7；未宣告完整对标。
 
 ## 维护与兼容
 

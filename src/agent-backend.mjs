@@ -56,6 +56,28 @@
 //                         {url, ready}; only normal create/deliver calls may start
 //                         it, never a status probe or an adapter probe().
 //   readClaudeReportStatus() Readiness/registration only; never starts anything.
+//
+// Codex Desktop deps (a codex-desktop backend uses these instead):
+//   ensureCodexReports()  Preflight, called once before a name is created. Read-only:
+//                         it verifies this project's effective MCP registration points
+//                         at the DEV entry over this same roster and that the entry's
+//                         tools/list carries ask_parent and report_parent. It must never
+//                         start a Codex session (a zero-model create stays zero-model)
+//                         and never treats a healthy HTTP endpoint as evidence.
+//                         -> {ready, registered:true, tools:[...], evidence?, reason?}
+//   readCodexReportStatus() Same evidence, read-only, for probe()/status; it fills
+//                         reportProtocol. Never starts anything, never sends a turn.
+//                         -> {ready, registered, tools?, evidence?, reason?}
+//   readCodexReportState() The pending explicit ask/report this name received.
+//                         -> {questions:[{id,state,message}], reports:[{id,taskId,message,
+//                         final,createdAt}]}; read-only. Consumption belongs to the
+//                         shared state machine, which owns the one queue.
+//   anchorResolver()      Bridge anchor for the child: a Codex chat this roster already
+//                         verified, preferring the same workspace. The object
+//                         {threadId, ownerId, workspace} is the contract (hosts extract
+//                         threadId; toString() yields it too). A Claude session id is
+//                         never an anchor, and there is no per-create new session.
+//   hostOptions.anchorResolver  The same resolver, offered where a host expects it.
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';

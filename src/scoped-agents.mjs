@@ -372,6 +372,8 @@ export function createScopedAgents(config, {
    * Bridge anchor for a Codex Desktop child: a Codex chat this plugin already
    * verified and saved in this roster, preferring the same project. A Claude session
    * id is never an anchor, because only a verified chat can carry a Codex bridge.
+   * The object is the contract; toString() yields the thread id so a host that still
+   * expects a plain string keeps working while it moves to the object.
    */
   function anchorResolver(record) {
     const owners = store.codexOwners();
@@ -380,7 +382,8 @@ export function createScopedAgents(config, {
         { code: 'codex-anchor-unavailable' });
     }
     const anchor = owners.find(owner => owner.workspace === record?.workspace) ?? owners[0];
-    return { threadId: anchor.threadId, ownerId: anchor.ownerId, workspace: anchor.workspace };
+    return { threadId: anchor.threadId, ownerId: anchor.ownerId, workspace: anchor.workspace,
+      toString() { return anchor.threadId; } };
   }
 
   /**
@@ -422,16 +425,15 @@ export function createScopedAgents(config, {
   }
   /**
    * Read-only status for the Codex backend's own probe, which fills reportProtocol
-   * from it. `ready` means the ask/report registration is configured and startable
-   * for this project — creation needs nothing more, because its first session does not
-   * exist yet. `registered` is the stronger live-tool evidence a real session adds,
-   * and status readiness uses that. Neither is ever inferred from HTTP health.
+   * from it. `registered` means this project's effective MCP registration points at the
+   * DEV entry over this same roster and that entry's tools/list carries ask_parent and
+   * report_parent — verified by reading, never by starting a Codex session and never by
+   * an HTTP answer. The first real dispatch proves the integration in a real session.
    */
   async function readCodexReportStatus(record) {
     const value = await readCodexToolsStatus(record);
     const registered = provenRegistration(value);
-    const configured = value?.configured === true || registered;
-    return { ...value, ready: configured, configured, registered };
+    return { ...value, ready: registered, registered, evidence: value?.evidence ?? 'registration' };
   }
   /** Both tool names, proven by whichever evidence the adapter has. */
   function provenRegistration(value) {
@@ -440,42 +442,27 @@ export function createScopedAgents(config, {
   }
   function codexToolsDiagnostics(value) {
     const registered = provenRegistration(value);
-    return { ready: registered, present: true, registered,
+    return { ready: registered, present: true, registered, evidence: value?.evidence ?? 'registration',
       ...(registered ? {} : { reason: value?.reason ?? { code: 'codex-tools-not-registered',
-        message: 'No verified native Codex session reported the ask/report tools yet.' } }) };
-  }
-  /**
-   * Post-start proof. Before a create the first native session does not exist, so only
-   * the registration config and the current MCP schema can be required; once the
-   * session exists its own tool list decides, and a session that proves the tools are
-   * absent fails the name explicitly instead of running blind.
-   */
-  async function verifyCodexTools(record) {
-    if (targetOf(record) !== 'codex-desktop' || typeof codexToolsStatus !== 'function') return;
-    const value = await readCodexToolsStatus(record);
-    if (value?.registered === true || value?.evidence !== 'session') return;
-    throw Object.assign(new Error('The new Codex session did not report the ask/report tools.'),
-      { code: 'codex-tools-not-registered', detail: value?.reason });
+        message: 'The Codex-side ask/report registration was not verified for this project.' } }) };
   }
   async function beginCodexReports(record) {
-    // Two honest stages, so creation is not deadlocked by its own readiness proof.
-    // Create only needs the ask/report registration to be configured and startable in
-    // this project (the adapter proves the registration config and the current MCP
-    // schema); the first native session does not exist yet. That session then has to
-    // show both tools itself, and verifyCodexTools() fails the name if it does not.
+    // Preflight is read-only registration verification only: the project's effective MCP
+    // entry must be the DEV entry over this roster and list both tools. It must not
+    // create or reuse a Codex session — the first dispatch is the real integration test,
+    // and a zero-model create stays zero-model.
     if (typeof codexReportReady !== 'function') {
-      return { ready: false, configured: false, registered: false,
+      return { ready: false, registered: false,
         reason: { code: 'codex-tools-not-registered', message: 'This build does not register the Codex-side ask/report tools yet.' } };
     }
     const value = (await codexReportReady(record, { phase: 'preflight' })) ?? {};
     const registered = provenRegistration(value);
-    const configured = value.configured === true || registered;
-    if (value.ready !== true || !configured) {
-      return { ...value, ready: false, configured, registered,
+    if (value.ready !== true || !registered) {
+      return { ...value, ready: false, registered,
         reason: value.reason ?? { code: 'codex-tools-not-registered',
-          message: 'The Codex-side ask/report registration is not configured for this project.' } };
+          message: 'The Codex-side ask/report registration is not verified for this project.' } };
     }
-    return { ...value, ready: true, configured, registered };
+    return { ...value, ready: true, registered, evidence: value.evidence ?? 'registration' };
   }
 
   /**
@@ -791,9 +778,6 @@ export function createScopedAgents(config, {
     store.save(record);
     const created = await backend.create();
     if (created.sessionId !== record.sessionId || created.modelRequestsStarted !== 0) throw new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the requested empty subagent.`);
-    // The session exists now, so the Codex target proves its tools for real instead of
-    // trusting the preflight registration config.
-    await verifyCodexTools(record);
     // The model is resolved from the live host default when the first input is
     // sent; creation must not add a second catalog round-trip or pin a stale model.
     record.model = created.model;

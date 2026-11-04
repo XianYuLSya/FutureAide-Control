@@ -52,7 +52,7 @@ async function setup() {
   return { adapter, deps, counters, append, record, getState: () => saved,
     replace: value => { saved = structuredClone(value); },
     setStatus: async status => { native.status = status; await writeFile(recordFile, JSON.stringify(native)); },
-    sessionId: sid };
+    sessionId: sid, recordFile, native };
 }
 
 test('reservation starts no model and first deliver binds by the host marker', async () => {
@@ -161,7 +161,7 @@ const cancelTree = (nodes, extra = {}) => ({ settled: false, running: true,
 const cancelDeps = (f, overrides) => ({ ...f.deps,
   tree: { TREE_PROTOCOL: 1,
     observeClaudeTree: async () => ({ tree: overrides.current(), state: {}, histories: {} }),
-    claudeTreeStopTargets: tree => tree.nodes.filter(node => node.status !== 'ended')
+    claudeTreeStopTargets: tree => (tree?.nodes ?? []).filter(node => node.status !== 'ended')
       .map(node => ({ sessionId: node.sessionId, status: node.status,
         ...(node.parentSessionId ? { taskId: node.nativeAgentId } : { root: true }) })) },
   host: { ...f.deps.host, ...overrides.host } });
@@ -185,7 +185,7 @@ test('cancel interrupts the root first, then stops the running child tasks', asy
       stopBackgroundTasks: async input => {
         order.push(`stop-tasks:${input.nativeSessionId}`);
         tree = { settled: true, running: false, nodes: tree.nodes.map(node => ({ ...node, status: 'ended' })) };
-        return { stopped: [{ index: 0, rowText: 'leaf one' }], remaining: [] };
+        return { stopped: [{ index: 0, rowText: 'leaf one', clicked: true }], remaining: [] };
       },
     } }));
   await f.setStatus('busy');
@@ -194,7 +194,7 @@ test('cancel interrupts the root first, then stops the running child tasks', asy
   assert.equal(result.cancelRequested, true);
   assert.equal(result.treeSettled, true, 'settle comes from the same observer');
   assert.deepEqual(result.cancelRounds[1], { round: 1, action: 'stop-tasks', requested: ['a1'],
-    stopped: 1, remaining: 0 });
+    clicked: 1, rows: 1, remaining: 0 });
 });
 
 test('an idle root with a running child still stops the child tasks', async () => {
@@ -265,4 +265,33 @@ test('cancel needs no native work when the first send never happened', async () 
   await adapter.create();
   assert.equal((await adapter.cancel()).cancelRequested, true);
   assert.deepEqual(calls, []);
+});
+
+test('an unobservable session never counts as a stopped tree', async () => {
+  const f = await setup();
+  const adapter = await bound(f, cancelDeps(f, { current: () => cancelTree([runningChild('leaf one', 'a1')]),
+    host: { resolveNativeSession: async () => {
+      throw Object.assign(new Error('unknown native session'), { code: 'unknown-native-session' });
+    } } }));
+  // Break the fast path so nativeSession has to resolve through the host.
+  await writeFile(f.recordFile, JSON.stringify({ ...f.native, pid: 424242 }));
+  const result = await adapter.cancel();
+  assert.equal(result.cancelRequested, false, 'a child can outlive the handle that named it');
+  assert.equal(result.reason, 'session-unavailable');
+  assert.equal(result.cancelPending, true);
+});
+
+test('a stop that clicked nothing is not an accepted cancel', async () => {
+  const f = await setup();
+  const tree = cancelTree([runningChild('leaf one', 'a1')]);
+  const adapter = await bound(f, cancelDeps(f, { current: () => tree,
+    host: { interrupt: async () => ({ interrupted: false, status: 'not-running' }),
+      stopBackgroundTasks: async () => ({ stopped: [], remaining: [{ index: 0, rowText: 'leaf one' }],
+        archiveOnly: true }) } }));
+  await f.setStatus('idle');
+  const result = await adapter.cancel();
+  assert.equal(result.cancelRequested, false, 'no click and no interrupt is not an accepted cancel');
+  assert.equal(result.reason, 'no-native-stop-accepted');
+  assert.equal(result.cancelPending, true);
+  assert.deepEqual(result.remainingTasks, ['a1']);
 });

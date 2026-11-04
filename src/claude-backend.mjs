@@ -336,7 +336,7 @@ export async function createClaudeBackend(record, deps = {}) {
       }
       const canStopTasks = typeof host.stopBackgroundTasks === 'function';
       const rounds = [];
-      let observed, gone = false;
+      let observed, unavailable = false;
       for (let round = 1; round <= CANCEL_ROUNDS; round += 1) {
         try {
           const native = await nativeSession(state);
@@ -356,27 +356,39 @@ export async function createClaudeBackend(record, deps = {}) {
             // task-name matching is used to choose the rows.
             const stop = await lockedHost(() => host.stopBackgroundTasks({
               nativeSessionId: state.binding.sessionId }, hostOptions()));
+            const rows = stop?.stopped ?? [];
             rounds.push({ round, action: 'stop-tasks', requested: targets,
               ...(stop?.status ? { status: stop.status } : {}),
-              stopped: (stop?.stopped ?? []).length, remaining: (stop?.remaining ?? []).length });
+              clicked: rows.filter(row => row?.clicked === true).length,
+              rows: rows.length, remaining: (stop?.remaining ?? []).length });
           }
           observed = await refresh();
         } catch (error) {
           if (error.code !== 'claude-session-unavailable') throw error;
-          gone = true; // no native process means no running child is left
+          // An unobservable session is not an empty tree: a child can outlive the
+          // handle that named it, so this stays unconfirmed and retryable.
+          unavailable = true;
           break;
         }
         if (observed?.tree?.settled === true) break;
         const after = await nativeSession(state).catch(() => ({ status: 'idle' }));
         if (after.status === 'idle' && observed?.tree?.running !== true) break; // converged
       }
-      const requested = gone || observed?.tree?.settled === true
-        || rounds.some(entry => entry.interrupted === true || entry.action === 'stop-tasks');
-      return { cancelRequested: requested, cancelRounds: rounds,
-        ...(observed?.tree ? { treeSettled: observed.tree.settled === true,
-          treeRunning: observed.tree.running === true } : {}),
-        ...(canStopTasks ? {} : { stopTasksUnsupported: true }),
-        ...(gone ? { reason: 'session-process-gone' } : {}) };
+      const settled = observed?.tree?.settled === true;
+      const interrupted = rounds.some(entry => entry.interrupted === true);
+      const clicked = rounds.some(entry => (entry.clicked ?? 0) > 0);
+      const remainingTasks = (treeModule?.claudeTreeStopTargets?.(observed?.tree) ?? [])
+        .filter(target => typeof target.taskId === 'string' && target.status !== 'ended')
+        .map(target => target.taskId);
+      const requested = settled || interrupted || clicked;
+      const cancelPending = !settled
+        && (observed?.tree?.running === true || remainingTasks.length > 0 || unavailable);
+      return { cancelRequested: requested, cancelPending,
+        ...(remainingTasks.length ? { remainingTasks } : {}),
+        ...(requested ? {} : { reason: unavailable ? 'session-unavailable' : 'no-native-stop-accepted' }),
+        cancelRounds: rounds,
+        ...(observed?.tree ? { treeSettled: settled, treeRunning: observed.tree.running === true } : {}),
+        ...(canStopTasks ? {} : { stopTasksUnsupported: true }) };
     },
     async destroy() {
       const state = await recoverFirstBinding(stateForTask());

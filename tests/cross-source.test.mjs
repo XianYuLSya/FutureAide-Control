@@ -612,3 +612,45 @@ test('queued Desktop cancel exposes a host failure, backs off and resumes the sa
     assert.equal(f.store.get('stop').state, 'cancelled');
   } finally { f.service.close(); }
 });
+
+test('a returned stop refusal remains visible through observation until native cancellation settles', async () => {
+  let cancels = 0, settled = false;
+  const base = fakeBackend();
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+    observe: async () => { const view = await base(record).observe(); return { ...view, running: !settled,
+      tree: { ...view.tree, running: !settled, settled } }; },
+    cancel: async () => {
+      cancels++;
+      if (cancels < 3) return { cancelRequested: cancels === 2, cancelPending: true, treeSettled: false,
+        reason: 'no-native-stop-accepted', cancelRounds: [{ round: 1, action: 'stop-tasks', clicked: 0, remaining: 1,
+          detail: [{ rowText: 'working child', clicked: false, state: 'refused',
+            error: { code: 'task-stop-click-unavailable', message: 'No clickable point', detail: { nativeSessionId: 'private-id' } } }] }] };
+      settled = true;
+      return { cancelRequested: true, cancelPending: false, treeSettled: true };
+    },
+  }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'refusal', ownerId: ownerIdFor(THREAD), sessionId: 'session-refusal', name: 'refusal', task: completedInput('refusal') }));
+    await f.service.cancel({ name: 'refusal' }, extra(THREAD));
+    await f.service.poll('refusal');
+    assert.equal(f.store.get('refusal').error, undefined, 'observe completed normally');
+    const listed = (await f.service.list(extra(THREAD))).items[0];
+    assert.equal(listed.error.code, 'native-cancel-unconfirmed');
+    assert.equal(listed.error.detail.rounds[0].rows[0].error.code, 'task-stop-click-unavailable');
+    assert.equal(JSON.stringify(listed).includes('private-id'), false);
+    const waited = await f.service.wait({ names: ['refusal'], timeoutSeconds: 1 }, extra(THREAD));
+    assert.equal(waited.timedOut, false);
+    assert.equal(waited.items[0].error.code, 'native-cancel-unconfirmed');
+    await f.service.poll('refusal');
+    assert.equal(cancels, 1, 'normal-return refusals also back off');
+    let r = f.store.get('refusal'); r.nextAttemptAt = 0; f.store.save(r);
+    await f.service.poll('refusal');
+    assert.equal((await f.service.list(extra(THREAD))).items[0].error.code, 'native-cancel-partial');
+    assert.equal(f.store.get('refusal').task.cancelPending, true);
+    r = f.store.get('refusal'); r.nextAttemptAt = 0; f.store.save(r);
+    await f.service.poll('refusal');
+    assert.equal(f.store.get('refusal').state, 'cancelled');
+    assert.equal((await f.service.list(extra(THREAD))).items[0].error, undefined);
+  } finally { f.service.close(); }
+});

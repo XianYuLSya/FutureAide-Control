@@ -120,7 +120,7 @@ function treeCoverage(record, view) {
 function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
   const lastDispatch = task?.dispatches?.at(-1);
-  const error = record.error ?? lastDispatch?.failure ?? lastDispatch?.error;
+  const error = record.error ?? task?.cancelError ?? lastDispatch?.failure ?? lastDispatch?.error;
   const view = record.observation ?? {};
   const changes = attributedChanges(record, view);
   return {
@@ -806,6 +806,7 @@ export function createScopedAgents(config, {
       record.task.cancelVerified = false;
       store.save(record);
       const result = await (await checkHost(record)).cancel();
+      retainCancelError(record, result);
       if (result.cancelRequested === true) {
         store.confirmCancel(record, result);
         record.task.cancelVerified = true;
@@ -818,6 +819,36 @@ export function createScopedAgents(config, {
   function deferRetry(value) {
     value.retryAttempts = (value.retryAttempts ?? 0) + 1;
     value.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(value.retryAttempts, 5));
+  }
+
+  // A native refusal is often a normal return value, not an exception. Keep its
+  // bounded explanation with the cancellation intent so observe() cannot erase it.
+  function retainCancelError(record, result) {
+    const task = record.task;
+    if (result.treeSettled === true) { task.cancelError = undefined; return; }
+    const rounds = (result.cancelRounds ?? []).slice(-3);
+    const refused = rounds.some(round => round.action === 'stop-tasks-unsupported'
+      || (round.action === 'interrupt-root' && round.interrupted === false)
+      || (round.detail ?? []).some(row => row.clicked === false));
+    if (result.cancelRequested !== false && !refused) return;
+    const details = rounds.map(round => ({ action: round.action,
+      ...(round.reason ? { reason: compactText(String(round.reason), 200) } : {}),
+      ...(round.status ? { status: round.status } : {}),
+      ...(typeof round.clicked === 'number' ? { clicked: round.clicked } : {}),
+      ...(typeof round.remaining === 'number' ? { remaining: round.remaining } : {}),
+      ...(round.detail?.length ? { rows: round.detail.slice(0, 4).map(row => ({
+        row: compactText(String(row.rowText ?? ''), 200), clicked: row.clicked === true, state: row.state,
+        ...(row.error ? { error: { code: row.error.code ?? 'native-stop-refused',
+          message: compactText(String(row.error.message ?? ''), 240) } } : {}),
+      })) } : {}),
+    }));
+    task.cancelError = { code: result.cancelRequested === false ? 'native-cancel-unconfirmed' : 'native-cancel-partial',
+      message: result.cancelRequested === false
+        ? 'The native host has not accepted a stop. Cancellation remains pending and will retry.'
+        : 'The native host refused part of the stop. Cancellation remains pending and will retry.',
+      detail: { ...(result.reason ? { reason: compactText(String(result.reason), 200) } : {}), rounds: details } };
+    if (targetOf(record) !== 'dsh') deferRetry(record);
+    store.save(record);
   }
 
   async function verifyOwner(owner) {
@@ -1237,6 +1268,7 @@ export function createScopedAgents(config, {
       if (task) absorbSubmissions(record);
       if (task?.cancelRequested && (!task.cancelVerified || task.cancelPending)) {
         const result = await (await checkHost(record)).cancel();
+        retainCancelError(record, result);
         if (result.cancelRequested === true) {
           store.confirmCancel(record, result);
           task.cancelAccepted = true; task.cancelVerified = true;
@@ -1275,6 +1307,7 @@ export function createScopedAgents(config, {
       const view = await observe(record);
       if (task.cancelRequested && task.cancelVerified && !view.running && treeSettled(record, view)) {
         task.cancelTreeSettled = true;
+        task.cancelError = undefined;
         store.save(record);
       }
       // Persist and deliver explicit reports before inspecting older dispatches:

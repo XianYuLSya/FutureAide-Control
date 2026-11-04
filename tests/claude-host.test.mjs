@@ -1340,9 +1340,11 @@ test('the current model comes from the session record without touching the windo
     model: 'claude-opus-5-5', effort: 'max', title: 'Fixture session', lastTurnEdgeAt: 1793769913649 });
   const driver = uiDriver({});
   try {
-    const read = await readCurrentModel({ nativeSessionId: SESSION }, { env: { ...host1.env, CLAUDE_DESKTOP_USER_DATA: userData },
+    const read = await readCurrentModel({ nativeSessionId: SESSION, source: 'store' }, { env: { ...host1.env, CLAUDE_DESKTOP_USER_DATA: userData },
       driver, isAlive: host1.isAlive, catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
     assert.equal(read.source, 'session-store');
+    assert.equal(read.authoritative, false, 'a record read is history, not the current control');
+    assert.equal(read.selectionObserved, false);
     assert.equal(read.windowTouched, false);
     assert.equal(read.model, 'claude-opus-5-5');
     assert.equal(read.reasoningEffort, 'max');
@@ -1368,6 +1370,22 @@ test('a record about another session is not used and the window is read instead'
     assert.equal(read.model, 'claude-opus-5-5');
     assert.equal(read.reasoningEffort, 'max');
     assert.ok(driver.calls.length > 0, 'the window was consulted because the record did not match');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('the default read is the window even when a record exists', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const userData = await sessionStore(host1.dir, record().hostSessionId, { sessionId: SESSION,
+    model: 'claude-sonnet-5-5', effort: 'low' });
+  const driver = uiDriver({ modelSnapshot: () => ({ documentName: `${record().name} - Claude Code`,
+    current: { raw: '模型：Opus 5.5 最高' }, default: null, notes: [] }) });
+  try {
+    const read = await readCurrentModel({ nativeSessionId: SESSION }, { env: { ...host1.env, CLAUDE_DESKTOP_USER_DATA: userData },
+      driver, isAlive: host1.isAlive, catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(read.source, 'composer-control', 'the window is asked first by default');
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.notEqual(read.model, 'claude-sonnet-5-5', 'the stored record is not treated as the current selection');
+    assert.ok(driver.calls.some(call => Array.isArray(call) && call[0] === 'modelSnapshot'));
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 

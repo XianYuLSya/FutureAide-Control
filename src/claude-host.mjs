@@ -1864,14 +1864,18 @@ export async function readStoredSession({ env = process.env, hostSessionId, nati
   return { found: false, reason: "session-record-missing", root };
 }
 
-export async function readCurrentModel({ nativeSessionId, workspace = undefined, folderLabel = undefined, source = "auto" }, {
+export async function readCurrentModel({ nativeSessionId, workspace = undefined, folderLabel = undefined, source = "ui" }, {
   driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive, catalog = undefined, asar = undefined,
   batch = true, allowDeepLink = true,
 } = {}) {
   const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
-  // The app own per-session record answers this without touching the window.
-  if (source !== "ui") {
+  // The window is the authority for a current selection. The app's own per-session
+  // record is readable without touching the window, but it is only a record of what
+  // was last written: whether a selection made without a turn is written straight
+  // away is unverified, so it is offered as history (source "store") and never as
+  // the current control unless the caller asks for it explicitly.
+  if (source === "store" || source === "auto") {
     const stored = await readStoredSession({ env, hostSessionId: record.hostSessionId, nativeSessionId: record.nativeSessionId });
     if (stored.found && stored.identity !== "mismatch" && typeof stored.record.model === "string") {
       const known = modelCatalog.models.find(model => model.id === stored.record.model);
@@ -1899,6 +1903,9 @@ export async function readCurrentModel({ nativeSessionId, workspace = undefined,
         effortLabel: effort ? (EFFORT_LABEL_FOR[effort] ?? null) : null,
         source: "session-store",
         windowTouched: false,
+        authoritative: false,
+        selectionObserved: false,
+        historical: true,
         targetConfirmedBy: stored.identity === "native-session-id" ? "session-record-native-id" : "session-record",
         verifiedBy: ["session-store", ...(stored.identity === "native-session-id" ? ["native-session-id"] : [])],
         persistedAt: stored.persistedAt,
@@ -1910,7 +1917,7 @@ export async function readCurrentModel({ nativeSessionId, workspace = undefined,
         historyDiffers,
         ...(known ? {} : { reason: "model-id-not-in-catalog", unresolvedModel: stored.record.model }),
         ...(historyDiffers ? { note: "The stored record differs from what this session last ran; the record is the current setting, the transcript is history." } : {}),
-        detail: "Read from the app own per-session record, so the window was not touched. Pass source ui to confirm against the composer control.",
+        detail: "Read from the app per-session record, so the window was not touched. It is the last written value, and whether a selection without a turn is written immediately is unverified; read the composer control (source ui) when the current selection must be authoritative.",
       };
     }
   }
@@ -2251,7 +2258,7 @@ export async function selectModel({ nativeSessionId, provider = 'anthropic', mod
   const record = await resolveNativeSession(nativeSessionId, { env, isAlive });
   const ui = requireDriver(driver, 'selecting a model');
   await ensureSessionVisible(record, { driver: ui, allowDeepLink: true, env });
-  const before = await readCurrentModel({ nativeSessionId }, { driver: ui, env, isAlive, catalog: modelCatalog });
+  const before = await readCurrentModel({ nativeSessionId, source: 'ui' }, { driver: ui, env, isAlive, catalog: modelCatalog });
   const attempt = await ui.selectModel({ label: mapped.label, effortLabel });
   let shown = modelInfo(attempt?.observed ?? await ui.readModel().catch(() => undefined));
   const deadline = Date.now() + timeoutMs;
@@ -2270,7 +2277,7 @@ export async function selectModel({ nativeSessionId, provider = 'anthropic', mod
       detail: 'The Claude Desktop model control did not show the requested model/effort, so no selection is claimed.',
     };
   }
-  const after = await readCurrentModel({ nativeSessionId }, { driver: ui, env, isAlive, catalog: modelCatalog });
+  const after = await readCurrentModel({ nativeSessionId, source: 'ui' }, { driver: ui, env, isAlive, catalog: modelCatalog });
   return {
     accepted: true, requested: { provider, model, reasoningEffort },
     before: { label: before.label, model: before.model, reasoningEffort: before.reasoningEffort },

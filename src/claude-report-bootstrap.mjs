@@ -33,17 +33,16 @@ const failure = (code, message, extra = {}) => ({ isError: true,
   content: [{ type: 'text', text: JSON.stringify({ error: { code, message, ...extra } }) }] });
 
 /**
- * Tools whose failure cannot have changed anything. Everything else is a write
- * (or a submission) and must never be replayed blindly — the service may already
- * have applied it before the answer was lost. A caller-supplied idempotency key is
- * the only other reason to retry.
+ * Tools whose failure cannot have changed anything, so a retry is safe. Nothing
+ * else is retried: no current tool has a durable server-side idempotency contract,
+ * and a field that merely looks like one would be neither guaranteed to reach the
+ * service nor honoured by it.
  */
 export const READ_ONLY_TOOLS = Object.freeze(['futureaide_status', 'futureaide_list_agents',
   'futureaide_wait_agents', 'futureaide_agent_changes', 'futureaide_inspect_agent']);
 
-export function mayRetry(name, args) {
-  if (READ_ONLY_TOOLS.includes(name)) return true;
-  return typeof args?.request_id === 'string' || typeof args?.requestId === 'string';
+export function mayRetry(name) {
+  return READ_ONLY_TOOLS.includes(name);
 }
 
 /**
@@ -143,7 +142,7 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     } catch (error) {
       // A write may already have been applied before the answer was lost. Never
       // replay it: say so plainly and let the caller inspect the operation.
-      if (!mayRetry(name, args)) {
+      if (!mayRetry(name)) {
         return failure('write-outcome-unknown',
           'This call may already have been applied and its answer was lost. Do not resend it; '
           + 'check the operation with status, list or inspect first.', { operation: name });

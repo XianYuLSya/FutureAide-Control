@@ -135,13 +135,14 @@ test('a read-only call that loses the connection is retried once', async () => {
   } finally { await close(); await bridge.close(); }
 });
 
-test('only reads and keyed calls may be retried', () => {
+test('only reads may be retried', () => {
   for (const name of READ_ONLY_TOOLS) assert.equal(mayRetry(name, {}), true, name);
   for (const name of ['futureaide_send_agent', 'futureaide_answer_agent', 'futureaide_create_agent',
     'futureaide_cancel_agent', 'futureaide_delete_agent', 'ask_parent', 'report_parent']) {
     assert.equal(mayRetry(name, {}), false, name);
   }
-  assert.equal(mayRetry('futureaide_send_agent', { request_id: 'r-1' }), true);
+  assert.equal(mayRetry('futureaide_send_agent', { request_id: 'r-1' }), false);
+  assert.equal(mayRetry('ask_parent', { requestId: 'r-1' }), false);
 });
 
 test('closing the bridge closes both the client and the roster handle', async () => {

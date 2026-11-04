@@ -38,6 +38,10 @@ export const SERVER_NAME = 'futureaide-report';
 export const SERVER_VERSION = '0.1.0';
 export const HTTP_PATH = '/mcp';
 export const DEFAULT_PORT = 17654;
+// How long an idle caller connection stays pooled: one identity lookup per session
+// instead of one per call. Never below Node's 5 second default, or the socket would
+// die between two ordinary tool calls.
+export const DEFAULT_KEEP_ALIVE_MS = 600000;
 export const REPORT_TOOL_NAMES = Object.freeze(['ask_parent', 'report_parent']);
 
 export const INSTRUCTIONS = `FutureAide managed session bridge.
@@ -275,7 +279,8 @@ async function readBody(req, limitBytes = 1024 * 1024) {
  * request, so one shared process cannot leak another session's identity.
  */
 export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1', resolveOwned,
-  resolveCaller, instructions, identity = {}, adopt, management, rosterId = undefined, log = () => {} } = {}) {
+  resolveCaller, instructions, identity = {}, adopt, management, rosterId = undefined,
+  keepAliveTimeoutMs = DEFAULT_KEEP_ALIVE_MS, log = () => {} } = {}) {
   const startedAt = new Date().toISOString();
   const stats = { requests: 0, owned: 0, unowned: 0, served: 0 };
   // One identity per TCP connection, dropped when that socket closes.
@@ -375,11 +380,22 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     server.once('error', onError);
     server.listen(port, host, () => { server.off('error', onError); resolve(); });
   });
+  // A tool call costs two process lookups when it has to re-establish identity, and
+  // the caller's own HTTP client keeps its pooled socket only as long as this
+  // timeout allows. Ten minutes keeps a working session on one connection instead of
+  // paying that cost every few calls. Node requires headersTimeout to exceed it.
+  server.keepAliveTimeout = keepAliveTimeoutMs;
+  server.headersTimeout = Math.max(server.headersTimeout ?? 0, keepAliveTimeoutMs + 1000);
   boundPort = server.address()?.port ?? port;
   const url = `http://${host}:${boundPort}${HTTP_PATH}`;
   return {
     server, stats, url, port: boundPort, host,
-    close: () => new Promise(resolve => server.close(() => resolve())),
+    // Idle keep-alive sockets would otherwise hold the listener open for the whole
+    // timeout; an in-flight request still finishes.
+    close: () => new Promise(resolve => {
+      server.close(() => resolve());
+      server.closeIdleConnections?.();
+    }),
   };
 }
 

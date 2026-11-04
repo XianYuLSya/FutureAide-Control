@@ -1529,3 +1529,20 @@ test('a failed final report delivery retry never automatically cleans a one-shot
     assert.ok(f.sessions.has(r.sessionId));
   } finally { f.service.close(); }
 });
+
+test('status names the DSH internals a changed host no longer provides', async () => {
+  const f = await fixture();
+  try {
+    const healthy = await f.service.status(extra(A));
+    assert.equal(healthy.backends.dsh.ready, true, 'a complete host stays ready');
+    assert.equal('missingInternals' in healthy.backends.dsh, false);
+
+    const hostStatus = f.api.hostStatus;
+    f.api.hostStatus = async () => ({ ...(await hostStatus()), compatibility: { missing: ['sessionController.inspect or sessionQuery.readSession'] } });
+    const changed = await f.service.status(extra(A));
+    assert.equal(changed.backends.dsh.ready, false, 'a host that renamed an internal cannot run a task');
+    assert.deepEqual(changed.backends.dsh.missingInternals, ['sessionController.inspect or sessionQuery.readSession']);
+    assert.equal(changed.backends.dsh.reason.code, 'dsh-internals-changed');
+    assert.match(changed.backends.dsh.reason.message, /sessionQuery\.readSession/);
+  } finally { f.service.close(); }
+});

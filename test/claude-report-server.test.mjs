@@ -381,3 +381,57 @@ test('the shared loopback HTTP service answers an owned session and lists nothin
     await unowned.close();
   }
 });
+
+// A tool call that has to re-identify its caller pays two process lookups first, so
+// the connection has to survive the idle gap between two ordinary calls.
+const keepAlivePost = (url, agent, body) => new Promise((resolve, reject) => {
+  const request = http.request(url, { method: 'POST', agent,
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' } }, response => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { text += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, text }));
+    });
+  request.on('error', reject);
+  request.end(JSON.stringify(body));
+});
+
+const mcpInitialize = { jsonrpc: '2.0', id: 1, method: 'initialize',
+  params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'keep-alive-test', version: '1' } } };
+const mcpListTools = { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} };
+
+test('a warm connection keeps its identity across an idle gap and close does not wait for it', async () => {
+  let resolved = 0;
+  const service = await startHttpService({ port: 0, resolveOwned: async () => null,
+    resolveCaller: async () => { resolved += 1; return { sessionId: 'keep-alive', workspace: process.cwd(), pid: process.pid }; } });
+  const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+  try {
+    assert.equal(service.server.keepAliveTimeout, 600000, 'the pooled socket outlives the old 5 second default');
+    const first = await keepAlivePost(service.url, agent, mcpInitialize);
+    assert.equal(first.status, 200);
+    assert.match(first.headers['keep-alive'] ?? '', /timeout=600/, 'the caller is told the connection stays open');
+    assert.equal(resolved, 1);
+
+    await new Promise(resolve => setTimeout(resolve, 5500));
+    const second = await keepAlivePost(service.url, agent, mcpListTools);
+    assert.equal(second.status, 200);
+    assert.equal(resolved, 1, 'one idle gap must not cost a second identity lookup');
+
+    // A new socket is a new caller: the cached identity belongs to the old peer.
+    const stranger = new http.Agent({ keepAlive: false });
+    await keepAlivePost(service.url, stranger, mcpListTools);
+    assert.equal(resolved, 2);
+    stranger.destroy();
+
+    // Closing must not wait for the idle keep-alive socket we are still holding.
+    let closed = false;
+    const closing = service.close().then(() => { closed = true; });
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    assert.equal(closed, true, 'an idle pooled connection must not hold close open');
+    await closing;
+  } finally {
+    agent.destroy();
+    // A failed assertion must still release the listener, or the run would never end.
+    await service.close().catch(() => {});
+  }
+});

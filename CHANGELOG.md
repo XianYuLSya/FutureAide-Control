@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.5.10 — 2026-11-04 · 适配 DSH 0.2.2 与工具调用提速
+
+升级到 DSH 0.2.2 时请同时升级本插件：旧版插件在 0.2.2 上恢复不了旧会话，也投递不了最终报告。实测读类工具单次调用从约 3.5 秒降到约 0.5 秒。
+
+- 适配 DSH 0.2.2-rc.1（nightly）：新版删掉了内部接口 `sessionController.inspect`，插件改由模块级 `readStoredSession` 读取存储会话，优先 `controller.inspect`，没有时用 `sessionQuery.readSession`（返回 `{session, events}`）；恢复旧会话、任务树检查、`managedHistory`、带后级的 `managedDestroy`、`resolveAgent`、`historyCursor` 六个调用点都走同一条路径，两种接口都缺时明确报 `managed-session-inspection-unavailable`。未知宿主异常另外写入 `managedStateDirectory` 上一级的 `host-last-error.json`（不含 bridge token，写入失败也不改变返回结果）。
+- 新增兼容探针：`host-plugin.mjs` 导出 `DSH_INTERNALS`（凭代码梳理的全部 DSH 内部接口，二选一的按“都缺才算缺”）与 `checkHostCompatibility`，`ping` 返回 `compatibility`；`status` 的 `backends.dsh` 在缺失时给出 `ready:false`、`missingInternals` 与 `dsh-internals-changed`，DSH 升级后会直接显示缺什么，而不是等任务卡住。
+- 工具调用提速：Claude 侧 HTTP 服务把 `keepAliveTimeout` 提到 10 分钟，空闲连接仍保留调用方身份，一次工具调用不再每次多花约 3 秒做父进程与启动时间查询；socket 关闭后身份照旧失效，`close()` 会主动断开空闲连接，不被长连接卡住。
+
 ## 0.5.9 — 2026-11-04 · 精简输出、团队视图与事件驱动监工
 
 本版让主控用起来更省：一次调用开工，工具默认只回决策需要的信息，一次 `list` 看全整棵树，回报格式统一。名单存储有一次自动迁移，升级后首次打开时在事务内完成，不需要手工操作；要退回旧版本，先把 `agent_history` 回填进记录，否则旧版看不到历史任务。
@@ -18,7 +26,6 @@
 - `inspect` 的 `detail` 与 `node` 组合时，`hasMore` 与 `note` 改用选中节点自己的（此前会串用根页字段）；`inspect` 的覆盖率提示改为“Showing n of m paths; changes lists them.”，“只列前 200 条”只留在 `changes` 工具里。
 - `futureaide_run_agent` 遇到正在清理或已关闭的名字时返回 `name-closing` 并说明该等它离开列表还是换名字，不再转述 send 的含糊报错。
 - `list` / `wait` 整体超过 40000 字符时，先把每个 `team` 换成 `teamSize` 计数并加提示，仍超才退化成 preview，避免满员团队时读不到任何条目。
-
 ## 0.5.8 — 2026-11-04 · Claude 调用 DSH 与用户级插件
 
 本版主要能力是 Claude 调用 DSH，已完成实机验证。Codex Desktop 与 Claude Desktop 作为被调用目标（`target: 'codex-desktop'`、`'claude-desktop'`）仍是实验性的：功能已经具备，后续继续完善，本版不按完成计。
@@ -91,7 +98,6 @@
 - 普通回复、轮次结束及树空闲不再唤醒 Codex；未提交 final 时显示 `awaiting_report`，同名发送继续原任务。
 - 报告先持久保存、按稳定身份去重恢复；final 等整树收尾后交付，成功的一次性任务随后清理整树。取消和失败只更新可见状态，不自动通知或清理，已提交报告仍可靠交付。
 - 新报告协议阻止旧 caller 按旧空闲语义收尾；升级需要重载插件/MCP 并更新后台 worker。接管原任务不重新派发，旧自动结果缓存不转换为显式报告。
-
 
 ## 0.4.0 — 2026-10-30 · 多层级 DSH 子代理与桥接修复
 

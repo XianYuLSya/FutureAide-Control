@@ -315,13 +315,24 @@ function Get-TasksPanelPattern {
 # Every background task row carries one stop button whose accessible name is the
 # same for all rows, so a row is identified by its own text, never by position.
 function Get-TaskRows {
+  # Rows live inside the background tasks region; anything outside it is not one.
   $stopPattern = Get-StopButtonPattern
+  $regionPattern = Get-TasksRegionPattern
   $busyPattern = Get-StopBusyPattern
   $donePattern = Get-StopDonePattern
   $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
   $rows = @()
   $index = 0
-  foreach ($button in @(Find-Elements $web.Element $stopPattern 'Button')) {
+  $rowButtons = @(Find-Elements $web.Element $stopPattern 'Button')
+  $regions = @(Find-Elements $web.Element $regionPattern '')
+  if ($regions.Count -ge 1) {
+    $inside = @()
+    foreach ($region in $regions) {
+      $inside += @(Find-Elements $region $stopPattern 'Button')
+    }
+    if ($inside.Count -gt 0) { $rowButtons = $inside }
+  }
+  foreach ($button in $rowButtons) {
     $rowElement = $null
     try { $rowElement = $walker.GetParent($button) } catch { }
     $depth = 0
@@ -340,7 +351,31 @@ function Get-TaskRows {
         if ($name -and $name -notmatch $stopPattern) { $texts += $name }
       }
     }
+    $listItemName = $null
+    $listItem = $null
+    $cursor = $button
+    for ($up = 0; $up -lt 6; $up++) {
+      try { $cursor = $walker.GetParent($cursor) } catch { break }
+      if ($null -eq $cursor) { break }
+      if ($cursor.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem) {
+        $listItem = $cursor
+        $listItemName = [string]$cursor.Current.Name
+        break
+      }
+    }
+    if ($null -ne $listItem) {
+      # The row is the list item; its own text is what names it.
+      $rowElement = $listItem
+      $texts = @()
+      if ($listItem.Current.Name) { $texts += [string]$listItem.Current.Name }
+      foreach ($node in $listItem.FindAll([System.Windows.Automation.TreeScope]::Descendants, (Get-Condition))) {
+        $nodeName = $node.Current.Name
+        if ($nodeName -and $nodeName -notmatch $stopPattern) { $texts += $nodeName }
+      }
+    }
+    if ($listItemName -and ($texts -notcontains $listItemName)) { $texts = @($listItemName) + $texts }
     $rowText = ((@($texts | Select-Object -Unique)) -join ' | ')
+    if (-not $rowText) { $rowText = [string]$listItemName }
     $rows += [pscustomobject]@{
       index = $index
       buttonName = $button.Current.Name
@@ -400,6 +435,49 @@ function Get-SessionListMenuPattern {
   $archive = ZH @(0x5F52, 0x6863)
   return ("^(" + $open + "|" + $pin + "|" + $unread + "|" + $rename + "|" + $fork + "|" + $move + "|" + $archive +
     "|Open in|Pin|Mark as unread|Rename|Fork|Move to|Archive)")
+}
+function Get-ViewOptionsPattern {
+  return ("^(" + (ZH @(0x67E5, 0x770B, 0x9009, 0x9879)) + "|View options)$")
+}
+
+function Get-SessionToolsPattern {
+  return ("(" + (ZH @(0x4F1A, 0x8BDD, 0x5DE5, 0x5177)) + "|Session tools)")
+}
+
+function Get-PromptEditPattern {
+  return ("^(" + (ZH @(0x63D0, 0x793A, 0x8BCD)) + "|Prompt)$")
+}
+
+function Get-TasksRegionPattern {
+  return ("^(" + (ZH @(0x540E, 0x53F0, 0x4EFB, 0x52A1)) + "|Background tasks)")
+}
+
+# The session header control is the one in the session tools toolbar. The two
+# controls named like the session title are different controls (title bar and
+# sidebar row) and open the row menu, so they are never used for this menu.
+function Get-HeaderOptionsButton {
+  $pattern = Get-ViewOptionsPattern
+  $tools = Get-SessionToolsPattern
+  $buttons = @(Find-Elements $web.Element $pattern "Button")
+  if ($buttons.Count -eq 0) { return $null }
+  $inToolbar = @($buttons | Where-Object {
+    (Get-AncestryTypes $_) | Where-Object { $_ -match "ToolBar" } | Select-Object -First 1
+  })
+  $chosen = $(if ($inToolbar.Count -ge 1) { $inToolbar[0] } else { $buttons[0] })
+  $toolbarName = $null
+  $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+  $node = $chosen
+  for ($step = 0; $step -lt 6; $step++) {
+    try { $node = $walker.GetParent($node) } catch { break }
+    if ($null -eq $node) { break }
+    if ($node.Current.ControlType -eq [System.Windows.Automation.ControlType]::ToolBar) {
+      $toolbarName = [string]$node.Current.Name
+      break
+    }
+  }
+  $toolbarMatches = (-not $toolbarName) -or ($toolbarName -match $tools)
+  return [pscustomobject]@{ Element = $chosen; Count = $buttons.Count; Toolbar = $toolbarName
+    ToolbarMatches = $toolbarMatches; Ancestry = (Get-AncestryTypes $chosen) }
 }
 function Get-SessionMenuButton([string]$title, [string]$scope = 'header') {
   if (-not $title) { throw 'session-title-required' }
@@ -464,8 +542,21 @@ function Get-PageSignature($windowArg) {
   }
 }
 function Get-MenuItems($windowElement) {
+  # Chromium renders a menuitemcheckbox as CheckBox, so a popup menu is read from
+  # the items of the Menu element when one is open, and only then from the flat
+  # MenuItem/CheckBox lists. Reading MenuItem alone lost every checkbox entry,
+  # including the background tasks one.
   $items = @()
-  foreach ($element in (Find-Elements $windowElement '' 'MenuItem')) {
+  foreach ($menu in @(Find-Elements $windowElement '' 'Menu')) {
+    foreach ($element in @(Find-Elements $menu '' '')) {
+      if ($element.Current.Name) { $items += $element }
+    }
+  }
+  if ($items.Count -gt 0) { return $items }
+  foreach ($element in @(Find-Elements $windowElement '' 'MenuItem')) {
+    if ($element.Current.Name) { $items += $element }
+  }
+  foreach ($element in @(Find-Elements $windowElement '' 'CheckBox')) {
     if ($element.Current.Name) { $items += $element }
   }
   return $items
@@ -599,9 +690,22 @@ try {
     }
     'interrupt' {
       Focus-Window $window.Element
-      # Only the page stop control counts; a sidebar entry is not it, and two of
-      # them in page scope is a state this driver refuses to guess about.
-      $stops = @(Find-Elements $web.Element $stopPattern 'Button' | Where-Object { -not (Test-InSidebarNav $_) })
+      # The generating stop control is the sibling of the prompt box, in the
+      # composer group. A control with the same name anywhere else is not it, and a
+      # session whose composer has no stop control is simply not generating.
+      $composerGroup = $null
+      $promptPattern = Get-PromptEditPattern
+      foreach ($edit in @(Find-Elements $web.Element $promptPattern 'Edit')) {
+        try { $composerGroup = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($edit) } catch { $composerGroup = $null }
+        if ($null -ne $composerGroup) { break }
+      }
+      $stops = @()
+      if ($null -ne $composerGroup) {
+        $stops = @(Find-Elements $composerGroup $stopPattern 'Button')
+      }
+      if ($stops.Count -eq 0) {
+        $stops = @(Find-Elements $web.Element $stopPattern 'Button' | Where-Object { -not (Test-InSidebarNav $_) })
+      }
       $method = $null
       $clickedName = $null
       $ancestry = @()
@@ -834,10 +938,36 @@ try {
         Send-Keys '{ESC}'
         Start-Sleep -Milliseconds 400
       }
-      $menu = Get-SessionMenuButton $title 'header'
-      Focus-Window $window.Element
-      $menuClick = Invoke-ElementByMouse $menu.Element
-      $attempts += ('menu:' + $(if ($menuClick.clicked) { $menuClick.method } else { $menuClick.reason }))
+      $header = Get-HeaderOptionsButton
+      if ($null -ne $header) {
+        $menu = $header
+      } else {
+        # fall back to the title-named control, but only outside the sidebar, and
+        # say so, because that locator was wrong once already.
+        $menu = Get-SessionMenuButton $title 'header'
+        $menu | Add-Member -NotePropertyName Fallback -NotePropertyValue $true -Force
+      }
+      # A click on this control toggles it, so an already open menu is used as it
+      # is. The automation Invoke is what the application reacts to here (proven on
+      # this host); the mouse click stays as the fallback.
+      $openMenus = @(Find-Elements $window.Element '' 'Menu')
+      if ($openMenus.Count -eq 0) {
+        Focus-Window $window.Element
+        $invoked = $null
+        try { $invoked = Invoke-Element $menu.Element } catch { $invoked = $null }
+        if ($invoked) {
+          $attempts += ('menu:' + [string]$invoked)
+        } else {
+          $menuClick = Invoke-ElementByMouse $menu.Element
+          $attempts += ('menu:' + $(if ($menuClick.clicked) { $menuClick.method } else { $menuClick.reason }))
+        }
+        for ($tick = 0; $tick -lt 12; $tick++) {
+          Start-Sleep -Milliseconds 200
+          if (@(Find-Elements $window.Element '' 'Menu').Count -gt 0) { break }
+        }
+      } else {
+        $attempts += 'menu:already-open'
+      }
       $panelPattern = Get-TasksPanelPattern
       $listPattern = Get-SessionListMenuPattern
       $names = @()
@@ -866,12 +996,16 @@ try {
         break
       }
       $entry = $entries[0]
-      $entryClick = Invoke-Element $entry
+      $entryName = [string]$entry.Current.Name
+      # The entry is a checkbox item in a popup menu; a real click is what the
+      # application reacts to, with the automation pattern as the fallback.
+      $entryMouse = Invoke-ElementByMouse $entry
+      $entryClick = $(if ($entryMouse.clicked) { [string]$entryMouse.method } else { Invoke-Element $entry })
       $attempts += ('entry:' + $entryClick)
       Start-Sleep -Milliseconds 1000
       $rows = @(Get-TaskRows)
       Write-Result @{ ok = $true; value = @{ opened = $true; mode = $(if ($mode) { $mode } else { 'open' })
-        entry = $entry.Current.Name; attempts = $attempts; rows = (Get-TaskRowSummary $rows) } }
+        entry = $entryName; entryRole = [string]$entry.Current.ControlType.ProgrammaticName; attempts = $attempts; rows = (Get-TaskRowSummary $rows) } }
     }
     'tasks-rows' {
       $rows = @(Get-TaskRows)

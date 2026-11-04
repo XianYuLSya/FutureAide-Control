@@ -908,6 +908,11 @@ export async function interrupt({ nativeSessionId }, {
         evidence: landed, revealed: visible.revealed, scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
     }
     return { interrupted: false, cancelled: true, status: 'idle-no-turn', reason: 'no-running-turn',
+      // The composer stop control appears while this session generates. Its absence
+      // with an idle registry does not prove the tree is quiet: background children
+      // can still be running, and they are stopped through the task panel.
+      mayStillHaveChildren: true,
+      note: 'No stop control and an idle registry. A background child can still be running; check the task panel before treating the tree as settled.',
       nativeSessionId, method: press?.method,
       verifiedBy: ['host-stop-control-absent', 'registry-idle'], revealed: visible.revealed,
       stopControl: { method: press?.method, name: press?.stopButtonName ?? null, ancestry: press?.ancestry ?? null },
@@ -945,7 +950,15 @@ export function classifySessionMenu(items = []) {
 
 export const STOP_ARCHIVE_NAME = /(停止任务并归档|停止全部|Stop task and archive|Stop tasks and archive)/i;
 
+/** A single row comes back as an object, not a one element array. */
+function rowsOf(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === 'object') return [value];
+  return [];
+}
+
 function runningTaskRows(rows = [], targets) {
+  rows = rowsOf(rows);
   const wanted = Array.isArray(targets) && targets.length
     ? targets.map(value => String(value).toLowerCase())
     : undefined;
@@ -982,7 +995,7 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
   const visible = await ensureSessionVisible(record, { driver: ui, allowDeepLink, env });
   const title = visible.title || record.name;
   const panel = await ui.tasksPanel({ title, mode: 'open' });
-  let rows = Array.isArray(panel?.rows) ? panel.rows : [];
+  let rows = rowsOf(panel?.rows);
   const stopped = [];
   let panelOpened = 1;
   for (let round = 0; round < Math.max(1, rounds); round += 1) {
@@ -1005,7 +1018,7 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
     // refresh: the panel only shows tasks that exist when it is opened
     const again = await ui.tasksPanel({ title, mode: 'refresh' })
       .catch(() => ({ rows }));
-    rows = Array.isArray(again?.rows) ? again.rows : rows;
+    rows = rowsOf(again?.rows).length ? rowsOf(again?.rows) : rows;
     panelOpened += 1;
   }
   const remaining = runningTaskRows(rows, targets);
@@ -1014,7 +1027,16 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
     nativeSessionId,
     pid: record.pid,
     scope: 'session-background-tasks',
-    panel: { opened: Boolean(panel?.opened), entry: panel?.entry, openedTimes: panelOpened },
+    panel: {
+      opened: Boolean(panel?.opened),
+      entry: panel?.entry ?? null,
+      entryCount: (() => {
+        const match = /(\d+)\s*$/.exec(String(panel?.entry ?? ''));
+        return match ? Number(match[1]) : null;
+      })(),
+      locator: panel?.fallback ? 'title-fallback' : 'view-options',
+      openedTimes: panelOpened,
+    },
     rows: (rows ?? []).map(row => ({ index: row.index, rowText: row.rowText, busy: row.busy, done: row.done,
       depth: row.depth ?? null })),
     nestedDetected: (rows ?? []).some(row => Number(row.depth ?? 0) > 0),

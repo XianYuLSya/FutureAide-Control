@@ -1459,3 +1459,33 @@ test('a stop reports which control it pressed', async () => {
     assert.deepEqual(result.stopControl.ancestry, ['ControlType.Pane', 'ControlType.Group']);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+test('the panel entry is matched by its name prefix and keeps the live count', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({
+    tasksPanel: input => (input.mode === 'refresh'
+      ? { opened: true, entry: '后台任务 1', rows: [taskRow(0, 'Cancel child A')] }
+      : { opened: true, entry: '后台任务 1', rows: [taskRow(0, 'Cancel child A')] }),
+    taskStop: () => ({ clicked: true, busySeen: true, doneSeen: true }),
+  });
+  try {
+    // the classifier accepts the counted name, which a static equality would not
+    assert.equal(classifySessionMenu(['后台任务 1', '查看更改']).kind, 'session');
+    const result = await stopBackgroundTasks({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive });
+    assert.equal(result.panel.entry, '后台任务 1');
+    assert.equal(result.panel.entryCount, 1);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('an idle session without a stop control says children may still be running', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({ interrupt: () => ({ method: 'stop-button', stopButtonFound: false }) });
+  try {
+    const result = await interrupt({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 220, pollMs: 20 });
+    assert.equal(result.interrupted, false);
+    assert.equal(result.status, 'idle-no-turn');
+    assert.equal(result.mayStillHaveChildren, true);
+    assert.match(result.note, /task panel/);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

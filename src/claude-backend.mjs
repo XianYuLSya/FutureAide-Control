@@ -1,0 +1,504 @@
+// Claude Desktop implementation of the same backend boundary DSH uses. The
+// scoped layer owns tasks, queues, notices, cancellation and cleanup decisions.
+// This adapter owns only native bindings, byte cursors and delivery evidence.
+import { readFile, stat } from 'node:fs/promises';
+import path from 'node:path';
+import { homedir } from 'node:os';
+import { randomUUID } from 'node:crypto';
+import * as hostModule from './claude-host.mjs';
+import { bindClaude, sendClaude } from './claude-inbox.mjs';
+import { emptyClaudeProjection, observeClaudeTranscript, claudeTurn, CLAUDE_FILE_COVERAGE } from './claude-observer.mjs';
+
+const METHODS = ['probe', 'create', 'beginTask', 'observe', 'history', 'answer', 'deliver',
+  'receipt', 'turn', 'models', 'model', 'selectModel', 'cancel', 'destroy', 'cursor'];
+// Rounds of "interrupt the root, stop the owned background tasks, observe again".
+// A handback can wake the root once per child, so this must never be a single pass.
+const CANCEL_ROUNDS = 3;
+const failure = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
+const samePath = (a, b) => typeof a === 'string' && typeof b === 'string'
+  && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+export async function createClaudeBackend(record, deps = {}) {
+  const env = deps.env ?? process.env;
+  const dataRoot = path.resolve(env.CLAUDE_CONFIG_DIR || path.join(homedir(), '.claude'));
+  const host = { ...hostModule, ...deps.host };
+  const driver = deps.driver ?? host.createPowerShellDriver();
+  const load = deps.load ?? (() => record);
+  const readState = () => deps.readNativeState?.() ?? { requests: {} };
+  // The shared service opts in only for an adapter owned by one locked poll or
+  // operation. Direct/long-lived adapter callers continue to read fresh state.
+  let observation;
+  let firstModelSelection;
+  let inputModelSnapshot;
+  const invalidateObservation = () => { observation = undefined; };
+  const invalidateInput = () => { invalidateObservation(); firstModelSelection = undefined; inputModelSnapshot = undefined; };
+  const save = value => {
+    invalidateObservation();
+    if (deps.writeNativeState?.(value) === false) throw failure('agent-not-found', 'This managed Claude agent was removed.');
+    return value;
+  };
+  const lockedHost = action => deps.withHostLock ? deps.withHostLock(action) : action();
+  const bind = deps.bindClaude ?? bindClaude;
+  const send = deps.sendClaude ?? sendClaude;
+  const observeTranscript = deps.observeTranscript ?? observeClaudeTranscript;
+  let treeModule = deps.tree;
+  if (!treeModule) {
+    try { treeModule = await import('./claude-tree.mjs'); }
+    catch (error) { if (error.code !== 'ERR_MODULE_NOT_FOUND' || !error.message.includes('claude-tree')) throw error; }
+  }
+
+  function stateForTask() {
+    const state = readState();
+    state.requests ??= {};
+    return state;
+  }
+  const hostOptions = () => ({ driver, env, workspace: load().workspace });
+
+  async function requireReports() {
+    if (deps.ensureClaudeReports) {
+      const result = await deps.ensureClaudeReports();
+      if (result?.ready !== true) throw failure('claude-report-not-ready', 'The shared Claude report service is not ready.');
+      return result;
+    }
+    throw failure('claude-report-not-ready', 'This installation has not connected the shared Claude report service.');
+  }
+
+  async function rememberBinding(state, native) {
+    const sessionId = native.nativeSessionId ?? native.sessionId;
+    const binding = await bind({ pid: native.pid, sessionId, workspace: load().workspace }, { env });
+    state.binding = { ...binding, hostSessionId: native.hostSessionId ?? state.binding?.hostSessionId,
+      name: native.name ?? state.binding?.name };
+    save(state); // visible to tools/list before the first model turn
+    return state.binding;
+  }
+
+  // The stable identity is the native session id. PID/pipe/start-time are just
+  // its current binding and can be refreshed without changing task identity.
+  async function nativeSession(state, { resume = false } = {}) {
+    const binding = state.binding;
+    if (!binding) return undefined;
+    try {
+      const value = JSON.parse(await readFile(binding.recordFile, 'utf8'));
+      if (value.sessionId === binding.sessionId && value.pid === binding.pid
+          && value.procStart === binding.procStart && value.entrypoint === 'claude-desktop'
+          && samePath(value.cwd, load().workspace) && (deps.isAlive ?? alive)(value.pid)) return value;
+    } catch (error) { if (!['ENOENT', 'ESRCH'].includes(error.code) && !(error instanceof SyntaxError)) throw error; }
+    let found;
+    try { found = await host.resolveNativeSession(binding.sessionId, { env, workspace: load().workspace }); }
+    catch (error) { if (error.code !== 'unknown-native-session') throw error; }
+    if (!found?.alive && resume) {
+      const reopened = await lockedHost(() => host.resume({ nativeSessionId: binding.sessionId,
+        hostSessionId: binding.hostSessionId }, hostOptions()));
+      if (!reopened?.resumed) throw failure('claude-session-unavailable', 'The original Claude session could not be resumed.');
+      found = await host.resolveNativeSession(binding.sessionId, { env, workspace: load().workspace });
+    }
+    if (!found?.alive) throw failure('claude-session-unavailable', 'The original Claude session is not running.');
+    await rememberBinding(state, found);
+    return { sessionId: found.nativeSessionId, pid: found.pid, status: found.status, cwd: found.workspace,
+      name: found.name, hostSessionId: found.hostSessionId };
+  }
+
+  async function refresh({ resume = false, fresh = false } = {}) {
+    if (deps.reuseObservation === true && !resume && !fresh && observation) return observation;
+    const current = load();
+    const state = stateForTask();
+    state.projection ??= emptyClaudeProjection(current.task?.taskId);
+    if (!state.binding) return observation = { state, native: undefined, running: false };
+    const native = await nativeSession(state, { resume });
+    const observed = await observeTranscript(state.binding, state.projection, {
+      workspace: current.workspace, agentId: current.agentId, requestIds: Object.keys(state.requests) });
+    state.projection = observed.projection;
+    for (const [requestId, delivery] of Object.entries(state.projection.deliveries)) {
+      const request = state.requests[requestId];
+      if (request) Object.assign(request, { status: 'accepted', deliveryStage: delivery.stage, deliverySeq: delivery.seq });
+    }
+    const running = native.status !== 'idle';
+    let tree;
+    if (treeModule?.observeClaudeTree) {
+      const result = await treeModule.observeClaudeTree(state.binding, state.projection, {
+        logicalSessionId: current.sessionId, agentId: current.agentId, name: current.name,
+        workspace: current.workspace, taskId: current.task?.taskId,
+        nativeStatus: native.status, state: state.treeState ?? {}, backgroundTaskStates: state.backgroundTaskStates ?? [] });
+      tree = result.tree;
+      state.treeState = result.state;
+      state.histories = result.histories;
+    }
+    save(state);
+    return observation = { state, native, running, tree, hasMore: observed.hasMore };
+  }
+
+  function receiptFrom(state, requestId) {
+    const request = state.requests?.[requestId];
+    if (!request) return undefined; // genuinely never attempted
+    return { status: request.status ?? 'unknown', afterSeq: request.afterSeq,
+      ...(request.prewriteEvidence ? { prewriteEvidence: request.prewriteEvidence } : {}),
+      ...(request.status === 'accepted' ? { result: { accepted: true, requestId } } : {}) };
+  }
+
+  async function recoverFirstBinding(state) {
+    if (state.binding || !state.bindingNonce) return state;
+    const first = Object.values(state.requests ?? {}).find(request => request.attempted);
+    if (!first || typeof host.findCreatedSession !== 'function') return state;
+    const found = await host.findCreatedSession({ workspace: load().workspace,
+      requestId: first.requestId, bindingNonce: state.bindingNonce }, { env });
+    if (!found) {
+      // The previous driver had exactly one uncaught clipboard operation:
+      // Set-Clipboard, before paste and before Enter. Recover only that recorded
+      // failure, after checking the original first-input marker; never infer
+      // non-delivery merely from an absent native session.
+      const dispatch = load().task?.dispatches?.find(item => item.requestId === first.requestId);
+      if (first.status === 'unknown' && dispatch?.state === 'unknown'
+        && dispatch.error?.code === 'ui-bridge-error'
+        && dispatch.error?.message === '\u6240\u8bf7\u6c42\u7684\u526a\u8d34\u677f\u64cd\u4f5c\u5931\u8d25\u3002') {
+        Object.assign(first, { attempted: false, status: 'retryable',
+          prewriteEvidence: { source: 'legacy-submit-clipboard-before-enter', enterAttempted: false,
+            error: { ...dispatch.error }, markerAbsent: true, recoveredAt: new Date().toISOString() } });
+        return save(state);
+      }
+      return state;
+    }
+    await rememberBinding(state, found);
+    const observed = await refresh();
+    state = observed.state;
+    const marker = host.markerLine(first.requestId, state.bindingNonce);
+    const user = state.projection.messages.find(item => item.role === 'user' && item.text.includes(marker));
+    state.requests[first.requestId].status = 'accepted';
+    state.projection.deliveries[first.requestId] = { requestId: first.requestId, stage: 'inserted',
+      seq: user?.seq ?? first.afterSeq };
+    return save(state);
+  }
+
+  async function firstDefaultModel() {
+    if (deps.reuseObservation !== true) return lockedHost(() => host.readDefaultModel(hostOptions()));
+    return firstModelSelection ??= lockedHost(() => host.readDefaultModel(hostOptions()));
+  }
+
+  async function modelSnapshot(state) {
+    if (deps.reuseObservation !== true || typeof driver.modelSnapshot !== 'function'
+      || typeof host.readModelSnapshot !== 'function') return undefined;
+    inputModelSnapshot ??= lockedHost(async () => {
+      const value = await host.readModelSnapshot({ nativeSessionId: state.binding.sessionId,
+        workspace: load().workspace }, hostOptions());
+      if (value?.titleMatchesRecord !== true || value.current?.resolved !== true || value.default?.resolved !== true) {
+        throw failure('claude-model-snapshot-unresolved', 'Claude Desktop’s current and default selections could not be read.');
+      }
+      return value;
+    });
+    return inputModelSnapshot;
+  }
+
+  async function currentModel(state) {
+    if (!state.binding) return firstDefaultModel();
+    const snapshot = await modelSnapshot(state);
+    if (snapshot) return snapshot.current;
+    if (typeof host.readCurrentModel !== 'function') {
+      throw failure('model-observation-unsupported', 'The host adapter cannot read the session’s next model selection yet.');
+    }
+    return lockedHost(() => host.readCurrentModel({ nativeSessionId: state.binding.sessionId, source: 'ui' }, hostOptions()));
+  }
+
+  return {
+    target: 'claude-desktop', labels: { host: 'Claude Desktop', bridge: 'The Claude Desktop adapter' },
+    requiredMethods: METHODS,
+    async probe() {
+      const present = await stat(path.join(dataRoot, 'sessions')).then(value => value.isDirectory(), () => false);
+      if (!present) throw failure('claude-desktop-unavailable', 'Claude Desktop has no native session registry on this host.');
+      return { identity: { application: 'claude-desktop', dataRoot }, methods: METHODS,
+        treeProtocol: treeModule?.TREE_PROTOCOL ?? null, reportProtocol: 1 };
+    },
+    async create() {
+      await requireReports();
+      save({ ...stateForTask(), reserved: true });
+      return { sessionId: load().sessionId, modelRequestsStarted: 0 };
+    },
+    async beginTask() {
+      invalidateInput();
+      const current = load();
+      let state = stateForTask();
+      if (state.binding) ({ state } = await refresh({ resume: true }));
+      if (state.projection?.taskId !== current.task?.taskId) {
+        state.projection = emptyClaudeProjection(current.task?.taskId, {
+          throughSeq: state.projection?.throughSeq ?? 0, currentModel: state.projection?.currentModel });
+        state.treeState = {};
+        state.histories = {};
+        // Old dispatch evidence remains for cold recovery/history; each shared
+        // task owns fresh request ids, so it cannot be sent twice on reuse.
+        save(state);
+      }
+      return { treeProtocol: treeModule?.TREE_PROTOCOL ?? null, reportProtocol: 1,
+        throughSeq: state.projection.throughSeq,
+        currentModel: state.binding ? state.projection.currentModel : await currentModel(state),
+        modelSelectionObserved: !state.binding };
+    },
+    async observe() {
+      const current = load();
+      const { state, running, tree } = await refresh({ fresh: true });
+      const p = state.projection;
+      const emptyTree = { settled: true, running: false, nodes: [{ sessionId: current.sessionId,
+        parentSessionId: null, name: current.name, status: 'idle', activity: 'idle', changes: [], coverage: CLAUDE_FILE_COVERAGE }] };
+      if (state.binding && !tree) throw failure('tree-protocol-required', 'Claude task-tree observation is not ready.');
+      return { sessionId: current.sessionId, taskId: current.task?.taskId, running: tree?.running ?? running,
+        throughSeq: p.throughSeq, currentModel: p.currentModel, modelSelectionObserved: false, activity: p.activity,
+        changes: p.changes, coverage: CLAUDE_FILE_COVERAGE, questions: p.questions, reports: p.reports,
+        tree: tree ?? emptyTree };
+    },
+    async history({ targetSessionId, maxMessages = 20 } = {}) {
+      const { state } = await refresh();
+      const root = !targetSessionId || targetSessionId === load().sessionId;
+      const history = root ? { messages: state.projection.messages, hasMore: state.projection.messagesOmitted > 0 }
+        : state.histories?.[targetSessionId];
+      if (!history) throw failure('unknown-owned-node', 'This node is not in the managed Claude task tree.');
+      return { messages: history.messages.slice(-maxMessages), hasMore: history.hasMore || history.messages.length > maxMessages };
+    },
+    async answer({ answerId, message }) {
+      invalidateInput();
+      const { state } = await refresh();
+      const previous = state.answers?.[answerId];
+      if (previous) return previous;
+      const questions = state.projection.questions.filter(item => item.state === 'pending');
+      const result = { consumedQuestionIds: questions.map(item => item.id), continuation: `主控回答：\n${message}\n请继续完成原任务。` };
+      if (questions.length) {
+        for (const question of questions) question.state = 'answered';
+        (state.answers ??= {})[answerId] = result;
+        save(state);
+      }
+      return result;
+    },
+    async deliver({ requestId, message }) {
+      invalidateInput();
+      await requireReports();
+      const current = load();
+      let state = stateForTask();
+      const previous = receiptFrom(state, requestId);
+      if (previous && previous.status !== 'retryable') return {
+        accepted: previous.status === 'accepted', status: previous.status, afterSeq: previous.afterSeq };
+      state.projection ??= emptyClaudeProjection(current.task?.taskId);
+      const request = { requestId, status: 'retryable', attempted: false, afterSeq: state.projection.throughSeq,
+        taskId: current.task?.taskId, startedAt: new Date().toISOString(),
+        ...(state.requests[requestId]?.prewriteEvidence ? { prewriteEvidence: state.requests[requestId].prewriteEvidence } : {}) };
+      state.requests[requestId] = request;
+      save(state); // write intent before either native write or UI submit
+      if (!state.binding) {
+        const bindingNonce = state.bindingNonce ??= randomUUID();
+        save(state);
+        const prompt = `你是 FutureAide Control 受管子代理「${current.name}」。工作目录：${current.workspace}。\n`
+          + '使用 futureaide-report 的 ask_parent 提问、report_parent 汇报；普通回复不会通知主控。'
+          + '完成当前任务并验证后调用 report_parent(message, final=true)，提问后结束本轮等待回答。\n\n' + message;
+        let created;
+        try {
+          created = await host.createFirstTurn({ workspace: current.workspace, requestId, message: prompt, bindingNonce },
+            { ...hostOptions(), withUiLock: lockedHost,
+              onBeforeSubmit: () => { request.attempted = true; request.status = 'unknown'; save(state); },
+              onBound: native => rememberBinding(state, native) });
+        } catch (error) {
+          if (error.attempted === false && error.prewriteEvidence?.enterAttempted === false) {
+            request.attempted = false;
+            request.prewriteEvidence = error.prewriteEvidence;
+          }
+          if (error.uncertain === true) {
+            request.attempted = true; request.status = 'unknown'; request.error = error.code ?? error.message; save(state);
+          }
+          if (!request.attempted) {
+            request.status = 'retryable'; request.error = error.code ?? error.message; save(state);
+          }
+          throw failure(error.code ?? 'claude-create-unconfirmed', error.message,
+            request.attempted ? { uncertain: true } : { retryableRead: true });
+        }
+        if (created?.attempted === false && !request.attempted) {
+          request.status = 'retryable'; request.error = created.reason ?? 'claude-create-not-submitted'; save(state);
+          throw failure(request.error, 'Claude Desktop has not submitted the first message.', { retryableRead: true });
+        }
+        if (!created?.nativeSessionId || (!created.created && !created.reused)) {
+          return { accepted: false, status: 'unknown', afterSeq: request.afterSeq };
+        }
+        try {
+          await rememberBinding(state, created);
+          ({ state } = await refresh());
+        } catch (error) {
+          throw failure(error.code ?? 'claude-created-observation-pending', error.message, { uncertain: true });
+        }
+        // The host verified our unique request+nonce in the initial user event.
+        // It is native acceptance evidence even though UI sends do not use our
+        // request id as the native user UUID.
+        const acceptedAt = state.projection.messages.find(item => item.role === 'user'
+          && item.text.includes(host.markerLine(requestId, bindingNonce)))?.seq ?? request.afterSeq;
+        state.requests[requestId].status = 'accepted';
+        state.projection.deliveries[requestId] = { requestId, stage: 'inserted', seq: acceptedAt };
+        try { save(state); }
+        catch (error) { throw failure(error.code ?? 'claude-receipt-pending', error.message, { uncertain: true }); }
+        return { accepted: true, afterSeq: request.afterSeq };
+      }
+      try {
+        await nativeSession(state, { resume: true });
+      } catch (error) {
+        request.error = error.code ?? error.message;
+        save(state);
+        throw failure(error.code ?? 'claude-send-unavailable', error.message, { retryableRead: true });
+      }
+      request.attempted = true; request.status = 'unknown'; save(state);
+      let result;
+      try { result = await send(state.binding, message, { requestId }); }
+      catch (error) {
+        // sendClaude throws only during its pre-write record/key checks. Once
+        // it connects, every outcome is a written/uncertain/failed receipt.
+        request.attempted = false; request.status = 'retryable'; request.error = error.code ?? error.message;
+        save(state);
+        throw failure(error.code ?? 'claude-send-unavailable', error.message, { retryableRead: true });
+      }
+      request.status = result.status === 'failed' ? 'retryable' : 'unknown';
+      request.attempted = result.status !== 'failed';
+      request.transport = result.status;
+      // A state-save failure after the write must leave the earlier unknown
+      // intent intact, never turn a written message into a retryable request.
+      try {
+        save(state);
+        ({ state } = await refresh());
+      } catch (error) {
+        throw failure(error.code ?? 'claude-written-observation-pending', error.message,
+          result.status === 'failed' ? { retryableRead: true } : { uncertain: true });
+      }
+      const receipt = receiptFrom(state, requestId);
+      return { accepted: receipt.status === 'accepted', status: receipt.status === 'retryable' ? 'retrying' : receipt.status,
+        afterSeq: receipt.afterSeq };
+    },
+    async receipt({ requestId }) {
+      let state = stateForTask();
+      if (!state.requests[requestId]) return undefined;
+      if (!state.binding) state = await recoverFirstBinding(state);
+      if (!state.binding) return receiptFrom(state, requestId);
+      return receiptFrom((await refresh()).state, requestId);
+    },
+    async turn({ requestId, afterSeq = 0 }) {
+      const { state, running, tree } = await refresh();
+      return claudeTurn(state.projection, requestId, { running: tree?.running ?? running, afterSeq });
+    },
+    async models() {
+      // A new session has no independent selection. beginTask/models/model in
+      // the same first dispatch can share one live default read. Each later
+      // input still reads the host default again.
+      const state = stateForTask();
+      const snapshot = state.binding ? await modelSnapshot(state) : undefined;
+      const value = snapshot?.default ?? (state.binding ? await lockedHost(() => host.readDefaultModel(hostOptions()))
+        : await firstDefaultModel());
+      if (!value?.model || value.resolved === false || value.verified === false) {
+        throw failure('claude-default-model-unresolved', 'Claude Desktop’s current default model could not be read.');
+      }
+      const selection = { provider: value.provider ?? 'anthropic', model: value.model,
+        ...(value.reasoningEffort ? { reasoningEffort: value.reasoningEffort } : {}) };
+      return { default: selection, routableProviders: [selection.provider], groups: [{ id: selection.provider,
+        models: [{ id: selection.model, reasoningEfforts: value.reasoningEffort ? [value.reasoningEffort] : [] }] }] };
+    },
+    async model() { return currentModel(stateForTask()); },
+    async selectModel(input) {
+      invalidateInput();
+      const state = stateForTask();
+      return lockedHost(() => host.selectModel({ ...input,
+        ...(state.binding ? { nativeSessionId: state.binding.sessionId } : {}) }, hostOptions()));
+    },
+    // Whole task-tree cancellation in native order: interrupt the root so it
+    // cannot launch another child, stop every owned background task that is still
+    // running, then observe again — a child's handback wakes the root for a short
+    // turn, and that turn is interrupted in the next round. `cancelRequested` only
+    // says the request reached the host; whether the tree really stopped is this
+    // same observer's verdict, never the adapter's guess.
+    async cancel() {
+      invalidateObservation();
+      const state = await recoverFirstBinding(stateForTask());
+      if (!state.binding) {
+        const attempted = Object.values(state.requests ?? {}).some(request => request.attempted);
+        return { cancelRequested: !attempted }; // never dispatched: nothing native exists
+      }
+      const canStopTasks = typeof host.stopBackgroundTasks === 'function';
+      const rounds = [];
+      let observed, unavailable = false, refusedRound = false, stoppedOnce = false;
+      for (let round = 1; round <= CANCEL_ROUNDS; round += 1) {
+        try {
+          const native = await nativeSession(state);
+          if (native.status !== 'idle') {
+            const interrupted = await lockedHost(() => host.interrupt({ nativeSessionId: state.binding.sessionId }, hostOptions()));
+            rounds.push({ round, action: 'interrupt-root', status: native.status,
+              interrupted: interrupted?.interrupted === true,
+              ...(interrupted?.reason ? { reason: interrupted.reason } : {}) });
+          }
+          observed = await refresh({ fresh: true });
+          const targets = (treeModule?.claudeTreeStopTargets?.(observed.tree) ?? [])
+            .filter(target => typeof target.taskId === 'string' && target.status !== 'ended')
+            .map(target => target.taskId);
+          if (targets.length && !canStopTasks) {
+            rounds.push({ round, action: 'stop-tasks-unsupported', requested: targets });
+            refusedRound = true; // nothing here will change by asking again
+          } else if (targets.length) {
+            // Scope-owned: the panel is this session's own, so no title or
+            // task-name matching is used to choose the rows.
+            const stop = await lockedHost(() => host.stopBackgroundTasks({
+              nativeSessionId: state.binding.sessionId }, hostOptions()));
+            const rows = stop?.stopped ?? [];
+            if (Array.isArray(stop?.backgroundTaskStates) && stop.backgroundTaskStates.length) {
+              const currentState = stateForTask();
+              const owned = new Set(targets);
+              const confirmed = stop.backgroundTaskStates.filter(item => owned.has(item.taskId)
+                && ['completed', 'failed', 'stopped'].includes(item.status) && item.evidence === 'native-task-panel');
+              if (confirmed.length) {
+                currentState.backgroundTaskStates = [...(currentState.backgroundTaskStates ?? []), ...confirmed];
+                save(currentState);
+              }
+            }
+            // Only the host's own click confirmation counts. `state` is filled in
+            // with 'requested' even when the press failed, so it is reported for
+            // diagnosis and never read as success.
+            const clickedRows = rows.filter(row => row?.clicked === true);
+            rounds.push({ round, action: 'stop-tasks', requested: targets,
+              ...(stop?.status ? { status: stop.status } : {}),
+              clicked: clickedRows.length, rows: rows.length, remaining: (stop?.remaining ?? []).length,
+              ...(rows.length ? { detail: rows.slice(0, 8).map(row => ({ index: row?.index,
+                rowText: row?.rowText ?? null, clicked: row?.clicked === true, state: row?.state ?? null,
+                ...(row?.error ? { error: row.error } : {}) })) } : {}) });
+            // A refusal means the host cannot press right now: report it once
+            // instead of burning the remaining rounds on the same panel.
+            stoppedOnce = true;
+            if (clickedRows.length === 0) refusedRound = true;
+          }
+          // Refresh again only when something was actually pressed; otherwise the
+          // observation above is already current.
+          if (stoppedOnce) observed = await refresh({ fresh: true });
+          if (refusedRound && observed?.tree?.settled !== true) break; // one honest report, no blind repeats
+          observed = await refresh({ fresh: true });
+        } catch (error) {
+          if (error.code !== 'claude-session-unavailable') throw error;
+          // An unobservable session is not an empty tree: a child can outlive the
+          // handle that named it, so this stays unconfirmed and retryable.
+          unavailable = true;
+          break;
+        }
+        if (observed?.tree?.settled === true) break;
+        const after = await nativeSession(state).catch(() => ({ status: 'idle' }));
+        if (after.status === 'idle' && observed?.tree?.running !== true) break; // converged
+      }
+      const settled = observed?.tree?.settled === true;
+      const interrupted = rounds.some(entry => entry.interrupted === true);
+      const clickedRound = rounds.some(entry => (entry.clicked ?? 0) > 0);
+      const remainingTasks = (treeModule?.claudeTreeStopTargets?.(observed?.tree) ?? [])
+        .filter(target => typeof target.taskId === 'string' && target.status !== 'ended')
+        .map(target => target.taskId);
+      const requested = settled || interrupted || clickedRound;
+      const cancelPending = !settled
+        && (observed?.tree?.running === true || remainingTasks.length > 0 || unavailable);
+      return { cancelRequested: requested, cancelPending,
+        ...(remainingTasks.length ? { remainingTasks } : {}),
+        ...(requested ? {} : { reason: unavailable ? 'session-unavailable' : 'no-native-stop-accepted' }),
+        cancelRounds: rounds,
+        ...(observed?.tree ? { treeSettled: settled, treeRunning: observed.tree.running === true } : {}),
+        ...(canStopTasks ? {} : { stopTasksUnsupported: true }) };
+    },
+    async destroy() {
+      invalidateObservation();
+      const state = await recoverFirstBinding(stateForTask());
+      const attempted = Object.values(state.requests ?? {}).some(request => request.attempted);
+      if (!state.binding) return { destroyed: !attempted,
+        ...(attempted ? { message: 'The first native send is still unconfirmed; retaining its ownership record.' } : {}) };
+      return lockedHost(() => host.destroy({ nativeSessionId: state.binding.sessionId, binding: state.binding }, hostOptions()));
+    },
+    async cursor() { return { throughSeq: (await refresh()).state.projection.throughSeq }; },
+  };
+}

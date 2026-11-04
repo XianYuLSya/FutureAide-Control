@@ -9,39 +9,52 @@ import { createPeers } from './peers.mjs';
 import { CODEX_THREAD_ID } from './codex-target.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
 import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
+import { TRUSTED_CALLER } from './calling-context.mjs';
 
-/** Default installed surface: each request is bound to its native calling chat. */
-export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.7' });
-  let servicePromise;
-  const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
-    const value = scopedFactory(config);
-    await value.resume?.();
-    await value.ensureIdleMonitor?.();
-    const monitorHealth = setInterval(() => { void value.ensureIdleMonitor?.().catch(() => {}); }, 30000);
-    monitorHealth.unref();
-    return value;
-  });
-  const name = z.string().min(1).max(80).describe('Subagent name in this Codex chat. Names in other chats are unrelated.');
-  const message = z.string().min(1).max(100000).describe('Task, update, or answer text. Pass it directly; do not create a communication file.');
-  const register = (tool, description, inputSchema, action, readOnly = false, destructive = false) => server.registerTool(tool, {
+const name = z.string().min(1).max(80).describe('Subagent name in this Codex chat. Names in other chats are unrelated.');
+const message = z.string().min(1).max(100000).describe('Task, update, or answer text. Pass it directly; do not create a communication file.');
+
+/**
+ * Wrap one tool registration: resolve the service, hand the handler a trusted
+ * caller context, and keep the existing result/error shape on every surface.
+ * @param {object} server MCP server to register on.
+ * @param {{service: Function|object, extraFor?: Function, diagnostics?: object}} options
+ */
+function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics } = {}) {
+  const resolve = typeof service === 'function' ? service : async () => service;
+  return (tool, description, inputSchema, action, readOnly = false, destructive = false) => server.registerTool(tool, {
     description, inputSchema,
     annotations: { readOnlyHint: readOnly, destructiveHint: destructive, idempotentHint: readOnly, openWorldHint: !readOnly },
   }, async (args, extra) => {
     const finished = diagnostics?.tool(tool, extra);
     try {
-      const result = await action(await service(), args, extra);
+      const trusted = (await extraFor(extra)) ?? extra;
+      const result = await action(await resolve(), args, trusted);
       return { content: [{ type: 'text', text: boundedOutput(result) }],
-        ...(result?.error || result?.ready === false || result?.created === false || result?.deleted === false ? { isError: true } : {}) };
+        ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
     } finally { finished?.(); }
   });
-  register('futureaide_status', 'Check this chat context and the local DSH connection. The plugin obtains chat and project automatically.', {}, (s, _a, e) => s.status(e), true);
-  register('futureaide_create_agent', 'Create a named DSH subagent in the current project, without running a model. once removes session data after an explicitly submitted final report is delivered and the tree settles; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
+}
+
+/**
+ * The ten name-addressed management tools, registered on any MCP server that has a
+ * service and can supply a trusted caller context: the stdio server for this chat and
+ * the loopback report service for a verified Claude caller. The Codex-side
+ * ask_parent/report_parent are registered by the stdio server alone, so a surface that
+ * provides its own never sees a duplicate name.
+ * @param {object} server MCP server to register on.
+ * @param {{service: Function|object, extraFor?: Function, diagnostics?: object}} options
+ */
+export function registerScopedTools(server, options = {}) {
+  const register = toolRegistrar(server, options);
+  register('futureaide_status', 'Check this chat context, the local DSH connection, and per-target readiness in backends (dsh, claude-desktop, codex-desktop). The plugin obtains chat and project automatically. A target reports ready:false with a reason when its adapter is missing or its protocols are unfinished; that is not a fallback and no model turn or session is started to find out.', {}, (s, _a, e) => s.status(e), true);
+  register('futureaide_create_agent', 'Create a named subagent in the current project, without running a model. target picks the application that runs it, once, at creation: dsh (the default), claude-desktop or codex-desktop; every later call addresses the subagent by name only. A target whose adapter is not installed is refused instead of substituting DSH. once removes session data after an explicitly submitted final report is delivered and the tree settles; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
     name, lifetime: z.enum(['once', 'persistent']),
+    target: z.enum(['dsh', 'claude-desktop', 'codex-desktop']).optional().describe('Execution target bound to this name. Defaults to dsh. A target that is unavailable here fails explicitly; it never falls back to another backend.'),
   }, (s, a, e) => s.create(a, e));
-  register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. Managed dispatch and monitoring read only the bound DSH session, not the full session list. queued:true means locally saved; do not resend. retrying:true means the original request awaits background recovery; the caller need not resend. unknown means inspect the original receipt and recipient before any retry; never blindly repeat. accepted:true means DSH accepted, not that work is complete. Use list for queue status or changes/inspect for details. A waiting subagent treats this as its answer. Only explicit questions and reports return to this chat; ordinary replies and idle trees never notify it.', { name, message }, (s, a, e) => s.send(a, e));
+  register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. Managed dispatch and monitoring read only the session this name is bound to (DSH, Claude Desktop or Codex Desktop), not the full session list. queued:true means locally saved; do not resend. retrying:true means the original request awaits background recovery; the caller need not resend. unknown means inspect the original receipt and recipient before any retry; never blindly repeat. accepted:true means the target accepted the request, not that work is complete. Use list for queue status or changes/inspect for details. A waiting subagent treats this as its answer. Only explicit questions and reports return to this chat; ordinary replies and idle trees never notify it.', { name, message }, (s, a, e) => s.send(a, e));
   register('futureaide_answer_agent', 'Answer the named subagent’s pending question directly. The plugin continues its original task once; no exchange ID, command, or text file is needed.', { name, message }, (s, a, e) => s.answer(a, e));
   register('futureaide_list_agents', 'Show only this chat’s subagents, including current task, descendant tree, activity, questions, attributed file changes, delivery and cleanup state. Deep history is unnecessary for ordinary supervision.', {}, (s, _a, e) => s.list(e), true);
   register('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, submit a report, await a report, or need attention. Other work may proceed concurrently; a timeout does not cancel a task.', {
@@ -54,10 +67,67 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
     name, max_messages: z.number().int().min(1).max(100).optional(),
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), true);
   register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
-  register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing their DSH session data and private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing the managed session data of its target (DSH, Claude Desktop or Codex Desktop) and the private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  return server;
+}
+
+/** Default installed surface: each request is bound to its native calling chat. */
+export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.8' });
+  let servicePromise;
+  const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
+    const value = scopedFactory(config);
+    await value.resume?.();
+    await value.ensureIdleMonitor?.();
+    const monitorHealth = setInterval(() => { void value.ensureIdleMonitor?.().catch(() => {}); }, 30000);
+    monitorHealth.unref();
+    return value;
+  });
+  registerScopedTools(server, { service, diagnostics });
+  const register = toolRegistrar(server, { service, diagnostics });
+  // Codex Desktop side of a cross-application call: the child chat asks or reports
+  // to the name that owns it. The caller is its own chat metadata, never a tool
+  // argument, so no chat id can be supplied by a model.
+  const parentMessage = z.string().min(1).max(100000).describe('Message for the managed parent of this chat. Pass it directly; never a chat id, path, or internal number.');
+  register('ask_parent', 'Ask the parent of this managed Codex subagent a question. The caller is identified from this chat itself, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer.', { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
+  register('report_parent', 'Submit an explicit report from this managed Codex subagent to its parent. The caller is identified from this chat itself. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true.', {
+    message: parentMessage,
+    final: z.boolean().optional().describe('Submit as the final report. Omitting it submits a progress report and keeps the task open.'),
+  }, (s, a, e) => s.submitToParent({ kind: 'report', message: a.message, final: a.final === true }, e));
   // Restore the shared listener on connection even before the first tool call.
   void service().catch(() => {});
   return server;
+}
+
+/**
+ * The trusted caller context a verified Claude session becomes. The report surface
+ * resolves the TCP peer itself and hands the answer here through its hook; nothing
+ * in it ever comes from a tool argument.
+ */
+export async function claudeTrustedCaller({ trusted, caller, extra } = {}) {
+  const value = (typeof trusted === 'function' ? await trusted(extra) : undefined)
+    ?? (typeof caller === 'function' ? await caller(extra) : undefined);
+  const nativeSessionId = value?.nativeSessionId ?? value?.sessionId ?? value?.session;
+  const workspace = value?.workspace ?? value?.cwd;
+  if (typeof nativeSessionId !== 'string' || !nativeSessionId || typeof workspace !== 'string' || !workspace) {
+    throw Object.assign(new Error('The calling Claude session could not be verified.'),
+      { code: 'calling-context-unavailable' });
+  }
+  return { source: 'claude-desktop', nativeSessionId, workspace,
+    ...(value.pid ? { pid: value.pid } : {}), ...(value.label ? { label: value.label } : {}) };
+}
+
+/**
+ * Hook the loopback report service calls to mount the management tools on its own
+ * MCP server: same names, schemas and errors as the chat surface, with the caller
+ * taken from the verified connection. It adds no service, database or process.
+ * @param {{service: object}} options The monitor's existing service instance.
+ */
+export function scopedManagement({ service } = {}) {
+  return ({ server, caller, trusted } = {}) => registerScopedTools(server, {
+    service,
+    extraFor: async extra => ({ [TRUSTED_CALLER]: await claudeTrustedCaller({ trusted, caller, extra }) }),
+  });
 }
 
 /**

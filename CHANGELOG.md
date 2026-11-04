@@ -1,5 +1,31 @@
 # 更新记录
 
+## 0.5.8 — 2026-11-04 · Claude 调用 DSH 与用户级插件
+
+本版主要能力是 Claude 调用 DSH，已完成实机验证。Codex Desktop 与 Claude Desktop 作为被调用目标（`target: 'codex-desktop'`、`'claude-desktop'`）仍是实验性的：功能已经具备，后续继续完善，本版不按完成计。
+
+- 创建工具新增可选 `target`：`dsh`（默认，行为不变）、`claude-desktop`、`codex-desktop`；其后所有操作仍只按名字寻址，不暴露原生会话 ID 或内部协议。
+- 后端边界抽成共享方法集：DSH、Claude Desktop、Codex Desktop 共用同一套名单、任务、问答、报告与清理状态机；`status` 一次报出各目标是否就绪。
+- 桌面目标（Claude Desktop / Codex Desktop）的首次派发、忙时补充、取消与删除为**持久排队意图**：受理后不重发；执行者或监听器中断后按原 `requestId` 恢复原请求，已发出的不重放。
+- 受管子代理侧提供 `ask_parent` / `report_parent`；跨应用下属的汇总与最终交付只走显式报告，普通输出与轮次结束不产生回包。
+- 模型在每次输入派出时跟随各宿主的当前默认设置，不逐条改写名单记录；一次性代理的 `once` 使用宿主原生删除，项目产物保留。
+- 共享监控改为单进程按需保活，支持同名并行 inflight、异步首派/补充/取消/删除意图、退避与可见错误；新增跨源任务树结算与清理快照。
+
+- 修复 Claude 实际模型菜单导航、输入前窗口和完整请求标记核对、仅对确定的发送前失败恢复；写入结果不明继续保留原请求以核对。
+- 修复 Claude 会话重启后回报发不回来：记录文件缺失或进程已死都判为绑定失效，刷新后的绑定写回名单，确定没写出去的通知才重发；`status` 的回传通道按实际绑定核验。
+- 修复收到 final 后马上派单被拒：回执确认前继续轮询、不进入 sleep，派单时先读回确认，窗口从最长 59 秒降到几秒。
+- 修复忙时补充被吞：DSH 的补充改走 steer，模型下一步就能读到；有待读输入时拒绝 final，避免补充晚于 final 到达后再也回不到主控。
+- `changes` 现在能看到 shell 写入：任务前后比对 `git status`，结果标为 `unconfirmed`，对三种目标都有效，非 git 目录和 gitignore 路径在覆盖说明里写明。
+- 修复删除与一次性清理超时：宿主不再等待 DSH 全量索引对账（DSH 每次搜索前会自己对账）；结果不明的删除和忙碌的下属保持 `cleaning` 并自动重试，不再记为 `cleanup_failed`。
+- 修复子代理结束后后台 PowerShell/Bash 命令被遗漏的问题：后台任务参与树结算与取消，以原生任务通知确认停止。
+- 修复补充消息重试阻挡已有报告与问题的推进；Codex 进程发现使用系统 PowerShell 绝对路径，不依赖 Claude 的 PATH。
+- 增加任务父级及生命周期索引，避免监控完整解析历史；Codex 就绪探测短时复用，每次真实派发仍读取当前默认模型。
+- `install.ps1` 现在把 FutureAide Control 注册为 Claude 的**用户级插件**：在 `.runtime/claude-marketplace` 生成只含清单、MCP 配置和 skill 的薄插件（用绝对路径指向 D 盘运行目录），再依次执行 `claude plugin marketplace add … --scope user` 与 `claude plugin install futureaide-control@futureaide --scope user`。任何项目的 Claude 会话都能按名字调用 DSH 子代理，新开会话时生效；找不到 `claude` 或注册失败不影响 Codex 安装，可用 `-ClaudeCli <path>` 指定桌面端自带的 `claude.exe`，或用 `-SkipClaude`、环境变量 `CLAUDE_CLI` 控制。
+
+本机验证（2026-11-04）：正式入口的 12 个工具已加载，Claude 调用 DSH 的全链路实机通过。正向 Claude 完成 create/send → ask/answer → Write → 显式 final → once 原生删除、产物保留；反向 Claude → Codex 完成普通回复留在同任务、补充、问答、原生 apply_patch、显式 final、once 原生 thread/delete（SQLite 与 rollout 消失）并回到 Claude。长期 Claude 跨任务保留口令并生成精确产物，下一次输入跟随宿主当前默认档位。公共取消停止 Claude → Codex → DSH 混合树；后台 shell 最小复验收到原生 stopped 通知并在自然结束前退出。性能实测 status 暖调用 9933ms → 37ms；4 running/39 sleeping 时监控单核 CPU 94.7% → 30.1%。本版验证结论与未完成项见 [README](README.md#本版验证结论2026-11-04)。Codex 与 Claude 互调目标的上述链路在本版最终改动后尚未重新验证。
+
+安装器的 Claude 注册只生成薄插件，运行目录与状态仍放在安装目录；Codex Desktop 注册不在安装器内，需要单独配置。整应用退出再打开后的自动恢复尚未实机验证，已有的原请求恢复和监控切换保留原任务身份。
+
 ## 0.5.7 — 2026-11-01 · 默认模型跟随与派单去重
 
 - 托管代理每次新任务、补充与回答接续采用 DSH 当前默认供应商、模型和推理档位；旧代理创建时保存的模型不再覆盖当前默认设置。

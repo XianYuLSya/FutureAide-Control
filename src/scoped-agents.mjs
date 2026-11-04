@@ -1,27 +1,40 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
-import { lstat, readFile, realpath, rm } from 'node:fs/promises';
+import { setImmediate as yieldToIO } from 'node:timers/promises';
+import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { createControl, endedState, historyMessages, modelTurnError } from './control.mjs';
-import { dispatchBoundary } from './dispatch.mjs';
+import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
-import { callingThread, ownerIdFor, resolveCallingContext, threadFromResult } from './calling-context.mjs';
+import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
+import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
+import { resolveNativeSession } from './claude-host.mjs';
 import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
-import { ensureIdleMonitor, idleSignal } from './idle-monitor.mjs';
+import { idleSignal } from './idle-monitor.mjs';
+import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
+import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './report-endpoint.mjs';
+import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
+  TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
+import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
 const now = () => new Date().toISOString();
 const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_report', 'reconnecting', 'delivery_pending', 'cleaning']);
-const METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+const METHODS = DSH_HOST_METHODS;
 const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
-const reportProtocolError = () => Object.assign(new Error('Update the DSH plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting DSH is not required.'), { code: 'report-protocol-required' });
-const treeProtocolError = () => Object.assign(new Error('The DSH bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting DSH is not required.'), { code: 'tree-protocol-required' });
+let codexProbePromise;
+/** codex-host's own registration probe, imported lazily so only the Codex path loads it. */
+function defaultCodexProbe() {
+  codexProbePromise ??= import('./codex-host.mjs')
+    .then(module => module.probeCodexReportRegistration)
+    .catch(() => undefined);
+  return codexProbePromise;
+}
+const reportProtocolError = (host = 'DSH') => Object.assign(new Error(`Update the ${host} plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting ${host} is not required.`), { code: 'report-protocol-required' });
+const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host} bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting ${host} is not required.`), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
 
 function assertName(name) {
@@ -37,8 +50,10 @@ function textMessage(message) {
 function stableHost(identity) {
   return { application: identity.application ?? null, dataRoot: path.resolve(identity.dataRoot ?? '') };
 }
+// The compact view keeps the one label that stops a snapshot guess reading as a confirmed write.
 const fileSummary = change => ({ path: change.path, operation: change.operation,
-  ...(change.agentPath ? { agentPath: change.agentPath } : {}) });
+  ...(change.agentPath ? { agentPath: change.agentPath } : {}),
+  ...(change.attribution === 'unconfirmed' ? { attribution: change.attribution } : {}) });
 const compactText = (value, length) => typeof value === 'string' && value.length > length ? value.slice(0, length) + '…' : value;
 
 // Native IDs stay internal. Even a malformed snapshot cannot expose an unrelated
@@ -69,7 +84,7 @@ function ownedTree(record, view) {
 }
 
 function treeSettled(record, view) {
-  return view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
+  return !record.task?.cancelPending && view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
 }
 
 function rootSummary(view) {
@@ -78,13 +93,42 @@ function rootSummary(view) {
     && ['completed', 'failed', 'cancelled'].includes(summary.state) ? summary : undefined;
 }
 
-function attributedChanges(record, view) {
+// What a workspace comparison can and cannot see. It is stated wherever the covered
+// files are, because a short list next to a silent claim of completeness is misleading.
+const WORKSPACE_LIMITATION = 'Compared before and after the task with git status, not watched live: edits made meanwhile by other processes or other assistants look identical, and paths covered by .gitignore or outside a git repository are invisible.';
+const workspaceCoverage = reason => ({ source: 'git-status-diff', complete: false,
+  limitation: WORKSPACE_LIMITATION, ...(reason ? { reason } : {}) });
+// Windows paths are case-insensitive, so a confirmed and a snapshotted spelling of the
+// same file must not both survive.
+const pathKey = value => {
+  const resolved = path.resolve(String(value));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+};
+
+/**
+ * Snapshot entries are unconfirmed: they name a path that changed, not an agent's own
+ * write. A path the target's file tools already reported is the same change, so the
+ * snapshot copy is dropped rather than counted twice.
+ */
+function withWorkspaceChanges(changes, workspace, name) {
+  const found = workspace?.changes;
+  if (!Array.isArray(found) || !found.length) return changes;
+  const known = new Set(changes.map(change => pathKey(change.path)));
+  const extra = found.filter(change => !known.has(pathKey(change.path)))
+    .map(change => ({ path: change.path, operation: change.operation, source: 'workspace-diff',
+      attribution: 'unconfirmed', agentPath: [name] }));
+  return [...changes, ...extra];
+}
+
+function attributedChanges(record, view, workspace = record.task?.workspace) {
   const tree = ownedTree(record, view);
-  if (!tree.nodes.length) return (view.changes ?? []).map(change => ({ ...change, agentPath: [record.name] }));
-  return tree.nodes.flatMap(({ node, agentPath }) => (node.changes ?? []).map(change => {
-    const { sessionId, parentSessionId, agentId, ...file } = change;
-    return { ...file, agentPath };
-  }));
+  const changes = tree.nodes.length
+    ? tree.nodes.flatMap(({ node, agentPath }) => (node.changes ?? []).map(change => {
+        const { sessionId, parentSessionId, agentId, ...file } = change;
+        return { ...file, agentPath };
+      }))
+    : (view.changes ?? []).map(change => ({ ...change, agentPath: [record.name] }));
+  return withWorkspaceChanges(changes, workspace, record.name);
 }
 
 function publicTree(record, view) {
@@ -99,26 +143,33 @@ function publicTree(record, view) {
       coverage: node.coverage ?? 'Not observed' })) };
 }
 
-function treeCoverage(record, view) {
+function treeCoverage(record, view, workspace) {
   const { nodes } = ownedTree(record, view);
-  return nodes.length > 1 ? { scope: 'DSH task tree',
-    nodes: nodes.map(({ node, agentPath }) => ({ agentPath, coverage: node.coverage ?? 'Not observed' })) }
-    : view.coverage ?? 'Not observed yet; zero known files is not a complete filesystem audit.';
+  // The workspace entry says what a zero count does not: whether a snapshot was even
+  // taken, and why not when it was not.
+  const covered = workspace ?? record.task?.workspace?.coverage ?? workspaceCoverage('not-captured');
+  const own = typeof view.coverage === 'object' && view.coverage ? view.coverage
+    : { note: view.coverage ?? 'Not observed yet; zero known files is not a complete filesystem audit.' };
+  return nodes.length > 1 ? { scope: `${hostLabel(record)} task tree`,
+    nodes: nodes.map(({ node, agentPath }) => ({ agentPath, coverage: node.coverage ?? 'Not observed' })),
+    workspace: covered }
+    : { ...own, workspace: covered };
 }
 
 function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
   const lastDispatch = task?.dispatches?.at(-1);
-  const error = record.error ?? (lastDispatch?.state === 'failed' ? lastDispatch.failure : undefined);
+  const error = record.error ?? task?.cancelError ?? (lastDispatch?.state === 'failed' ? lastDispatch.failure : undefined)
+    ?? (!['completed', 'cancelled'].includes(lastDispatch?.state) ? lastDispatch?.error : undefined);
   const view = record.observation ?? {};
   const changes = attributedChanges(record, view);
   return {
-    name: record.name, lifetime: record.lifetime, state: record.state,
+    name: record.name, lifetime: record.lifetime, target: targetOf(record), state: record.state,
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
       ...(task.finishedAt ? { finishedAt: task.finishedAt } : {}),
       ...(task.result ? { result: { state: task.result.state,
         ...(fullResult ? { reply: task.result.reply } : { summary: compactText(task.result.reply, 800) }),
-        files: (task.result.changes ?? []).map(fileSummary), coverage: task.result.coverage } } : {}) } : null,
+        files: (task.result.changes ?? []).slice(0, 12).map(fileSummary), coverage: task.result.coverage } } : {}) } : null,
     activity: view.activity ?? (record.state === 'idle' ? 'Waiting for a task' : record.state),
     changes: { count: changes.length, files: changes.slice(0, 12).map(fileSummary),
       coverage: treeCoverage(record, view),
@@ -133,18 +184,83 @@ function publicResult(record, { fullResult = false } = {}) {
   };
 }
 
-export async function workerSpawn(configFile, agentId, lease, spawnProcess = spawn) {
-  if (!configFile) throw new Error('The installed plugin has no private configuration path for recovery.');
-  const script = fileURLToPath(new URL('./scoped-worker.mjs', import.meta.url));
-  const child = spawnProcess(process.execPath, [script, '--config', configFile, '--agent', agentId, '--lease', lease], {
-    detached: true, stdio: 'ignore', windowsHide: true,
-  });
-  return new Promise((resolve, reject) => {
-    // Spawn failures arrive asynchronously; a surrounding try/catch cannot catch
-    // an unhandled ChildProcess error event. Confirm spawn before saving its PID.
-    child.once('error', reject);
-    child.once('spawn', () => { child.unref(); resolve(child.pid); });
-  });
+/**
+ * Native receipt for a Claude notice. Our request id survives as the queue,
+ * attachment or user uuid, so the delivery record — not the transcript text — is
+ * the evidence: the reader truncates text at 8k, which would drop the trailing
+ * marker of a long report.
+ * @param {Array<{requestId: string, stage: string, seq?: number}>} deliveries
+ * @param {string} requestId
+ */
+export function claudeNoticeReceipt(deliveries, requestId) {
+  if (!Array.isArray(deliveries) || typeof requestId !== 'string') return undefined;
+  return deliveries.find(item => item?.requestId === requestId && ['accepted', 'inserted'].includes(item.stage));
+}
+
+const CLAUDE_STALE_BINDING = ['claude-session-changed', 'claude-process-replaced', 'claude-inbox-key-mismatch',
+  'claude-binding-mismatch', 'claude-transcript-unresolved', 'claude-binding-invalid', 'claude-transcript-replaced'];
+
+/** A cached Claude transport binding the session has outgrown: refresh it once. */
+export const claudeBindingStale = error =>
+  CLAUDE_STALE_BINDING.some(code => String(error?.message ?? error ?? '').includes(code));
+
+const CLAUDE_PAGE_BYTES = 1 << 20;
+const CLAUDE_MAX_PAGE_BYTES = 16 << 20;
+const CLAUDE_PAGES_PER_POLL = 8;
+
+/**
+ * Complete-line byte cursor at the current end of a transcript: where a new notice
+ * starts looking for its receipt. Only a small tail window is read, so a long parent
+ * chat costs the same as an empty one.
+ */
+export async function transcriptCursor(binding) {
+  const handle = await open(binding.transcriptFile, 'r');
+  try {
+    const { size } = await handle.stat();
+    const window = Math.min(size, 64 * 1024);
+    if (!window) return 0;
+    const buffer = Buffer.alloc(window);
+    await handle.read(buffer, 0, window, size - window);
+    const lastBreak = buffer.lastIndexOf(10);
+    // A tail with no line break cannot be a cursor; start over rather than misalign.
+    return lastBreak === -1 ? 0 : size - window + lastBreak + 1;
+  } finally { await handle.close(); }
+}
+
+/**
+ * Follow one notice's page window for its own request id, advancing the saved cursor
+ * as it goes. Pages continue on the next poll instead of rescanning history, and a
+ * line longer than a page retries at the reader's 16MiB ceiling.
+ * @param {object} binding Native transport binding.
+ * @param {{id: string, cursor?: number}} notice Persisted notice; its cursor advances.
+ */
+export const claudeNoticeRequestId = id => /^[a-zA-Z0-9-]{1,100}$/.test(id)
+  ? id : `notice-${createHash('sha256').update(id).digest('hex')}`;
+
+/**
+ * Failures older builds recorded as unknown although sendClaude stops before it opens
+ * a socket: nothing reached the session, so these notices may be sent again.
+ */
+const claudeNeverWritten = notice => notice.error?.code === 'ENOENT'
+  || (claudeNoticeRequestId(notice.id) !== notice.id && notice.error?.message === 'claude-request-id-invalid');
+
+export async function findClaudeReceipt(binding, notice) {
+  let cursor = Number.isSafeInteger(notice.cursor) ? notice.cursor : 0;
+  for (let page = 0; page < CLAUDE_PAGES_PER_POLL; page++) {
+    let read;
+    try { read = await readClaudeEvents(binding, { offset: cursor, maxBytes: CLAUDE_PAGE_BYTES }); }
+    catch (error) {
+      if (!String(error?.message ?? '').includes('line-exceeds-page') || CLAUDE_PAGE_BYTES >= CLAUDE_MAX_PAGE_BYTES) throw error;
+      read = await readClaudeEvents(binding, { offset: cursor, maxBytes: CLAUDE_MAX_PAGE_BYTES });
+    }
+    const matched = claudeNoticeReceipt(read.deliveries, claudeNoticeRequestId(notice.id));
+    const next = Number.isSafeInteger(read.offset) ? read.offset : cursor;
+    notice.cursor = next;
+    if (matched) return matched;
+    if (read.hasMore !== true || next <= cursor) return undefined;
+    cursor = next;
+  }
+  return undefined;
 }
 
 /** Name-addressed operations; owner and native identifiers never come from tool arguments. */
@@ -155,34 +271,405 @@ export function createScopedAgents(config, {
     target: settings.target, instanceFile: settings.instanceFile, preferredInstanceFile: settings.preferredInstanceFile,
     baseUrl: settings.baseUrl, timeoutMs: settings.timeoutMs, hostBridgeFile: settings.hostBridgeFile }),
   controlFactory = createControl,
-  startWorker = workerSpawn,
-  startIdleMonitor = ensureIdleMonitor,
+  startSharedMonitor = ensureSharedMonitor,
   monitorFailureGraceMs = 60000,
   removeTree = rm,
+  backendAdapters = {},
+  backendAdapterLoader = undefined,
+  reportStatusProbe = readReportStatus,
+  codexReportReady = undefined,
+  codexToolsStatus = undefined,
+  codexProbeRegistration = undefined,
+  reportReadyTimeoutMs = 2000,
+  captureFiles = captureWorkspace,
+  onPollComplete = () => {},
 } = {}) {
   const clients = new Map();
-  let monitorUnavailableSince;
+  const operationBackends = new WeakMap();
+  const inflight = new Map(), monitorInflight = new Map();
+  // A snapshot write started by a dispatch is not awaited by it, so its promise is kept
+  // per task: reading the baseline and shutting down both wait for it here.
+  const baselineWrites = new Map();
+  const nextPollAt = new Map();
+  let draining = false;
+  let monitorUnavailableSince, monitorError;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
-  const settings = record => ({ ...config, workspace: record.workspace, stateDirectory: agentDirectory(record),
-    codexThreadId: undefined, futureaideSessionId: undefined });
-  const apiFor = record => {
-    if (!clients.has(record.agentId)) clients.set(record.agentId, clientFactory(settings(record)));
-    return clients.get(record.agentId);
-  };
-  const controlFor = record => controlFactory(settings(record), { client: apiFor(record), managed: hostArgs(record) });
+  const workspaceBaselineFile = record => path.join(agentDirectory(record), 'workspace-baseline.json');
+  // The snapshot is started before the dispatch is written and saved after it without
+  // being awaited, so git runs next to the dispatch instead of in front of it. It is
+  // kept beside the agent's own state: the record body is saved on every poll and is
+  // far too large to carry a file list.
+  function startWorkspaceBaseline(record) {
+    const taskId = record.task?.taskId;
+    if (!taskId) return undefined;
+    const pending = Promise.resolve()
+      .then(() => captureFiles(record.workspace))
+      .catch(() => ({ available: false, reason: 'capture-failed' }));
+    return { taskId, pending };
+  }
+
+  async function saveWorkspaceBaseline(record, baseline) {
+    if (!baseline) return;
+    try {
+      const capture = await baseline.pending;
+      const file = workspaceBaselineFile(record);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, JSON.stringify({ taskId: baseline.taskId, workspace: record.workspace,
+        capturedAt: now(), capture }), 'utf8');
+    } catch { /* best effort: a missing snapshot only costs coverage, never the task */ }
+  }
+
+  /**
+   * Hand the snapshot write to the roster instead of the dispatching caller: git keeps
+   * running while the target already has its task, and every reader waits on the map.
+   * saveWorkspaceBaseline swallows its own errors, so these promises never reject.
+   */
+  function trackWorkspaceBaseline(record, baseline) {
+    if (!baseline) return;
+    const taskId = baseline.taskId;
+    const write = saveWorkspaceBaseline(record, baseline)
+      .finally(() => { if (baselineWrites.get(taskId) === write) baselineWrites.delete(taskId); });
+    baselineWrites.set(taskId, write);
+  }
+
+  async function readWorkspaceBaseline(record) {
+    try {
+      const saved = JSON.parse(await readFile(workspaceBaselineFile(record), 'utf8'));
+      return saved?.taskId === record.task?.taskId ? saved : undefined;
+    } catch { return undefined; }
+  }
+
+  /**
+   * The task's workspace changes, computed once its tree has settled. Anything that
+   * keeps the comparison from being trustworthy is reported as coverage rather than
+   * thrown, because the report itself must still be delivered.
+   */
+  async function workspaceDiff(record) {
+    // The write outlives the dispatch that started it, so the file may still be missing.
+    const pending = baselineWrites.get(record.task?.taskId);
+    if (pending) await pending;
+    const baseline = await readWorkspaceBaseline(record);
+    if (!baseline) return { changes: [], coverage: workspaceCoverage('no-baseline') };
+    if (baseline.capture?.available !== true) {
+      return { changes: [], coverage: workspaceCoverage(baseline.capture?.reason ?? 'capture-failed') };
+    }
+    let after;
+    try { after = await captureFiles(record.workspace); }
+    catch { return { changes: [], coverage: workspaceCoverage('capture-failed') }; }
+    if (after?.available !== true) return { changes: [], coverage: workspaceCoverage(after?.reason ?? 'capture-failed') };
+    const changes = diffWorkspace(baseline.capture, after);
+    return { changes, coverage: workspaceCoverage(), ...(changes.truncated ? { truncated: true } : {}) };
+  }
+  const settings = record => ({ ...config, target: targetOf(record), workspace: record.workspace,
+    stateDirectory: agentDirectory(record), codexThreadId: undefined, futureaideSessionId: undefined });
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
     sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
     ...(record.task ? { taskId: record.task.taskId } : {}) });
+  // Handles an adapter needs on the shared side: the target's own state in its own
+  // row (never inside the record the shared layer will save again) and one host
+  // lock per target application, reusing the existing lease table.
+  //
+  // ensureClaudeReports() makes the loopback tool service ready and returns
+  // {url, ready}: it starts THE shared monitor (the single host of that service —
+  // never a service per MCP connection) and waits for its health check with a
+  // short deadline. If the monitor cannot answer, ready is false with a reason; no
+  // other process grabs the port. readClaudeReportStatus() only reads
+  // readiness/registration, so a status probe can ask without starting anything.
+  const adapterDeps = (record, { startReports = true } = {}) => {
+    const load = () => store.get(record.agentId) ?? record;
+    const target = targetOf(record);
+    const readStatus = () => reportStatusProbe({ port: reportPort(config), expectedRoster: rosterIdentity(store) });
+    return {
+      load,
+      requestDirectory: () => agentDirectory(load()),
+      readNativeState: () => store.backendState(record.agentId),
+      writeNativeState: value => store.saveBackendState(record.agentId, value),
+      withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
+      ensureClaudeReports: () => (startReports ? ensureReportsReady() : readStatus()),
+      readClaudeReportStatus: readStatus,
+      ensureCodexReports: () => beginCodexReports(record),
+      readCodexReportState: () => readCodexReportState(load()),
+      // The Codex probe reads its protocol readiness only; this must never start a
+      // session, so it is the same read-only evidence status uses.
+      readCodexReportStatus: () => readCodexReportStatus(record),
+      // A Codex child's bridge is anchored on a verified Codex chat, never on a Claude
+      // session id, and the same resolver is offered both ways for its host options.
+      anchorResolver: () => anchorResolver(load()),
+      hostOptions: { anchorResolver: () => anchorResolver(load()) },
+    };
+  };
+  async function ensureReportsReady() {
+    const port = reportPort(config);
+    await ensureMonitor();
+    const deadline = Date.now() + reportReadyTimeoutMs;
+    for (;;) {
+      const status = await reportStatusProbe({ port, expectedRoster: rosterIdentity(store) });
+      if (status.ready) return { ...status, via: 'monitor' };
+      if (Date.now() >= deadline) break;
+      await wait(50);
+    }
+    // The single monitor owns the service; this call never takes the port itself.
+    return { port, url: reportUrl(port), ready: false, via: 'none',
+      reason: { code: 'report-service-unavailable', message: 'The shared monitor that hosts the tool service did not answer in time.' } };
+  }
+  // The chosen backend is rebuilt per operation from the live record, so a new
+  // task id or state never hides behind a cached binding. Only the DSH client
+  // (one authenticated connection per agent) is kept.
+  async function backendFor(record) {
+    if (operationBackends.has(record)) return operationBackends.get(record);
+    const pending = resolveRecordBackend(record);
+    operationBackends.set(record, pending);
+    try { return await pending; }
+    catch (error) { operationBackends.delete(record); throw error; }
+  }
+  async function resolveRecordBackend(record) {
+    const target = targetOf(record);
+    const load = () => store.get(record.agentId) ?? record;
+    const deps = { ...adapterDeps(record), reuseObservation: true };
+    if (target === 'dsh') {
+      if (!clients.has(record.agentId)) clients.set(record.agentId, clientFactory(settings(record)));
+      const client = clients.get(record.agentId);
+      return resolveBackend(record, { target, load, deps, dsh: { client, requestDirectory: deps.requestDirectory,
+        control: () => controlFactory(settings(load()), { client, managed: hostArgs(load()) }),
+        hostArgs: () => hostArgs(load()) } });
+    }
+    return resolveBackend(record, { target, load, deps, adapters: backendAdapters, ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
+  }
+  const forgetBackend = record => { clients.delete(record.agentId); operationBackends.delete(record); };
+  // A target without a usable adapter is refused before the name is taken, and is
+  // never answered by the DSH path instead. Pre-conditions that would only fail
+  // later (unfinished protocols, a tool service that never came up) are settled
+  // here too, so a broken name is never left in the roster.
+  async function ensureTargetBackend(record) {
+    const target = targetOf(record);
+    if (target === 'dsh') return target;
+    const deps = adapterDeps(record);
+    const backend = await resolveBackend(record, { target, load: () => record, deps, adapters: backendAdapters,
+      ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
+    const probe = await backend.probe();
+    const required = backend.requiredMethods ?? probe.methods ?? [];
+    const label = backend.labels?.host ?? hostLabel(record);
+    if (!required.every(method => probe.methods?.includes(method))) {
+      throw Object.assign(new Error(`${backend.labels?.bridge ?? `The ${label} backend`} needs this plugin version installed before subagents can be created.`), { code: 'managed-host-required' });
+    }
+    if (probe.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(label);
+    if (probe.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(label);
+    // A zero-model session whose tool endpoint is not up would make the target's
+    // first turn call nothing. Refuse the name instead of creating it half-wired.
+    if (TARGET_REQUIRES_REPORT_SERVICE[target] === true) {
+      const endpoint = await deps.ensureClaudeReports();
+      if (endpoint?.ready !== true) {
+        throw Object.assign(new Error('The loopback tool service that managed sessions report through is not ready; no subagent was created.'),
+          { code: 'report-service-unavailable', ...(endpoint?.reason ? { detail: endpoint.reason } : {}) });
+      }
+    }
+    // A Codex Desktop name is useless without its own ask/report tool surface, and
+    // an online endpoint alone does not mean those tools are registered.
+    if (target === 'codex-desktop') {
+      const endpoint = await deps.ensureCodexReports();
+      if (endpoint?.ready !== true) {
+        const reason = endpoint?.reason ?? { code: 'codex-tools-not-registered' };
+        throw Object.assign(new Error('The Codex Desktop tool service is not ready; no subagent was created.'),
+          { code: reason.code ?? 'codex-tools-not-registered', detail: reason, registered: endpoint?.registered === true });
+      }
+    }
+    return target;
+  }
 
   async function context(extra) {
-    const threadId = callingThread(extra);
-    const ownerId = ownerIdFor(threadId);
-    return store.saveOwner(await resolveCallingContext(extra, { knownOwner: store.owner(ownerId), callCodex }));
+    // The owner comes from a verified caller (Codex chat metadata or a verified
+    // Claude native session); owner ids are namespaced by source, so the same name
+    // in two applications never collides.
+    const caller = trustedCaller(extra);
+    const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+    return store.saveOwner(await resolveCallingContext(extra,
+      { knownOwner: store.owner(ownerId), callCodex, verifyClaude, bindOwner: bindClaude }));
+  }
+  /**
+   * Records this owner can see: its own, plus every managed descendant that a
+   * session beneath it created — including descendants on another application,
+   * which have their own owner id. One tree, one state machine.
+   */
+  function visibleRecords(ownerId) {
+    const own = store.list(ownerId);
+    return { own, all: [...own, ...store.descendantsOf(own.map(record => record.agentId))] };
   }
   function named(owner, name) {
+    // Addressable names are this chat's own, exactly as in 0.5.7: a descendant's name
+    // belongs to the session that created it and never hijacks this chat's namespace.
     const record = store.named(owner.ownerId, assertName(name));
     if (!record) throw Object.assign(new Error(`No subagent named “${name}” exists in this chat.`), { code: 'agent-not-found' });
     return record;
+  }
+
+  /** A Claude caller is checked against the native registry before it becomes an owner. */
+  async function verifyClaude(caller) {
+    const session = await resolveNativeSession(caller.nativeSessionId,
+      { ...(caller.workspace ? { workspace: caller.workspace } : {}) });
+    return { pid: session?.pid, workspace: session?.cwd ?? session?.workspace ?? caller.workspace };
+  }
+
+  /**
+   * Bridge anchor for a Codex Desktop child: a Codex chat this plugin already
+   * verified and saved in this roster, preferring the same project. A Claude session
+   * id is never an anchor, because only a verified chat can carry a Codex bridge.
+   * The object is the contract; toString() yields the thread id so a host that still
+   * expects a plain string keeps working while it moves to the object.
+   */
+  function anchorResolver(record) {
+    const owners = store.codexOwners();
+    if (!owners.length) {
+      throw Object.assign(new Error('No verified Codex chat is available to anchor this Codex Desktop session.'),
+        { code: 'codex-anchor-unavailable' });
+    }
+    const anchor = owners.find(owner => owner.workspace === record?.workspace) ?? owners[0];
+    return { threadId: anchor.threadId, ownerId: anchor.ownerId, workspace: anchor.workspace,
+      toString() { return anchor.threadId; } };
+  }
+
+  /**
+   * Codex-side explicit ask/report arrive through the shared submission queue. The
+   * adapter surfaces them as its own questions/reports; the one state machine owns
+   * delivery, so no second task or notice machine exists.
+   */
+  function readCodexReportState(record) {
+    if (!record?.task) return { questions: [], reports: [] };
+    const pending = store.submissions(record.agentId, record.task.taskId);
+    // Both lists carry the task they belong to: the Codex backend filters by taskId, so
+    // a question without it would be dropped before the shared layer ever saw it.
+    return {
+      questions: pending.filter(item => item.kind === 'ask').map(item => ({ id: `submission:${item.id}`,
+        taskId: record.task.taskId, state: 'pending', message: item.message, createdAt: item.created })),
+      reports: pending.filter(item => item.kind === 'report').map(item => ({ id: `submission:${item.id}`,
+        taskId: record.task.taskId, message: item.message, final: item.final, createdAt: item.created })),
+    };
+  }
+  /**
+   * Position of a record in the managed graph: root/child/grand. It comes from the
+   * saved parentAgentId edges, never from a name lookup, so same-named records at
+   * different depths are reported separately.
+   */
+  function managedPath(record) {
+    const names = [];
+    const seen = new Set();
+    let current = record;
+    while (current && !seen.has(current.agentId)) {
+      seen.add(current.agentId);
+      names.unshift(current.name);
+      current = current.parentAgentId ? store.get(current.parentAgentId) : undefined;
+    }
+    return names.join('/');
+  }
+
+  /**
+   * The one read-only registration probe: a trusted entry in this project's effective
+   * config that points at the same DEV tree and roster, plus that entry's real MCP
+   * tools/list — exactly what codex-host.probeCodexReportRegistration answers. It never
+   * starts a Codex session and never sends a model turn, so sessionVerified stays false
+   * until a real dispatch proves otherwise.
+   *
+   * A caller may inject its own probe (tests, a host that owns the check); otherwise the
+   * default is codex-host's own function, imported lazily so only the Codex path ever
+   * loads it. Either way it is asked about this record's workspace and this config file.
+   */
+  async function probeCodexRegistration(record) {
+    const probe = typeof codexProbeRegistration === 'function' ? codexProbeRegistration : await defaultCodexProbe();
+    if (typeof probe !== 'function') {
+      return { ready: false, registered: false, sessionVerified: false,
+        reason: { code: 'codex-tools-not-registered', message: 'This build has no Codex registration probe.' } };
+    }
+    try {
+      return (await probe({ workspace: record?.workspace ?? config.workspace,
+        configPath: config.configFile })) ?? undefined;
+    } catch (error) { return { ready: false, registered: false, sessionVerified: false, reason: safeError(error) }; }
+  }
+  /** Read-only Codex tool registration, for status: it never starts a session. */
+  async function readCodexToolsStatus(record) {
+    const probed = await probeCodexRegistration(record);
+    if (probed) return probed;
+    if (typeof codexToolsStatus !== 'function') return { registered: false };
+    try { return (await codexToolsStatus(record)) ?? { registered: false }; }
+    catch (error) { return { registered: false, reason: safeError(error) }; }
+  }
+  /**
+   * Read-only status for the Codex backend's own probe, which fills reportProtocol
+   * from it. `registered` means this project's effective MCP registration points at the
+   * DEV entry over this same roster and that entry's tools/list carries ask_parent and
+   * report_parent — verified by reading, never by starting a Codex session and never by
+   * an HTTP answer. The first real dispatch proves the integration in a real session.
+   */
+  async function readCodexReportStatus(record) {
+    const value = await readCodexToolsStatus(record);
+    const registered = provenRegistration(value);
+    return { ...value, ready: registered, registered, evidence: value?.evidence ?? 'registration',
+      sessionVerified: value?.sessionVerified === true };
+  }
+  /** Both tool names, proven by whichever evidence the adapter has. */
+  function provenRegistration(value) {
+    return value?.registered === true && Array.isArray(value.tools)
+      && ['ask_parent', 'report_parent'].every(tool => value.tools.includes(tool));
+  }
+  function codexToolsDiagnostics(value) {
+    const registered = provenRegistration(value);
+    return { ready: registered, present: true, registered, evidence: value?.evidence ?? 'registration',
+      ...(registered ? {} : { reason: value?.reason ?? { code: 'codex-tools-not-registered',
+        message: 'The Codex-side ask/report registration was not verified for this project.' } }) };
+  }
+  async function beginCodexReports(record) {
+    // Preflight is read-only registration verification only: the project's effective MCP
+    // entry must be the DEV entry over this roster and list both tools. It must not
+    // create or reuse a Codex session — the first dispatch is the real integration test,
+    // and a zero-model create stays zero-model. The host probe is the one source of that
+    // evidence; codexReportReady stays as a fallback for a host that supplies it instead.
+    const probed = await probeCodexRegistration(record);
+    if (probed) {
+      const registered = provenRegistration(probed);
+      return { ...probed, ready: registered && probed.ready !== false, registered,
+        evidence: probed.evidence ?? 'registration', sessionVerified: probed.sessionVerified === true,
+        ...(registered ? {} : { reason: probed.reason ?? { code: 'codex-tools-not-registered',
+          message: 'The Codex-side ask/report registration was not verified for this project.' } }) };
+    }
+    if (typeof codexReportReady !== 'function') {
+      return { ready: false, registered: false,
+        reason: { code: 'codex-tools-not-registered', message: 'This build does not register the Codex-side ask/report tools yet.' } };
+    }
+    const value = (await codexReportReady(record, { phase: 'preflight' })) ?? {};
+    const registered = provenRegistration(value);
+    if (value.ready !== true || !registered) {
+      return { ...value, ready: false, registered,
+        reason: value.reason ?? { code: 'codex-tools-not-registered',
+          message: 'The Codex-side ask/report registration is not verified for this project.' } };
+    }
+    return { ...value, ready: true, registered, evidence: value.evidence ?? 'registration' };
+  }
+
+  /**
+   * Fold pending explicit submissions into the task: a report becomes a task
+   * report, an ask becomes a pending question. Task changes and consumption commit
+   * together; the durable submission remains readable by the Codex backend.
+   */
+  function absorbSubmissions(record) {
+    const pending = store.pendingSubmissions(record.agentId, record.task.taskId);
+    if (!pending.length) return;
+    let changed = false;
+    for (const item of pending) {
+      changed = true;
+      if (item.kind === 'report') {
+        record.task.reports ??= [];
+        if (!record.task.reports.some(report => report.id === `submission:${item.id}`)) {
+          record.task.reports.push({ id: `submission:${item.id}`, taskId: record.task.taskId,
+            message: item.message, final: item.final, createdAt: item.created, delivery: { state: 'pending' } });
+        }
+      } else {
+        record.observation ??= {};
+        record.observation.questions ??= [];
+        if (!record.observation.questions.some(question => question.id === `submission:${item.id}`)) {
+          record.observation.questions.push({ id: `submission:${item.id}`, state: 'pending', message: item.message });
+        }
+        record.state = 'awaiting_input';
+      }
+    }
+    if (changed) store.saveAndConsumeSubmissions(record, pending.map(item => item.id));
   }
   async function withName(extra, name, action, options) {
     const owner = await context(extra);
@@ -195,56 +682,172 @@ export function createScopedAgents(config, {
   }
 
   async function checkHost(record, { creation = false, taskTree = false } = {}) {
-    const api = apiFor(record);
-    const identity = await api.connectionIdentity();
-    const stable = stableHost(identity);
+    const backend = await backendFor(record);
+    const probe = await backend.probe();
+    const stable = stableHost(probe.identity);
+    const labels = backend.labels ?? {};
     if (record.host && JSON.stringify(record.host) !== JSON.stringify(stable)) {
-      throw Object.assign(new Error('The original DSH data store is not connected. The task was not sent to another host.'), { code: 'host-ownership-mismatch' });
+      throw Object.assign(new Error(`The original ${labels.host ?? targetOf(record)} data store is not connected. The task was not sent to another host.`), { code: 'host-ownership-mismatch' });
     }
     if (creation || taskTree) {
-      const status = await api.hostStatus();
-      if (!METHODS.every(method => status.methods?.includes(method))) {
-        throw Object.assign(new Error('The DSH bridge needs this plugin version installed before subagents can be created.'), { code: 'managed-host-required' });
+      const required = backend.requiredMethods ?? probe.methods ?? [];
+      if (!required.every(method => probe.methods?.includes(method))) {
+        throw Object.assign(new Error(`${labels.bridge ?? `The ${targetOf(record)} backend`} needs this plugin version installed before subagents can be created.`), { code: 'managed-host-required' });
       }
-      if (status.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
-      if (status.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
+      if (probe.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(labels.host ?? hostLabel(record));
+      if (probe.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(labels.host ?? hostLabel(record));
     }
     record.host ??= stable;
-    return api;
+    return backend;
   }
 
-  async function ensureWorker(record, { wake = false } = {}) {
-    if (!record) return;
-    const previousSleep = wake ? record.sleep : undefined;
-    if (wake && record.sleep && store.lease(`worker:${record.agentId}`)?.expires > Date.now()) {
-      store.markWake(record.agentId, record.sleep.taskId);
-      return true;
-    }
-    if (wake && record.sleep) { store.wake(record.agentId, record.sleep.taskId); record = store.get(record.agentId) ?? record; }
-    if (record.sleep) return;
-    const queued = store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
-    if (!ACTIVE.has(record.state) && !queued && (record.callbackBlocked || !(record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered' && report.delivery.state !== 'blocked'))) return;
-    const holder = uid('worker');
-    if (!store.claimLease(`worker:${record.agentId}`, holder, 30000)) return true;
-    try { record.workerPid = await startWorker(config.configFile, record.agentId, holder); store.setWorker(record.agentId, record.workerPid); return true; }
+  // DSH readiness for status, derived from the one host probe status already made.
+  function dshDiagnostics(host, status) {
+    if (!host) return { ready: false, connected: false, treeProtocol: null, reportProtocol: null,
+      reason: safeError(status.hostError ?? { message: 'The DSH host is not reachable.' }) };
+    const connected = status.dshConnected === true;
+    const entry = { ready: connected && host.treeProtocol === TREE_PROTOCOL && host.reportProtocol === REPORT_PROTOCOL,
+      connected, treeProtocol: host.treeProtocol ?? null, reportProtocol: host.reportProtocol ?? null,
+      ...(connected ? {} : { missing: METHODS.filter(method => !host.methods?.includes(method)) }) };
+    if (!connected) entry.reason = { code: 'managed-host-required', message: 'Install the current managed DSH bridge.' };
+    else if (entry.treeProtocol !== TREE_PROTOCOL) entry.reason = safeError(treeProtocolError());
+    else if (entry.reportProtocol !== REPORT_PROTOCOL) entry.reason = safeError(reportProtocolError());
+    return entry;
+  }
+
+  // Does this name still owe the shared monitor a poll? Sleeping names are driven
+  // by the monitor's existing DSH host-state wake path instead.
+  function needsPoll(record) {
+    if (record?.state === 'cleaning') return true;
+    if (!record || record.closed || record.sleep) return false;
+    if (ACTIVE.has(record.state)) return true;
+    if (store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return true;
+    return !record.callbackBlocked
+      && (record.task?.reports ?? []).some(report => !['delivered', 'blocked'].includes(report.delivery.state));
+  }
+
+  async function ensureMonitor() {
+    try { return await startSharedMonitor(config, store); }
     catch (error) {
-      try { store.setWorkerError(record.agentId, holder, safeError(error)); }
-      finally { store.releaseLease(`worker:${record.agentId}`, holder); }
-      if (previousSleep) store.restoreSleep({ ...record, sleep: previousSleep });
+      monitorError = safeError(error);
       return false;
     }
   }
 
-  async function observe(record) {
-    const api = await checkHost(record);
-    const observed = await api.managedStatus(hostArgs(record));
+  // One monitor serves every name: this only makes sure it exists and, for a
+  // sleeping name, clears the marker so the same durable task is polled again.
+  async function ensureWorker(record, { wake = false } = {}) {
+    if (!record) return false;
+    if (wake && record.sleep) {
+      if (!await ensureMonitor()) {
+        // Nothing can watch this installation right now. Keep the sleeping
+        // baseline so a later call resumes the same task instead of losing it.
+        store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+        return false;
+      }
+      store.wake(record.agentId, record.sleep.taskId);
+      record = store.get(record.agentId) ?? record;
+    }
+    if (record.sleep) return true;
+    if (!needsPoll(record)) return false;
+    const ready = await ensureMonitor();
+    if (!ready) store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+    return ready;
+  }
+
+  /** The record's own backend observation, exactly as its host reported it. */
+  async function observeOwn(record) {
+    const backend = await checkHost(record);
+    const observed = await backend.observe();
     if (observed.sessionId !== record.sessionId || (record.task && observed.taskId !== record.task.taskId)) {
       throw new Error('The host returned a different subagent task.');
     }
-    if (record.task?.treeProtocol === TREE_PROTOCOL && !observed.tree) throw treeProtocolError();
-    record.observation = { ...observed, capturedAt: now() };
-    record.error = undefined;
+    if (record.task?.treeProtocol === TREE_PROTOCOL && !observed.tree) throw treeProtocolError(hostLabel(record));
     return observed;
+  }
+
+  /**
+   * One view for the whole managed tree: the record's own native tree plus every
+   * managed descendant's native tree, each child's native root hanging under the
+   * parent's own node. Everything downstream (settled, public shape, changes,
+   * coverage, finish gate, history snapshots, inspect) reads this view and nothing
+   * else, so no interface grows its own tree logic.
+   *
+   * The root's questions and reports stay the root's own: a child's questions and
+   * reports are delivered through that child's own state machine, never folded into
+   * the root's report.
+   */
+  async function observe(record) {
+    const own = await observeOwn(record);
+    const keyOf = (agentId, native) => agentId === record.agentId ? native : `${agentId}:${native}`;
+    const nodes = (own.tree?.nodes ?? []).map(node => ({ ...node,
+      name: node.sessionId === record.sessionId ? record.name : node.name,
+      backendKey: record.agentId, nativeSessionId: node.sessionId }));
+    const managed = new Map([[record.agentId, { record, backend: await backendFor(record), rootKey: record.sessionId }]]);
+    let settled = own.tree?.settled === true && !record.task?.cancelPending;
+    let running = own.tree?.running === true || record.task?.cancelPending === true;
+    for (const child of store.descendantsOf([record.agentId])) {
+      const parentEntry = managed.get(child.parentAgentId);
+      if (!parentEntry) continue;
+      const parentKey = parentEntry.rootKey;
+      const entry = { record: child, backend: undefined, view: undefined, rootKey: keyOf(child.agentId, child.sessionId) };
+      managed.set(child.agentId, entry);
+      // A child owns its adapter under its own operation lock. Reading its durable
+      // observation never races its request/receipt writes or blocks this parent.
+      const saved = child.observation;
+      entry.view = saved?.sessionId === child.sessionId && saved?.taskId === child.task?.taskId
+        ? saved : undefined;
+      const childNodes = (entry.view?.tree?.nodes ?? []).filter(node => !node.archived
+        && (!node.backendKey || node.backendKey === child.agentId));
+      if (childNodes.length) {
+        entry.rootKey = keyOf(child.agentId, child.sessionId);
+        for (const node of childNodes) nodes.push({ ...node,
+          sessionId: keyOf(child.agentId, node.sessionId),
+          parentSessionId: node.parentSessionId ? keyOf(child.agentId, node.parentSessionId) : parentKey,
+          name: node.sessionId === child.sessionId ? child.name : node.name,
+          backendKey: child.agentId, nativeSessionId: node.sessionId });
+      } else {
+        // A managed child with no native tree of its own still belongs in the tree, so
+        // an unfinished child can never let the parent settle early.
+        nodes.push({ sessionId: entry.rootKey, parentSessionId: parentKey, name: child.name,
+          status: child.closed ? 'closed' : child.state, activity: child.state, changes: [], coverage: 'Not observed',
+          backendKey: child.agentId, nativeSessionId: child.sessionId, synthetic: true });
+      }
+      const pendingReports = (child.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
+      const pendingQuestions = (entry.view?.questions ?? []).some(question => question.state === 'pending');
+      const busy = Boolean(child.task) && (pendingReports || pendingQuestions
+        || ACTIVE.has(child.state) || child.state === 'cleanup_failed'
+        || !['completed', 'failed', 'cancelled'].includes(child.task.state));
+      const childSettled = !child.task
+        ? true
+        : entry.view?.capturedAt && !entry.view.stale && entry.view?.tree?.settled === true
+          && entry.view?.tree?.running === false && !busy;
+      settled = settled && childSettled;
+      running = running || entry.view?.tree?.running === true || busy;
+    }
+    // Removed one-shot children remain part of this task's evidence. Live records
+    // take precedence while cleanup is in progress or being retried.
+    for (const entry of managed.values()) {
+      const latest = store.get(entry.record.agentId);
+      const snapshots = latest?.task?.taskId === entry.record.task?.taskId
+        ? latest?.task?.childSnapshots : entry.record.task?.childSnapshots;
+      for (const snapshot of snapshots ?? []) {
+        if (managed.has(snapshot.agentId)) continue;
+        const snapshotKey = native => `${snapshot.agentId}:${native}`;
+        for (const node of snapshot.nodes ?? []) nodes.push({ ...node,
+          sessionId: snapshotKey(node.sessionId),
+          parentSessionId: node.parentSessionId ? snapshotKey(node.parentSessionId) : entry.rootKey,
+          archived: true });
+      }
+    }
+    const composed = { ...own, tree: { ...(own.tree ?? {}), nodes, settled, running } };
+    composed.managed = managed;
+    // Everything persisted stays plain data: backends and the managed map are live
+    // objects and must never reach the roster.
+    const { managed: _managed, ...storable } = composed;
+    record.observation = { ...storable, capturedAt: now() };
+    record.error = undefined;
+    return composed;
   }
 
   function sameModel(left, right) {
@@ -255,19 +858,23 @@ export function createScopedAgents(config, {
 
   async function followHostModel(record, dispatch, observed) {
     if (dispatch.modelReady) return;
-    const control = controlFor(record);
+    const backend = await backendFor(record);
     if (!dispatch.model) {
-      dispatch.model = resolveModel(await control.models(), {});
+      dispatch.model = resolveModel(await backend.models(), {});
       store.save(record);
     }
     // Only a live host observation proves what the session will use. The roster
-    // model is a display snapshot and may have been migrated while asleep.
-    const current = observed ? observed.currentModel
-      : (await apiFor(record).managedSession(hostArgs(record))).projections?.values?.modelSelection?.next;
+    // model is a display snapshot and may have been migrated while asleep. An
+    // observation that reports modelSelectionObserved:false carries a historical
+    // value (read back from a transcript), which is stale exactly when the user
+    // changed the model in the UI without sending a turn — then the real
+    // next-turn control is read instead of trusting that value.
+    const current = observed && observed.modelSelectionObserved !== false
+      ? observed.currentModel
+      : await backend.model();
     if (!sameModel(current, dispatch.model)) {
-      const selected = await control.selectModel({ sessionId: record.sessionId, ...dispatch.model,
-        requestId: `${dispatch.requestId}-model` });
-      if (selected.accepted !== true) throw Object.assign(new Error('DSH did not confirm the default model selection.'),
+      const selected = await backend.selectModel({ ...dispatch.model, requestId: `${dispatch.requestId}-model` });
+      if (selected.accepted !== true) throw Object.assign(new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the default model selection.`),
         { code: 'model-selection-unconfirmed', uncertain: selected.status === 'unknown' });
     }
     record.model = dispatch.model;
@@ -278,7 +885,7 @@ export function createScopedAgents(config, {
   async function sendDispatch(record, message, kind = 'task', answerIds = [], requestId = uid('request'), observed) {
     const task = record.task;
     const baseline = Number.isSafeInteger(observed?.throughSeq)
-      ? observed : await apiFor(record).historyCursor(record.sessionId, record.workspace);
+      ? observed : await (await backendFor(record)).cursor();
     const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now() };
     task.dispatches.push(dispatch);
     record.state = 'running'; task.state = 'running';
@@ -289,15 +896,28 @@ export function createScopedAgents(config, {
 
   async function dispatchOnce(record, dispatch, observed) {
     const current = store.get(record.agentId);
-    if (current?.task?.taskId !== record.task?.taskId || current.task.cancelRequested) return;
+    if (current?.task?.taskId !== record.task?.taskId || current.closed || current.task.cancelRequested) return;
+    if (dispatch.nextAttemptAt > Date.now()) return;
+    let delivering = false;
     try {
       await followHostModel(record, dispatch, observed);
-      const sent = await controlFor(record).send({ sessionId: record.sessionId, message: dispatch.message, requestId: dispatch.requestId,
-        background: false, suppressCallback: true, mode: 'queue' });
+      // The model this request runs on is given explicitly, so a backend never has to
+      // guess it from a catalog default that may have moved since the preflight.
+      const backend = await backendFor(record);
+      delivering = true;
+      const sent = await backend.deliver({ requestId: dispatch.requestId,
+        message: dispatch.message, kind: dispatch.kind, model: dispatch.model });
       Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
-        afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined } : {}) });
+        afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined, nextAttemptAt: undefined } : {}) });
+      if (!sent.accepted && ['retryable', 'retrying'].includes(dispatch.state)) {
+        dispatch.state = 'retrying'; deferRetry(dispatch);
+      }
     } catch (error) {
-      Object.assign(dispatch, { state: error.retryableRead === true ? 'retrying' : error.uncertain ? 'unknown' : 'failed', afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
+      const retryable = error.retryableRead === true || (targetOf(record) !== 'dsh' && (!delivering || error.code === 'agent-busy'));
+      const state = targetOf(record) !== 'dsh' && !delivering ? 'retrying'
+        : error.uncertain ? 'unknown' : retryable ? 'retrying' : 'failed';
+      Object.assign(dispatch, { state, afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
+      if (dispatch.state === 'retrying' && targetOf(record) !== 'dsh') deferRetry(dispatch);
     }
     store.save(record);
     const latest = store.get(record.agentId);
@@ -305,13 +925,59 @@ export function createScopedAgents(config, {
       record.task.cancelRequested = true;
       record.task.cancelVerified = false;
       store.save(record);
-      const result = await (await checkHost(record)).managedCancel(hostArgs(record));
+      const result = await (await checkHost(record)).cancel();
+      retainCancelError(record, result);
       if (result.cancelRequested === true) {
-        store.confirmCancel(record);
+        store.confirmCancel(record, result);
         record.task.cancelVerified = true;
+        record.task.cancelPending = result.cancelPending === true;
         store.save(record);
       }
     }
+  }
+
+  function deferRetry(value) {
+    value.retryAttempts = (value.retryAttempts ?? 0) + 1;
+    value.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(value.retryAttempts, 5));
+  }
+
+  function firstDispatchDeferred(record) {
+    const dispatches = record.task?.dispatches ?? [];
+    const first = dispatches[0];
+    // A supplementary input's backoff must never stop observation or delivery
+    // for work already admitted by the native session.
+    return !record.task?.cancelRequested && dispatches.length === 1 && first.kind === 'task'
+      && !first.accepted && first.state === 'retrying' && first.nextAttemptAt > Date.now();
+  }
+
+  // A native refusal is often a normal return value, not an exception. Keep its
+  // bounded explanation with the cancellation intent so observe() cannot erase it.
+  function retainCancelError(record, result) {
+    const task = record.task;
+    if (result.treeSettled === true) { task.cancelError = undefined; return; }
+    const rounds = (result.cancelRounds ?? []).slice(-3);
+    const refused = rounds.some(round => round.action === 'stop-tasks-unsupported'
+      || (round.action === 'interrupt-root' && round.interrupted === false)
+      || (round.detail ?? []).some(row => row.clicked === false));
+    if (result.cancelRequested !== false && !refused) return;
+    const details = rounds.map(round => ({ action: round.action,
+      ...(round.reason ? { reason: compactText(String(round.reason), 200) } : {}),
+      ...(round.status ? { status: round.status } : {}),
+      ...(typeof round.clicked === 'number' ? { clicked: round.clicked } : {}),
+      ...(typeof round.remaining === 'number' ? { remaining: round.remaining } : {}),
+      ...(round.detail?.length ? { rows: round.detail.slice(0, 4).map(row => ({
+        row: compactText(String(row.rowText ?? ''), 200), clicked: row.clicked === true, state: row.state,
+        ...(row.error ? { error: { code: row.error.code ?? 'native-stop-refused',
+          message: compactText(String(row.error.message ?? ''), 240) } } : {}),
+      })) } : {}),
+    }));
+    task.cancelError = { code: result.cancelRequested === false ? 'native-cancel-unconfirmed' : 'native-cancel-partial',
+      message: result.cancelRequested === false
+        ? 'The native host has not accepted a stop. Cancellation remains pending and will retry.'
+        : 'The native host refused part of the stop. Cancellation remains pending and will retry.',
+      detail: { ...(result.reason ? { reason: compactText(String(result.reason), 200) } : {}), rounds: details } };
+    if (targetOf(record) !== 'dsh') deferRetry(record);
+    store.save(record);
   }
 
   async function verifyOwner(owner) {
@@ -333,14 +999,30 @@ export function createScopedAgents(config, {
     notice.attempts = (notice.attempts ?? 0) + 1;
     notice.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(notice.attempts, 5));
     const marker = `<!-- futureaide-control:${notice.id} -->`;
+    const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
+    // These exact legacy failures happened before sendClaude opened a socket. They
+    // can resume; other unknown outcomes stay read-only.
+    if (claude && notice.state === 'unknown' && claudeNeverWritten(notice)) notice.state = 'pending';
     if (notice.state === 'unknown' || notice.state === 'sending') {
       try {
-        const history = await callCodex(owner.threadId, 'read_thread', {
-          threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
-        });
-        if (!history?.isError && JSON.stringify(history).includes(marker)) {
-          Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
-        } else notice.state = 'unknown';
+        if (claude) {
+          // The native receipt is the request id itself: our envelope uuid survives
+          // as the queue/attachment/user uuid. Transcript text is truncated at 8k,
+          // so a long report's trailing marker is never reliable — deliveries are.
+          // The scan starts at this notice's own cursor, so a long parent chat is
+          // never rescanned and a page boundary simply continues on the next poll.
+          const settled = await findClaudeReceipt(await claudeNoticeBinding(owner), notice);
+          Object.assign(notice, settled
+            ? { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined }
+            : { state: 'unknown' });
+        } else {
+          const history = await callCodex(owner.threadId, 'read_thread', {
+            threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
+          });
+          if (!history?.isError && JSON.stringify(history).includes(marker)) {
+            Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
+          } else notice.state = 'unknown';
+        }
       } catch { notice.state = 'unknown'; }
       store.save(record);
       return;
@@ -348,26 +1030,103 @@ export function createScopedAgents(config, {
     // A newly confirmed channel rejection must not rewrite an older ambiguous
     // delivery: the read-back branch above remains its only recovery path.
     if (record.callbackBlocked) { notice.state = 'blocked'; store.save(record); return; }
-    try { await verifyOwner(owner); }
+    try { await (claude ? claudeNoticeBinding(owner) : verifyOwner(owner)); }
     catch (error) { Object.assign(notice, { state: 'pending', error: safeError(error) }); store.save(record); return; }
     // A previous attempt may have reached the desktop. Never send a second copy blindly.
     Object.assign(notice, { state: 'sending', attemptedAt: now() });
     store.save(record);
     try {
-      const result = await callCodex(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
-      const unavailable = result?.isError && JSON.stringify(result).includes('direct app-server input is not allowed for multi-agent v2 sub-agents');
-      if (unavailable) record.callbackBlocked = true;
-      Object.assign(notice, unavailable ? { state: 'blocked', error: { code: 'native-callback-unavailable' } } : result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
-        : { state: 'delivered', deliveredAt: now(), error: undefined });
-    } catch (error) { Object.assign(notice, { state: 'unknown', error: safeError(error) }); }
+      if (claude) {
+        // The Claude inbox answers 'written' when the channel accepted the text,
+        // which is not that the session read it: stay unknown until the read-back
+        // branch finds our request id in the native deliveries. A definite channel
+        // failure stays 'pending'. The cached binding is reused; only a binding the
+        // session outgrew is refreshed, and the parent session is never replaced.
+        const binding = await claudeNoticeBinding(owner);
+        // Remember where the transcript ends before writing: the receipt can only
+        // appear after this point, so later polls start here instead of rescanning.
+        notice.cursor = await transcriptCursor(binding).catch(() => undefined);
+        const send = target => sendClaude(target, `${text}\n\n${marker}`, { requestId: claudeNoticeRequestId(notice.id) });
+        const resend = async () => {
+          const fresh = await refreshClaudeBinding(owner);
+          notice.cursor = await transcriptCursor(fresh).catch(() => undefined);
+          return send(fresh);
+        };
+        let sent;
+        try { sent = await send(binding); }
+        catch (error) {
+          // A binding is refreshed only when the write provably failed before it
+          // happened; a written/uncertain channel is never retried here.
+          if (!claudeBindingStale(error)) throw error;
+          sent = await resend();
+        }
+        // The pipe never opened, so nothing was written. A session that crashed leaves
+        // its old record behind, and only a fresh lookup finds where it came back.
+        if (sent?.status === 'failed') sent = await resend();
+        if (sent?.status === 'failed') Object.assign(notice, { state: 'pending', error: { message: 'The Claude inbox rejected this notice before acceptance.' } });
+        else Object.assign(notice, { state: 'unknown', error: undefined });
+      } else {
+        const result = await callCodex(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
+        const unavailable = result?.isError && JSON.stringify(result).includes('direct app-server input is not allowed for multi-agent v2 sub-agents');
+        if (unavailable) record.callbackBlocked = true;
+        Object.assign(notice, unavailable ? { state: 'blocked', error: { code: 'native-callback-unavailable' } } : result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
+          : { state: 'delivered', deliveredAt: now(), error: undefined });
+      }
+    } catch (error) {
+      // sendClaude throws only before its write, and a session that cannot be found was
+      // never written to, so a Claude notice that lands here can be sent again.
+      Object.assign(notice, { state: claude ? 'pending' : 'unknown', error: safeError(error) });
+    }
     store.save(record);
   }
 
+  /**
+   * Transport binding for the Claude session that owns this name. A saved binding
+   * is re-validated natively by sendClaude/readClaudeEvents on every use, so the
+   * normal path runs no discovery and no rebind, and a cold process resumes straight
+   * from the roster.
+   */
+  async function claudeNoticeBinding(owner) {
+    const cached = owner?.binding;
+    if (cached?.socketPath && cached?.recordFile && cached?.transcriptFile) return cached;
+    return refreshClaudeBinding(owner);
+  }
+  async function refreshClaudeBinding(owner) {
+    if (!owner?.nativeSessionId) throw Object.assign(new Error('This owner has no native Claude session to answer.'),
+      { code: 'callback-target-missing' });
+    const wanted = String(owner.nativeSessionId).toLowerCase();
+    const { sessions } = await discoverClaude();
+    const session = (sessions ?? []).find(item => String(item.sessionId).toLowerCase() === wanted);
+    if (!session) throw Object.assign(new Error('The Claude session that owns this name is not running.'),
+      { code: 'callback-target-missing' });
+    // Same native session, same parent context: only the transport binding is
+    // refreshed, never the conversation it belongs to.
+    const binding = await bindClaude({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
+    store.saveOwner({ ...(store.owner(owner.ownerId) ?? owner), hostSessionId: owner.nativeSessionId, binding });
+    store.rebindOwner(owner.ownerId, binding);
+    return binding;
+  }
+
+  /**
+   * What status may claim about the way back to this caller. A Claude session keeps
+   * its id across a restart but not its process or pipe, so a saved binding proves
+   * nothing until it matches the live record. The caller is verified here, which makes
+   * this the moment to replace a binding it has outgrown.
+   */
+  async function returnChannel(owner) {
+    if (!owner.nativeSessionId) return { returnChannel: 'chat-verified' };
+    try {
+      try { currentRecord(await claudeNoticeBinding(owner)); }
+      catch (error) { if (!claudeBindingStale(error)) throw error; await refreshClaudeBinding(owner); }
+      return { returnChannel: 'chat-verified' };
+    } catch (error) { return { returnChannel: 'unavailable', returnChannelError: safeError(error) }; }
+  }
+
   async function prepare(record) {
-    const api = await checkHost(record, { creation: true });
+    const backend = await checkHost(record, { creation: true });
     store.save(record);
-    const created = await api.managedCreate(hostArgs(record));
-    if (created.sessionId !== record.sessionId || created.modelRequestsStarted !== 0) throw new Error('DSH did not confirm the requested empty subagent.');
+    const created = await backend.create();
+    if (created.sessionId !== record.sessionId || created.modelRequestsStarted !== 0) throw new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the requested empty subagent.`);
     // The model is resolved from the live host default when the first input is
     // sent; creation must not add a second catalog round-trip or pin a stale model.
     record.model = created.model;
@@ -376,12 +1135,12 @@ export function createScopedAgents(config, {
 
   async function negotiateTree(record, force = false) {
     if (!force && record.task.treeProtocol === TREE_PROTOCOL && record.task.reportProtocol === REPORT_PROTOCOL) return;
-    const api = await checkHost(record, { taskTree: true });
+    const backend = await checkHost(record, { taskTree: true });
     const after = record.task.dispatches[0]?.afterSeq;
-    const started = await api.managedBeginTask({ ...hostArgs(record),
+    const started = await backend.beginTask({
       ...(Number.isSafeInteger(after) && after >= -1 ? { taskStartSeq: after } : {}) });
-    if (started.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError();
-    if (started.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError();
+    if (started.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(hostLabel(record));
+    if (started.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(hostLabel(record));
     record.task.treeProtocol = TREE_PROTOCOL;
     record.task.reportProtocol = REPORT_PROTOCOL;
     store.save(record);
@@ -389,26 +1148,49 @@ export function createScopedAgents(config, {
   }
 
   async function beginTask(record) {
-    const observed = await negotiateTree(record, true);
-    await sendDispatch(record, record.task.message, 'task', [], undefined, observed);
+    const baseline = startWorkspaceBaseline(record);
+    try {
+      const observed = await negotiateTree(record, true);
+      await sendDispatch(record, record.task.message, 'task', [], undefined, observed);
+    } finally { trackWorkspaceBaseline(record, baseline); }
   }
 
   async function resolveAnswer(record, answer) {
     if (answer.questionIds) return;
-    const result = await apiFor(record).managedAnswer({ ...hostArgs(record), answerId: answer.answerId, message: answer.message });
+    const result = await (await backendFor(record)).answer({ answerId: answer.answerId, message: answer.message });
     if (!result.consumedQuestionIds?.length) throw new Error('This subagent has no unanswered question.');
     answer.questionIds = result.consumedQuestionIds;
     answer.continuation = result.continuation ?? `主控回答：\n${answer.message}\n请继续完成原任务。`;
     store.save(record);
   }
 
+  /**
+   * Close one name and everything created beneath it. Children go first: a child that
+   * cannot be cleaned keeps the parent in cleanup_failed (still listed, still retryable)
+   * instead of vanishing from the roster while its session survives. A child already in
+   * cleanup_failed is retried too — closed is not the same as cleaned.
+   */
   async function clearRecord(record, { autoClaimed = false } = {}) {
     record.state = 'cleaning'; record.closed = true;
     if (!autoClaimed) store.save(record);
     try {
+      for (const child of store.childrenOf(record.agentId)) {
+        const current = store.get(child.agentId);
+        if (!current || current.agentId === record.agentId) continue;
+        const verdict = await store.locked(current.agentId, async () => {
+          const fresh = store.get(current.agentId);
+          return fresh ? clearRecord(fresh) : { deleted: true };
+        }, { waitMs: 0 });
+        if (verdict?.deleted !== true) {
+          throw Object.assign(new Error(`The managed subagent “${current.name}” could not be cleaned; this name stays listed so cleanup can be retried.`),
+            { code: verdict?.queued ? 'agent-busy' : 'child-cleanup-failed', child: current.name, childError: verdict?.error });
+        }
+      }
+      if (record.lifetime === 'once' && record.parentAgentId) await keepChildSnapshot(record);
       if (!record.nativeDestroyed) {
-        const result = await (await checkHost(record)).managedDestroy(hostArgs(record));
-        if (result.destroyed !== true) throw new Error(result.message ?? 'DSH has not confirmed complete session cleanup.');
+        const backend = await checkHost(record);
+        const result = await backend.destroy();
+        if (result.destroyed !== true) throw new Error(result.message ?? `${backend.labels?.host ?? targetOf(record)} has not confirmed complete session cleanup.`);
         record.nativeDestroyed = true; store.save(record);
       }
       const directory = agentDirectory(record);
@@ -425,30 +1207,86 @@ export function createScopedAgents(config, {
         await removeTree(directory, { recursive: true, force: true });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       store.remove(record);
-      clients.delete(record.agentId);
+      forgetBackend(record);
       return { name: record.name, deleted: true, sessionDataRemoved: true };
     } catch (error) {
       const current = store.get(record.agentId);
+      // An uncertain destroy is a write whose outcome is unknown, not a failed cleanup:
+      // the host may already be finishing it. A busy or queued child makes the parent
+      // wait the same way. Neither is reported as an error, or a queued cleanup would
+      // be listed as failed.
+      if (current && (error.uncertain === true || error.code === 'agent-busy')) {
+        current.state = 'cleaning'; current.closed = true; current.error = safeError(error); deferRetry(current); store.save(current);
+        return { name: record.name, deleted: false, queued: true, state: 'cleaning' };
+      }
       if (current) { current.state = 'cleanup_failed'; current.closed = true; current.error = safeError(error); store.save(current); }
       return { name: record.name, deleted: false, state: 'cleanup_failed', error: safeError(error) };
     }
+  }
+
+  /**
+   * Keep a one-shot child's terminal tree, files and history inside the parent's
+   * current task snapshot, in the fields the task already has. No second state machine.
+   */
+  async function keepChildSnapshot(child) {
+    const parent = store.get(child.parentAgentId);
+    if (!parent?.task) return;
+    const view = child.nativeDestroyed ? child.observation ?? {} : await observe(child);
+    const nodes = [];
+    for (const { node } of ownedTree(child, view).nodes) {
+      const saved = { ...node };
+      if (!saved.archivedHistory && !child.nativeDestroyed) {
+        const backend = view.managed?.get(node.backendKey)?.backend ?? await backendFor(child);
+        const page = await backend.history({ targetSessionId: node.nativeSessionId ?? node.sessionId,
+          running: false, maxMessages: 100 });
+        saved.archivedHistory = { messages: page.messages ?? [], hasMore: page.hasMore === true,
+          ...(page.note ? { note: page.note } : {}) };
+      }
+      nodes.push(saved);
+    }
+    store.saveChildSnapshot(parent.agentId, parent.task.taskId,
+      { agentId: child.agentId, taskId: child.task?.taskId, nodes });
   }
 
   // Only persisted report_parent calls may wake the parent chat.
   async function deliverReports(record) {
     for (const report of record.task.reports ?? []) {
       if (report.final && !report.treeSettledConfirmed) continue;
-      await deliver(record, report.delivery, `DSH「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`);
+      await deliver(record, report.delivery, `${hostLabel(record)}「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`);
       if (report.delivery.state !== 'delivered') return false;
     }
     return true;
   }
 
+  /**
+   * The caller can only order the next task after reading the final report, so that
+   * notice's native receipt is already in the transcript. Re-read it here instead of
+   * waiting for the next 30-second delivery batch. Only a notice whose write outcome
+   * is still ambiguous is re-read this way; delivered and blocked ones are untouched,
+   * so no report is ever written twice.
+   */
+  async function settleDelivery(record) {
+    for (const report of record.task?.reports ?? []) {
+      const notice = report.delivery;
+      if (notice && ['unknown', 'sending'].includes(notice.state)) notice.nextAttemptAt = undefined;
+    }
+    store.save(record);
+    await deliverReports(record);
+    const task = record.task;
+    const final = (task?.reports ?? []).find(report => report.final);
+    // The same finish gate a poll uses, so a settled report closes its task once.
+    if (final?.treeSettledConfirmed && task.result
+        && task.reports.every(report => report.delivery.state === 'delivered')) await finishDeliveredReport(record);
+  }
+
   async function finishDeliveredReport(record) {
     const task = record.task;
     const current = store.get(record.agentId);
-    if (current?.task?.taskId === task.taskId && current.task.cancelRequested) task.cancelRequested = true;
-    if (task.cancelRequested && (!task.cancelVerified || !task.cancelTreeSettled)) {
+    if (current?.task?.taskId === task.taskId && current.task.cancelRequested) {
+      task.cancelRequested = true;
+      task.cancelPending = current.task.cancelPending === true;
+    }
+    if (task.cancelRequested && (!task.cancelVerified || task.cancelPending || !task.cancelTreeSettled)) {
       record.state = task.state = 'running';
       store.save(record);
       return publicResult(record);
@@ -500,6 +1338,17 @@ export function createScopedAgents(config, {
     store.save(record);
     const delivered = await deliverReports(record);
     if (final && final.treeSettledConfirmed) {
+      // Compared only after the tree settled and only once, because polls repeat this
+      // block until delivery ends. The report never waits for git and a failed
+      // comparison is coverage, not an error.
+      if (!task.workspace) {
+        task.workspace = await workspaceDiff(record);
+        if (task.result) {
+          task.result.changes = attributedChanges(record, view);
+          task.result.coverage = treeCoverage(record, view);
+        }
+        store.save(record);
+      }
       if (delivered) return finishDeliveredReport(record);
       record.state = record.callbackBlocked && ['failed', 'cancelled'].includes(task.result.state)
         && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled)) ? task.result.state : 'delivery_pending';
@@ -510,30 +1359,31 @@ export function createScopedAgents(config, {
 
   function waitForTree(record, view, summaryOnly = false) {
     record.state = record.task.state = 'running';
-    record.observation = { ...view, activity: summaryOnly ? 'Waiting for the top-level DSH summary' : 'Waiting for the DSH task tree and notifications to settle' };
+    record.observation = { ...view, activity: summaryOnly ? `Waiting for the top-level ${hostLabel(record)} summary` : `Waiting for the ${hostLabel(record)} task tree and notifications to settle` };
     store.save(record);
     return publicResult(record);
   }
 
   async function recoverDispatch(record, dispatch, { allowResend = true } = {}) {
     if (dispatch.accepted || !['sending', 'retrying', 'unknown'].includes(dispatch.state)) return;
-    const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, dispatch.requestId])).digest('hex');
-    try {
-      const receipt = JSON.parse(await readFile(path.join(agentDirectory(record), 'requests', `${key}.json`), 'utf8'));
-      dispatch.afterSeq = receipt.result?.afterSeq ?? receipt.afterSeq ?? dispatch.afterSeq;
-      if (receipt.status === 'accepted') { dispatch.accepted = true; dispatch.state = 'running'; }
-      if (receipt.status === 'rejected') dispatch.state = 'failed';
-      if (receipt.status === 'retryable') {
-        if (!allowResend) return 'not-sent';
-        await dispatchOnce(record, dispatch);
-      }
-    } catch (error) {
-      if (error.code === 'ENOENT' && ['sending', 'retrying'].includes(dispatch.state)) {
-        // writeOnce creates its receipt before entering the native send. No receipt
-        // means this saved intent never reached that send; keep the exact request ID.
-        if (!allowResend) return 'not-sent';
-        await dispatchOnce(record, dispatch);
-      } else if (error.code !== 'ENOENT') throw error;
+    if (dispatch.nextAttemptAt > Date.now()) return;
+    // The backend owns its own receipt format; undefined means this saved intent
+    // never reached a native write.
+    const receipt = await (await backendFor(record)).receipt({ requestId: dispatch.requestId });
+    if (!receipt) {
+      if (!['sending', 'retrying'].includes(dispatch.state)) return;
+      // The receipt is written before entering the native send. No receipt means
+      // this intent never reached that send; keep the exact request ID.
+      if (!allowResend) return 'not-sent';
+      await dispatchOnce(record, dispatch);
+      return;
+    }
+    dispatch.afterSeq = receipt.afterSeq ?? dispatch.afterSeq;
+    if (receipt.status === 'accepted') Object.assign(dispatch, { accepted: true, state: 'running', error: undefined, failure: undefined, nextAttemptAt: undefined, retryAttempts: undefined });
+    if (receipt.status === 'rejected') dispatch.state = 'failed';
+    if (receipt.status === 'retryable') {
+      if (!allowResend) return 'not-sent';
+      await dispatchOnce(record, dispatch);
     }
   }
 
@@ -563,10 +1413,10 @@ export function createScopedAgents(config, {
           await dispatchOnce(record, prior);
         }
         if (!prior.accepted && prior.state !== 'failed' && Number.isSafeInteger(prior.afterSeq)) {
-          const observed = await controlFor(record).wait({ sessionId: record.sessionId, requestId: prior.requestId,
+          const observed = await (await backendFor(record)).turn({ requestId: prior.requestId,
             afterSeq: prior.afterSeq, timeoutSeconds: 0, maxMessages: 100 });
           if (observed.state === 'ended' && observed.correlation === 'request-id') Object.assign(prior,
-            { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq,
+            { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
               failure: modelTurnError(observed.completionReason) });
         }
         store.save(record);
@@ -604,13 +1454,25 @@ export function createScopedAgents(config, {
   }
 
   async function pollLocked(record) {
+    if (record.nextAttemptAt > Date.now()) return publicResult(record);
+    if (firstDispatchDeferred(record)) return publicResult(record);
     if (record.state === 'cleaning') return clearRecord(record);
     if (record.closed || record.state === 'cleanup_failed' || record.state === 'idle') return publicResult(record);
     const task = record.task;
     try {
-      if (task?.cancelRequested && !task.cancelVerified) {
-        const result = await (await checkHost(record)).managedCancel(hostArgs(record));
-        if (result.cancelRequested === true) { store.confirmCancel(record); task.cancelAccepted = true; task.cancelVerified = true; store.save(record); }
+      // Explicit ask/report that a Codex-side tool wrote into the shared queue join
+      // the same task as questions/reports before anything else looks at them.
+      if (task) absorbSubmissions(record);
+      if (task?.cancelRequested && (!task.cancelVerified || task.cancelPending)) {
+        const result = await (await checkHost(record)).cancel();
+        retainCancelError(record, result);
+        if (result.cancelRequested === true) {
+          store.confirmCancel(record, result);
+          task.cancelAccepted = true; task.cancelVerified = true;
+          task.cancelPending = result.cancelPending === true;
+          if (task.cancelPending) task.cancelTreeSettled = false;
+          store.save(record);
+        }
       }
       if (task && store.supplements(record.agentId).length) await drainSupplements(record);
       // Never migrate an automatic result into an explicit report or cleanup.
@@ -632,12 +1494,17 @@ export function createScopedAgents(config, {
       }
       if (!record.created) { await prepare(record); return publicResult(record); }
       if (!task) return publicResult(record);
-      if (!task.dispatches.length && !task.cancelRequested && !task.legacyAutomaticResult) await beginTask(record);
+      if (!task.dispatches.length && !task.cancelRequested && !task.legacyAutomaticResult) {
+        await beginTask(record);
+        record.nextAttemptAt = undefined; record.retryAttempts = 0;
+        if (task.dispatches[0]?.state === 'retrying' && task.dispatches[0].nextAttemptAt > Date.now()) return publicResult(record);
+      }
       else await negotiateTree(record);
       for (const answer of task.answers ?? []) if (!answer.questionIds && !task.cancelRequested) await resolveAnswer(record, answer);
       const view = await observe(record);
       if (task.cancelRequested && task.cancelVerified && !view.running && treeSettled(record, view)) {
         task.cancelTreeSettled = true;
+        task.cancelError = undefined;
         store.save(record);
       }
       // Persist and deliver explicit reports before inspecting older dispatches:
@@ -649,17 +1516,18 @@ export function createScopedAgents(config, {
         task.questionNotices ??= {};
         const notice = task.questionNotices[question.id] ??= { state: 'pending' };
         await deliver(record, notice,
-          `DSH 子代理「${record.name}」等待回答：\n${question.message}\n\n请调用 futureaide_answer_agent，name=${JSON.stringify(record.name)}，message 为回答正文。任务保持等待；无需文件、命令或内部编号。`);
+          `${hostLabel(record)} 子代理「${record.name}」等待回答：\n${question.message}\n\n请调用 futureaide_answer_agent，name=${JSON.stringify(record.name)}，message 为回答正文。任务保持等待；无需文件、命令或内部编号。`);
       }
       for (const dispatch of task.dispatches) {
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
         await recoverDispatch(record, dispatch);
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
-        const result = await controlFor(record).wait({ sessionId: record.sessionId, requestId: dispatch.requestId,
+        if (dispatch.state === 'retrying' && dispatch.nextAttemptAt > Date.now()) continue;
+        const result = await (await backendFor(record)).turn({ requestId: dispatch.requestId,
           ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}), timeoutSeconds: 0, maxMessages: 100 });
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
-          Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true,
+          Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
             endSeq: result.endSeq, failure: modelTurnError(result.completionReason) });
         }
       }
@@ -695,7 +1563,8 @@ export function createScopedAgents(config, {
     } catch (error) {
       record.state = record.task?.result ? 'delivery_pending' : 'reconnecting';
       record.error = safeError(error); record.observation = { ...record.observation, stale: true };
-      clients.delete(record.agentId);
+      if (targetOf(record) !== 'dsh') deferRetry(record);
+      forgetBackend(record);
       store.save(record);
       return publicResult(record);
     }
@@ -705,28 +1574,62 @@ export function createScopedAgents(config, {
     store,
     async status(extra) {
       const status = { toolsLoaded: true, contextVerified: false, dshConnected: false, returnChannel: 'not-checked' };
+      let owner;
       try {
-        const owner = await context(extra);
-        Object.assign(status, { contextVerified: true, workspace: owner.workspace, returnChannel: 'chat-verified',
+        owner = await context(extra);
+        Object.assign(status, { contextVerified: true, workspace: owner.workspace, ...await returnChannel(owner),
           agents: typeof store.count === 'function' ? store.count(owner.ownerId) : store.list(owner.ownerId).length });
       } catch (error) { status.contextError = safeError(error); }
+      let host;
       try {
-        const host = await clientFactory(config).hostStatus();
+        host = await clientFactory(config).hostStatus();
         status.dshConnected = METHODS.every(method => host.methods?.includes(method));
         status.treeProtocolReady = host.treeProtocol === TREE_PROTOCOL;
         status.reportProtocolReady = host.reportProtocol === REPORT_PROTOCOL;
         if (!status.dshConnected) status.hostError = { message: 'Install the current managed DSH bridge.' };
         else if (!status.treeProtocolReady) status.hostError = safeError(treeProtocolError());
       } catch (error) { status.hostError = safeError(error); }
-      status.ready = status.contextVerified && status.dshConnected && status.treeProtocolReady === true && status.reportProtocolReady === true;
+      status.ready = status.contextVerified && status.returnChannel === 'chat-verified' && status.dshConnected
+        && status.treeProtocolReady === true && status.reportProtocolReady === true;
+      // Per-target readiness beside the unchanged DSH fields. Neither entry starts
+      // a model turn or a session: the DSH probe is the same one above, and the
+      // claude-desktop entry imports its adapter and asks probe() only.
+      const probe = { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
+        lifetime: 'once', target: 'claude-desktop', workspace: owner?.workspace ?? config.workspace,
+        state: 'probing', createdAt: now(), updatedAt: now(), history: [] };
+      status.backends = {
+        dsh: dshDiagnostics(host, status),
+        // This probe name is not in the roster, so a state write during diagnostics
+        // reports false instead of inventing a row.
+        'claude-desktop': await diagnoseTarget('claude-desktop', { adapters: backendAdapters,
+          ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
+          record: probe, deps: adapterDeps(probe, { startReports: false }) }),
+      };
+      // A Codex Desktop entry is ready only when a real native Codex session reports
+      // the ask/report tools; an adapter that merely answers probe() is not enough,
+      // and a healthy loopback endpoint proves nothing about those tools.
+      const codexProbe = { ...probe, target: 'codex-desktop' };
+      const codexEntry = await diagnoseTarget('codex-desktop', { adapters: backendAdapters,
+        ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
+        record: codexProbe, deps: adapterDeps(codexProbe, { startReports: false }) });
+      status.backends['codex-desktop'] = codexEntry.ready ? codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)) : codexEntry;
       return status;
     },
-    async create({ name, lifetime }, extra) {
+    async create({ name, lifetime, target }, extra) {
       assertName(name);
       if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
+      const backendTarget = normalizeTarget(target);
       const owner = await context(extra);
+      // A cross-application call: when the caller is itself a managed name — a
+      // Claude session by its native id, or a Codex child by its own chat — the new
+      // name is its child and follows that owner tree.
+      const caller = trustedCaller(extra);
+      const parent = caller ? store.agentForNativeSession(caller.nativeSessionId)
+        : store.agentForCodexThread(callingThread(extra));
       const record = { agentId: uid('agent'), ownerId: owner.ownerId, sessionId: uid('session-codex'), name, lifetime,
-        workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [] };
+        target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
+        ...(parent ? { parentAgentId: parent.agentId } : {}) };
+      await ensureTargetBackend(record);
       store.insert(record); // The database's (owner,name) constraint arbitrates parallel creation.
       return store.locked(record.agentId, async () => {
         if (!store.get(record.agentId)) throw new Error('This subagent was removed while it was being created.');
@@ -749,18 +1652,27 @@ export function createScopedAgents(config, {
         return { name: record.name, accepted: false, queued: true, state: record.state,
           ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
       };
-      try { return await withName(extra, name, async record => {
+      // Named so the busy retry below runs exactly this body against a fresh record.
+      const operation = async record => {
         enteredOperation = true;
-        if (record.closed || ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'].includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
-        if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait before assigning another task.');
+        const closing = ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'];
+        if (record.closed || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
+        if (record.state === 'delivery_pending') {
+          await settleDelivery(record);
+          // Settling a one-shot agent's final finishes its task and removes the name on
+          // the spot, so the ordinary closing error applies instead of a new dispatch.
+          if (record.closed || !store.get(record.agentId) || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
+          if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait before assigning another task.');
+        }
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
-        await checkHost(record);
+        if (targetOf(record) === 'dsh') await checkHost(record);
         const stoppedTask = record.task && ['cancelled', 'failed'].includes(record.state);
         if (!stoppedTask && store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return enqueue(record);
         const pendingReports = (record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
         if (stoppedTask && (record.lifetime === 'once' || pendingReports)) throw new Error('This task stopped; delete the one-shot agent or wait for its submitted reports before reusing a persistent agent.');
         if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
         if (record.task && ACTIVE.has(record.state)) {
+          if (targetOf(record) !== 'dsh' || !record.task.dispatches.length) return enqueue(record);
           await negotiateTree(record);
           const view = await observe(record);
           if ((view.reports ?? []).some(report => report.final)) throw new Error('The agent has already submitted its final report.');
@@ -770,7 +1682,12 @@ export function createScopedAgents(config, {
           if (record.task) record.history.push({ ...record.task, changes: attributedChanges(record, record.observation ?? {}),
             coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) });
           record.task = { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [] };
-          record.state = 'running'; record.observation = undefined; store.save(record);
+          record.state = 'running'; record.observation = undefined; record.error = undefined;
+          record.nextAttemptAt = undefined; record.retryAttempts = 0; store.save(record);
+          if (targetOf(record) !== 'dsh') {
+            await ensureWorker(record, { wake: true });
+            return { name: record.name, accepted: false, queued: true, state: record.state };
+          }
           try { await beginTask(record); }
           catch (error) { record.state = 'reconnecting'; record.error = safeError(error); store.save(record); }
         }
@@ -782,10 +1699,15 @@ export function createScopedAgents(config, {
           ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
           ...(error ? { error } : {}),
           ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
-      }, { waitMs: 0 }); } catch (error) {
+      };
+      try { return await withName(extra, name, operation, { waitMs: 0 }); } catch (error) {
         if (enteredOperation || error.code !== 'agent-busy') throw error;
         const owner = await context(extra);
         const record = named(owner, name);
+        // A poll holds this lock for one round only, so waiting for it is cheap. Queuing
+        // here would hand a supplement to a task that has already ended, and report that
+        // as "the task changed, stopped" for a dispatch the next round would accept.
+        if (record.state === 'delivery_pending') return withName(extra, name, operation);
         return enqueue(record);
       }
     },
@@ -795,10 +1717,12 @@ export function createScopedAgents(config, {
     },
     async list(extra) {
       const owner = await context(extra);
+      // Own names only, each with its own composed tree; managed descendants appear
+      // inside that tree, never as extra entries in this chat's list.
       for (const record of store.list(owner.ownerId)) await ensureWorker(record);
       const records = store.list(owner.ownerId);
       return { items: records.map(record => ({ ...publicResult(record),
-        monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping') : (store.lease(`worker:${record.agentId}`)?.expires > Date.now() ? 'running' : 'stopped'),
+        monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping') : (monitorAlive(store) ? 'running' : 'stopped'),
         supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
     },
     async changes({ name, task = 0 }, extra) {
@@ -810,8 +1734,15 @@ export function createScopedAgents(config, {
             coverage: historical.coverage, tree: historical.tree ?? historical.result?.tree };
         }
         try { await observe(record); store.save(record); } catch (error) { record.error = safeError(error); }
-        return { name, task: 0, changes: attributedChanges(record, record.observation ?? {}),
-          tree: publicTree(record, record.observation ?? {}), coverage: treeCoverage(record, record.observation ?? {}),
+        // A running task has no stored comparison yet, so it is computed for this
+        // answer only: an unfinished task must not look like a query that changed it.
+        const live = record.task && !record.task.workspace ? await workspaceDiff(record) : undefined;
+        const changes = attributedChanges(record, record.observation ?? {});
+        // The composed view already carries every managed descendant's attributed
+        // changes under its own agentPath, so no second walk happens here.
+        return { name, task: 0, changes: withWorkspaceChanges(changes, live, record.name),
+          tree: publicTree(record, record.observation ?? {}),
+          coverage: treeCoverage(record, record.observation ?? {}, live?.coverage),
           stale: Boolean(record.error || record.observation?.stale), ...(record.error ? { error: record.error } : {}) };
       });
     },
@@ -828,25 +1759,40 @@ export function createScopedAgents(config, {
         const tree = publicTree(record, inspectionView);
         const nodes = ownedTree(record, inspectionView).nodes;
         let rootHistory, rootError;
+        // Every node — this record's own sessions and managed descendants on any
+        // application — reads its history through the backend that owns it. The public
+        // shape stays the existing tree.nodes[].messages/agentPath/depth; internal ids
+        // and bindings never leave this loop.
+        const backend = await backendFor(record);
         for (let index = 0; index < nodes.length; index++) {
           const { node } = nodes[index];
+          if (node.archived) {
+            const page = node.archivedHistory ?? { messages: [], hasMore: false };
+            Object.assign(tree.nodes[index], { ...page, messages: page.messages.slice(-maxMessages),
+              hasMore: page.hasMore || page.messages.length > maxMessages });
+            continue;
+          }
+          const owner = node.backendKey && node.backendKey !== record.agentId ? view.managed?.get(node.backendKey) : undefined;
+          const nodeBackend = backend;
+          const targetSessionId = node.nativeSessionId ?? node.sessionId;
+          if (node.synthetic && !owner?.view) { tree.nodes[index].status = tree.nodes[index].status ?? node.status; continue; }
           try {
-            const raw = await apiFor(record).managedHistory({ ...hostArgs(record), targetSessionId: node.sessionId });
-            if (!Array.isArray(raw?.events)) throw Object.assign(new Error('The DSH bridge returned invalid session history.'), { code: 'invalid-response' });
-            const page = { records: raw.events.map(event => ({ type: 'event', event })), hasMore: false };
             const dispatch = node.sessionId === record.sessionId ? record.task?.dispatches?.at(-1) : undefined;
-            if (dispatch?.state === 'failed' && !dispatch.failure) {
-              // Upgrade old failed records from this inspection's existing page,
-              // and only when it contains this task's original request.
-              const boundary = dispatchBoundary(page.records, dispatch.afterSeq ?? -1, dispatch.requestId);
-              if (boundary.matched && boundary.endSeq !== undefined) {
-                const failure = modelTurnError(boundary.completionReason);
-                if (failure) { dispatch.failure = failure; store.save(record); }
-              }
-            }
-            const history = historyMessages(page, { sessionId: node.sessionId, running: node.status === 'running' });
-            const selected = { messages: history.messages.slice(-maxMessages), hasMore: history.hasMore || history.messages.length > maxMessages,
-              ...(history.note ? { note: history.note } : {}) };
+            // Upgrade old failed records from this inspection's own page, and only
+            // when it contains this task's original request. The backend reads its
+            // own native history: no target format is parsed in this shared layer.
+            const upgrade = dispatch?.state === 'failed' && !dispatch.failure;
+            const request = { targetSessionId, running: node.status === 'running',
+              maxMessages, ...(upgrade ? { requestId: dispatch.requestId, afterSeq: dispatch.afterSeq ?? -1 } : {}) };
+            const page = owner ? await store.locked(owner.record.agentId, async () => {
+              const child = store.get(owner.record.agentId);
+              if (!child) throw Object.assign(new Error('This child finished; inspect the refreshed tree.'), { code: 'agent-removed' });
+              return (await backendFor(child)).history(request);
+            }, { waitMs: 0 }) : await nodeBackend.history(request);
+            if (!Array.isArray(page?.messages)) throw Object.assign(new Error(`${nodeBackend.labels?.bridge ?? `The ${targetOf(record)} backend`} returned invalid session history.`), { code: 'invalid-response' });
+            if (upgrade && page.failure) { dispatch.failure = page.failure; store.save(record); }
+            const selected = { messages: page.messages, hasMore: page.hasMore === true,
+              ...(page.note ? { note: page.note } : {}) };
             Object.assign(tree.nodes[index], selected);
             if (node.sessionId === record.sessionId) rootHistory = selected;
           } catch (error) {
@@ -856,7 +1802,8 @@ export function createScopedAgents(config, {
         }
         return { ...publicResult(record), ...(rootHistory ?? {}), ...(rootError ? { error: rootError } : {}),
           reports: { ...publicResult(record).reports, items: (record.task?.reports ?? []).map(report => ({ message: report.message, final: report.final, delivery: report.delivery.state })) },
-          tree, inspectionIncomplete: tree.nodes.some(node => node.error !== undefined),
+          tree,
+          inspectionIncomplete: tree.nodes.some(node => node.error !== undefined),
           historyCount: record.history.length,
           history: record.history.slice(-20).reverse().map((task, index) => ({ task: index + 1, message: compactText(task.message, 240),
             state: task.state, startedAt: task.startedAt, finishedAt: task.finishedAt })) };
@@ -867,17 +1814,76 @@ export function createScopedAgents(config, {
       const record = named(owner, name);
       if (!record.task || record.closed) return { name, accepted: false, state: record.state };
       if (!store.requestCancel(record)) return { name, accepted: false, state: store.get(record.agentId)?.state ?? 'removed' };
+      if (targetOf(record) !== 'dsh') {
+        for (const child of store.descendantsOf([record.agentId])) {
+          if (!child.closed && child.task && store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
+        }
+        await ensureWorker(store.get(record.agentId), { wake: true });
+        return { name, accepted: false, queued: true, state: 'cancelling' };
+      }
       try {
-        const api = await checkHost(record);
-        const result = await api.managedCancel(hostArgs(record));
-        if (result.cancelRequested === true) store.confirmCancel(record);
+        const result = await (await checkHost(record)).cancel();
+        if (result.cancelRequested === true) store.confirmCancel(record, result);
+        // Descendants on any application stop with their parent; each keeps its own
+        // record and report, so nothing is dropped from the tree.
+        for (const child of store.descendantsOf([record.agentId])) {
+          if (child.closed || !child.task) continue;
+          if (targetOf(child) !== 'dsh') {
+            if (store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
+            continue;
+          }
+          try {
+            await store.locked(child.agentId, async () => {
+              const current = store.get(child.agentId);
+              if (!current || current.closed || !store.requestCancel(current)) return;
+              const cancelled = await (await checkHost(current)).cancel();
+              if (cancelled.cancelRequested === true) store.confirmCancel(current, cancelled);
+            });
+          } catch { /* its own poll reports the failure on that record. */ }
+        }
         return { name, accepted: result.cancelRequested === true, state: 'cancelling' };
       } finally {
         const current = store.get(record.agentId);
         if (current?.task?.taskId === record.task.taskId) await ensureWorker(current);
       }
     },
-    async delete({ name }, extra) { return withName(extra, name, record => clearRecord(record)); },
+    async delete({ name }, extra) {
+      const owner = await context(extra);
+      const record = named(owner, name);
+      if (targetOf(record) === 'dsh') {
+        const result = await withName(extra, name, current => clearRecord(current));
+        if (result.queued) await ensureWorker(store.get(record.agentId), { wake: true });
+        return result;
+      }
+      const queued = store.requestCleanup(record);
+      if (queued) await ensureWorker(store.get(record.agentId), { wake: true });
+      return { name, deleted: false, queued, state: queued ? 'cleaning' : 'removed' };
+    },
+    /**
+     * Explicit ask/report from a managed Codex Desktop child, called from that
+     * child's own chat. The caller is found from its chat metadata (never a tool
+     * argument) through the binding its backend recorded, and the submission joins
+     * the same task so the one state machine delivers it to the parent.
+     */
+    async submitToParent({ kind, message, final = false }, extra) {
+      textMessage(message);
+      if (!['ask', 'report'].includes(kind)) throw new Error('kind must be ask or report.');
+      const threadId = callingThread(extra);
+      const bound = store.agentForCodexThread(threadId);
+      const record = bound ? store.get(bound.agentId) : undefined;
+      if (!record || record.closed || !record.task) {
+        throw Object.assign(new Error('This chat is not bound to a managed subagent with a current task.'),
+          { code: 'submission-not-owned' });
+      }
+      if (record.task.reports?.some(report => report.final)) {
+        throw Object.assign(new Error('This task already submitted its final report.'), { code: 'final-already-submitted' });
+      }
+      const id = uid('submission');
+      store.enqueueSubmission({ id, ownerId: record.ownerId, agentId: record.agentId,
+        taskId: record.task.taskId, kind, message, final: final === true });
+      await ensureWorker(record, { wake: true });
+      return { accepted: true, name: record.name, taskId: record.task.taskId, submissionId: id, kind };
+    },
     async wait({ names, timeoutSeconds = 0 } = {}, extra) {
       if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 45) throw new Error('Wait between 0 and 45 seconds.');
       const owner = await context(extra);
@@ -895,7 +1901,7 @@ export function createScopedAgents(config, {
           if (!record) { notListed.add(selected.find(item => item.agentId === id).name); continue; }
           items.push(publicResult(record, { fullResult: true }));
         }
-        if (!selectedIds.length || notListed.size || items.some(item => ['awaiting_input', 'awaiting_report', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
+        if (!selectedIds.length || notListed.size || items.some(item => item.error || ['awaiting_input', 'awaiting_report', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
         if (Date.now() >= deadline) break;
         await wait(Math.min(250, deadline - Date.now()));
       } while (true);
@@ -903,24 +1909,77 @@ export function createScopedAgents(config, {
         ...(notListed.size ? { note: 'These names are not in this chat’s current list. Absence alone does not prove task completion; use the delivered result.' } : {}),
         timedOut: Date.now() >= deadline && items.some(item => item.state === 'running') };
     },
-    async poll(agentId) {
-      return store.locked(agentId, async () => { const record = store.get(agentId); return record ? pollLocked(record) : { removed: true }; });
+    poll(agentId) {
+      if (inflight.has(agentId)) return inflight.get(agentId);
+      if (draining) return Promise.resolve({ draining: true });
+      const work = store.locked(agentId, async () => { const record = store.get(agentId); return record ? pollLocked(record) : { removed: true }; }, { waitMs: 0 })
+        .finally(() => { inflight.delete(agentId); onPollComplete(); });
+      inflight.set(agentId, work);
+      return work;
     },
     async resume() {
       const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
-      for (const record of records) await ensureWorker(record, { wake: record.sleep?.wakePending === true });
+      const pending = records.filter(record => record.sleep?.wakePending === true || needsPoll(record));
+      if (!pending.length) return;
+      if (await ensureMonitor()) return;
+      // One listener serves every name: record the failure on each waiting name
+      // instead of starting a process per agent.
+      for (const record of pending) {
+        store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+      }
+    },
+    // One shared round: poll every name that still owes work through the same
+    // state machine. The shared monitor calls this each round, and the degraded
+    // in-process sweep below reuses it when no monitor can be started.
+    async monitorScan() {
+      if (draining) return inflight.size > 0 || monitorInflight.size > 0;
+      const candidates = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
+      let busy = inflight.size > 0 || monitorInflight.size > 0;
+      for (const candidate of candidates) {
+        if (!needsPoll(candidate)) continue;
+        busy = true;
+        if (monitorInflight.has(candidate.agentId) || nextPollAt.get(candidate.agentId) > Date.now()) continue;
+        // Large retained histories must not turn resolved-promise polls into a
+        // single uninterrupted CPU burst that starves the shared HTTP listener.
+        await yieldToIO();
+        if (draining) break;
+        const record = store.get(candidate.agentId);
+        if (!record || !needsPoll(record)) continue;
+        busy = true;
+        if (monitorInflight.has(record.agentId) || nextPollAt.get(record.agentId) > Date.now() || record.nextAttemptAt > Date.now()
+            || firstDispatchDeferred(record)) continue;
+        const work = service.poll(record.agentId).then(() => service.trySleep(record.agentId))
+          .catch(() => { /* The next round retries from durable state. */ })
+          .finally(() => {
+            monitorInflight.delete(record.agentId);
+            if (store.get(record.agentId)) nextPollAt.set(record.agentId, Date.now() + 1000);
+            else nextPollAt.delete(record.agentId);
+            onPollComplete();
+          });
+        monitorInflight.set(record.agentId, work);
+      }
+      return busy;
+    },
+    async drainPolls() {
+      draining = true;
+      await Promise.allSettled([...monitorInflight.values(), ...inflight.values()]);
+      // A baseline write survives the poll that started it; a shutdown that only waited
+      // for polls could close the database with half a snapshot still being written.
+      while (baselineWrites.size) await Promise.allSettled([...baselineWrites.values()]);
     },
     async ensureIdleMonitor() {
-      if (!store.hasSleeping()) { monitorUnavailableSince = undefined; return false; }
+      const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
+      const pending = records.some(record => record.sleep?.wakePending === true || needsPoll(record));
+      if (!store.hasSleeping() && !pending) { monitorUnavailableSince = undefined; return false; }
       let ready = false;
-      try { ready = await startIdleMonitor(config, store); } catch { /* Fall back to active workers below. */ }
+      try { ready = await startSharedMonitor(config, store); } catch { ready = false; }
       if (ready) { monitorUnavailableSince = undefined; return true; }
       monitorUnavailableSince ??= Date.now();
       if (Date.now() - monitorUnavailableSince >= monitorFailureGraceMs) {
-        for (const record of store.listSleeping()) {
-          await ensureWorker(record, { wake: true });
-        }
-        monitorUnavailableSince = undefined;
+        // Degraded mode: sweep in this process instead of spawning one per name.
+        monitorUnavailableSince = Date.now();
+        try { await service.monitorScan(); } catch { /* The next call retries. */ }
+        return true;
       }
       return false;
     },
@@ -934,7 +1993,7 @@ export function createScopedAgents(config, {
       return store.locked(agentId, async () => {
         const record = store.get(agentId);
         if (!record || !canSleep(record, store.supplements(agentId), treeSettled)) return false;
-        if (!await startIdleMonitor(config, store)) return false;
+        if (!await startSharedMonitor(config, store)) return false;
         return store.sleep(record, idleSignal({ ...record.observation, taskId: record.task.taskId }));
       });
     },

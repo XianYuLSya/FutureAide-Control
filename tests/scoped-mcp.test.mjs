@@ -28,7 +28,7 @@ test('installed MCP exposes only name-addressed tools and forwards trusted reque
   await server.connect(b); await client.connect(a);
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 10);
+    assert.equal(tools.length, 12, 'ten name-addressed tools plus the Codex-side ask_parent/report_parent');
     assert.ok(!tools.some(tool => /spawn_agent|register_peer|create_session|profile_create/.test(tool.name)));
     for (const tool of tools) {
       const fields = Object.keys(tool.inputSchema.properties ?? {});
@@ -39,5 +39,58 @@ test('installed MCP exposes only name-addressed tools and forwards trusted reque
     assert.notEqual(result.isError, true);
     assert.deepEqual(calls[0].args, { name: '画图助手', lifetime: 'once' });
     assert.equal(calls[0].meta.threadId, threadId);
+  } finally { await client.close(); await server.close(); }
+});
+
+test('creation advertises one optional target and never repeats it on later calls', async () => {
+  const calls = [];
+  const service = { async resume() {}, async create(args, extra) { calls.push({ args, meta: extra._meta });
+    return { created: true, name: args.name, target: args.target ?? 'dsh' }; } };
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const server = makeScopedServer({ configPath: path.join(root, 'clean', 'scoped-mcp-config-absent.json'), scopedFactory: () => service });
+  const client = new Client({ name: 'scoped-test', version: '1.0.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(b); await client.connect(a);
+  const threadId = '11111111-1111-4111-8111-111111111111';
+  try {
+    const { tools } = await client.listTools();
+    const create = tools.find(tool => tool.name === 'futureaide_create_agent');
+    assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['lifetime', 'name', 'target']);
+    assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'claude-desktop', 'codex-desktop'],
+      'every supported application is reachable from the public schema, not just internally');
+    assert.ok(!create.inputSchema.required?.includes('target'), 'the target stays optional');
+    for (const tool of tools.filter(tool => tool.name !== 'futureaide_create_agent')) {
+      assert.ok(!('target' in (tool.inputSchema.properties ?? {})), `${tool.name} must stay name-addressed`);
+    }
+
+    await client.callTool({ name: 'futureaide_create_agent', arguments: { name: '搭档', lifetime: 'persistent' }, _meta: { threadId } });
+    assert.deepEqual(calls[0].args, { name: '搭档', lifetime: 'persistent' }, 'an omitted target adds no argument');
+    const selected = await client.callTool({ name: 'futureaide_create_agent',
+      arguments: { name: 'Opus搭档', lifetime: 'persistent', target: 'claude-desktop' }, _meta: { threadId } });
+    assert.notEqual(selected.isError, true);
+    assert.deepEqual(calls[1].args, { name: 'Opus搭档', lifetime: 'persistent', target: 'claude-desktop' });
+    const refused = await client.callTool({ name: 'futureaide_create_agent',
+      arguments: { name: 'other', lifetime: 'once', target: 'claude' }, _meta: { threadId } });
+    assert.equal(refused.isError, true, 'the schema owns the enum');
+    assert.equal(calls.length, 2);
+  } finally { await client.close(); await server.close(); }
+});
+
+test('queued desktop deletion is accepted while a cleanup error stays visible', async () => {
+  let response = { name: 'cleanup', deleted: false, queued: true, state: 'cleaning' };
+  const service = { async resume() {}, async delete() { return response; } };
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const server = makeScopedServer({ configPath: path.join(root, 'clean', 'scoped-mcp-config-absent.json'), scopedFactory: () => service });
+  const client = new Client({ name: 'scoped-test', version: '1.0.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(b); await client.connect(a);
+  try {
+    const queued = await client.callTool({ name: 'futureaide_delete_agent', arguments: { name: 'cleanup' } });
+    assert.notEqual(queued.isError, true, 'durable cleanup acceptance must not invite a retry');
+    assert.deepEqual(JSON.parse(queued.content[0].text), response);
+    response = { ...response, error: { code: 'child-cleanup-failed', message: 'A child still needs cleanup.' } };
+    const failed = await client.callTool({ name: 'futureaide_delete_agent', arguments: { name: 'cleanup' } });
+    assert.equal(failed.isError, true, 'queued intent must not hide a real cleanup failure');
+    assert.equal(JSON.parse(failed.content[0].text).error.code, 'child-cleanup-failed');
   } finally { await client.close(); await server.close(); }
 });

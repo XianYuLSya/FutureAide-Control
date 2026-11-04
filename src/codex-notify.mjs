@@ -24,6 +24,7 @@ const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 // a task.
 const DISCOVER = String.raw`
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $hosted = @()
 $legacy = @()
 $desktops = @()
@@ -201,8 +202,9 @@ export function parseInspection(stdout) {
 }
 
 async function inspectCodexProcesses() {
-  const { stdout } = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', DISCOVER], {
-    windowsHide: true, timeout: 15000, maxBuffer: 32768,
+  const powershell = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const { stdout } = await run(powershell, ['-NoProfile', '-NonInteractive', '-Command', DISCOVER], {
+    windowsHide: true, timeout: 15000, maxBuffer: 32768, encoding: 'utf8',
   });
   return parseInspection(stdout);
 }

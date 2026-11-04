@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,20 +9,40 @@ const pause = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 export class RosterStore {
   constructor(filename) {
     if (filename !== ':memory:') mkdirSync(path.dirname(filename), { recursive: true });
+    // Canonical absolute location. Its hash is this roster's identity — a public
+    // name for the database, never a credential.
+    this.location = filename === ':memory:' ? ':memory:' : path.resolve(filename);
     this.db = new DatabaseSync(filename);
     this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(owner,name));
+      CREATE INDEX IF NOT EXISTS agents_parent ON agents(json_extract(body,'$.parentAgentId'),name);
+      CREATE INDEX IF NOT EXISTS agents_lifecycle ON agents(
+        json_extract(body,'$.sessionId'),json_extract(body,'$.state'),json_extract(body,'$.closed'),
+        json_extract(body,'$.callbackBlocked'),json_extract(body,'$.sleep'),json_extract(body,'$.task.taskId'),
+        json_extract(body,'$.task.reports'),json_extract(body,'$.task.cancelRequested'),
+        json_extract(body,'$.task.cancelVerified'),json_extract(body,'$.task.cancelTreeSettled'),id,owner,name);
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS submissions (id TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL,
+        task TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, final INTEGER NOT NULL,
+        created TEXT NOT NULL, state TEXT NOT NULL, consumed TEXT);`);
   }
 
   owner(id) { const row = this.db.prepare('SELECT body FROM owners WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
   saveOwner(owner) {
     this.db.prepare('INSERT OR IGNORE INTO owners(id,body) VALUES (?,?)').run(owner.ownerId, JSON.stringify(owner));
     const saved = this.owner(owner.ownerId);
-    if (saved.threadId !== owner.threadId || saved.workspace !== owner.workspace) throw new Error('This chat is already bound to another project.');
+    // Both sources bind one owner to one chat/session and one project.
+    const sameCaller = (saved.threadId ?? null) === (owner.threadId ?? null)
+      && (saved.nativeSessionId ?? null) === (owner.nativeSessionId ?? null);
+    if (!sameCaller || saved.workspace !== owner.workspace) throw new Error('This chat is already bound to another project.');
     return saved;
+  }
+  /** A restarted session keeps its owner; only the way to reach it moves. */
+  rebindOwner(id, binding) {
+    this.db.prepare("UPDATE owners SET body=json_set(body,'$.pid',?,'$.binding',json(?)) WHERE id=?").run(binding.pid, JSON.stringify(binding), id);
   }
   get(id) { const row = this.db.prepare('SELECT body FROM agents WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
   lease(key) { return this.db.prepare('SELECT holder,expires FROM leases WHERE key=?').get(key); }
@@ -67,6 +87,103 @@ export class RosterStore {
     const latest = this.db.prepare('SELECT status,reason FROM supplements WHERE agent=? AND task=? ORDER BY rowid DESC LIMIT 1').get(agentId, taskId);
     return { ...counts, ...(latest ? { latest: { status: latest.status, ...(latest.reason ? { reason: latest.reason } : {}) } } : {}) };
   }
+  // The executing target's own state (native binding, transcript cursor,
+  // incremental projection, native write attempts) lives in its own row beside
+  // the roster. It must not ride in the agent record: the shared state machine
+  // keeps saving records it loaded earlier, and such a save would overwrite an
+  // adapter's fresh write. This is state, not a second task or notice machine:
+  // dispatch intent, delivery and cleanup stay in the shared tables above.
+  backendState(agentId) {
+    const row = this.db.prepare('SELECT body FROM backend_state WHERE agent=?').get(agentId);
+    return row ? JSON.parse(row.body) : undefined;
+  }
+  /** Upsert one target-state document. False means the name is already gone. */
+  saveBackendState(agentId, value) {
+    return this.db.prepare(`INSERT INTO backend_state(agent,body) SELECT id,? FROM agents WHERE id=?
+      ON CONFLICT(agent) DO UPDATE SET body=excluded.body`).run(JSON.stringify(value), agentId).changes === 1;
+  }
+  deleteBackendState(agentId) { this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(agentId); }
+  /**
+   * Read-only reverse lookup for a reply surface that must identify its caller
+   * from the native session it was invoked in. Only live claude-desktop names
+   * qualify; a closed or other-target name is not the caller.
+   */
+  agentForNativeSession(nativeSessionId) {
+    if (typeof nativeSessionId !== 'string' || !nativeSessionId) return undefined;
+    const row = this.db.prepare(`SELECT a.id AS agentId, a.owner AS ownerId, a.name AS name,
+      json_extract(a.body,'$.target') AS target, json_extract(a.body,'$.state') AS state,
+      json_extract(a.body,'$.sessionId') AS logicalSessionId, b.body AS body
+      FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
+      WHERE json_extract(b.body,'$.binding.sessionId')=?
+        AND json_extract(a.body,'$.target')='claude-desktop'
+        AND coalesce(json_extract(a.body,'$.closed'),0)=0`).get(nativeSessionId);
+    if (!row) return undefined;
+    const binding = JSON.parse(row.body).binding ?? null;
+    return { agentId: row.agentId, ownerId: row.ownerId, name: row.name, target: row.target,
+      state: row.state, logicalSessionId: row.logicalSessionId, nativeSessionId, binding };
+  }
+  /**
+   * The same reverse lookup for a Codex Desktop child: its own chat id is the
+   * binding its backend records, and only a live codex-desktop name qualifies.
+   */
+  agentForCodexThread(threadId) {
+    if (typeof threadId !== 'string' || !threadId) return undefined;
+    const wanted = threadId.toLowerCase();
+    const row = this.db.prepare(`SELECT a.id AS agentId, a.owner AS ownerId, a.name AS name,
+      json_extract(a.body,'$.target') AS target, json_extract(a.body,'$.state') AS state,
+      json_extract(a.body,'$.sessionId') AS logicalSessionId, b.body AS body
+      FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
+      WHERE json_extract(a.body,'$.target')='codex-desktop'
+        AND coalesce(json_extract(a.body,'$.closed'),0)=0`).all()
+      .find(candidate => {
+        const binding = JSON.parse(candidate.body)?.binding ?? {};
+        return [binding.threadId, binding.sessionId, binding.nativeSessionId]
+          .filter(value => typeof value === 'string')
+          .some(value => value.toLowerCase() === wanted);
+      });
+    if (!row) return undefined;
+    return { agentId: row.agentId, ownerId: row.ownerId, name: row.name, target: row.target,
+      state: row.state, logicalSessionId: row.logicalSessionId, binding: JSON.parse(row.body).binding ?? null };
+  }
+  /**
+   * Direct children of a managed record, whatever owner they belong to: a name
+   * created from inside another managed session is its child even though that
+   * session has its own owner id.
+   */
+  childrenOf(agentId) {
+    if (typeof agentId !== 'string' || !agentId) return [];
+    return this.db.prepare("SELECT body FROM agents WHERE json_extract(body,'$.parentAgentId')=? ORDER BY name")
+      .all(agentId).map(row => JSON.parse(row.body));
+  }
+  /** Whole descendant closure beneath these records, breadth first. */
+  descendantsOf(agentIds) {
+    const seen = new Set(agentIds);
+    const found = [];
+    let frontier = [...agentIds];
+    while (frontier.length) {
+      const next = [];
+      for (const id of frontier) {
+        for (const child of this.childrenOf(id)) {
+          if (seen.has(child.agentId)) continue;
+          seen.add(child.agentId); found.push(child); next.push(child.agentId);
+        }
+      }
+      frontier = next;
+    }
+    return found;
+  }
+  /**
+   * Verified Codex chats this roster knows, newest first. Only these may anchor a
+   * Codex bridge: a Claude session id is never a Codex caller identity. Owners saved
+   * before the source field existed count too, because a thread id is the marker.
+   */
+  codexOwners() {
+    const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
+    return this.db.prepare('SELECT body FROM owners').all()
+      .map(row => JSON.parse(row.body))
+      .filter(owner => typeof owner.threadId === 'string' && UUID.test(owner.threadId))
+      .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
+  }
   list(owner) {
     const rows = owner === undefined
       ? this.db.prepare('SELECT body FROM agents ORDER BY name').all()
@@ -80,8 +197,11 @@ export class RosterStore {
   // These projections keep periodic checks and shared-monitor scans independent
   // of task/report/history body size. Full records are loaded only for an agent
   // whose worker or delivery poll is actually about to run.
+  // The covering expression index stores these fields at write time. Selecting
+  // json_extract alone still reparses every large body unless the scan uses it;
+  // SQLite maintains it even when another/older connection updates the roster.
   hasSleeping() {
-    return this.db.prepare("SELECT 1 AS found FROM agents WHERE json_type(body,'$.sleep')='object' LIMIT 1").get() !== undefined;
+    return this.db.prepare("SELECT 1 AS found FROM agents INDEXED BY agents_lifecycle WHERE json_type(json_extract(body,'$.sleep'))='object' LIMIT 1").get() !== undefined;
   }
   listSleeping() {
     return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
@@ -93,7 +213,7 @@ export class RosterStore {
       EXISTS (SELECT 1 FROM supplements AS queued WHERE queued.agent=agents.id
         AND queued.task=json_extract(agents.body,'$.task.taskId')
         AND queued.status IN ('queued','sending','unknown')) AS hasSupplement
-      FROM agents WHERE json_type(body,'$.sleep')='object' ORDER BY name`).all().map(row => ({
+      FROM agents INDEXED BY agents_lifecycle WHERE json_type(json_extract(body,'$.sleep'))='object' ORDER BY name`).all().map(row => ({
       agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
       task: row.taskId == null ? undefined : { taskId: row.taskId,
         ...(row.cancelRequested ? { cancelRequested: true } : {}),
@@ -118,16 +238,16 @@ export class RosterStore {
   }
   listWorkerCandidates() {
     return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
-      json_extract(body,'$.state') AS state, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
+      json_extract(body,'$.state') AS state, json_extract(body,'$.closed') AS closed, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
       json_extract(body,'$.sleep') AS sleep, json_extract(body,'$.task.taskId') AS taskId,
-      (SELECT coalesce(json_group_array(coalesce(json_extract(value,'$.delivery.state'),'')),'[]')
-        FROM json_each(agents.body,'$.task.reports')) AS deliveries
-      FROM agents ORDER BY name`).all().map(row => ({
+      json_extract(body,'$.task.reports') AS reports
+      FROM agents INDEXED BY agents_lifecycle ORDER BY name`).all().map(row => ({
       agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
+      ...(row.closed ? { closed: true } : {}),
       ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
       ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
       ...(row.taskId == null ? {} : { task: { taskId: row.taskId,
-        reports: JSON.parse(row.deliveries).map(delivery => ({ delivery: { state: delivery } })) } }),
+        reports: (JSON.parse(row.reports ?? '[]') ?? []).map(report => ({ delivery: { state: report.delivery?.state ?? '' } })) } }),
     }));
   }
   insert(record) {
@@ -137,14 +257,56 @@ export class RosterStore {
       throw error;
     }
   }
+  /**
+   * WAL-aware commit counter for this connection. It changes when another
+   * connection commits, and does not change for this connection's own writes, so
+   * a listener can tell an external change from the echo of its own poll.
+   */
+  dataVersion() {
+    const row = this.db.prepare('PRAGMA data_version').get();
+    return row?.data_version ?? row?.DATA_VERSION;
+  }
+  /**
+   * Stable identity of this roster: sha256 of the canonical absolute database
+   * path (case-normalized on Windows). It answers "which database is this service
+   * serving" without carrying a credential, so a listener for another roster can
+   * never be mistaken for ours.
+   */
+  identity() {
+    const location = this.location === ':memory:'
+      ? ':memory:'
+      : (process.platform === 'win32' ? this.location.toLowerCase() : this.location);
+    return createHash('sha256').update(location).digest('hex');
+  }
+  /** Open claude-desktop bindings only, for the listener's watch set. */
+  listClaudeBindings() {
+    return this.db.prepare(`SELECT b.body AS body FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
+      WHERE json_extract(a.body,'$.target')='claude-desktop' AND coalesce(json_extract(a.body,'$.closed'),0)=0`)
+      .all().map(row => JSON.parse(row.body)?.binding ?? {});
+  }
+  /**
+   * Does this chat still own any open name on that target? A zero-model
+   * reservation counts: the session has been promised a place before its first
+   * turn, so the listener that serves it must not retire while it exists.
+   */
+  hasOpenTarget(target) {
+    return this.db.prepare(`SELECT 1 AS found FROM agents
+      WHERE coalesce(json_extract(body,'$.target'),'dsh')=? AND coalesce(json_extract(body,'$.closed'),0)=0 LIMIT 1`)
+      .get(target) !== undefined;
+  }
   save(record) {
     record.updatedAt = new Date().toISOString();
     // A watcher or sender can wake without the operation lock. Never restore a
     // sleep marker from an older in-memory poll after that atomic wake.
-    const input = "CASE WHEN json_type(body,'$.sleep') IS NULL THEN json_remove(?1,'$.sleep') WHEN json_extract(body,'$.sleep.wakePending')=1 AND json_extract(body,'$.sleep.taskId')=json_extract(?1,'$.sleep.taskId') THEN json_set(?1,'$.sleep.wakePending',json('true')) ELSE ?1 END";
+    const sleeping = "CASE WHEN json_type(body,'$.sleep') IS NULL THEN json_remove(?1,'$.sleep') WHEN json_extract(body,'$.sleep.wakePending')=1 AND json_extract(body,'$.sleep.taskId')=json_extract(?1,'$.sleep.taskId') THEN json_set(?1,'$.sleep.wakePending',json('true')) ELSE ?1 END";
+    // Children can finish while their parent holds an older in-memory view.
+    // Preserve the atomic handoff for this task when that parent next saves.
+    const input = `CASE WHEN json_extract(body,'$.task.taskId')=json_extract(?1,'$.task.taskId') AND json_type(body,'$.task.childSnapshots')='array' THEN json_set(${sleeping},'$.task.childSnapshots',json_extract(body,'$.task.childSnapshots')) ELSE ${sleeping} END`;
     const result = this.db.prepare(`UPDATE agents SET body=CASE
+      WHEN json_extract(body,'$.state')='cleaning' AND coalesce(json_extract(${input},'$.state'),'') NOT IN ('cleaning','cleanup_failed')
+      THEN json_set(${input},'$.state','cleaning','$.closed',json('true'))
       WHEN json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId') AND json_extract(body,'$.task.cancelRequested')=1
-      THEN json_set(${input},'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(${input},'$.task.cancelRequested')=1 THEN json_extract(${input},'$.state') ELSE 'running' END)
+      THEN json_set(${input},'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.task.cancelPending',json(CASE WHEN json_extract(body,'$.task.cancelPending')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(${input},'$.task.cancelRequested')=1 THEN json_extract(${input},'$.state') ELSE 'running' END)
       WHEN json_extract(${input},'$.state')='idle' AND json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId')
         AND EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND status IN ('queued','sending','unknown'))
       THEN json_set(${input},'$.state','running') ELSE ${input} END
@@ -153,10 +315,15 @@ export class RosterStore {
     if (!result.changes) throw new Error('This subagent instance has already been removed.');
   }
   requestCancel(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelRequested',json('true'),'$.state','running')
+    return this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.task.cancelRequested',json('true'),'$.task.cancelPending',json('true'),'$.task.cancelTreeSettled',json('false'),'$.state','running'),'$.nextAttemptAt')
       WHERE id=? AND owner=? AND name=? AND json_extract(body,'$.sessionId')=? AND json_extract(body,'$.task.taskId')=?
       AND coalesce(json_extract(body,'$.closed'),0)=0 AND coalesce(json_extract(body,'$.state'),'') NOT IN ('cleaning','cleanup_failed')`)
       .run(record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
+  }
+  requestCleanup(record) {
+    return this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.state','cleaning','$.closed',json('true')),'$.sleep','$.error','$.nextAttemptAt')
+      WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=?`)
+      .run(record.agentId, record.ownerId, record.sessionId).changes === 1;
   }
   claimAutoCleanup(record) {
     return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.closed',json('true'),'$.state','cleaning')
@@ -165,18 +332,18 @@ export class RosterStore {
       AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=json_extract(agents.body,'$.task.taskId') AND status IN ('queued','sending','unknown','blocked'))`)
       .run(record.agentId, record.ownerId, record.task?.taskId).changes === 1;
   }
-  confirmCancel(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'))
+  confirmCancel(record, result = {}) {
+    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'),'$.task.cancelPending',json(?))
       WHERE id=? AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.task.cancelRequested')=1`)
-      .run(record.agentId, record.task?.taskId).changes === 1;
+      .run(result.cancelPending === true ? 'true' : 'false', record.agentId, record.task?.taskId).changes === 1;
   }
-  setWorker(id, pid) { this.db.prepare("UPDATE agents SET body=json_set(body,'$.workerPid',?) WHERE id=?").run(pid ?? null, id); }
-  setWorkerError(id, holder, error) {
-    // The launcher may have awaited spawn while another call advanced or removed
-    // this record. Update only the error, and only for our still-owned lease.
+  // Update only the error, and never overwrite a different error that a later
+  // attempt already recorded, so a delayed spawn failure cannot mask new state.
+  setError(id, error) {
+    const body = JSON.stringify(error);
     this.db.prepare(`UPDATE agents SET body=json_set(body,'$.error',json(?)) WHERE id=?
-      AND EXISTS (SELECT 1 FROM leases WHERE key=? AND holder=? AND expires>?)`)
-      .run(JSON.stringify(error), id, `worker:${id}`, holder, Date.now());
+      AND (json_type(body,'$.error') IS NULL OR json_extract(body,'$.error.code')=json_extract(?,'$.code'))`)
+      .run(body, id, body);
   }
   claimLease(key, holder, leaseMs) {
     return this.db.prepare(`INSERT INTO leases(key,holder,expires) VALUES (?,?,?)
@@ -185,14 +352,65 @@ export class RosterStore {
   }
   renewLease(key, holder, leaseMs) { return this.db.prepare('UPDATE leases SET expires=? WHERE key=? AND holder=?').run(Date.now() + leaseMs, key, holder).changes > 0; }
   releaseLease(key, holder) { this.db.prepare('DELETE FROM leases WHERE key=? AND holder=?').run(key, holder); }
+  /**
+   * Raw submissions an explicit Codex ask_parent/report_parent left behind. They
+   * are consumed by the same scoped state machine during a poll — this table is a
+   * durable inbox, not a second task or notice machine, and ordinary final text
+   * from a native turn is never recorded here.
+   */
+  enqueueSubmission({ id, ownerId, agentId, taskId, kind, message, final = false, created = new Date().toISOString() }) {
+    if (!['ask', 'report'].includes(kind)) throw new Error('A submission must be an ask or a report.');
+    return this.db.prepare(`INSERT OR IGNORE INTO submissions(id,owner,agent,task,kind,message,final,created,state)
+      VALUES (?,?,?,?,?,?,?,?,'pending')`)
+      .run(id, ownerId, agentId, taskId, kind, message, final ? 1 : 0, created).changes === 1;
+  }
+  pendingSubmissions(agentId, taskId) {
+    return this.submissions(agentId, taskId, true);
+  }
+  submissions(agentId, taskId, pendingOnly = false) {
+    return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created FROM submissions
+      WHERE agent=? AND task=? ${pendingOnly ? "AND state='pending'" : ''} ORDER BY created`)
+      .all(agentId, taskId)
+      .map(row => ({ id: row.id, ownerId: row.owner, agentId: row.agent, taskId: row.task,
+        kind: row.kind, message: row.message, final: row.final === 1, created: row.created }));
+  }
+  saveAndConsumeSubmissions(record, ids) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.save(record);
+      for (const id of ids) this.consumeSubmission(id);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  saveChildSnapshot(parentId, taskId, snapshot) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const parent = this.get(parentId);
+      if (parent?.task?.taskId === taskId) {
+        const snapshots = [...(parent.task.childSnapshots ?? []).filter(item => item.agentId !== snapshot.agentId), snapshot];
+        this.db.prepare("UPDATE agents SET body=json_set(body,'$.task.childSnapshots',json(?)) WHERE id=?")
+          .run(JSON.stringify(snapshots), parentId);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  /** Consume once: false means another poll already took it. */
+  consumeSubmission(id) {
+    return this.db.prepare(`UPDATE submissions SET state='consumed', consumed=? WHERE id=? AND state='pending'`)
+      .run(new Date().toISOString(), id).changes === 1;
+  }
   remove(record) {
     this.db.prepare('DELETE FROM supplements WHERE agent=? AND owner=?').run(record.agentId, record.ownerId);
+    this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(record.agentId);
+    this.db.prepare('DELETE FROM submissions WHERE agent=?').run(record.agentId);
     this.db.prepare('DELETE FROM agents WHERE id=? AND owner=?').run(record.agentId, record.ownerId);
+    // The per-target host lock is shared with other names and is left to its holder.
     this.db.prepare('DELETE FROM leases WHERE key=? OR key=?').run(record.agentId, `worker:${record.agentId}`);
     // Secure-delete overwrites freed database cells; checkpoint removes old WAL copies.
     const checkpoint = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
     if (checkpoint?.busy) {
       this.insert({ agentId: record.agentId, ownerId: record.ownerId, name: record.name, lifetime: record.lifetime,
+        ...(record.target ? { target: record.target } : {}),
         workspace: record.workspace, sessionId: record.sessionId, state: 'cleanup_failed', nativeDestroyed: true,
         updatedAt: new Date().toISOString(), error: 'Database cleanup is waiting for another reader. Delete this name again to finish.' });
       throw new Error('The session was removed; local database cleanup is still pending.');

@@ -2,6 +2,7 @@
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import path from 'node:path';
 
 const METHODS = new Map([['thread-owner-discovery', 1], ['thread-follower-read-model-settings', 1],
   ['thread-follower-interrupt-turn', 3]]);
@@ -80,6 +81,7 @@ export async function interruptCodexSession(threadId, { expectedTurnId, ...optio
 // with extra flags or connect to a web/account/browser profile instead.
 const DISCOVER_RENDERER = String.raw`
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $all = @(Get-CimInstance Win32_Process)
 $native = @($all | Where-Object {
   $_.ExecutablePath -and $_.Name -match '^(ChatGPT|Codex)\.exe$' -and
@@ -93,8 +95,9 @@ $native = @($all | Where-Object {
 
 export async function discoverCodexRenderer() {
   if (process.platform !== 'win32') throw fail('codex-native-rpc-unavailable', 'Desktop renderer discovery is currently implemented for Windows.');
-  const endpoints = await new Promise((resolve, reject) => execFile('pwsh', ['-NoProfile', '-NonInteractive', '-Command', DISCOVER_RENDERER],
-    { windowsHide: true, timeout: 10000, maxBuffer: 65536 }, (error, stdout) => {
+  const powershell = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const endpoints = await new Promise((resolve, reject) => execFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', DISCOVER_RENDERER],
+    { windowsHide: true, timeout: 10000, maxBuffer: 65536, encoding: 'utf8' }, (error, stdout) => {
       if (error) return reject(fail('codex-native-rpc-unavailable', 'Could not locate the running Desktop native endpoint.'));
       try { const parsed = stdout.trim() ? JSON.parse(stdout) : []; resolve(Array.isArray(parsed) ? parsed : [parsed]); } catch (error) { reject(error); }
     }));

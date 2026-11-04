@@ -826,6 +826,15 @@ export function createScopedAgents(config, {
     value.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(value.retryAttempts, 5));
   }
 
+  function firstDispatchDeferred(record) {
+    const dispatches = record.task?.dispatches ?? [];
+    const first = dispatches[0];
+    // A supplementary input's backoff must never stop observation or delivery
+    // for work already admitted by the native session.
+    return !record.task?.cancelRequested && dispatches.length === 1 && first.kind === 'task'
+      && !first.accepted && first.state === 'retrying' && first.nextAttemptAt > Date.now();
+  }
+
   // A native refusal is often a normal return value, not an exception. Keep its
   // bounded explanation with the cancellation intent so observe() cannot erase it.
   function retainCancelError(record, result) {
@@ -1267,7 +1276,7 @@ export function createScopedAgents(config, {
 
   async function pollLocked(record) {
     if (record.nextAttemptAt > Date.now()) return publicResult(record);
-    if (!record.task?.cancelRequested && (record.task?.dispatches ?? []).some(d => !d.accepted && d.state === 'retrying' && d.nextAttemptAt > Date.now())) return publicResult(record);
+    if (firstDispatchDeferred(record)) return publicResult(record);
     if (record.state === 'cleaning') return clearRecord(record);
     if (record.closed || record.state === 'cleanup_failed' || record.state === 'idle') return publicResult(record);
     const task = record.task;
@@ -1736,7 +1745,7 @@ export function createScopedAgents(config, {
         if (!record || !needsPoll(record)) continue;
         busy = true;
         if (monitorInflight.has(record.agentId) || nextPollAt.get(record.agentId) > Date.now() || record.nextAttemptAt > Date.now()
-            || (!record.task?.cancelRequested && (record.task?.dispatches ?? []).some(d => !d.accepted && d.state === 'retrying' && d.nextAttemptAt > Date.now()))) continue;
+            || firstDispatchDeferred(record)) continue;
         const work = service.poll(record.agentId).then(() => service.trySleep(record.agentId))
           .catch(() => { /* The next round retries from durable state. */ })
           .finally(() => {

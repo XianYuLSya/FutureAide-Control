@@ -571,6 +571,36 @@ test('pre-delivery failures back off visibly, while ambiguous delivery is never 
   } finally { f.service.close(); }
 });
 
+test('supplement backoff does not delay a running task question and progress notice', async () => {
+  const base = fakeBackend();
+  let observations = 0, sends = 0, receipts = 0;
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+    observe: async () => { observations++; return { ...await base(record).observe(),
+      questions: [{ id: 'q-live', state: 'pending', message: 'Need a decision' }],
+      reports: [{ id: 'progress-live', taskId: record.task.taskId, message: 'Work progressed', final: false }] }; },
+    deliver: async () => { sends++; return { accepted: true }; },
+    receipt: async () => { receipts++; return undefined; },
+    turn: async () => ({ state: 'running' }),
+  }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    const task = completedInput('live');
+    task.dispatches[0].state = 'running'; task.dispatches[0].kind = 'task';
+    task.dispatches.push({ requestId: 'supplement-delayed', kind: 'supplement', state: 'retrying', accepted: false,
+      nextAttemptAt: Date.now() + 30000, error: { code: 'agent-busy' } });
+    f.store.insert(taskRecord({ agentId: 'live', name: 'live', ownerId: ownerIdFor(THREAD), sessionId: 'session-live', state: 'running', task }));
+    await f.service.monitorScan();
+    await f.service.drainPolls();
+    const current = f.store.get('live');
+    assert.ok(observations > 0, 'the monitor still observes the admitted task during supplement backoff');
+    assert.equal(current.task.questionNotices['q-live'].state, 'delivered');
+    assert.equal(current.task.reports.find(report => report.id === 'progress-live').delivery.state, 'delivered');
+    assert.equal(current.task.dispatches[1].state, 'retrying');
+    assert.equal(sends, 0, 'the supplementary input retains its own retry deadline');
+    assert.equal(receipts, 0);
+  } finally { await f.service.drainPolls(); f.service.close(); }
+});
+
 test('parent observation never enters a busy child backend and stale child evidence cannot settle', async () => {
   const calls = [];
   const base = fakeBackend();

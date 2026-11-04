@@ -4,7 +4,7 @@
 
 让 Codex 和 Claude Desktop 都能按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务；调用方也可以把 Claude Desktop 或 Codex Desktop 当作被调用目标（实验性）。插件自动识别当前聊天和项目；每个调用方有自己的名单。
 
-> **0.5.8（2026-11-04）**：Claude 调用 DSH 已实机验证，是本版的主要能力。Codex Desktop 与 Claude Desktop 作为被调用目标（`target: 'codex-desktop'`、`'claude-desktop'`）仍是实验性的：功能在，后续继续完善，本版不按完成计。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
+> **0.5.9（2026-11-04）**：主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 与 Claude Desktop 作为被调用目标（`target: 'codex-desktop'`、`'claude-desktop'`）仍是实验性的：功能在，后续继续完善，本版不按完成计。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
 
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：助手用 `ask_parent` 提问，父级按名字回答；显式 `report_parent` 决定何时回包，正文只转发它提交的内容。
@@ -54,6 +54,8 @@ futureaide_status({})
 
 确认工具已加载、聊天上下文已校验、DSH 已连接且 `treeProtocolReady: true`、`reportProtocolReady: true`、`ready: true`，即可派活。也可以直接说：“检查 FutureAide Control 是否就绪。” 如果工具尚未出现，先检查插件是否启用，再重启客户端。使用时保持 DSH Desktop 运行，模型与网络设置继续由 DSH 管理。
 
+Claude 侧的桥接进程声明了 `tools.listChanged`：服务端的工具名或 schema 变化后（重连时或每 45 秒的比对中）会向已打开的会话发 `tools/list_changed`，不必为看到新工具而新开会话；比对本身失败只记日志，不影响工具调用。
+
 使用自定义 DSH 数据目录时，安装可加 `-DshHome 'E:\DSH-data'`；重装会保留已保存的选择。升级可在原目录执行 `git pull`、重新运行 `install.ps1`，然后重新加载插件连接。
 
 从 0.4 升级到 0.5 前，先让正在运行的任务完成。需要保留在途任务升级时，还须按原任务身份切换后台 `scoped-worker`；仅重新加载 MCP 不会替换已经启动的监工进程，也不要重新派发任务来代替迁移。
@@ -67,11 +69,10 @@ futureaide_status({})
 直接对 Codex 说：“创建一次性画图助手，为当前项目生成中文架构图，保存为 `docs/architecture.svg`。” Codex 的工具调用如下，代码块是 MCP 调用示例，无需在终端执行：
 
 ```text
-futureaide_create_agent({name: "画图助手", lifetime: "once"})
-futureaide_send_agent({name: "画图助手", message: "阅读当前项目，生成中文架构图，保存为 docs/architecture.svg。"})
+futureaide_run_agent({name: "画图助手", lifetime: "once", message: "阅读当前项目，生成中文架构图，保存为 docs/architecture.svg。"})
 ```
 
-创建不会启动模型轮次，收到任务后才开始工作。切换供应商时，只需修改 DSH 默认模型；插件名单里的新旧代理在下一次输入派出时跟随该设置，无需逐条改配置或提供模型参数。正在执行的模型请求继续完成，失败任务不会自动重放，休眠代理不会为切换而全部唤醒；同一输入的后台恢复保留最初已确定的模型和请求身份。DSH 原生下属的新建与复用仍遵循其自身的模型继承和显式选择规则。
+`run` 一次完成创建与派单，可以省略 `name` 让插件生成；名字已存在时直接把任务发给它。创建本身不会启动模型轮次，收到任务后才开始工作。切换供应商时，只需修改 DSH 默认模型；插件名单里的新旧代理在下一次输入派出时跟随该设置，无需逐条改配置或提供模型参数。正在执行的模型请求继续完成，失败任务不会自动重放，休眠代理不会为切换而全部唤醒；同一输入的后台恢复保留最初已确定的模型和请求身份。DSH 原生下属的新建与复用仍遵循其自身的模型继承和显式选择规则。
 
 如果 DSH 询问图中需要包含哪些模块，问题会主动回到当前聊天，Codex 按名字回答即可：
 
@@ -130,17 +131,20 @@ futureaide_inspect_agent({name: "设计团队长"})
 | 工具 | 用途 |
 |---|---|
 | `futureaide_status` | 检查当前调用方与项目，以及三种后端各自是否就绪 |
+| `futureaide_run_agent` | 一步创建并派单；名字已存在就直接发给它；省略 `name` 时自动生成 |
 | `futureaide_create_agent` | 创建一次性或长期子代理；可选 `target`：`dsh`（默认）/`claude-desktop`/`codex-desktop` |
 | `futureaide_send_agent` | 发任务、运行中补充（DSH 下模型下一步就能读到）；等待回答时也可直接答复 |
 | `futureaide_answer_agent` | 回答当前待答问题 |
-| `futureaide_list_agents` | 查看本聊天名单、任务、活动、问题和修改摘要 |
+| `futureaide_list_agents` | 查看本聊天名单；有下属的名字用 `team` 一行一人列出整棵树 |
 | `futureaide_wait_agents` | 按需等一个或多个名字，单次最多 45 秒 |
-| `futureaide_agent_changes` | 看具体修改路径和可得的内容差异 |
-| `futureaide_inspect_agent` | 深入查看上下文、工具及任务历史 |
+| `futureaide_agent_changes` | 看具体修改路径；每个路径一行，不带文件正文 |
+| `futureaide_inspect_agent` | 深入查看上下文、工具及任务历史；`node` 只看一个成员 |
 | `futureaide_cancel_agent` | 停止当前任务及所属后代，清除未执行输入，保留上下文 |
 | `futureaide_delete_agent` | 关闭代理及所属后代，清除会话数据，保留项目产物 |
 
-受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。
+受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。两者的说明里带着同一份回报契约：`report_parent` 要求按 Result / Changes / Verified / Not verified / Decisions 分段、控制在 300 词内，团队长只汇总一份；`ask_parent` 要求写清要定的决定、选项与建议。Claude、Codex、DSH 三侧用的是同一段文本。
+
+上级看全队只用一次 `futureaide_list_agents`：有下属的名字返回 `team`，后代每人一行（相对根、可寻址的 `path`、状态、运行时活动、文件数，文件数封顶时显示 `12+`），最多 30 行，超出以 `{more:n}` 收尾；两个成员同名时第二个起用 `名字#2`、`名字#3`。宿主读不到树时条目带 `treeError` 且没有 `team`——那是未知，不是“没有下属”。需要某个成员的对话时用 `futureaide_inspect_agent({name, node})`：`node` 取 `team` 里的路径（如 `"团队长/前端"`、`"subagent#2"`）或成员名，路径优先；被省略成 `…` 的路径按前缀匹配；同名命中多个成员时以 `node-ambiguous` 拒绝并给出可用路径，其余节点只留名字和状态。整份答案仍超长时先把每个 `team` 换成 `teamSize` 计数并加一条提示，再超才退化成 preview。
 
 发送任务或补充消息返回精简受理回执；需要任务树、文件变更或历史时，按需使用列表、变更或查看工具。`queued: true` 表示已在本地保存（普通监工忙时进入持久队列），不得重发；`retrying: true` 表示原请求正等待后台恢复，调用方无需重发；`unknown` 表示原生写入结果不明，重试前先核对原回执和原收件人，绝不盲目重复；`accepted: true` 只表示目标宿主已受理，不代表任务完成或要求已落实。列表展示队列状态。
 
@@ -150,7 +154,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 
 取消请求优先送到所属代理，即使普通监工操作正忙也不必等待其释放操作锁。返回 `accepted` 表示请求已被宿主接受；通过列表确认任务树停止，取消不会撤销已经发生的操作。若自动清理已经开始，取消返回未接受。
 
-列表保持简短，文件全文只在请求详细变更时返回。文件观察优先采用本代理原生文件工具的成功结果。shell 写入靠任务前后的 `git status` 比对发现，这类条目标为 `attribution: unconfirmed`：同一时间别的进程或助手的改动也会出现，gitignore 覆盖的路径和非 git 目录看不到。仍可能只有部分覆盖，工具会明确说明，不把共享项目的全部改动归给某个代理。
+列表保持简短，文件全文只在请求详细变更时返回。五个读工具（`futureaide_status`、`futureaide_list_agents`、`futureaide_wait_agents`、`futureaide_agent_changes`、`futureaide_inspect_agent`）与 `futureaide_create_agent` 默认返回精简结构：列表条目只有名字、状态、生命周期、任务、待答问题、最新报告（含未送达数量）、改动文件计数（含精确的 unconfirmed 数量）、团队名单与停止的监控，覆盖率、时间戳、每个成员的改动清单和完整结果文字都不占上下文；`changes` 每条路径只留路径、操作，根以下的 `agentPath` 与 `unconfirmed` 归属才保留，文件正文只在 `detail: true` 时返回。文件观察优先采用本代理原生文件工具的成功结果。shell 写入靠任务前后的 `git status` 比对发现，这类条目标为 `attribution: unconfirmed`：同一时间别的进程或助手的改动也会出现，gitignore 覆盖的路径和非 git 目录看不到。仍可能只有部分覆盖，工具会明确说明，不把共享项目的全部改动归给某个代理。
 
 DSH 助手可以继续调用其原生子代理，形成多层任务树；Codex 仍只按顶层名字操作。列表和变更会显示下属层级、活动以及文件的 `agentPath` 归属，`inspect_agent` 可深入查看该树的对话。顶层一轮结束不等于整项任务完成：只有顶层助手显式提交 final 报告，插件才在子孙执行与原生通知全部收齐后转发其正文，并为一次性助手清理整棵受管树。下属向其 DSH 父级汇总，不直接报告 Codex。取消或删除顶层名字也作用于它的下属树，不影响其他聊天的代理。
 

@@ -86,7 +86,7 @@ test('a Claude notice is settled by its native delivery record, never by trailin
   assert.equal(claudeBindingStale(new Error('claude-message-empty')), false, 'a message error is not a stale binding');
 });
 
-test('the shared registration mounts the ten management tools with a trusted caller', async () => {
+test('the shared registration mounts the eleven management tools with a trusted caller', async () => {
   const registered = [];
   const server = { registerTool: (tool, config, handler) => registered.push({ tool, config, handler }) };
   const seen = [];
@@ -94,7 +94,7 @@ test('the shared registration mounts the ten management tools with a trusted cal
   registerScopedTools(server, { service,
     extraFor: async () => ({ [TRUSTED_CALLER]: { source: 'claude-desktop', nativeSessionId: 'native-1', workspace } }) });
   const names = registered.map(item => item.tool);
-  assert.deepEqual(names, ['futureaide_status', 'futureaide_create_agent', 'futureaide_send_agent', 'futureaide_answer_agent',
+  assert.deepEqual(names, ['futureaide_status', 'futureaide_run_agent', 'futureaide_create_agent', 'futureaide_send_agent', 'futureaide_answer_agent',
     'futureaide_list_agents', 'futureaide_wait_agents', 'futureaide_agent_changes', 'futureaide_inspect_agent',
     'futureaide_cancel_agent', 'futureaide_delete_agent']);
   assert.equal(names.includes('ask_parent'), false, 'the report surface keeps its own ask/report tools');
@@ -110,7 +110,7 @@ test('the management hook builds the trusted context from the connection', async
   const received = [];
   scopedManagement({ service: { status: async extra => { received.push(extra); return { ready: true }; } } })
     ({ server, caller: async () => ({ sessionId: 'native-9', cwd: workspace, pid: 42 }), trusted: async () => undefined });
-  assert.equal(registered.length, 10);
+  assert.equal(registered.length, 11);
   const status = registered.find(item => item.tool === 'futureaide_status');
   await status.handler({}, {});
   assert.equal(received[0][TRUSTED_CALLER].nativeSessionId, 'native-9');
@@ -1075,9 +1075,10 @@ test('a caller that already read the final report orders the next task without w
     const current = f.store.get('settle');
     assert.equal(current.task.message, 'next order');
     assert.equal(current.state, 'running');
-    assert.equal(current.history.length, 1, 'the delivered task moved to history');
-    assert.equal(current.history[0].taskId, 'task-settle');
-    assert.equal(current.history[0].reports[0].delivery.state, 'delivered');
+    const history = f.store.historyFor('settle');
+    assert.equal(history.length, 1, 'the delivered task moved to history');
+    assert.equal(history[0].taskId, 'task-settle');
+    assert.equal(history[0].reports[0].delivery.state, 'delivered');
     assert.equal(sent.queued, true);
   } finally { await claude.close(); f.service.close(); }
 });
@@ -1108,8 +1109,9 @@ test('a busy delivery_pending name waits for the poll lock instead of queueing o
       const current = f.store.get('busy');
       assert.equal(current.task.message, 'next order');
       assert.equal(current.state, 'running');
-      assert.equal(current.history.at(-1).taskId, 'task-busy', 'the settled task moved to history');
-      assert.equal(current.history.at(-1).reports[0].delivery.state, 'delivered');
+      const history = f.store.historyFor('busy');
+      assert.equal(history.at(-1).taskId, 'task-busy', 'the settled task moved to history');
+      assert.equal(history.at(-1).reports[0].delivery.state, 'delivered');
       assert.equal(claude.received.length, 0, 'the receipt is read back, never written again');
     } finally { f.store.locked = lock; }
   } finally { await claude.close(); f.service.close(); }

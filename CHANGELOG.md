@@ -1,5 +1,24 @@
 # 更新记录
 
+## 0.5.9 — 2026-11-04 · 精简输出、团队视图与事件驱动监工
+
+本版让主控用起来更省：一次调用开工，工具默认只回决策需要的信息，一次 `list` 看全整棵树，回报格式统一。名单存储有一次自动迁移，升级后首次打开时在事务内完成，不需要手工操作；要退回旧版本，先把 `agent_history` 回填进记录，否则旧版看不到历史任务。
+
+- 工具输出精简：调用方是模型，答案直接进上下文，所以 `futureaide_status`、`futureaide_create_agent`、`futureaide_list_agents`、`futureaide_wait_agents`、`futureaide_agent_changes`、`futureaide_inspect_agent` 现在返回精简视图。列表条目原本 1～4KB，同一份报告最多重复三遍（`task.result.summary`、`reports.latest.summary` 与正文），现在只保留名字、状态、生命周期、任务、待答问题、最新报告、改动文件计数和树规模：报告文字只出现一次，仍有未送达报告时 `report.pending` 报出数量，只有监控停止时才显示 `monitor`；文件计数包含 unconfirmed 路径并另给精确总数（不受 12 条摘要截断影响）；`inspect` 不再把根节点消息列两遍，超长消息截到 4000 字并标 `truncated: true`；`status` 去掉各后端的 `methods` 列表；`changes` 的覆盖率压成一句话（`note`），历史任务保留其任务文本，比对超过 200 条时在 `coverage.workspace.truncated` 与 note 里写明只列了前 200 条。精简输出不缩进，长度保护与之前一致。
+- 五个读工具（`status`、`list_agents`、`wait_agents`、`agent_changes`、`inspect_agent`）都接受 `detail: true` 取回完整结构；服务层返回结构未变，`isError` 仍按完整结果判定（`created: false`、`ready: false` 等不会被视图掩盖）。
+- 新增 `futureaide_run_agent`：一次调用完成创建与派单，名字已存在时直接发给它；省略 `name` 时生成“助手-”加 4 位十六进制，撞名重新生成。调用方显式传 `target` 或 `lifetime` 且与已有记录不同时报错，说明这个名字绑定的是哪个应用和生命周期，不静默用错目标；创建失败原样返回且不再发送；新建成功但首次发送抛错时，仍返回这个名字和 `created: true`，避免自动生成的名字丢失。返回 `{name, lifetime, state, accepted, queued?, retrying?, error?}`，新建带 `created: true`，复用带 `reused: true`。
+- `changes` 不再带回文件正文：实机上 7 个新建文件曾回约 20KB。默认每条只留 `path`、`operation`，根以下的 `agentPath` 和 `unconfirmed` 归属才保留，正文与来源只在 `detail: true` 时出现；`inspect` 的每个节点也不再重复顶层文件清单。
+- 新增团队视图：`list` / `wait` 里树节点多于一个时，用 `team` 数组取代原来的节点计数，每个后代一行（相对根的 `path`、状态、运行时活动、文件数），最多 30 行并以 `{more:n}` 收尾，单行不超过 120 字节。上级一条 `list` 就能看完整棵树。
+- `inspect` 新增 `node` 参数（成员名或 `team` 里的路径）：只返回该节点的对话，其他节点只留名字和状态；找不到时明确报错并列出可选节点。`detail: true` 时同样按 `node` 过滤。
+- 新增 `src/report-contract.mjs`：三方 `ask_parent` / `report_parent` 说明里嵌入同一份回报与提问契约（Claude 走 `claude-report-server.mjs`，Codex 走 `mcp-server.mjs`，DSH 在 `host-plugin.mjs` 内联并由测试逐字比对）。DSH 说明里的“controlling Codex agent”改为“controlling agent”，上级不一定是 Codex。
+- Claude 桥接声明 `tools.listChanged` 并每 45 秒（不低于 30 秒）比对服务端工具列表，工具名或 schema 变化时发 `tools/list_changed`，已打开的会话不必重开；比对只在服务已经 ready 时进行（绝不因此拉起监工），并且用一条独立短连接，失败不会碰会话正在用的客户端，所以不会把在途写变成 write-outcome-unknown；比对失败只记日志，不影响工具调用。
+- 监工减负：`history` 从记录正文移到 `agent_history` 表（打开数据库时在事务内幂等迁移，删除名字时一并抹掉），内容没变的保存不再写库，名单投影按 `data_version` 缓存。循环改为事件驱动：文件事件只轮询被点名的名字，其余每 5 秒兜底，跨进程提交 1 秒内发现，待投递回报按各自的退避时间重试。实测在 6 个助手运行时，监工从 55～62% 单核降到约 20%，final 到进对话从 3～5 秒降到约 2 秒。
+- 投递连续失败超过 20 次后，重试上限从 30 秒放宽到 5 分钟，父聊天已不在时不再每 30 秒试一次。Codex 桥的发现结果缓存 15 秒（失败 5 秒），不再每次调用都枚举全部进程。
+- 列表条目在树读不到时带 `treeError`（此前只剩 running、team 为空，会被读成“没有下属”）；团队 `path` 现在可寻址：同名成员第二个起编号 `#2`、`#3`，`inspect` 的 `node` 用同一套编号，路径优先、省略路径按前缀匹配、同名命中多个成员时以 `node-ambiguous` 拒绝并列出可用路径。团队行的文件数在封顶时显示 `12+`，`activity` 截到 40 字符，单行仍控制在 120 字节内。
+- `inspect` 的 `detail` 与 `node` 组合时，`hasMore` 与 `note` 改用选中节点自己的（此前会串用根页字段）；`inspect` 的覆盖率提示改为“Showing n of m paths; changes lists them.”，“只列前 200 条”只留在 `changes` 工具里。
+- `futureaide_run_agent` 遇到正在清理或已关闭的名字时返回 `name-closing` 并说明该等它离开列表还是换名字，不再转述 send 的含糊报错。
+- `list` / `wait` 整体超过 40000 字符时，先把每个 `team` 换成 `teamSize` 计数并加提示，仍超才退化成 preview，避免满员团队时读不到任何条目。
+
 ## 0.5.8 — 2026-11-04 · Claude 调用 DSH 与用户级插件
 
 本版主要能力是 Claude 调用 DSH，已完成实机验证。Codex Desktop 与 Claude Desktop 作为被调用目标（`target: 'codex-desktop'`、`'claude-desktop'`）仍是实验性的：功能已经具备，后续继续完善，本版不按完成计。

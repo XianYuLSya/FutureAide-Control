@@ -36,8 +36,12 @@ export function createDirectoryWatchers(onEvent, { watchImpl = watch } = {}) {
         if (watchers.has(directory)) continue;
         try {
           // The listener is told which directory changed, not the raw event type.
-          const watcher = watchImpl(directory, { persistent: false }, () => onEvent(directory));
-          watcher.on('error', () => { watcher.close(); watchers.delete(directory); onEvent(directory); });
+          // The file name is carried along when the platform reports it: the managed
+          // host names one file per name, so it can point at a single record instead
+          // of a whole-roster sweep. A null name (or a directory we do not map) is
+          // simply a hint to sweep.
+          const watcher = watchImpl(directory, { persistent: false }, (eventType, filename) => onEvent(directory, filename ?? null));
+          watcher.on('error', () => { watcher.close(); watchers.delete(directory); onEvent(directory, null); });
           watchers.set(directory, watcher);
         } catch { /* A directory that cannot be watched is simply skipped. */ }
       }
@@ -79,6 +83,77 @@ export function monitorDirectories(config, { env = process.env, bindings = [], e
 
 function defaultExists(directory) {
   try { return statSync(directory).isDirectory(); } catch { return false; }
+}
+
+/**
+ * The managed host writes one state file per name, named
+ * sha256(owner + newline + agent).json, so a file event usually names exactly one
+ * record. Returns that file's hash, or null for anything else (a session registry,
+ * a transcript directory, a partial write).
+ */
+export function wakeHintName(filename) {
+  const match = typeof filename === 'string' ? /^([0-9a-f]{64})(?:\.json)?$/i.exec(filename) : null;
+  return match ? match[1].toLowerCase() : null;
+}
+
+/**
+ * Hints a file event leaves for the next round: the names to poll, whether the
+ * whole roster has to be swept, and whether the sweep may ignore the per-name
+ * poll floor (an external commit is news nobody was waiting for).
+ *
+ * Unmapped events ask for a sweep at most once per sweepRequestMs; a burst keeps
+ * the marker without waking the loop again, because the sweep already pending will
+ * see everything the burst touched.
+ */
+export function createWakeQueue({ sweepRequestMs = 1000, now = Date.now } = {}) {
+  const names = new Set();
+  let sweep = false, force = false, lastSweepRequest = -Infinity;
+  return {
+    get pending() { return names.size; },
+    get sweeping() { return sweep; },
+    /** One file event. True means the loop should be woken now. */
+    event(agentId) {
+      if (agentId) { names.add(agentId); return true; }
+      sweep = true;
+      if (now() - lastSweepRequest < sweepRequestMs) return false;
+      lastSweepRequest = now();
+      return true;
+    },
+    /** Another connection committed: a sweep now, without the per-name poll floor. */
+    commit() { sweep = true; force = true; return true; },
+    /** Work was queued in this process for one name. */
+    queued(agentId) { if (agentId) names.add(agentId); return Boolean(agentId); },
+    /** Everything waiting, consumed; the queue is empty afterwards. */
+    take() {
+      const taken = { names: [...names], sweep, force };
+      names.clear();
+      sweep = false;
+      force = false;
+      return taken;
+    },
+    /** A hint whose own poll was still running: back in the queue, and wake again. */
+    defer(ids) { for (const id of ids) names.add(id); return ids.length > 0; },
+  };
+}
+
+/**
+ * Wait for work in slices. A file event wakes the wait at once; a commit from
+ * another process cannot, so every slice re-reads the roster's commit counter and
+ * ends the wait so the loop can sweep. Injected functions keep this testable.
+ */
+export async function waitForCommit({ timeoutMs, floorMs = 0, sliceMs = 1000,
+  sleep, signalled, readVersion, version }) {
+  const deadline = Date.now() + timeoutMs;
+  let first = true;
+  while (true) {
+    const remaining = Math.max(0, deadline - Date.now());
+    await sleep(Math.max(first ? floorMs : 0, Math.min(remaining, sliceMs)));
+    first = false;
+    if (signalled()) return { reason: 'work' };
+    const current = readVersion();
+    if (current !== version) return { reason: 'commit', version: current };
+    if (Date.now() >= deadline) return { reason: 'timeout' };
+  }
 }
 
 export function monitorAlive(store, now = Date.now()) {

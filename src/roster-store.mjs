@@ -22,12 +22,70 @@ export class RosterStore {
         json_extract(body,'$.callbackBlocked'),json_extract(body,'$.sleep'),json_extract(body,'$.task.taskId'),
         json_extract(body,'$.task.reports'),json_extract(body,'$.task.cancelRequested'),
         json_extract(body,'$.task.cancelVerified'),json_extract(body,'$.task.cancelTreeSettled'),id,owner,name);
+      -- The listener asks "is any name open on this target?" every round; without an
+      -- index that reads every body. Two small values, maintained on write.
+      CREATE INDEX IF NOT EXISTS agents_target ON agents(json_extract(body,'$.target'));
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS submissions (id TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL,
         task TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, final INTEGER NOT NULL,
-        created TEXT NOT NULL, state TEXT NOT NULL, consumed TEXT);`);
+        created TEXT NOT NULL, state TEXT NOT NULL, consumed TEXT);
+      CREATE TABLE IF NOT EXISTS agent_history (agent TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
+        PRIMARY KEY (agent, seq)) WITHOUT ROWID;
+      CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
+    // Single-connection caches. They only ever skip work whose result is already
+    // known here; every entry is dropped by any write this connection makes to the
+    // same row, and projections are keyed by PRAGMA data_version so a commit from
+    // the Codex side (which can hold this roster open at the same time) invalidates
+    // them. A fresh process starts with empty caches, so the first save of a record
+    // is always a real write.
+    this.bodies = new Map();
+    this.projections = new Map();
+    this.settled = 0;
+    this.migrateHistory();
+  }
+
+  /**
+   * Task history used to ride inside the agent body, where every poll rewrite also
+   * rewrote it: 32MB of a 54MB roster, ~60% of each save. It moves to its own table
+   * and the body keeps an empty array, so a build from before this change still
+   * opens the migrated roster and simply sees no earlier tasks.
+   *
+   * Idempotent: the marker is written in the same transaction as the move, so an
+   * interrupted run rolls back whole and a finished run never repeats. Rolling back
+   * means restoring the array into each body and deleting the marker row.
+   */
+  migrateHistory() {
+    const done = this.db.prepare("SELECT value FROM schema_meta WHERE key='agent-history-table-v1'").get();
+    if (done) return;
+    // A deployment migration can find another process holding the write lock; it
+    // gets 30 seconds instead of the 5 a normal statement waits, and the old limit is
+    // restored whatever happens. A migration that still cannot run throws: this store
+    // must never serve a body whose history was left behind.
+    this.db.exec('PRAGMA busy_timeout=30000');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.db.prepare(`SELECT id, json_extract(body,'$.history') AS body FROM agents
+        WHERE json_type(json_extract(body,'$.history'))='array'`).all();
+      const insert = this.db.prepare('INSERT OR IGNORE INTO agent_history(agent,seq,body) VALUES (?,?,?)');
+      const clear = this.db.prepare("UPDATE agents SET body=json_set(body,'$.history',json('[]')) WHERE id=?");
+      for (const row of rows) {
+        const items = JSON.parse(row.body ?? '[]');
+        if (!Array.isArray(items) || !items.length) continue;
+        items.forEach((item, index) => insert.run(row.id, index, JSON.stringify(item)));
+        clear.run(row.id);
+        this.bodies.delete(row.id);
+      }
+      this.db.prepare("INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('agent-history-table-v1',?)")
+        .run(new Date().toISOString());
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    } finally {
+      this.db.exec('PRAGMA busy_timeout=5000');
+    }
   }
 
   owner(id) { const row = this.db.prepare('SELECT body FROM owners WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
@@ -44,31 +102,102 @@ export class RosterStore {
   rebindOwner(id, binding) {
     this.db.prepare("UPDATE owners SET body=json_set(body,'$.pid',?,'$.binding',json(?)) WHERE id=?").run(binding.pid, JSON.stringify(binding), id);
   }
-  get(id) { const row = this.db.prepare('SELECT body FROM agents WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
+  get(id) {
+    const row = this.db.prepare('SELECT body FROM agents WHERE id=?').get(id);
+    if (!row) { this.bodies.delete(id); return undefined; }
+    const record = JSON.parse(row.body);
+    // Remember the exact text, with its recency stamp neutralised, so save() can tell
+    // an unchanged record from a changed one without a second trip through SQLite and
+    // without a second serialisation.
+    this.bodies.set(id, { text: row.body });
+    return record;
+  }
+  /** Earlier tasks of one name, oldest first. Never part of the body any more. */
+  historyFor(agentId, { limit = 0, offset = 0 } = {}) {
+    const rows = limit > 0
+      ? this.db.prepare('SELECT body FROM agent_history WHERE agent=? ORDER BY seq DESC LIMIT ? OFFSET ?').all(agentId, limit, offset).reverse()
+      : this.db.prepare('SELECT body FROM agent_history WHERE agent=? ORDER BY seq').all(agentId);
+    return rows.map(row => JSON.parse(row.body));
+  }
+  historyCount(agentId) {
+    return this.db.prepare('SELECT count(*) AS count FROM agent_history WHERE agent=?').get(agentId).count;
+  }
+  /** Append-only: an earlier task is never rewritten by a later poll. */
+  appendHistory(agentId, item) {
+    const row = this.db.prepare('SELECT coalesce(max(seq),-1)+1 AS seq FROM agent_history WHERE agent=?').get(agentId);
+    this.db.prepare('INSERT INTO agent_history(agent,seq,body) VALUES (?,?,?)').run(agentId, row.seq, JSON.stringify(item));
+    return row.seq;
+  }
+  leaseHeld(key, holder) { const lease = this.lease(key); return lease && lease.holder === holder && lease.expires > Date.now(); }
+  /**
+   * A projection query is only recomputed when the roster could have moved: another
+   * connection committed (PRAGMA data_version) or this database was written by
+   * something other than this store (SQLite total_changes moved past the writes we
+   * know about). Any write of our own to agents, supplements or backend_state drops
+   * every projection instead: a cache that cannot prove it is current must not
+   * decide whether a report still has to be polled or delivered.
+   */
+  changed() { return this.db.prepare('SELECT total_changes() AS changed').get().changed; }
+  /**
+   * Our own write that cannot change any projection (leases, submissions): the
+   * caches stay valid and simply start from the new change counter.
+   */
+  settle(rows = 0) {
+    // Only the rows this write changed are accounted for. Pushing the counter to the
+    // current total would swallow a write that bypassed the store in the meantime,
+    // and a projection would then look current while it is stale.
+    this.settled += Math.max(0, Number(rows) || 0);
+    for (const cached of this.projections.values()) cached.settled = this.settled;
+    return this.settled;
+  }
+  projection(key, build) {
+    const version = this.dataVersion();
+    const changed = this.changed();
+    let cached = this.projections.get(key);
+    if (!cached || cached.version !== version || cached.settled !== changed) {
+      // The rebuild read the whole table, so every change counted here is seen. Other
+      // keys keep their own stamp: rebuilding one key must never vouch for another.
+      cached = { version, settled: changed, rows: build() };
+      this.projections.set(key, cached);
+      this.settled = changed;
+    }
+    return cached.rows;
+  }
+  dropProjections() { this.projections.clear(); this.settled = this.changed(); }
+  /** A row changed outside save(): forget whatever we cached about this name. */
+  touched(agentId) { if (agentId) this.bodies.delete(agentId); this.dropProjections(); }
   lease(key) { return this.db.prepare('SELECT holder,expires FROM leases WHERE key=?').get(key); }
   wake(id, taskId) {
-    return this.db.prepare("UPDATE agents SET body=json_remove(body,'$.sleep') WHERE id=? AND json_extract(body,'$.sleep.taskId')=? AND json_extract(body,'$.sessionId')=json_extract(body,'$.sleep.sessionId')").run(id, taskId).changes === 1;
+    const changed = this.db.prepare("UPDATE agents SET body=json_remove(body,'$.sleep') WHERE id=? AND json_extract(body,'$.sleep.taskId')=? AND json_extract(body,'$.sessionId')=json_extract(body,'$.sleep.sessionId')").run(id, taskId).changes === 1;
+    if (changed) this.touched(id);
+    return changed;
   }
   markWake(id, taskId) {
-    return this.db.prepare("UPDATE agents SET body=json_set(body,'$.sleep.wakePending',json('true')) WHERE id=? AND json_extract(body,'$.sleep.taskId')=?").run(id, taskId).changes === 1;
+    const changed = this.db.prepare("UPDATE agents SET body=json_set(body,'$.sleep.wakePending',json('true')) WHERE id=? AND json_extract(body,'$.sleep.taskId')=?").run(id, taskId).changes === 1;
+    if (changed) this.touched(id);
+    return changed;
   }
   sleep(record, signal) {
-    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.sleep',json(?)) WHERE id=? AND owner=?
+    const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.sleep',json(?)) WHERE id=? AND owner=?
       AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.state')=?
       AND (coalesce(json_extract(body,'$.task.cancelRequested'),0)=0 OR (json_extract(body,'$.task.cancelVerified')=1 AND json_extract(body,'$.task.cancelTreeSettled')=1))
       AND EXISTS (SELECT 1 FROM leases a JOIN leases b ON a.holder=b.holder WHERE a.key='idle-monitor' AND b.key='idle-monitor:ready' AND a.expires>? AND b.expires>?)
       AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=? AND status IN ('queued','sending','unknown'))`)
       .run(JSON.stringify({ taskId: record.task.taskId, sessionId: record.sessionId, signal }), record.agentId, record.ownerId, record.task.taskId, record.state, Date.now(), Date.now(), record.task.taskId).changes === 1;
+    if (changed) this.touched(record.agentId);
+    return changed;
   }
   restoreSleep(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.sleep',json(?))
+    const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.sleep',json(?))
       WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=?
       AND coalesce(json_extract(body,'$.closed'),0)=0`)
       .run(JSON.stringify(record.sleep), record.agentId, record.ownerId, record.sleep.sessionId).changes === 1;
+    if (changed) this.touched(record.agentId);
+    return changed;
   }
   named(owner, name) { const row = this.db.prepare('SELECT body FROM agents WHERE owner=? AND name=?').get(owner, name); return row ? JSON.parse(row.body) : undefined; }
   enqueueSupplement(record, requestId, message) {
-    return this.db.prepare(`INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created)
+    const changed = this.db.prepare(`INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created)
       SELECT ?,id.owner,id.id,json_extract(id.body,'$.sessionId'),json_extract(id.body,'$.task.taskId'),?,'queued',?
       FROM agents AS id WHERE id.id=? AND id.owner=? AND id.name=? AND json_extract(id.body,'$.sessionId')=?
       AND json_extract(id.body,'$.task.taskId')=? AND coalesce(json_extract(id.body,'$.closed'),0)=0
@@ -76,10 +205,12 @@ export class RosterStore {
       AND json_extract(id.body,'$.state') IN ('running','awaiting_input','awaiting_report','reconnecting')
       AND NOT EXISTS (SELECT 1 FROM json_each(id.body,'$.task.reports') WHERE json_extract(value,'$.final')=1)`)
       .run(requestId, message, new Date().toISOString(), record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
+    this.dropProjections();
+    return changed;
   }
   supplements(agentId) { return this.db.prepare("SELECT * FROM supplements WHERE agent=? AND status IN ('queued','sending','unknown','blocked') ORDER BY rowid").all(agentId); }
-  setSupplement(requestId, status, reason = null) { this.db.prepare('UPDATE supplements SET status=?,reason=? WHERE requestId=?').run(status, reason, requestId); }
-  blockQueued(agentId, taskId, reason) { this.db.prepare("UPDATE supplements SET status='blocked',reason=? WHERE agent=? AND task=? AND status='queued'").run(reason, agentId, taskId); }
+  setSupplement(requestId, status, reason = null) { this.db.prepare('UPDATE supplements SET status=?,reason=? WHERE requestId=?').run(status, reason, requestId); this.dropProjections(); }
+  blockQueued(agentId, taskId, reason) { this.db.prepare("UPDATE supplements SET status='blocked',reason=? WHERE agent=? AND task=? AND status='queued'").run(reason, agentId, taskId); this.dropProjections(); }
   supplementSummary(agentId, taskId) {
     const rows = this.db.prepare('SELECT status,count(*) AS count FROM supplements WHERE agent=? AND task=? GROUP BY status').all(agentId, taskId);
     const counts = { queued: 0, unknown: 0, blocked: 0, accepted: 0 };
@@ -99,10 +230,12 @@ export class RosterStore {
   }
   /** Upsert one target-state document. False means the name is already gone. */
   saveBackendState(agentId, value) {
-    return this.db.prepare(`INSERT INTO backend_state(agent,body) SELECT id,? FROM agents WHERE id=?
+    const changed = this.db.prepare(`INSERT INTO backend_state(agent,body) SELECT id,? FROM agents WHERE id=?
       ON CONFLICT(agent) DO UPDATE SET body=excluded.body`).run(JSON.stringify(value), agentId).changes === 1;
+    this.dropProjections();
+    return changed;
   }
-  deleteBackendState(agentId) { this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(agentId); }
+  deleteBackendState(agentId) { this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(agentId); this.dropProjections(); }
   /**
    * Read-only reverse lookup for a reply surface that must identify its caller
    * from the native session it was invoked in. Only live claude-desktop names
@@ -200,11 +333,9 @@ export class RosterStore {
   // The covering expression index stores these fields at write time. Selecting
   // json_extract alone still reparses every large body unless the scan uses it;
   // SQLite maintains it even when another/older connection updates the roster.
-  hasSleeping() {
-    return this.db.prepare("SELECT 1 AS found FROM agents INDEXED BY agents_lifecycle WHERE json_type(json_extract(body,'$.sleep'))='object' LIMIT 1").get() !== undefined;
-  }
+  hasSleeping() { return this.listSleeping().length > 0; }
   listSleeping() {
-    return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
+    return this.projection('sleeping', () => this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
       json_extract(body,'$.state') AS state, json_extract(body,'$.task.taskId') AS taskId,
       json_extract(body,'$.task.cancelRequested') AS cancelRequested,
       json_extract(body,'$.task.cancelVerified') AS cancelVerified,
@@ -220,7 +351,23 @@ export class RosterStore {
         ...(row.cancelVerified ? { cancelVerified: true } : {}),
         ...(row.cancelTreeSettled ? { cancelTreeSettled: true } : {}) },
       sleep: JSON.parse(row.sleep), hasSupplement: Boolean(row.hasSupplement),
-    }));
+    })));
+  }
+  /**
+   * Hash -> agentId for every name. The managed host writes one state file per name,
+   * named sha256(owner + newline + agent), so a file event names exactly one record to
+   * poll instead of the whole roster. Only id and owner are selected, never the body:
+   * a closed name is kept in the map because a hint for it costs one rejected poll,
+   * while filtering it would read every body on every rebuild.
+   */
+  wakeIndex() {
+    return this.projection('wake-index', () => {
+      const index = new Map();
+      for (const row of this.db.prepare('SELECT id, owner FROM agents').all()) {
+        index.set(createHash('sha256').update(`${row.owner}\n${row.id}`).digest('hex'), row.id);
+      }
+      return index;
+    });
   }
   listPendingDeliveries() {
     return this.db.prepare(`SELECT id AS agentId, json_extract(body,'$.sleep.taskId') AS taskId,
@@ -237,18 +384,31 @@ export class RosterStore {
       ORDER BY name`).all().map(row => ({ agentId: row.agentId, taskId: row.taskId, sessionId: row.sessionId }));
   }
   listWorkerCandidates() {
-    return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
-      json_extract(body,'$.state') AS state, json_extract(body,'$.closed') AS closed, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
-      json_extract(body,'$.sleep') AS sleep, json_extract(body,'$.task.taskId') AS taskId,
-      json_extract(body,'$.task.reports') AS reports
-      FROM agents INDEXED BY agents_lifecycle ORDER BY name`).all().map(row => ({
-      agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
-      ...(row.closed ? { closed: true } : {}),
-      ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
-      ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
-      ...(row.taskId == null ? {} : { task: { taskId: row.taskId,
-        reports: (JSON.parse(row.reports ?? '[]') ?? []).map(report => ({ delivery: { state: report.delivery?.state ?? '' } })) } }),
-    }));
+    return this.projection('candidates', () => {
+      // Everything selected here comes from the covering expression index. Two extra
+      // correlated subqueries would each read the whole body again for every name, so
+      // the supplement flag is a second small query and the report count is folded in
+      // from the reports column the scan already has.
+      const supplements = new Set(this.db.prepare("SELECT agent, task FROM supplements WHERE status IN ('queued','sending','unknown')")
+        .all().map(row => `${row.agent}\n${row.task}`));
+      return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
+        json_extract(body,'$.state') AS state, json_extract(body,'$.closed') AS closed, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
+        json_extract(body,'$.sleep') AS sleep, json_extract(body,'$.task.taskId') AS taskId,
+        json_extract(body,'$.task.reports') AS reports
+        FROM agents INDEXED BY agents_lifecycle ORDER BY name`).all().map(row => {
+        const reports = (JSON.parse(row.reports ?? '[]') ?? [])
+          .map(report => ({ delivery: { state: report.delivery?.state ?? '' } }));
+        return {
+          agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
+          ...(row.closed ? { closed: true } : {}),
+          ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
+          ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
+          hasSupplement: supplements.has(`${row.agentId}\n${row.taskId}`),
+          pendingReports: reports.filter(report => !['delivered', 'blocked'].includes(report.delivery.state)).length,
+          ...(row.taskId == null ? {} : { task: { taskId: row.taskId, reports } }),
+        };
+      });
+    });
   }
   insert(record) {
     try { this.db.prepare('INSERT INTO agents(id,owner,name,body) VALUES (?,?,?,?)').run(record.agentId, record.ownerId, record.name, JSON.stringify(record)); }
@@ -256,6 +416,7 @@ export class RosterStore {
       if (String(error.message).includes('UNIQUE')) throw Object.assign(new Error('A subagent with this name already exists in this chat.'), { code: 'name-in-use' });
       throw error;
     }
+    this.touched(record.agentId);
   }
   /**
    * WAL-aware commit counter for this connection. It changes when another
@@ -279,23 +440,48 @@ export class RosterStore {
     return createHash('sha256').update(location).digest('hex');
   }
   /** Open claude-desktop bindings only, for the listener's watch set. */
-  listClaudeBindings() {
-    return this.db.prepare(`SELECT b.body AS body FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
+  listClaudeBindings() { return [...this.claudeBindings().values()]; }
+  claudeBindings() {
+    return this.projection('claude-bindings', () => new Map(this.db.prepare(`SELECT b.agent AS agent, b.body AS body
+      FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
       WHERE json_extract(a.body,'$.target')='claude-desktop' AND coalesce(json_extract(a.body,'$.closed'),0)=0`)
-      .all().map(row => JSON.parse(row.body)?.binding ?? {});
+      .all().map(row => [row.agent, JSON.parse(row.body)?.binding ?? {}])));
   }
   /**
    * Does this chat still own any open name on that target? A zero-model
    * reservation counts: the session has been promised a place before its first
    * turn, so the listener that serves it must not retire while it exists.
+   *
+   * Two index lookups on agents_target, not a scan of every body: this is asked once
+   * per round and must stay cheap enough to ask every second.
    */
   hasOpenTarget(target) {
-    return this.db.prepare(`SELECT 1 AS found FROM agents
-      WHERE coalesce(json_extract(body,'$.target'),'dsh')=? AND coalesce(json_extract(body,'$.closed'),0)=0 LIMIT 1`)
-      .get(target) !== undefined;
+    const found = this.db.prepare(`SELECT 1 AS found FROM agents WHERE json_extract(body,'$.target')=?
+      AND coalesce(json_extract(body,'$.closed'),0)=0 LIMIT 1`).get(target);
+    if (found) return true;
+    // Names recorded before the field existed are this target by default.
+    if (target !== 'dsh') return false;
+    return this.db.prepare(`SELECT 1 AS found FROM agents WHERE json_extract(body,'$.target') IS NULL
+      AND coalesce(json_extract(body,'$.closed'),0)=0 LIMIT 1`).get() !== undefined;
+  }
+  /** Does this exact name still own its row? A skip must not hide a removal. */
+  stillPresent(record) {
+    return this.db.prepare('SELECT 1 AS found FROM agents WHERE id=? AND owner=? AND name=?')
+      .get(record.agentId, record.ownerId, record.name) !== undefined;
   }
   save(record) {
+    // Nothing durable changed: this record still serialises to exactly the body we
+    // read or wrote last, so this save would rewrite megabytes for nothing. The
+    // statement below parses the body once per json() argument and rebuilds the
+    // expression index, which is the single largest cost of a quiet round.
+    const cached = this.bodies.get(record.agentId);
+    const candidate = JSON.stringify(record);
+    if (cached !== undefined && cached.text === candidate && this.stillPresent(record)) return;
     record.updatedAt = new Date().toISOString();
+    // A plain second serialisation: a body can carry a nested updatedAt of its own, and
+    // matching the recency stamp as text is not worth the risk of writing the wrong
+    // one. Real writes are rare; quiet rounds never reach this line.
+    const body = JSON.stringify(record);
     // A watcher or sender can wake without the operation lock. Never restore a
     // sleep marker from an older in-memory poll after that atomic wake.
     const sleeping = "CASE WHEN json_type(body,'$.sleep') IS NULL THEN json_remove(?1,'$.sleep') WHEN json_extract(body,'$.sleep.wakePending')=1 AND json_extract(body,'$.sleep.taskId')=json_extract(?1,'$.sleep.taskId') THEN json_set(?1,'$.sleep.wakePending',json('true')) ELSE ?1 END";
@@ -311,47 +497,66 @@ export class RosterStore {
         AND EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND status IN ('queued','sending','unknown'))
       THEN json_set(${input},'$.state','running') ELSE ${input} END
       WHERE id=?2 AND owner=?3 AND name=?4`)
-      .run(JSON.stringify(record), record.agentId, record.ownerId, record.name);
+      .run(body, record.agentId, record.ownerId, record.name);
     if (!result.changes) throw new Error('This subagent instance has already been removed.');
+    this.bodies.set(record.agentId, { text: body });
+    this.dropProjections();
   }
   requestCancel(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.task.cancelRequested',json('true'),'$.task.cancelPending',json('true'),'$.task.cancelTreeSettled',json('false'),'$.state','running'),'$.nextAttemptAt')
+    const changed = this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.task.cancelRequested',json('true'),'$.task.cancelPending',json('true'),'$.task.cancelTreeSettled',json('false'),'$.state','running'),'$.nextAttemptAt')
       WHERE id=? AND owner=? AND name=? AND json_extract(body,'$.sessionId')=? AND json_extract(body,'$.task.taskId')=?
       AND coalesce(json_extract(body,'$.closed'),0)=0 AND coalesce(json_extract(body,'$.state'),'') NOT IN ('cleaning','cleanup_failed')`)
       .run(record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
+    if (changed) this.touched(record.agentId);
+    return changed;
   }
   requestCleanup(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.state','cleaning','$.closed',json('true')),'$.sleep','$.error','$.nextAttemptAt')
+    const changed = this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.state','cleaning','$.closed',json('true')),'$.sleep','$.error','$.nextAttemptAt')
       WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=?`)
       .run(record.agentId, record.ownerId, record.sessionId).changes === 1;
+    if (changed) this.touched(record.agentId);
+    return changed;
   }
   claimAutoCleanup(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.closed',json('true'),'$.state','cleaning')
+    const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.closed',json('true'),'$.state','cleaning')
       WHERE id=? AND owner=? AND json_extract(body,'$.task.taskId')=? AND coalesce(json_extract(body,'$.task.cancelRequested'),0)=0
       AND coalesce(json_extract(body,'$.closed'),0)=0
       AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=json_extract(agents.body,'$.task.taskId') AND status IN ('queued','sending','unknown','blocked'))`)
       .run(record.agentId, record.ownerId, record.task?.taskId).changes === 1;
+    if (changed) this.touched(record.agentId);
+    return changed;
   }
   confirmCancel(record, result = {}) {
-    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'),'$.task.cancelPending',json(?))
+    const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'),'$.task.cancelPending',json(?))
       WHERE id=? AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.task.cancelRequested')=1`)
       .run(result.cancelPending === true ? 'true' : 'false', record.agentId, record.task?.taskId).changes === 1;
+    if (changed) this.touched(record.agentId);
+    return changed;
   }
   // Update only the error, and never overwrite a different error that a later
   // attempt already recorded, so a delayed spawn failure cannot mask new state.
   setError(id, error) {
     const body = JSON.stringify(error);
-    this.db.prepare(`UPDATE agents SET body=json_set(body,'$.error',json(?)) WHERE id=?
+    const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.error',json(?)) WHERE id=?
       AND (json_type(body,'$.error') IS NULL OR json_extract(body,'$.error.code')=json_extract(?,'$.code'))`)
-      .run(body, id, body);
+      .run(body, id, body).changes === 1;
+    if (changed) this.touched(id);
   }
   claimLease(key, holder, leaseMs) {
-    return this.db.prepare(`INSERT INTO leases(key,holder,expires) VALUES (?,?,?)
+    const result = this.db.prepare(`INSERT INTO leases(key,holder,expires) VALUES (?,?,?)
       ON CONFLICT(key) DO UPDATE SET holder=excluded.holder,expires=excluded.expires WHERE leases.expires<? OR leases.holder=?`)
-      .run(key, holder, Date.now() + leaseMs, Date.now(), holder).changes > 0;
+      .run(key, holder, Date.now() + leaseMs, Date.now(), holder);
+    this.settle(result.changes);
+    return Number(result.changes) > 0;
   }
-  renewLease(key, holder, leaseMs) { return this.db.prepare('UPDATE leases SET expires=? WHERE key=? AND holder=?').run(Date.now() + leaseMs, key, holder).changes > 0; }
-  releaseLease(key, holder) { this.db.prepare('DELETE FROM leases WHERE key=? AND holder=?').run(key, holder); }
+  renewLease(key, holder, leaseMs) {
+    const result = this.db.prepare('UPDATE leases SET expires=? WHERE key=? AND holder=?').run(Date.now() + leaseMs, key, holder);
+    this.settle(result.changes);
+    return Number(result.changes) > 0;
+  }
+  releaseLease(key, holder) {
+    this.settle(this.db.prepare('DELETE FROM leases WHERE key=? AND holder=?').run(key, holder).changes);
+  }
   /**
    * Raw submissions an explicit Codex ask_parent/report_parent left behind. They
    * are consumed by the same scoped state machine during a poll — this table is a
@@ -360,9 +565,11 @@ export class RosterStore {
    */
   enqueueSubmission({ id, ownerId, agentId, taskId, kind, message, final = false, created = new Date().toISOString() }) {
     if (!['ask', 'report'].includes(kind)) throw new Error('A submission must be an ask or a report.');
-    return this.db.prepare(`INSERT OR IGNORE INTO submissions(id,owner,agent,task,kind,message,final,created,state)
+    const queued = this.db.prepare(`INSERT OR IGNORE INTO submissions(id,owner,agent,task,kind,message,final,created,state)
       VALUES (?,?,?,?,?,?,?,?,'pending')`)
       .run(id, ownerId, agentId, taskId, kind, message, final ? 1 : 0, created).changes === 1;
+    this.settle(queued ? 1 : 0);
+    return queued;
   }
   pendingSubmissions(agentId, taskId) {
     return this.submissions(agentId, taskId, true);
@@ -375,6 +582,11 @@ export class RosterStore {
         kind: row.kind, message: row.message, final: row.final === 1, created: row.created }));
   }
   saveAndConsumeSubmissions(record, ids) {
+    // A deployment migration can find another process holding the write lock; it
+    // gets 30 seconds instead of the 5 a normal statement waits, and the old limit is
+    // restored whatever happens. A migration that still cannot run throws: this store
+    // must never serve a body whose history was left behind.
+    this.db.exec('PRAGMA busy_timeout=30000');
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.save(record);
@@ -383,6 +595,11 @@ export class RosterStore {
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   saveChildSnapshot(parentId, taskId, snapshot) {
+    // A deployment migration can find another process holding the write lock; it
+    // gets 30 seconds instead of the 5 a normal statement waits, and the old limit is
+    // restored whatever happens. A migration that still cannot run throws: this store
+    // must never serve a body whose history was left behind.
+    this.db.exec('PRAGMA busy_timeout=30000');
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const parent = this.get(parentId);
@@ -392,26 +609,37 @@ export class RosterStore {
           .run(JSON.stringify(snapshots), parentId);
       }
       this.db.exec('COMMIT');
+      this.dropProjections();
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   /** Consume once: false means another poll already took it. */
   consumeSubmission(id) {
-    return this.db.prepare(`UPDATE submissions SET state='consumed', consumed=? WHERE id=? AND state='pending'`)
+    const consumed = this.db.prepare(`UPDATE submissions SET state='consumed', consumed=? WHERE id=? AND state='pending'`)
       .run(new Date().toISOString(), id).changes === 1;
+    this.settle(consumed ? 1 : 0);
+    return consumed;
   }
   remove(record) {
     this.db.prepare('DELETE FROM supplements WHERE agent=? AND owner=?').run(record.agentId, record.ownerId);
     this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(record.agentId);
     this.db.prepare('DELETE FROM submissions WHERE agent=?').run(record.agentId);
+    // Task history lives in its own table now: deleting the name has to delete what
+    // the tasks said, and it has to happen before the checkpoint below, so the freed
+    // cells are overwritten by secure_delete and the old WAL copies are truncated.
+    this.db.prepare('DELETE FROM agent_history WHERE agent=?').run(record.agentId);
     this.db.prepare('DELETE FROM agents WHERE id=? AND owner=?').run(record.agentId, record.ownerId);
     // The per-target host lock is shared with other names and is left to its holder.
     this.db.prepare('DELETE FROM leases WHERE key=? OR key=?').run(record.agentId, `worker:${record.agentId}`);
     // Secure-delete overwrites freed database cells; checkpoint removes old WAL copies.
     const checkpoint = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    this.touched(record.agentId);
     if (checkpoint?.busy) {
+      // The name comes back only as a marker telling the caller to delete again. Its
+      // history is deliberately not restored: the delete has already erased it, and a
+      // tombstone must not resurrect the task text this call was asked to remove.
       this.insert({ agentId: record.agentId, ownerId: record.ownerId, name: record.name, lifetime: record.lifetime,
         ...(record.target ? { target: record.target } : {}),
-        workspace: record.workspace, sessionId: record.sessionId, state: 'cleanup_failed', nativeDestroyed: true,
+        workspace: record.workspace, sessionId: record.sessionId, state: 'cleanup_failed', nativeDestroyed: true, history: [],
         updatedAt: new Date().toISOString(), error: 'Database cleanup is waiting for another reader. Delete this name again to finish.' });
       throw new Error('The session was removed; local database cleanup is still pending.');
     }
@@ -425,18 +653,20 @@ export class RosterStore {
       const result = this.db.prepare(`INSERT INTO leases(key,holder,expires) VALUES (?,?,?)
         ON CONFLICT(key) DO UPDATE SET holder=excluded.holder,expires=excluded.expires WHERE leases.expires<?`)
         .run(key, holder, now + leaseMs, now);
+      this.settle(result.changes);
       if (result.changes) break;
       if (Date.now() >= deadline) throw Object.assign(new Error('This subagent is processing another operation. Try again shortly.'), { code: 'agent-busy' });
       await pause(40);
     }
     const heartbeat = setInterval(() => {
-      this.db.prepare('UPDATE leases SET expires=? WHERE key=? AND holder=?').run(Date.now() + leaseMs, key, holder);
+      const beat = this.db.prepare('UPDATE leases SET expires=? WHERE key=? AND holder=?').run(Date.now() + leaseMs, key, holder);
+      this.settle(beat.changes);
     }, Math.floor(leaseMs / 3));
     heartbeat.unref();
     try { return await action(); }
     finally {
       clearInterval(heartbeat);
-      this.db.prepare('DELETE FROM leases WHERE key=? AND holder=?').run(key, holder);
+      this.settle(this.db.prepare('DELETE FROM leases WHERE key=? AND holder=?').run(key, holder).changes);
     }
   }
   close() { this.db.close(); }

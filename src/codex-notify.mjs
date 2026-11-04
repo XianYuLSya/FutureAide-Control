@@ -225,7 +225,36 @@ async function verifyBridges(candidates, probe) {
   return answers.filter(Boolean);
 }
 
-export async function discoverCodexBridge({ environment = process.env, inspect = inspectCodexProcesses, probe = probeAppToolsBridge } = {}) {
+// Discovery is a property of the running desktop, not of one call: it enumerates every
+// process and pipe through PowerShell. A delivery retry loop (or a status call) would
+// otherwise pay that spawn on every attempt — the child's CPU is real, it just is not
+// counted against this process. A success is reused for a few seconds; a failure is
+// retried sooner, so a desktop that is starting up is still picked up quickly.
+const DISCOVERY_TTL_MS = 15000;
+const DISCOVERY_FAILURE_TTL_MS = 5000;
+let discoveryCache;
+
+/** Drop the cached discovery: the desktop it described answered with nothing. */
+export function forgetCodexBridge() { discoveryCache = undefined; }
+
+export async function discoverCodexBridge(options = {}) {
+  // An injected inspection is a test or a caller asking for exactly one look, so it is
+  // cached only when the caller asks for that too.
+  if ((options.inspect || options.probe || options.environment) && options.cache !== true) return discoverCodexBridgeNow(options);
+  if (discoveryCache && discoveryCache.expires > Date.now()) return discoveryCache.promise;
+  const entry = { expires: Date.now() + DISCOVERY_TTL_MS, promise: undefined };
+  entry.promise = discoverCodexBridgeNow(options).then(value => {
+    entry.expires = Date.now() + DISCOVERY_TTL_MS;
+    return value;
+  }, error => {
+    entry.expires = Date.now() + DISCOVERY_FAILURE_TTL_MS;
+    throw error;
+  });
+  discoveryCache = entry;
+  return entry.promise;
+}
+
+async function discoverCodexBridgeNow({ environment = process.env, inspect = inspectCodexProcesses, probe = probeAppToolsBridge } = {}) {
   if (process.platform !== 'win32') throw new Error('This local desktop callback is currently implemented for Windows.');
   const inherited = environment?.CODEX_APP_TOOLS_PIPE_PATH;
   const declared = typeof inherited === 'string' ? inherited.trim() : '';
@@ -311,6 +340,11 @@ export async function invokeCodexTool(threadId, toolName, args, options = {}) {
       _meta: { 'openai/threadId': threadId },
     }, undefined, { timeout });
     return assertMcpResult(result);
+  } catch (error) {
+    // The desktop behind a cached discovery may have restarted: drop it so the next
+    // attempt discovers again instead of reusing a pipe that no longer answers.
+    if (options?.bridge === undefined) forgetCodexBridge();
+    throw error;
   } finally {
     await client.close();
   }

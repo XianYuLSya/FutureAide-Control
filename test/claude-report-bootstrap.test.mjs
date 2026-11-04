@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { mayRetry, READ_ONLY_TOOLS, startColdStartBridge } from '../src/claude-report-bootstrap.mjs';
 
 const config = { configFile: 'D:\\c\\config.json', stateDirectory: 'D:\\c\\state' };
@@ -176,6 +177,122 @@ test('only reads may be retried', () => {
     assert.equal(mayRetry(name), false, name);
   }
   assert.equal(mayRetry('futureaide_send_agent', { request_id: 'r-1' }), false);
+});
+
+test('a changed tool list is announced to a session that is already open', async () => {
+  const changing = remote();
+  const { bridge } = await bridgeWith({ remotes: [changing] });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    let announced = 0;
+    const heard = new Promise(resolve => {
+      client.setNotificationHandler(ToolListChangedNotificationSchema, () => { announced += 1; resolve(); });
+    });
+    assert.equal(client.getServerCapabilities().tools.listChanged, true,
+      'the session knows this bridge can announce a new tool');
+    assert.equal(await bridge.checkToolList(), false, 'an unchanged list says nothing');
+    changing.client.listTools = async () => ({ tools: [...TOOLS, { name: 'futureaide_run_agent', inputSchema: { type: 'object' } }] });
+    assert.equal(await bridge.checkToolList(), true);
+    await heard;
+    assert.equal(announced, 1);
+    const { tools } = await client.listTools();
+    assert.ok(tools.some(tool => tool.name === 'futureaide_run_agent'), 'the new tool is listed without a new session');
+
+    // A comparison that fails is only a comparison that failed.
+    changing.client.listTools = async () => { throw new Error('service down'); };
+    await assert.rejects(bridge.checkToolList(), /service down/);
+    const status = await client.callTool({ name: 'futureaide_status', arguments: {} });
+    assert.notEqual(status.isError, true, 'tool calls keep working when the comparison cannot run');
+  } finally { await close(); await bridge.close(); }
+});
+
+test('the tool list check never starts the monitor', async () => {
+  let ready = false;
+  let ensures = 0;
+  const changing = remote();
+  const bridge = await startColdStartBridge({
+    configPath: 'D:\\c\\config.json',
+    load: async () => config,
+    storeFor: () => ({ identity: () => 'roster-1', close() {} }),
+    status: async () => ({ ready }),
+    ensure: async () => { ensures += 1; return true; },
+    connect: async () => changing.client,
+    log: () => {},
+    waitMs: 0, pollMs: 0,
+  });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    assert.equal(bridge.ready, false);
+    const afterStartup = ensures;
+    for (let round = 0; round < 3; round += 1) {
+      assert.equal(await bridge.checkToolList(), false, 'a down service is skipped, not retried');
+    }
+    assert.equal(ensures, afterStartup, 'no comparison may start the shared monitor');
+    assert.equal(changing.lists.length, 0, 'and nothing is listed while the service is down');
+
+    ready = true;
+    assert.equal(await bridge.checkToolList(), true, 'a table that appeared while the service was down is announced');
+    changing.client.listTools = async () => ({ tools: [...TOOLS, { name: 'futureaide_run_agent', inputSchema: { type: 'object' } }] });
+    const announced = new Promise(resolve => client.setNotificationHandler(ToolListChangedNotificationSchema, resolve));
+    assert.equal(await bridge.checkToolList(), true, 'a serving service is compared, once a real call is up');
+    await announced;
+  } finally { await close(); await bridge.close(); }
+});
+
+test('a refused list_changed notification is handled, never left unhandled', async () => {
+  const changing = remote();
+  const { bridge } = await bridgeWith({ remotes: [changing] });
+  const { client, close } = await roundTrip(bridge.server);
+  const unhandled = [];
+  const onUnhandled = reason => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    bridge.server.sendToolListChanged = async () => { throw new Error('transport closed'); };
+    changing.client.listTools = async () => ({ tools: [...TOOLS, { name: 'futureaide_run_agent', inputSchema: { type: 'object' } }] });
+    const error = await bridge.checkToolList().then(() => null, reason => reason);
+    assert.match(error?.message ?? '', /transport closed/, 'the refusal surfaces to whoever awaits the comparison');
+    // The timer awaits the same promise, so nothing is ever left unhandled.
+    const handled = bridge.checkToolList().catch(reason => reason);
+    await handled;
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.deepEqual(unhandled, [], 'a dead transport never becomes an unhandled rejection');
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    await close(); await bridge.close();
+  }
+});
+
+test('the tool list comparison never borrows the client a real call is using', async () => {
+  const connections = [];
+  const connect = async () => {
+    const connection = remote();
+    connections.push(connection);
+    // The comparison's own connection is the one that fails here.
+    if (connections.length === 2) connection.client.listTools = async () => { throw new Error('dead comparison'); };
+    return connection.client;
+  };
+  const bridge = await startColdStartBridge({
+    configPath: 'D:\\c\\config.json',
+    load: async () => config,
+    storeFor: () => ({ identity: () => 'roster-1', close() {} }),
+    status: async () => ({ ready: true }),
+    ensure: async () => true,
+    connect, log: () => {},
+    waitMs: 0, pollMs: 0,
+  });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    assert.equal(connections.length, 1, 'startup opened one connection for the session');
+    await client.listTools();
+    const sharedLists = connections[0].lists.length;
+    await assert.rejects(bridge.checkToolList(), /dead comparison/);
+    assert.equal(connections.length, 2, 'the comparison opened a connection of its own');
+    assert.equal(connections[0].lists.length, sharedLists, 'the session client was never asked to list');
+    const status = await client.callTool({ name: 'futureaide_status', arguments: {} });
+    assert.notEqual(status.isError, true, 'a failed comparison leaves tool calls working');
+    assert.equal(connections[0].calls.length, 1, 'and still on the session client, not a rebuilt one');
+    assert.equal(connections.length, 2, 'nothing was discarded');
+  } finally { await close(); await bridge.close(); }
 });
 
 test('closing the bridge closes both the client and the roster handle', async () => {

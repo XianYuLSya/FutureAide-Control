@@ -15,7 +15,7 @@ import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
 import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './report-endpoint.mjs';
 import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
-  TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
+  TARGET_LABELS, TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -96,8 +96,8 @@ function rootSummary(view) {
 // What a workspace comparison can and cannot see. It is stated wherever the covered
 // files are, because a short list next to a silent claim of completeness is misleading.
 const WORKSPACE_LIMITATION = 'Compared before and after the task with git status, not watched live: edits made meanwhile by other processes or other assistants look identical, and paths covered by .gitignore or outside a git repository are invisible.';
-const workspaceCoverage = reason => ({ source: 'git-status-diff', complete: false,
-  limitation: WORKSPACE_LIMITATION, ...(reason ? { reason } : {}) });
+const workspaceCoverage = (reason, truncated = false) => ({ source: 'git-status-diff', complete: false,
+  limitation: WORKSPACE_LIMITATION, ...(reason ? { reason } : {}), ...(truncated ? { truncated: true } : {}) });
 // Windows paths are case-insensitive, so a confirmed and a snapshotted spelling of the
 // same file must not both survive.
 const pathKey = value => {
@@ -171,7 +171,10 @@ function publicResult(record, { fullResult = false } = {}) {
         ...(fullResult ? { reply: task.result.reply } : { summary: compactText(task.result.reply, 800) }),
         files: (task.result.changes ?? []).slice(0, 12).map(fileSummary), coverage: task.result.coverage } } : {}) } : null,
     activity: view.activity ?? (record.state === 'idle' ? 'Waiting for a task' : record.state),
-    changes: { count: changes.length, files: changes.slice(0, 12).map(fileSummary),
+    // unconfirmed is counted over the whole list, not the 12 paths this answer can
+    // afford: a compact view must not under-report how much is unattributed.
+    changes: { count: changes.length, unconfirmed: changes.filter(change => change.attribution === 'unconfirmed').length,
+      files: changes.slice(0, 12).map(fileSummary),
       coverage: treeCoverage(record, view),
       observedAt: view.capturedAt ?? null, stale: Boolean(view.stale) },
     questions: (view.questions ?? []).filter(question => question.state === 'pending').map(question => ({ message: question.message })),
@@ -263,6 +266,57 @@ export async function findClaudeReceipt(binding, notice) {
   return undefined;
 }
 
+const RETRY_CAP_MS = 30000;
+// A delivery whose parent chat is gone keeps failing forever. Past this many attempts it
+// backs off to five minutes instead of hammering a channel that cannot answer; a live
+// channel never reaches it (a few attempts at most), so normal delivery is unchanged.
+const ABANDONED_AFTER = 20;
+const ABANDONED_RETRY_CAP_MS = 300000;
+const FAST_POLL_DUE_MS = 2000;
+
+/** Retry spacing for one delivery or dispatch attempt. */
+export function retryDelayMs(attempts) {
+  const cap = attempts > ABANDONED_AFTER ? ABANDONED_RETRY_CAP_MS : RETRY_CAP_MS;
+  return Math.min(cap, 1000 * 2 ** Math.min(attempts, 9));
+}
+
+/**
+ * The observation to store for this round. When only the capture moment moved, the
+ * previous object is kept verbatim — its stamp included — so the record still
+ * serialises to the body already in the roster and save() writes nothing.
+ */
+export function captureObservation(previous, payload, at) {
+  return previous && sameObservation(previous, payload) ? previous : { ...payload, capturedAt: at };
+}
+
+function sameObservation(left, right) {
+  const keysOf = value => Object.keys(value ?? {}).filter(key => key !== 'capturedAt');
+  const leftKeys = keysOf(left), rightKeys = keysOf(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  for (const key of leftKeys) {
+    if (!(key in (right ?? {}))) return false;
+    if (JSON.stringify(left[key]) !== JSON.stringify(right[key])) return false;
+  }
+  return true;
+}
+
+/**
+ * Does this name owe something a five-second cadence would slow down? Only work that is
+ * about to be retried: a report or question notice whose own backoff is due (or was
+ * never set), a dispatch waiting to be retried, an attempt about to become due. A name
+ * that is merely delivery_pending is not here: its own nextAttemptAt decides, so a
+ * delivery that has been failing for days is not re-polled every second.
+ */
+export function owesFastPoll(record, at = Date.now()) {
+  if (!record || record.closed || record.sleep) return false;
+  const dueSoon = notice => Boolean(notice) && !['delivered', 'blocked'].includes(notice.state ?? 'pending')
+    && (!notice.nextAttemptAt || notice.nextAttemptAt <= at + FAST_POLL_DUE_MS);
+  if ((record.task?.reports ?? []).some(report => dueSoon(report.delivery))) return true;
+  if (Object.values(record.task?.questionNotices ?? {}).some(dueSoon)) return true;
+  if ((record.task?.dispatches ?? []).some(dispatch => dispatch.state === 'retrying' && dueSoon(dispatch))) return true;
+  return typeof record.nextAttemptAt === 'number' && record.nextAttemptAt <= at + FAST_POLL_DUE_MS;
+}
+
 /** Name-addressed operations; owner and native identifiers never come from tool arguments. */
 export function createScopedAgents(config, {
   store = new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
@@ -283,6 +337,10 @@ export function createScopedAgents(config, {
   reportReadyTimeoutMs = 2000,
   captureFiles = captureWorkspace,
   onPollComplete = () => {},
+  // Work queued in this process (a supplement, a cancel, a first dispatch) is a wake
+  // a listener living in the same process can act on at once. A caller in another
+  // process cannot be seen this way and waits for the monitor's own sweep.
+  onWorkQueued = () => {},
 } = {}) {
   const clients = new Map();
   const operationBackends = new WeakMap();
@@ -291,6 +349,11 @@ export function createScopedAgents(config, {
   // per task: reading the baseline and shutting down both wait for it here.
   const baselineWrites = new Map();
   const nextPollAt = new Map();
+  // Names that owe something a five-second cadence would slow down.
+  const fastPoll = new Set();
+  // Names whose own poll has just found new work: one immediate re-poll, so a final is
+  // not held back by the floor, and only once, so this cannot become a burst.
+  const urgentPoll = new Set();
   let draining = false;
   let monitorUnavailableSince, monitorError;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
@@ -358,7 +421,9 @@ export function createScopedAgents(config, {
     catch { return { changes: [], coverage: workspaceCoverage('capture-failed') }; }
     if (after?.available !== true) return { changes: [], coverage: workspaceCoverage(after?.reason ?? 'capture-failed') };
     const changes = diffWorkspace(baseline.capture, after);
-    return { changes, coverage: workspaceCoverage(), ...(changes.truncated ? { truncated: true } : {}) };
+    // A clipped comparison is a coverage fact, so it rides with the other limits
+    // instead of disappearing with the dropped paths.
+    return { changes, coverage: workspaceCoverage(undefined, changes.truncated === true), ...(changes.truncated ? { truncated: true } : {}) };
   }
   const settings = record => ({ ...config, target: targetOf(record), workspace: record.workspace,
     stateDirectory: agentDirectory(record), codexThreadId: undefined, futureaideSessionId: undefined });
@@ -717,10 +782,16 @@ export function createScopedAgents(config, {
 
   // Does this name still owe the shared monitor a poll? Sleeping names are driven
   // by the monitor's existing DSH host-state wake path instead.
+
   function needsPoll(record) {
     if (record?.state === 'cleaning') return true;
     if (!record || record.closed || record.sleep) return false;
     if (ACTIVE.has(record.state)) return true;
+    // The scan projection already carries both of these, so a roster sweep no longer
+    // runs one supplement query per name. A record loaded whole has neither field
+    // and takes the queries below.
+    if (record.hasSupplement === true) return true;
+    if (record.pendingReports !== undefined) return !record.callbackBlocked && record.pendingReports > 0;
     if (store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return true;
     return !record.callbackBlocked
       && (record.task?.reports ?? []).some(report => !['delivered', 'blocked'].includes(report.delivery.state));
@@ -736,6 +807,9 @@ export function createScopedAgents(config, {
 
   // One monitor serves every name: this only makes sure it exists and, for a
   // sleeping name, clears the marker so the same durable task is polled again.
+  /** Tell a listener in this process that a name now owes work. */
+  function announceWork(agentId) { try { if (agentId) onWorkQueued(agentId); } catch { /* a hint is never worth failing a call for */ } }
+
   async function ensureWorker(record, { wake = false } = {}) {
     if (!record) return false;
     if (wake && record.sleep) {
@@ -752,6 +826,10 @@ export function createScopedAgents(config, {
     if (!needsPoll(record)) return false;
     const ready = await ensureMonitor();
     if (!ready) store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+    // Only an explicit wake — new work arriving from outside — is news for the loop. A
+    // poll also calls this, and announcing from there would make every poll re-hint its
+    // own name and turn the loop into a self-feeding burst.
+    else if (wake) announceWork(record.agentId);
     return ready;
   }
 
@@ -845,7 +923,12 @@ export function createScopedAgents(config, {
     // Everything persisted stays plain data: backends and the managed map are live
     // objects and must never reach the roster.
     const { managed: _managed, ...storable } = composed;
-    record.observation = { ...storable, capturedAt: now() };
+    // Keep the stored observation when nothing but the capture moment moved. A poll that
+    // observed the same tree used to rewrite the whole body and invalidate every cached
+    // projection, which is most of what a quiet round cost. capturedAt therefore means
+    // "when this observation last changed"; the live view returned below still carries
+    // this round's stamp for the answer the caller gets.
+    record.observation = captureObservation(record.observation, storable, now());
     record.error = undefined;
     return composed;
   }
@@ -938,7 +1021,7 @@ export function createScopedAgents(config, {
 
   function deferRetry(value) {
     value.retryAttempts = (value.retryAttempts ?? 0) + 1;
-    value.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(value.retryAttempts, 5));
+    value.nextAttemptAt = Date.now() + retryDelayMs(value.retryAttempts);
   }
 
   function firstDispatchDeferred(record) {
@@ -997,7 +1080,7 @@ export function createScopedAgents(config, {
     const owner = store.owner(record.ownerId);
     notice.id ??= uid('notice');
     notice.attempts = (notice.attempts ?? 0) + 1;
-    notice.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(notice.attempts, 5));
+    notice.nextAttemptAt = Date.now() + retryDelayMs(notice.attempts);
     const marker = `<!-- futureaide-control:${notice.id} -->`;
     const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
     // These exact legacy failures happened before sendClaude opened a socket. They
@@ -1679,7 +1762,7 @@ export function createScopedAgents(config, {
           if ((view.questions ?? []).some(question => question.state === 'pending')) return answerLocked(record, message);
           await sendDispatch(record, message, 'supplement', [], undefined, view);
         } else {
-          if (record.task) record.history.push({ ...record.task, changes: attributedChanges(record, record.observation ?? {}),
+          if (record.task) store.appendHistory(record.agentId, { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
             coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) });
           record.task = { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [] };
           record.state = 'running'; record.observation = undefined; record.error = undefined;
@@ -1711,6 +1794,57 @@ export function createScopedAgents(config, {
         return enqueue(record);
       }
     },
+    /**
+     * Create the name if it is new and send the task, in one call. An existing name
+     * keeps its own application and lifetime, so a conflicting explicit value is
+     * refused instead of quietly running the task on the wrong backend.
+     */
+    async run({ name, message, lifetime, target } = {}, extra) {
+      textMessage(message);
+      const owner = await context(extra);
+      const wanted = normalizeTarget(target);
+      const createdLifetime = lifetime ?? 'once';
+      if (!['once', 'persistent'].includes(createdLifetime)) throw new Error('lifetime must be once or persistent.');
+      const sent = result => ({ state: result.state, accepted: result.accepted === true,
+        ...(result.queued ? { queued: true } : {}), ...(result.retrying ? { retrying: true } : {}),
+        ...(result.callbackError ? { callbackError: result.callbackError } : {}), ...(result.error ? { error: result.error } : {}) });
+      const existing = name === undefined ? undefined : store.named(owner.ownerId, assertName(name));
+      if (existing) {
+        // send only says "closing, blocked or not ready"; a caller that picked this
+        // name needs to know the name is on its way out rather than misbound.
+        if (existing.closed || ['cleaning', 'cleanup_failed'].includes(existing.state)) {
+          throw Object.assign(new Error(`The name “${existing.name}” is still being cleaned up. Wait until it leaves list, or use another name.`),
+            { code: 'name-closing' });
+        }
+        const boundTarget = targetOf(existing);
+        if (target !== undefined && wanted !== boundTarget) throw Object.assign(new Error(`The name “${existing.name}” is already bound to ${hostLabel(existing)}; it cannot run on ${TARGET_LABELS[wanted]}. Omit target to continue this name, or use another name.`), { code: 'target-conflict' });
+        if (lifetime !== undefined && lifetime !== existing.lifetime) throw Object.assign(new Error(`The name “${existing.name}” is already a ${existing.lifetime} subagent; omit lifetime, pass ${existing.lifetime}, or use another name.`), { code: 'lifetime-conflict' });
+        const result = await service.send({ name: existing.name, message }, extra);
+        return { name: existing.name, lifetime: existing.lifetime, ...(boundTarget !== 'dsh' ? { target: boundTarget } : {}), ...sent(result), reused: true };
+      }
+      let chosen = name === undefined ? undefined : assertName(name);
+      if (chosen === undefined) {
+        for (let attempt = 0; attempt < 5 && chosen === undefined; attempt++) {
+          const candidate = `助手-${randomUUID().replaceAll('-', '').slice(0, 4)}`;
+          if (!store.named(owner.ownerId, candidate)) chosen = candidate;
+        }
+        if (chosen === undefined) throw new Error('Could not generate an unused subagent name; pass one explicitly.');
+      }
+      const created = await service.create({ name: chosen, lifetime: createdLifetime, target: wanted }, extra);
+      // A failed creation keeps its own receipt: sending into a name that never
+      // connected would report a delivery nobody is waiting for.
+      if (created.created !== true || created.error) return created;
+      try {
+        const result = await service.send({ name: chosen, message }, extra);
+        return { name: chosen, lifetime: createdLifetime, ...(wanted !== 'dsh' ? { target: wanted } : {}), ...sent(result), created: true };
+      } catch (error) {
+        // The name exists now, so a thrown send would hide the name the caller must
+        // use to continue; report the created name with the failure instead.
+        const current = store.named(owner.ownerId, chosen);
+        return { name: chosen, lifetime: createdLifetime, ...(wanted !== 'dsh' ? { target: wanted } : {}),
+          created: true, state: current?.state ?? 'reconnecting', accepted: false, error: safeError(error) };
+      }
+    },
     async answer({ name, message }, extra) {
       textMessage(message);
       return withName(extra, name, record => answerLocked(record, message));
@@ -1728,7 +1862,7 @@ export function createScopedAgents(config, {
     async changes({ name, task = 0 }, extra) {
       return withName(extra, name, async record => {
         if (task !== 0) {
-          const historical = record.history.at(-task);
+          const historical = store.historyFor(record.agentId, { limit: task }).at(-task);
           if (!historical) throw new Error('That earlier task is not available. Use 0 for the current or latest task.');
           return { name, task, message: historical.message, changes: historical.changes ?? historical.result?.changes ?? [],
             coverage: historical.coverage, tree: historical.tree ?? historical.result?.tree };
@@ -1804,8 +1938,8 @@ export function createScopedAgents(config, {
           reports: { ...publicResult(record).reports, items: (record.task?.reports ?? []).map(report => ({ message: report.message, final: report.final, delivery: report.delivery.state })) },
           tree,
           inspectionIncomplete: tree.nodes.some(node => node.error !== undefined),
-          historyCount: record.history.length,
-          history: record.history.slice(-20).reverse().map((task, index) => ({ task: index + 1, message: compactText(task.message, 240),
+          historyCount: store.historyCount(record.agentId),
+          history: store.historyFor(record.agentId, { limit: 20 }).reverse().map((task, index) => ({ task: index + 1, message: compactText(task.message, 240),
             state: task.state, startedAt: task.startedAt, finishedAt: task.finishedAt })) };
       });
     },
@@ -1931,30 +2065,74 @@ export function createScopedAgents(config, {
     // One shared round: poll every name that still owes work through the same
     // state machine. The shared monitor calls this each round, and the degraded
     // in-process sweep below reuses it when no monitor can be started.
-    async monitorScan() {
+    async monitorScan({ only = null, fresh = null, sweep = true, force = false, deferred = [] } = {}) {
       if (draining) return inflight.size > 0 || monitorInflight.size > 0;
-      const candidates = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
+      const wanted = new Set(only ?? []);
+      // Only a real hint — a file event or work queued in this process — may skip a
+      // name's own one-second floor. A name that merely owes fast work is polled again
+      // as soon as the floor allows, not on every round: otherwise every completion
+      // signals another round and the loop spins at ten rounds a second.
+      const hints = new Set(fresh ?? []);
+      // A round that was pointed at particular names does not pay for the roster
+      // sweep; the last sweep is at most SWEEP_MS old, and every name it would have
+      // found is polled by the sweep that follows.
+      if (!sweep && !wanted.size) return inflight.size > 0 || monitorInflight.size > 0;
+      const candidates = sweep && typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : [];
+      const queue = candidates.map(candidate => ({ agentId: candidate.agentId, candidate }));
+      const seen = new Set(queue.map(item => item.agentId));
+      for (const agentId of wanted) if (!seen.has(agentId)) queue.push({ agentId, candidate: undefined });
       let busy = inflight.size > 0 || monitorInflight.size > 0;
-      for (const candidate of candidates) {
-        if (!needsPoll(candidate)) continue;
+      for (const { agentId, candidate } of queue) {
+        const hinted = hints.has(agentId);
+        // A hint is news about that name, so it is polled even if its own last poll
+        // just finished; the ordinary 1s floor still applies to the sweep.
+        if (!needsPoll(candidate ?? store.get(agentId))) { fastPoll.delete(agentId); continue; }
         busy = true;
-        if (monitorInflight.has(candidate.agentId) || nextPollAt.get(candidate.agentId) > Date.now()) continue;
+        // A poll already in flight cannot take this hint: hand it back so the round
+        // after that poll ends still knows the name moved, instead of waiting for the
+        // next sweep.
+        // Re-queueing a name that is merely in the fast set would hand it back as a
+        // hint for ever, so only a real hint is deferred.
+        if (monitorInflight.has(agentId)) { if (hints.has(agentId)) deferred.push(agentId); continue; }
+        if (!hinted && !urgentPoll.has(agentId) && nextPollAt.get(agentId) > Date.now()) continue;
         // Large retained histories must not turn resolved-promise polls into a
         // single uninterrupted CPU burst that starves the shared HTTP listener.
         await yieldToIO();
         if (draining) break;
-        const record = store.get(candidate.agentId);
-        if (!record || !needsPoll(record)) continue;
+        const record = store.get(agentId);
+        if (!record || !needsPoll(record)) { fastPoll.delete(agentId); continue; }
+        if (owesFastPoll(record)) fastPoll.add(record.agentId); else fastPoll.delete(record.agentId);
         busy = true;
-        if (monitorInflight.has(record.agentId) || nextPollAt.get(record.agentId) > Date.now() || record.nextAttemptAt > Date.now()
-            || firstDispatchDeferred(record)) continue;
-        const work = service.poll(record.agentId).then(() => service.trySleep(record.agentId))
+        if (monitorInflight.has(record.agentId)) { if (hints.has(agentId)) deferred.push(agentId); continue; }
+        const urgent = urgentPoll.delete(record.agentId);
+        if (!hinted && !urgent && !force && nextPollAt.get(record.agentId) > Date.now()) continue;
+        if (firstDispatchDeferred(record)) continue;
+        if (!hinted && !urgent && !force && record.nextAttemptAt > Date.now()) continue;
+        let becameFast = false;
+        const work = service.poll(record.agentId)
+          // The record this poll was scheduled from is already stale: the poll is what
+          // found the report. Deciding again on what the poll just wrote is what keeps a
+          // final from waiting out the five-second sweep — a brand new report or question
+          // has no nextAttemptAt yet, so the name becomes fast here and is polled again on
+          // the next round (250ms floor) until delivery starts or the tree settles.
+          .then(() => {
+            const latest = store.get(record.agentId);
+            if (!latest) { fastPoll.delete(record.agentId); return; }
+            // Only something the poll itself just found is worth waking the loop for;
+            // a poll that changed nothing must not start another round.
+            const before = fastPoll.has(record.agentId);
+            if (owesFastPoll(latest)) fastPoll.add(record.agentId); else fastPoll.delete(record.agentId);
+            if (!before && fastPoll.has(record.agentId)) { becameFast = true; urgentPoll.add(record.agentId); }
+          })
+          .then(() => service.trySleep(record.agentId))
           .catch(() => { /* The next round retries from durable state. */ })
           .finally(() => {
             monitorInflight.delete(record.agentId);
             if (store.get(record.agentId)) nextPollAt.set(record.agentId, Date.now() + 1000);
             else nextPollAt.delete(record.agentId);
-            onPollComplete();
+            // A poll that found nothing new is not news: waking the loop for it is what
+            // turns "one round per second" into a self-feeding burst.
+            if (becameFast) onPollComplete();
           });
         monitorInflight.set(record.agentId, work);
       }
@@ -1983,6 +2161,8 @@ export function createScopedAgents(config, {
       }
       return false;
     },
+    /** Names that owe time-critical work; the listener polls these every second. */
+    fastPollNames() { return [...fastPoll]; },
     async wake(agentId, taskId) {
       const record = store.get(agentId);
       if (!record || record.sleep?.taskId !== taskId || record.sleep.sessionId !== record.sessionId) return false;

@@ -104,6 +104,14 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     if (state.client) { try { await state.client.close(); } catch { /* already gone */ } state.client = undefined; }
     state.client = await connect(state.url);
   };
+  // A monitor restart invalidates the old MCP client even though the port answers
+  // health again: its socket and session are gone. Any transport failure therefore
+  // discards the client, and the next prepare builds a fresh one.
+  const discardClient = async () => {
+    const client = state.client;
+    state.client = undefined;
+    try { await client?.close(); } catch { /* already gone */ }
+  };
   // Health, then the one existing monitor, then a live client. Called before every
   // forward, so a monitor that went quiet is brought back instead of failing.
   const prepare = async () => {
@@ -133,8 +141,22 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
   // The twelve tools stay the service's own: nothing is defined here.
   const fetchTools = async () => {
     await prepare();
-    const { tools } = await state.client.listTools();
-    return Array.isArray(tools) ? tools : [];
+    try {
+      const { tools } = await state.client.listTools();
+      return Array.isArray(tools) ? tools : [];
+    } catch (error) {
+      // A listing carries nothing durable, so one rebuild-and-retry is safe.
+      await discardClient();
+      await prepare();
+      try {
+        const { tools } = await state.client.listTools();
+        return Array.isArray(tools) ? tools : [];
+      } catch (retryError) {
+        await discardClient();
+        throw coded('report-service-unavailable',
+          `The loopback tool service stopped answering (${retryError?.message ?? retryError}).`);
+      }
+    }
   };
   const callTool = async (name, args) => {
     try { await prepare(); }
@@ -142,6 +164,8 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     try {
       return await state.client.callTool({ name, arguments: args });
     } catch (error) {
+      // The client is dead from here on, whatever the tool was.
+      await discardClient();
       // A write may already have been applied before the answer was lost. Never
       // replay it: say so plainly and let the caller inspect the operation.
       if (!mayRetry(name)) {
@@ -153,6 +177,7 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
         await prepare();
         return await state.client.callTool({ name, arguments: args });
       } catch (retryError) {
+        await discardClient();
         return failure('report-service-unavailable',
           `The loopback tool service stopped answering (${retryError?.message ?? retryError}).`, { operation: name });
       }

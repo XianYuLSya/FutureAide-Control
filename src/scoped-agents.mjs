@@ -171,6 +171,7 @@ export function createScopedAgents(config, {
   backendAdapterLoader = undefined,
   reportStatusProbe = readReportStatus,
   codexReportReady = undefined,
+  codexToolsStatus = undefined,
   reportReadyTimeoutMs = 2000,
 } = {}) {
   const clients = new Map();
@@ -343,6 +344,19 @@ export function createScopedAgents(config, {
       reports: pending.filter(item => item.kind === 'report').map(item => ({ id: `submission:${item.id}`,
         taskId: record.task.taskId, message: item.message, final: item.final, createdAt: item.created })),
     };
+  }
+  /** Read-only Codex tool registration, for status: it never starts a session. */
+  async function readCodexToolsStatus(record) {
+    if (typeof codexToolsStatus !== 'function') return { registered: false };
+    try { return (await codexToolsStatus(record)) ?? { registered: false }; }
+    catch (error) { return { registered: false, reason: safeError(error) }; }
+  }
+  function codexToolsDiagnostics(value) {
+    const registered = value?.registered === true && Array.isArray(value.tools)
+      && ['ask_parent', 'report_parent'].every(tool => value.tools.includes(tool));
+    return { ready: registered, present: true, registered,
+      ...(registered ? {} : { reason: value?.reason ?? { code: 'codex-tools-not-registered',
+        message: 'No verified native Codex session reported the ask/report tools yet.' } }) };
   }
   async function beginCodexReports(record) {
     // A healthy endpoint is not a registration. Only the adapter's probe of a real new
@@ -1044,6 +1058,14 @@ export function createScopedAgents(config, {
           ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
           record: probe, deps: adapterDeps(probe, { startReports: false }) }),
       };
+      // A Codex Desktop entry is ready only when a real native Codex session reports
+      // the ask/report tools; an adapter that merely answers probe() is not enough,
+      // and a healthy loopback endpoint proves nothing about those tools.
+      const codexProbe = { ...probe, target: 'codex-desktop' };
+      const codexEntry = await diagnoseTarget('codex-desktop', { adapters: backendAdapters,
+        ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
+        record: codexProbe, deps: adapterDeps(codexProbe, { startReports: false }) });
+      status.backends['codex-desktop'] = codexEntry.ready ? codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)) : codexEntry;
       return status;
     },
     async create({ name, lifetime, target }, extra) {

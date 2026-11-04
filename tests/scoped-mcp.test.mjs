@@ -56,7 +56,8 @@ test('creation advertises one optional target and never repeats it on later call
     const { tools } = await client.listTools();
     const create = tools.find(tool => tool.name === 'futureaide_create_agent');
     assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['lifetime', 'name', 'target']);
-    assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'claude-desktop']);
+    assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'claude-desktop', 'codex-desktop'],
+      'every supported application is reachable from the public schema, not just internally');
     assert.ok(!create.inputSchema.required?.includes('target'), 'the target stays optional');
     for (const tool of tools.filter(tool => tool.name !== 'futureaide_create_agent')) {
       assert.ok(!('target' in (tool.inputSchema.properties ?? {})), `${tool.name} must stay name-addressed`);

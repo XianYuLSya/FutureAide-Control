@@ -1750,18 +1750,21 @@ test('a panel that lags behind the screen is reported instead of clicked', async
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
-test('a press counts as clicked even if the bridge omits the flag', async () => {
+
+test('a bridge that omits the clicked flag is a contract violation, not a press', async () => {
   const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
   const rows = [{ index: 0, title: 'Cancel child A', rowText: 'Cancel child A | running', running: true, enabled: true, done: false }];
   const driver = uiDriver({
     tasksPanel: () => ({ opened: true, entry: '后台任务 1', rows }),
-    // an older bridge returns the press without the clicked field
-    taskStop: () => ({ method: 'mouse', at: '2026-11-04T06:08:57.000Z', busySeen: true, doneSeen: true }),
+    // the field is required; a method name is not evidence that anything stopped
+    taskStop: () => ({ method: 'mouse', at: '2026-11-04T06:12:33.000Z', busySeen: false, doneSeen: false }),
   });
   try {
     const result = await stopBackgroundTasks({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive });
-    assert.equal(result.clickedCount, 1, 'a reported press is not lost');
-    assert.equal(result.status, undefined);
-    assert.equal(result.stopped[0].bridgeContract, 'missing-clicked-field');
+    assert.equal(result.clickedCount, 0, 'no press is claimed without the bridge saying so');
+    assert.equal(result.status, 'stop-refused');
+    assert.equal(result.stopped[0].state, 'refused');
+    assert.equal(result.stopped[0].bridgeContract, 'bridge-contract-missing');
+    assert.equal(result.refused[0].error.code, 'bridge-contract-missing');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

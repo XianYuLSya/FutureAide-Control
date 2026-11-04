@@ -1095,15 +1095,16 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
     const attempt = await ui.taskStop({ title: row.title, match: row.rowText, index: row.index })
       .catch(error => ({ clicked: false, code: error.code ?? 'task-stop-refused', message: error.message,
         detail: error.detail ?? null, rowsSeen: error.detail?.value?.rows ?? null }));
-    // The bridge states whether it clicked. If an older bridge omits that field but
-    // reports a method, the press is counted and the missing contract is reported,
-    // instead of every real press looking like a refusal.
+    // The bridge states whether it clicked, and it ships with this module, so a
+    // missing field is a contract violation rather than a press: it is reported as
+    // such and stays not clicked. Whether anything actually stopped is then read
+    // from the session, never inferred from the method name.
     const contractMissing = attempt?.clicked === undefined;
-    const clicked = attempt?.clicked === true || (contractMissing && Boolean(attempt?.method ?? attempt?.clickMethod));
+    const clicked = attempt?.clicked === true;
     stopped.push({
       index: row.index,
       title: row.title ?? null,
-      ...(contractMissing ? { bridgeContract: 'missing-clicked-field' } : {}),
+      ...(contractMissing ? { bridgeContract: 'bridge-contract-missing' } : {}),
       rowText: row.rowText,
       rowName: row.rowName,
       matchedBy: attempt?.matchedBy ?? null,
@@ -1117,7 +1118,7 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
         ? (attempt?.doneSeen ? 'stopped' : (attempt?.busySeen ? 'stopping' : 'clicked-unconfirmed'))
         : 'refused',
       at: attempt?.at,
-      ...(clicked ? {} : { error: { code: attempt?.code ?? 'task-stop-refused', message: attempt?.message,
+      ...(clicked ? {} : { error: { code: attempt?.code ?? (contractMissing ? 'bridge-contract-missing' : 'task-stop-refused'), message: attempt?.message,
         detail: attempt?.detail ?? null } }),
     });
     // refresh: the panel only shows tasks that exist when it is opened

@@ -47,12 +47,14 @@ export function mayRetry(name) {
 
 /**
  * A tools-only MCP server that forwards list and call to the loopback service, so
- * the 12 tools are defined in exactly one place.
- * @param {{fetchTools: Function, callTool: Function}} options
+ * the 12 tools are defined in exactly one place. The usage instructions come from
+ * that same service, never from a copy kept here.
+ * @param {{fetchTools: Function, callTool: Function, instructions?: string}} options
  */
-export function createForwardServer({ fetchTools, callTool }) {
+export function createForwardServer({ fetchTools, callTool, instructions }) {
   const server = new Server({ name: BOOTSTRAP_NAME, version: BOOTSTRAP_VERSION },
-    { capabilities: { tools: {} } });
+    { capabilities: { tools: {} },
+      ...(typeof instructions === 'string' && instructions ? { instructions } : {}) });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await fetchTools() }));
   server.setRequestHandler(CallToolRequestSchema, async request => {
     const result = await callTool(request.params.name, request.params.arguments ?? {});
@@ -162,7 +164,11 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
   let ready = false;
   try { await prepare(); ready = true; } catch (error) { log(`${error?.code ?? 'unavailable'}: ${error.message}`); }
   const tools = ready ? await fetchTools().then(list => list.length).catch(() => 0) : 0;
-  const server = createForwardServer({ fetchTools, callTool });
+  // The service own usage rules ride along, so a bridged session keeps the same
+  // reporting guidance it would get over HTTP. Nothing is copied or rewritten here.
+  let instructions;
+  try { instructions = state.client?.getInstructions?.(); } catch { instructions = undefined; }
+  const server = createForwardServer({ fetchTools, callTool, instructions });
   if (ready) log(`bridging ${tools} tool(s) to ${state.url}`);
   const close = async () => {
     const client = state.client; state.client = undefined;

@@ -12,11 +12,12 @@ const config = { configFile: 'D:\\c\\config.json', stateDirectory: 'D:\\c\\state
 const TOOLS = [{ name: 'futureaide_status', inputSchema: { type: 'object' } },
   { name: 'ask_parent', inputSchema: { type: 'object' } }];
 
-function remote({ tools = TOOLS, onCall } = {}) {
+function remote({ tools = TOOLS, onCall, instructions = 'Report only through these tools.' } = {}) {
   const calls = [];
   return {
     calls,
     client: {
+      getInstructions() { return instructions; },
       async listTools() { return { tools }; },
       async callTool(request) {
         calls.push(request);
@@ -67,6 +68,14 @@ test('a healthy service is bridged without starting anything', async () => {
     const result = await client.callTool({ name: 'ask_parent', arguments: { message: 'hi' } });
     assert.notEqual(result.isError, true);
     assert.deepEqual(fake.calls.map(call => call.name), ['ask_parent']);
+  } finally { await close(); await bridge.close(); }
+});
+
+test('the service own instructions ride along into the bridge', async () => {
+  const { bridge } = await bridgeWith();
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    assert.equal(client.getInstructions(), 'Report only through these tools.');
   } finally { await close(); await bridge.close(); }
 });
 

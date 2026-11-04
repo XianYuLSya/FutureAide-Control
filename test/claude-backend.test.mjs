@@ -183,6 +183,21 @@ test('a timeout after submit retains unknown ownership and cannot resend', async
   assert.equal((await adapter.destroy()).destroyed, false);
 });
 
+test('existing ambiguous submission evidence survives a preflight error', async () => {
+  const f = await setup();
+  let checks = 0;
+  const adapter = await createClaudeBackend(f.record, { ...f.deps, host: { ...f.deps.host,
+    createFirstTurn: async () => { checks++; throw Object.assign(new Error('Existing marker is duplicated'),
+      { code: 'marker-not-unique', uncertain: true }); } } });
+  await assert.rejects(adapter.deliver({ requestId: 'first', message: 'First' }), {
+    code: 'marker-not-unique', uncertain: true,
+  });
+  assert.equal(f.getState().requests.first.attempted, true);
+  assert.equal(f.getState().requests.first.status, 'unknown');
+  assert.equal((await adapter.deliver({ requestId: 'first', message: 'First' })).status, 'unknown');
+  assert.equal(checks, 1);
+});
+
 test('one operation reuses an observation and refreshes after native changes', async () => {
   const f = await setup();
   let reads = 0;

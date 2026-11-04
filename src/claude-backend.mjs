@@ -256,6 +256,9 @@ export async function createClaudeBackend(record, deps = {}) {
               onBeforeSubmit: () => { request.attempted = true; request.status = 'unknown'; save(state); },
               onBound: native => rememberBinding(state, native) });
         } catch (error) {
+          if (error.uncertain === true) {
+            request.attempted = true; request.status = 'unknown'; request.error = error.code ?? error.message; save(state);
+          }
           if (!request.attempted) {
             request.status = 'retryable'; request.error = error.code ?? error.message; save(state);
           }

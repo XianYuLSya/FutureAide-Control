@@ -25,6 +25,14 @@ const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
 /** The project-level MCP server entry the Codex ask/report tools are registered under. */
 const CODEX_SERVER_NAME = 'futureaide-dev';
+let codexProbePromise;
+/** codex-host's own registration probe, imported lazily so only the Codex path loads it. */
+function defaultCodexProbe() {
+  codexProbePromise ??= import('./codex-host.mjs')
+    .then(module => module.probeCodexReportRegistration)
+    .catch(() => undefined);
+  return codexProbePromise;
+}
 const reportProtocolError = (host = 'DSH') => Object.assign(new Error(`Update the ${host} plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting ${host} is not required.`), { code: 'report-protocol-required' });
 const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host} bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting ${host} is not required.`), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
@@ -424,18 +432,26 @@ export function createScopedAgents(config, {
   }
 
   /**
-   * The one read-only registration probe (codex-host): a trusted entry in this
-   * project's effective config that points at the same DEV tree and roster, plus that
-   * entry's real MCP tools/list. It never starts a Codex session and never sends a
-   * model turn, so sessionVerified stays false until a real dispatch proves otherwise.
+   * The one read-only registration probe: a trusted entry in this project's effective
+   * config that points at the same DEV tree and roster, plus that entry's real MCP
+   * tools/list — exactly what codex-host.probeCodexReportRegistration answers. It never
+   * starts a Codex session and never sends a model turn, so sessionVerified stays false
+   * until a real dispatch proves otherwise.
+   *
+   * A caller may inject its own probe (tests, a host that owns the check); otherwise the
+   * default is codex-host's own function, imported lazily so only the Codex path ever
+   * loads it. Either way it is asked about this record's workspace and this config file.
    */
   async function probeCodexRegistration(record) {
-    if (typeof codexProbeRegistration !== 'function') return undefined;
+    const probe = typeof codexProbeRegistration === 'function' ? codexProbeRegistration : await defaultCodexProbe();
+    if (typeof probe !== 'function') {
+      return { ready: false, registered: false, sessionVerified: false,
+        reason: { code: 'codex-tools-not-registered', message: 'This build has no Codex registration probe.' } };
+    }
     try {
-      const value = await codexProbeRegistration({ workspace: record?.workspace ?? config.workspace,
-        configPath: config.configFile, serverName: CODEX_SERVER_NAME });
-      return value ?? undefined;
-    } catch (error) { return { ready: false, registered: false, reason: safeError(error) }; }
+      return (await probe({ workspace: record?.workspace ?? config.workspace,
+        configPath: config.configFile, serverName: CODEX_SERVER_NAME })) ?? undefined;
+    } catch (error) { return { ready: false, registered: false, sessionVerified: false, reason: safeError(error) }; }
   }
   /** Read-only Codex tool registration, for status: it never starts a session. */
   async function readCodexToolsStatus(record) {

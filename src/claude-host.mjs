@@ -1110,7 +1110,12 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
       clicked,
       busySeen: Boolean(attempt?.busySeen),
       doneSeen: Boolean(attempt?.doneSeen),
-      state: attempt?.doneSeen ? 'stopped' : (attempt?.busySeen ? 'stopping' : 'requested'),
+      // Only what was observed: the row moved to stopped, it moved to stopping, or a
+      // click happened and nothing was seen yet. A press that never happened is a
+      // refusal, not a requested stop.
+      state: clicked
+        ? (attempt?.doneSeen ? 'stopped' : (attempt?.busySeen ? 'stopping' : 'clicked-unconfirmed'))
+        : 'refused',
       at: attempt?.at,
       ...(clicked ? {} : { error: { code: attempt?.code ?? 'task-stop-refused', message: attempt?.message,
         detail: attempt?.detail ?? null } }),

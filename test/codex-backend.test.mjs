@@ -73,7 +73,29 @@ test('explicit question/report is same-task scoped; ordinary final never reports
   assert.deepEqual((await f.adapter.answer({ answerId: 'a1', message: 'answer' })).consumedQuestionIds, ['q']);
   assert.equal((await f.adapter.observe()).questions[0].state, 'answered');
   assert.equal((await f.adapter.turn({ requestId: 'r' })).state, 'ended');
+  assert.equal((await f.adapter.turn({ requestId: 'r' })).correlation, 'request-id');
+  assert.equal((await f.adapter.turn({ requestId: 'r' })).turnId, f.projection.turnId);
   assert.equal((await f.adapter.destroy()).destroyed, false);
+});
+
+test('retry preserves the original dispatch model while a new input resolves the new default', async () => {
+  const f = await setup(); await f.adapter.create(); await f.adapter.beginTask();
+  const original = { provider: 'openai', model: 'model-a', reasoningEffort: 'high' };
+  f.record.task.dispatches = [{ requestId: 'r', model: original }];
+  f.setModel('model-b');
+  let attempts = 0;
+  const adapter = await createCodexBackend(f.record, { ...f.deps, host: { ...f.deps.host,
+    createFirstTurn: async input => {
+      if (++attempts === 1) throw Object.assign(new Error('project pending'), { code: 'codex-project-unresolved' });
+      assert.deepEqual(input.model, original);
+      return f.deps.host.createFirstTurn(input);
+    } } });
+  await assert.rejects(adapter.deliver({ requestId: 'r', message: 'work' }), { retryableRead: true });
+  f.setModel('model-c');
+  await adapter.deliver({ requestId: 'r', message: 'work' });
+  assert.equal(f.state().requests.r.model.model, 'model-a');
+  f.complete(); await adapter.deliver({ requestId: 'next', message: 'new work' });
+  assert.equal(f.state().requests.next.model.model, 'model-c');
 });
 
 test('cancel is only requested for the bound native tree and readiness exposes missing delete', async () => {

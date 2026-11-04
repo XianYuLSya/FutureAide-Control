@@ -119,7 +119,7 @@ export async function createCodexBackend(record, deps = {}) {
       (value.answers ??= {})[answerId] = result; save(value);
       return result;
     },
-    async deliver({ requestId, message }) {
+    async deliver({ requestId, message, model: dispatchModel }) {
       if (!requestId || typeof message !== 'string' || !message.trim()) throw fail('invalid-dispatch', 'A request id and message are required.');
       await reportsReady();
       let value = await recover(state());
@@ -127,7 +127,11 @@ export async function createCodexBackend(record, deps = {}) {
       const prior = value.requests[requestId];
       if (prior && prior.messageHash !== hash) throw fail('request-id-conflict', 'This request id already belongs to another message.');
       if (prior && prior.status !== 'retryable') return { accepted: prior.status === 'accepted', status: prior.status, afterSeq: prior.afterSeq };
-      const model = await defaultModel(); // every task, supplement and answer follows the live default
+      // The coordinator freezes each input's default before dispatch. Recovery of
+      // that same input must retain its choice even if the user changes defaults.
+      const model = prior?.model ?? dispatchModel
+        ?? load().task?.dispatches?.find(item => item.requestId === requestId)?.model
+        ?? value.selectedModels?.[`${requestId}-model`] ?? await defaultModel();
       value.nonce ??= randomUUID();
       const marker = markerLine(requestId, value.nonce);
       const request = { requestId, marker, messageHash: hash, taskId: load().task?.taskId,
@@ -166,8 +170,9 @@ export async function createCodexBackend(record, deps = {}) {
     async turn({ requestId }) {
       const { value, tree } = await refresh(), p = projection(value), request = value.requests[requestId];
       const native = request?.turnId && p.turns[request.turnId];
-      if (request?.status !== 'accepted' || !native || tree.running || !tree.settled) return { state: 'running', correlation: request?.turnId };
-      return native.state === 'ended' ? { ...native, correlation: request.turnId } : { state: 'running', correlation: request.turnId };
+      const correlation = request?.status === 'accepted' && request.turnId ? 'request-id' : undefined;
+      if (request?.status !== 'accepted' || !native || tree.running || !tree.settled) return { state: 'running', correlation, turnId: request?.turnId };
+      return { ...native, correlation, turnId: request.turnId };
     },
     async models() {
       const selection = await defaultModel();
@@ -179,11 +184,10 @@ export async function createCodexBackend(record, deps = {}) {
       return value.binding ? host.readCurrentModel(value.binding.sessionId) : defaultModel();
     },
     async selectModel(input) {
-      const expected = await defaultModel();
-      if (input.model !== expected.model || input.provider !== expected.provider || input.reasoningEffort !== expected.reasoningEffort) {
-        throw fail('codex-default-model-changed', 'Codex default changed before delivery; resolve the current model again.');
-      }
-      save({ ...state(), selectedModel: expected });
+      if (!input.model || !input.provider || !input.reasoningEffort || !input.requestId) throw fail('invalid-model-selection', 'A dispatch model and selection request id are required.');
+      const value = state();
+      (value.selectedModels ??= {})[input.requestId] = { provider: input.provider, model: input.model, reasoningEffort: input.reasoningEffort };
+      save(value);
       // Selection belongs to the next native send's explicit model/thinking args.
       return { accepted: true, appliesOnDelivery: true };
     },

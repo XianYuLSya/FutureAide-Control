@@ -4,7 +4,7 @@ import { mkdir, writeFile, appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { createCodexHost, emptyProjection, readTranscript, readDefaultModel, markerLine } from '../src/codex-host.mjs';
+import { createCodexHost, createDesktopToolBridge, emptyProjection, readTranscript, readDefaultModel, markerLine } from '../src/codex-host.mjs';
 
 const directory = () => fileURLToPath(new URL(`../clean/validation/codex/${randomUUID()}/`, import.meta.url));
 test('native transcript cursor admits exact marker, keeps partial line and attributes FileChange', async () => {
@@ -28,7 +28,7 @@ test('native transcript cursor admits exact marker, keeps partial line and attri
 });
 
 test('current profile files precede trusted project overrides; project cannot change provider/profile', async () => {
-  const dir = directory(), home = path.join(dir, 'home'), workspace = path.join(dir, 'workspace');
+  const dir = directory(), home = path.join(dir, '\u6d4b\u8bd5-home'), workspace = path.join(dir, 'workspace');
   await mkdir(home, { recursive: true }); await mkdir(path.join(workspace, '.codex'), { recursive: true });
   await writeFile(path.join(home, 'config.toml'), `model = "base"\n[projects.${JSON.stringify(workspace.replaceAll('\\', '/'))}]\ntrust_level = "trusted"\n`);
   await writeFile(path.join(home, 'review.config.toml'), 'model = "profile-a"\nmodel_reasoning_effort = "high"\n');
@@ -41,12 +41,30 @@ test('current profile files precede trusted project overrides; project cannot ch
 
 test('first native creation uses verified anchor and exact saved workspace, never fork', async () => {
   const calls = [];
-  const host = createCodexHost({ anchorResolver: async () => 'anchor', invoke: async (id, name, args) => {
+  const host = createCodexHost({ anchorResolver: async () => ({ threadId: 'anchor', workspace: 'D:/other' }), invoke: async (id, name, args) => {
     calls.push({ id, name, args });
     return name === 'list_projects' ? { projects: [{ projectId: 'project', projectKind: 'local', path: 'D:/work/p', hostId: 'local' }] } : { threadId: 'new' };
   } });
   const result = await host.createFirstTurn({ workspace: 'D:/work/p', message: 'work', title: 'helper', model: { model: 'default', reasoningEffort: 'max' } });
   assert.equal(result.nativeSessionId, 'new'); assert.deepEqual(calls.map(c => c.name), ['list_projects', 'create_thread']);
   assert.equal(calls[1].args.target.projectId, 'project');
+  assert.equal(calls[1].id, 'anchor');
   await assert.rejects(host.destroy({ nativeSessionId: 'new' }), { code: 'codex-native-delete-unavailable' });
+});
+
+test('desktop bridge shares discovery and handshake, changes caller metadata, and never replays a failed call', async () => {
+  let discovered = 0, connected = 0, closed = 0, calls = 0;
+  const seen = [];
+  const bridge = createDesktopToolBridge({ discover: async () => { discovered++; return {}; }, createTransport: () => ({}),
+    createClient: () => ({ connect: async () => { connected++; }, close: async () => { closed++; },
+      callTool: async input => { calls++; seen.push(input._meta['openai/threadId']);
+        if (input.arguments.fail) throw new Error('lost response');
+        return { structuredContent: { ok: true } }; } }) });
+  await Promise.all([bridge.invoke('a', 'read_thread', {}), bridge.invoke('b', 'list_projects', {})]);
+  assert.equal(discovered, 1); assert.equal(connected, 1); assert.deepEqual(seen, ['a', 'b']);
+  await assert.rejects(bridge.invoke('a', 'send_message_to_thread', { fail: true }), /lost response/);
+  assert.equal(calls, 3); assert.equal(closed, 1);
+  await bridge.invoke('b', 'list_projects', {});
+  assert.equal(discovered, 2); assert.equal(connected, 2);
+  await bridge.close(); assert.equal(closed, 2);
 });

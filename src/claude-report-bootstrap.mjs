@@ -29,10 +29,22 @@ export const BOOTSTRAP_VERSION = '1.0.0';
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-const unavailable = message => ({
-  isError: true,
-  content: [{ type: 'text', text: JSON.stringify({ error: { code: 'report-service-unavailable', message } }) }],
-});
+const failure = (code, message, extra = {}) => ({ isError: true,
+  content: [{ type: 'text', text: JSON.stringify({ error: { code, message, ...extra } }) }] });
+
+/**
+ * Tools whose failure cannot have changed anything. Everything else is a write
+ * (or a submission) and must never be replayed blindly — the service may already
+ * have applied it before the answer was lost. A caller-supplied idempotency key is
+ * the only other reason to retry.
+ */
+export const READ_ONLY_TOOLS = Object.freeze(['futureaide_status', 'futureaide_list_agents',
+  'futureaide_wait_agents', 'futureaide_agent_changes', 'futureaide_inspect_agent']);
+
+export function mayRetry(name, args) {
+  if (READ_ONLY_TOOLS.includes(name)) return true;
+  return typeof args?.request_id === 'string' || typeof args?.requestId === 'string';
+}
 
 /**
  * A tools-only MCP server that forwards list and call to the loopback service, so
@@ -68,77 +80,98 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     await client.connect(new StreamableHTTPClientTransport(new URL(url)));
     return client;
   } } = {}) {
-  const empty = () => ({ server: createForwardServer({ fetchTools: async () => [],
-    callTool: async () => unavailable('The loopback tool service is not reachable.') }), ready: false,
-  tools: 0, close: async () => {} });
+  const state = { config: undefined, store: undefined, client: undefined, port: undefined, url: undefined };
 
-  let config;
-  let store;
   try {
-    config = await load(configPath);
-    store = storeFor(config);
+    state.config = await load(configPath);
+    state.store = storeFor(state.config);
+    state.port = reportPort(state.config, env);
+    state.url = reportUrl(state.port);
   } catch (error) {
-    log(`no usable configuration (${error?.code ?? error?.message ?? error}); this session gets no tools`);
-    return empty();
+    log(`no usable configuration (${error?.code ?? error?.message ?? error})`);
   }
-  const port = reportPort(config, env);
   let expectedRoster;
-  try { expectedRoster = rosterIdentity(store); } catch { expectedRoster = undefined; }
-  const ready = async () => {
-    try { return (await status({ port, expectedRoster }))?.ready === true; }
+  try { expectedRoster = rosterIdentity(state.store); } catch { expectedRoster = undefined; }
+
+  const coded = (code, message) => Object.assign(new Error(message), { code });
+  const serviceReady = async () => {
+    if (!state.config) return false;
+    try { return (await status({ port: state.port, expectedRoster }))?.ready === true; }
     catch { return false; }
   };
-
-  if (!(await ready())) {
+  const connectClient = async () => {
+    if (state.client) { try { await state.client.close(); } catch { /* already gone */ } state.client = undefined; }
+    state.client = await connect(state.url);
+  };
+  // Health, then the one existing monitor, then a live client. Called before every
+  // forward, so a monitor that went quiet is brought back instead of failing.
+  const prepare = async () => {
+    if (!state.config) {
+      throw coded('configuration-unavailable',
+        'This session has no FutureAide configuration, so the tool service cannot be located.');
+    }
+    if (await serviceReady()) {
+      if (!state.client) await connectClient();
+      return;
+    }
     try {
-      const started = await ensure(config, store);
+      const started = await ensure(state.config, state.store);
       if (started === false) log('this build cannot start the shared monitor here');
-      else log('asked the shared monitor to start');
     } catch (error) {
       log(`the shared monitor did not start (${error?.code ?? error?.message ?? error})`);
     }
     const deadline = Date.now() + waitMs;
-    while (Date.now() < deadline && !(await ready())) await pause(pollMs);
-  }
-  if (!(await ready())) {
-    log(`the loopback tool service did not answer on ${port}; this session gets no tools`);
-    return empty();
-  }
-
-  const url = reportUrl(port);
-  let client = await connect(url);
-  let cached;
-  const fetchTools = async () => {
-    if (cached) return cached;
-    const { tools } = await client.listTools();
-    cached = Array.isArray(tools) ? tools : [];
-    return cached;
+    while (Date.now() < deadline && !(await serviceReady())) await pause(pollMs);
+    if (!(await serviceReady())) {
+      throw coded('report-service-unavailable',
+        `The loopback tool service is not reachable on port ${state.port}.`);
+    }
+    await connectClient();
   };
-  const reopen = async () => {
-    cached = undefined;
-    try { await client.close(); } catch { /* already gone */ }
-    try { await ensure(config, store); } catch { /* the health check below decides */ }
-    const deadline = Date.now() + waitMs;
-    while (Date.now() < deadline && !(await ready())) await pause(pollMs);
-    client = await connect(url);
+
+  // The twelve tools stay the service's own: nothing is defined here.
+  const fetchTools = async () => {
+    await prepare();
+    const { tools } = await state.client.listTools();
+    return Array.isArray(tools) ? tools : [];
   };
   const callTool = async (name, args) => {
-    try { return await client.callTool({ name, arguments: args }); }
-    catch {
-      // The monitor may have gone quiet between calls; bring the one monitor back
-      // and retry this single call rather than failing the model's turn.
-      try { await reopen(); return await client.callTool({ name, arguments: args }); }
-      catch (error) { return unavailable(`The loopback tool service stopped answering (${error?.message ?? error}).`); }
+    try { await prepare(); }
+    catch (error) { return failure(error?.code ?? 'report-service-unavailable', error?.message ?? String(error)); }
+    try {
+      return await state.client.callTool({ name, arguments: args });
+    } catch (error) {
+      // A write may already have been applied before the answer was lost. Never
+      // replay it: say so plainly and let the caller inspect the operation.
+      if (!mayRetry(name, args)) {
+        return failure('write-outcome-unknown',
+          'This call may already have been applied and its answer was lost. Do not resend it; '
+          + 'check the operation with status, list or inspect first.', { operation: name });
+      }
+      try {
+        await prepare();
+        return await state.client.callTool({ name, arguments: args });
+      } catch (retryError) {
+        return failure('report-service-unavailable',
+          `The loopback tool service stopped answering (${retryError?.message ?? retryError}).`, { operation: name });
+      }
     }
   };
 
-  const tools = await fetchTools().catch(() => []);
+  // One bounded attempt so the first list is usually ready; a failure is not
+  // cached: every later list or call prepares again and can recover.
+  let ready = false;
+  try { await prepare(); ready = true; } catch (error) { log(`${error?.code ?? 'unavailable'}: ${error.message}`); }
+  const tools = ready ? await fetchTools().then(list => list.length).catch(() => 0) : 0;
   const server = createForwardServer({ fetchTools, callTool });
-  log(`bridging ${tools.length} tool(s) to ${url}`);
-  return {
-    server, ready: true, tools: tools.length, port, url,
-    close: async () => { try { await client.close(); } catch { /* ignore */ } },
+  if (ready) log(`bridging ${tools} tool(s) to ${state.url}`);
+  const close = async () => {
+    const client = state.client; state.client = undefined;
+    try { await client?.close(); } catch { /* ignore */ }
+    const store = state.store; state.store = undefined;
+    try { store?.close?.(); } catch { /* ignore */ }
   };
+  return { server, ready, tools, port: state.port, url: state.url, close };
 }
 
 async function main() {

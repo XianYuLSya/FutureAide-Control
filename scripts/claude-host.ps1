@@ -100,12 +100,36 @@ function Get-ClaudeWindow {
   return $chosen
 }
 
+function Select-WebDocument($documents, [string]$titleHint = '') {
+  $named = @($documents | Where-Object { $_.Name -and $_.Descendants -gt 2 -and $_.Visible })
+  return $named | Sort-Object -Property @{ Expression = 'FocusWithin'; Descending = $true },
+    @{ Expression = { [bool]($titleHint -and $_.Name.StartsWith($titleHint)) }; Descending = $true },
+    @{ Expression = 'WindowTitleMatch'; Descending = $true },
+    @{ Expression = 'Descendants'; Descending = $true } | Select-Object -First 1
+}
+
+function Test-ElementVisible($element) {
+  try {
+    $current = $element.Current; $rect = $current.BoundingRectangle
+    return (-not $current.IsOffscreen -and -not $rect.IsEmpty -and $rect.Width -gt 0 -and $rect.Height -gt 0)
+  } catch { return $false }
+}
+
 function Get-WebRoot($window, [string]$titleHint = '') {
   # The window can hold more than one document: the app shell (an empty
   # RootWebArea) and the page the user is on. The page is the document with a
   # real subtree and a name; the shell and empty snapshots are reported but not
   # chosen. A stale tree (only the shell) is retried once after focusing.
   function Read-Documents {
+    $focusAncestors = @()
+    try {
+      $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+      for ($cursor = [System.Windows.Automation.AutomationElement]::FocusedElement; $null -ne $cursor; $cursor = $walker.GetParent($cursor)) {
+        $focusAncestors += [string]::Join('.', $cursor.GetRuntimeId())
+        if ($focusAncestors.Count -ge 30) { break }
+      }
+    } catch { }
+    $windowRect = $window.Current.BoundingRectangle
     $documents = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants,
       (New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
@@ -114,17 +138,18 @@ function Get-WebRoot($window, [string]$titleHint = '') {
     foreach ($document in $documents) {
       if ($document.Current.AutomationId -ne 'RootWebArea') { continue }
       $count = $document.FindAll([System.Windows.Automation.TreeScope]::Descendants, (Get-Condition)).Count
-      $list += [pscustomobject]@{ Element = $document; Name = $document.Current.Name; Descendants = $count }
+      $rect = $document.Current.BoundingRectangle
+      $visible = (Test-ElementVisible $document) -and $rect.IntersectsWith($windowRect)
+      $list += [pscustomobject]@{ Element = $document; Name = $document.Current.Name; Descendants = $count
+        Visible = $visible; Offscreen = $document.Current.IsOffscreen
+        FocusWithin = ($focusAncestors -contains [string]::Join('.', $document.GetRuntimeId()))
+        WindowTitleMatch = ($document.Current.Name -eq $window.Current.Name)
+        Bounds = @{ x = $rect.X; y = $rect.Y; width = $rect.Width; height = $rect.Height } }
     }
     return $list
   }
   $documents = @(Read-Documents)
-  $named = @($documents | Where-Object { $_.Name -and $_.Descendants -gt 2 })
-  $best = $null
-  if ($titleHint) {
-    $best = $named | Where-Object { $_.Name.StartsWith($titleHint) } | Sort-Object Descendants -Descending | Select-Object -First 1
-  }
-  if ($null -eq $best) { $best = $named | Sort-Object Descendants -Descending | Select-Object -First 1 }
+  $best = Select-WebDocument $documents $titleHint
   $refreshed = $false
   if ($null -eq $best -and $documents.Count -gt 0) {
     # Only shells or an empty snapshot were readable: focus the window (allowed
@@ -132,14 +157,11 @@ function Get-WebRoot($window, [string]$titleHint = '') {
     try { Focus-Window $window } catch { }
     Start-Sleep -Milliseconds 500
     $documents = @(Read-Documents)
-    $named = @($documents | Where-Object { $_.Name -and $_.Descendants -gt 2 })
-    if ($titleHint) {
-      $best = $named | Where-Object { $_.Name.StartsWith($titleHint) } | Sort-Object Descendants -Descending | Select-Object -First 1
-    }
-    if ($null -eq $best) { $best = $named | Sort-Object Descendants -Descending | Select-Object -First 1 }
+    $best = Select-WebDocument $documents $titleHint
     $refreshed = $true
   }
-  $summary = @($documents | ForEach-Object { @{ name = $_.Name; descendants = $_.Descendants } })
+  $summary = @($documents | ForEach-Object { @{ name = $_.Name; descendants = $_.Descendants
+    visible = $_.Visible; offscreen = $_.Offscreen; focusWithin = $_.FocusWithin; bounds = $_.Bounds } })
   return [pscustomobject]@{
     Element = $(if ($null -ne $best) { $best.Element } else { $null })
     DocumentName = $(if ($null -ne $best) { $best.Name } else { '' })
@@ -468,7 +490,7 @@ function Get-SessionMenuButton([string]$title, [string]$scope = 'header') {
 
 function Get-TrustPattern {
   $zh = [string][char]0x4FE1 + [char]0x4EFB + [char]0x6B64 + [char]0x5DE5 + [char]0x4F5C + [char]0x533A
-  return ($zh + '|Trust this workspace|Trust this folder')
+  return ('^(?:' + $zh + '|Trust this workspace|Trust this folder)[?' + [char]0xFF1F + ']?$')
 }
 
 function Get-FolderLabelPatterns([string]$label) {
@@ -491,7 +513,13 @@ function Get-PageSignature($windowArg) {
   $composers = Find-Elements $webRoot.Element $composerPattern 'Edit'
   $messagePattern = '^' + [char]0x6D88 + [char]0x606F + ' \d+$'
   $messages = Find-Elements $webRoot.Element $messagePattern 'Group'
-  $trust = Find-Elements $webRoot.Element (Get-TrustPattern) 'Text'
+  # A transcript can discuss this prompt. A visible, exact heading together
+  # with the actual trust action identifies the prompt, not arbitrary body text.
+  $trust = @(Find-Elements $webRoot.Element (Get-TrustPattern) 'Text' | Where-Object { Test-ElementVisible $_ })
+  $trustButtons = @()
+  if ($trust.Count -gt 0 -and $payload.trustPattern) {
+    $trustButtons = @(Find-Elements $webRoot.Element ([string]$payload.trustPattern) 'Button' | Where-Object { Test-ElementVisible $_ })
+  }
   $texts = @()
   foreach ($element in (Find-Elements $webRoot.Element '' 'Text')) {
     if ($texts.Count -ge 14) { break }
@@ -508,7 +536,7 @@ function Get-PageSignature($windowArg) {
     documentName = $webRoot.DocumentName
     hasComposer = ($composers.Count -gt 0)
     messages = $messages.Count
-    trustPrompt = ($trust.Count -gt 0)
+    trustPrompt = ($trust.Count -gt 0 -and $trustButtons.Count -gt 0)
     composerValue = $value
     texts = $texts
   }
@@ -606,6 +634,8 @@ try {
       } }
     }
     'submit' {
+      $script:SubmitAttempted = $false
+      $script:SubmitStage = 'preflight'
       $signature = Get-PageSignature $window
       if ($signature.trustPrompt -and $payload.trustWorkspace) {
         $trustButtons = Find-Elements $web.Element ([string]$payload.trustPattern) 'Button'
@@ -632,7 +662,17 @@ try {
         try { $previous = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
         $text = [string]$payload.prompt
         $expected = $text.Length
-        Set-Clipboard -Value $text
+        $script:SubmitStage = 'clipboard-set'
+        # The clipboard can be briefly owned by another app. Retry the preparation,
+        # never the Enter keystroke that creates the model turn.
+        for ($clipboardAttempt = 0; $clipboardAttempt -lt 3; $clipboardAttempt++) {
+          try { Set-Clipboard -Value $text; break }
+          catch {
+            if ($clipboardAttempt -eq 2) { throw }
+            Start-Sleep -Milliseconds 120
+          }
+        }
+        $script:SubmitStage = 'composer-paste'
         Send-Keys '^v'
         $typed = $true
         # A long message is pasted whole; wait until the composer really holds it
@@ -649,6 +689,8 @@ try {
       if ($null -ne $after -and $after.Trim().Length -eq 0) { throw 'composer-still-empty' }
       $composerLength = $(if ($null -ne $after) { $after.Length } else { 0 })
       if ($expected -gt 0 -and $composerLength -lt [int]($expected * 0.95)) { throw 'composer-paste-incomplete' }
+      $script:SubmitStage = 'enter'
+      $script:SubmitAttempted = $true
       Send-Keys '{ENTER}'
       Write-Result @{ ok = $true; value = @{
         method = $(if ($typed) { 'clipboard-type-then-enter' } else { 'enter-on-prefilled-composer' })
@@ -741,8 +783,11 @@ try {
         $identity.matched = [bool]($view0.documentName -and ($titleWanted -eq '' -or $view0.documentName.StartsWith($titleWanted)))
       }
       $currentDocumentName = $view0.documentName
+      $web = Get-WebRoot $window.Element
       $readModelName = {
-        $found = @(Find-Elements $web.Element $modelPattern 'Button')
+        # Navigation replaces the document. Resolve it at the moment of reading.
+        $currentWeb = Get-WebRoot $window.Element
+        $found = @(Find-Elements $currentWeb.Element $modelPattern 'Button' | Where-Object { Test-ElementVisible $_ })
         if ($found.Count -eq 0) { return $null }
         return $found[0].Current.Name
       }
@@ -786,6 +831,7 @@ try {
           }
           if ($opened) {
             $defaultRaw = & $readModelName
+            $web = Get-WebRoot $window.Element
             $navigation = @{ navigated = $true; draft = 'fresh'; restored = 'unconfirmed' }
             $restoreTitle = $(if ($title) { $title } else { $previousTitle })
             if ($restoreTitle) {
@@ -804,6 +850,7 @@ try {
         }
       }
       $after = Get-PageSignature $window
+      $web = Get-WebRoot $window.Element
       Write-Result @{ ok = $true; value = @{
         documentName = $after.documentName; windowHwnd = $window.Hwnd; documents = $web.Documents
         previousDocumentName = $view0.documentName; stale = $web.Stale
@@ -1269,5 +1316,8 @@ try {
     default { throw "unknown-action:$Action" }
   }
 } catch {
-  Write-Failure 'ui-bridge-error' $_.Exception.Message
+  if ($Action -eq 'submit' -and $null -ne $script:SubmitAttempted) {
+    Write-Result @{ ok = $false; code = 'ui-bridge-error'; message = $_.Exception.Message
+      attempted = $script:SubmitAttempted; stage = $script:SubmitStage }
+  } else { Write-Failure 'ui-bridge-error' $_.Exception.Message }
 }

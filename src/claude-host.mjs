@@ -22,7 +22,7 @@
 // Claude CLI or SDK model, imports a former three-way implementation, or keeps an
 // LLM as a scheduler. A UI driver may be injected; when it is missing every
 // operation that needs it fails explicitly instead of reporting a fake success.
-import { readdir, readFile, stat, open } from 'node:fs/promises';
+import { readdir, readFile, stat, open, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
@@ -467,7 +467,9 @@ export function createPowerShellDriver({
   patterns = DEFAULT_UI_PATTERNS, trustPattern = DEFAULT_TRUST_PATTERN,
 } = {}) {
   async function run(action, payload = {}, { timeoutMs: actionTimeout = timeoutMs } = {}) {
-    const outFile = path.join(os.tmpdir(),
+    const resultDirectory = path.resolve(path.dirname(script), '..', '.runtime', 'claude-host-results');
+    await mkdir(resultDirectory, { recursive: true });
+    const outFile = path.join(resultDirectory,
       `futureaide-claude-host-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
     const body = JSON.stringify({ ...payload, action, patterns, trustPattern });
     const child = spawn(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
@@ -495,7 +497,11 @@ export function createPowerShellDriver({
         { action, exit });
     }
     if (parsed.ok !== true) {
-      throw fail(parsed.code ?? 'ui-bridge-refused', parsed.message ?? `The ${action} action was refused.`, { action, detail: parsed });
+      const prewrite = action === 'submit' && parsed.attempted === false
+        && ['preflight', 'clipboard-set', 'composer-paste'].includes(parsed.stage);
+      throw fail(parsed.code ?? 'ui-bridge-refused', parsed.message ?? `The ${action} action was refused.`,
+        { action, detail: parsed, ...(prewrite ? { attempted: false, uncertain: false, retryable: true,
+          prewriteEvidence: { source: 'native-ui-submit', stage: parsed.stage, enterAttempted: false } } : {}) });
     }
     return parsed.value;
   }

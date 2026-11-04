@@ -183,6 +183,41 @@ test('a timeout after submit retains unknown ownership and cannot resend', async
   assert.equal((await adapter.destroy()).destroyed, false);
 });
 
+test('a clipboard preparation failure overrides submit intent and preserves evidence on retry', async () => {
+  const f = await setup();
+  const evidence = { source: 'native-ui-submit', stage: 'clipboard-set', enterAttempted: false };
+  const blocked = await createClaudeBackend(f.record, { ...f.deps, host: { ...f.deps.host,
+    createFirstTurn: async (_input, options) => {
+      await options.onBeforeSubmit();
+      throw Object.assign(new Error('clipboard busy'), { code: 'ui-bridge-error', attempted: false, prewriteEvidence: evidence });
+    } } });
+  await assert.rejects(blocked.deliver({ requestId: 'first', message: 'First' }), { retryableRead: true });
+  assert.deepEqual((await blocked.receipt({ requestId: 'first' })).prewriteEvidence, evidence);
+  assert.equal(f.getState().requests.first.attempted, false);
+  assert.equal((await f.adapter.deliver({ requestId: 'first', message: 'First' })).accepted, true);
+  assert.deepEqual((await f.adapter.receipt({ requestId: 'first' })).prewriteEvidence, evidence);
+  assert.equal(f.counters.created, 1);
+});
+
+test('legacy clipboard recovery requires exact stored failure and checks the original marker', async () => {
+  const f = await setup();
+  const message = '\u6240\u8bf7\u6c42\u7684\u526a\u8d34\u677f\u64cd\u4f5c\u5931\u8d25\u3002';
+  f.record.task.dispatches = [{ requestId: 'first', state: 'unknown', error: { code: 'ui-bridge-error', message } }];
+  f.replace({ bindingNonce: 'original-nonce', requests: { first: { requestId: 'first', attempted: true, status: 'unknown' } } });
+  const seen = [];
+  const adapter = await createClaudeBackend(f.record, { ...f.deps, host: { ...f.deps.host,
+    findCreatedSession: async input => { seen.push(input); return undefined; } } });
+  f.record.task.dispatches[0].error.message = 'unrelated failure';
+  assert.equal((await adapter.receipt({ requestId: 'first' })).status, 'unknown');
+  f.record.task.dispatches[0].error.message = message;
+  const receipt = await adapter.receipt({ requestId: 'first' });
+  assert.equal(receipt.status, 'retryable');
+  assert.equal(receipt.prewriteEvidence.enterAttempted, false);
+  assert.equal(seen[1].bindingNonce, 'original-nonce');
+  assert.equal(f.getState().requests.first.attempted, false);
+  assert.equal(f.counters.created, 0);
+});
+
 test('existing ambiguous submission evidence survives a preflight error', async () => {
   const f = await setup();
   let checks = 0;

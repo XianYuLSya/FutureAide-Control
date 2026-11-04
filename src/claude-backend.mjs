@@ -132,6 +132,7 @@ export async function createClaudeBackend(record, deps = {}) {
     const request = state.requests?.[requestId];
     if (!request) return undefined; // genuinely never attempted
     return { status: request.status ?? 'unknown', afterSeq: request.afterSeq,
+      ...(request.prewriteEvidence ? { prewriteEvidence: request.prewriteEvidence } : {}),
       ...(request.status === 'accepted' ? { result: { accepted: true, requestId } } : {}) };
   }
 
@@ -141,7 +142,22 @@ export async function createClaudeBackend(record, deps = {}) {
     if (!first || typeof host.findCreatedSession !== 'function') return state;
     const found = await host.findCreatedSession({ workspace: load().workspace,
       requestId: first.requestId, bindingNonce: state.bindingNonce }, { env });
-    if (!found) return state;
+    if (!found) {
+      // The previous driver had exactly one uncaught clipboard operation:
+      // Set-Clipboard, before paste and before Enter. Recover only that recorded
+      // failure, after checking the original first-input marker; never infer
+      // non-delivery merely from an absent native session.
+      const dispatch = load().task?.dispatches?.find(item => item.requestId === first.requestId);
+      if (first.status === 'unknown' && dispatch?.state === 'unknown'
+        && dispatch.error?.code === 'ui-bridge-error'
+        && dispatch.error?.message === '\u6240\u8bf7\u6c42\u7684\u526a\u8d34\u677f\u64cd\u4f5c\u5931\u8d25\u3002') {
+        Object.assign(first, { attempted: false, status: 'retryable',
+          prewriteEvidence: { source: 'legacy-submit-clipboard-before-enter', enterAttempted: false,
+            error: { ...dispatch.error }, markerAbsent: true, recoveredAt: new Date().toISOString() } });
+        return save(state);
+      }
+      return state;
+    }
     await rememberBinding(state, found);
     const observed = await refresh();
     state = observed.state;
@@ -259,7 +275,8 @@ export async function createClaudeBackend(record, deps = {}) {
         accepted: previous.status === 'accepted', status: previous.status, afterSeq: previous.afterSeq };
       state.projection ??= emptyClaudeProjection(current.task?.taskId);
       const request = { requestId, status: 'retryable', attempted: false, afterSeq: state.projection.throughSeq,
-        taskId: current.task?.taskId, startedAt: new Date().toISOString() };
+        taskId: current.task?.taskId, startedAt: new Date().toISOString(),
+        ...(state.requests[requestId]?.prewriteEvidence ? { prewriteEvidence: state.requests[requestId].prewriteEvidence } : {}) };
       state.requests[requestId] = request;
       save(state); // write intent before either native write or UI submit
       if (!state.binding) {
@@ -275,6 +292,10 @@ export async function createClaudeBackend(record, deps = {}) {
               onBeforeSubmit: () => { request.attempted = true; request.status = 'unknown'; save(state); },
               onBound: native => rememberBinding(state, native) });
         } catch (error) {
+          if (error.attempted === false && error.prewriteEvidence?.enterAttempted === false) {
+            request.attempted = false;
+            request.prewriteEvidence = error.prewriteEvidence;
+          }
           if (error.uncertain === true) {
             request.attempted = true; request.status = 'unknown'; request.error = error.code ?? error.message; save(state);
           }

@@ -50,7 +50,9 @@ async function setup() {
   };
   const adapter = await createClaudeBackend(record, deps);
   return { adapter, deps, counters, append, record, getState: () => saved,
-    replace: value => { saved = structuredClone(value); } };
+    replace: value => { saved = structuredClone(value); },
+    setStatus: async status => { native.status = status; await writeFile(recordFile, JSON.stringify(native)); },
+    sessionId: sid };
 }
 
 test('reservation starts no model and first deliver binds by the host marker', async () => {
@@ -148,4 +150,119 @@ test('a failed receipt save after a native write cannot cause a resend', async (
   assert.equal((await recovered.receipt({ requestId: 'followup' })).status, 'unknown');
   await recovered.deliver({ requestId: 'followup', message: 'More' });
   assert.equal(f.counters.sent, 1);
+});
+
+// ------------------------------------------------------------------ cancel
+
+const runningChild = (name, taskId) => ({ sessionId: `claude-agent-${taskId}`, parentSessionId: 'logical',
+  name, status: 'running', nativeAgentId: taskId });
+const cancelTree = (nodes, extra = {}) => ({ settled: false, running: true,
+  nodes: [{ sessionId: 'logical', parentSessionId: null, status: 'idle' }, ...nodes], ...extra });
+const cancelDeps = (f, overrides) => ({ ...f.deps,
+  tree: { TREE_PROTOCOL: 1,
+    observeClaudeTree: async () => ({ tree: overrides.current(), state: {}, histories: {} }),
+    claudeTreeStopTargets: tree => tree.nodes.filter(node => node.status !== 'ended')
+      .map(node => ({ sessionId: node.sessionId, status: node.status,
+        ...(node.parentSessionId ? { taskId: node.nativeAgentId } : { root: true }) })) },
+  host: { ...f.deps.host, ...overrides.host } });
+
+async function bound(f, deps) {
+  const adapter = await createClaudeBackend(f.record, deps);
+  await adapter.create();
+  await adapter.beginTask();
+  await adapter.deliver({ requestId: 'first', message: 'Go' });
+  return adapter;
+}
+
+test('cancel interrupts the root first, then stops the running child tasks', async () => {
+  const f = await setup();
+  const order = [];
+  let tree = cancelTree([runningChild('leaf one', 'a1')], { nodes: [
+    { sessionId: 'logical', parentSessionId: null, status: 'running' }, runningChild('leaf one', 'a1')] });
+  const adapter = await bound(f, cancelDeps(f, { current: () => tree,
+    host: {
+      interrupt: async () => { order.push('interrupt-root'); return { interrupted: true }; },
+      stopBackgroundTasks: async input => {
+        order.push(`stop-tasks:${input.nativeSessionId}`);
+        tree = { settled: true, running: false, nodes: tree.nodes.map(node => ({ ...node, status: 'ended' })) };
+        return { stopped: [{ index: 0, rowText: 'leaf one' }], remaining: [] };
+      },
+    } }));
+  await f.setStatus('busy');
+  const result = await adapter.cancel();
+  assert.deepEqual(order, ['interrupt-root', `stop-tasks:${f.sessionId}`]);
+  assert.equal(result.cancelRequested, true);
+  assert.equal(result.treeSettled, true, 'settle comes from the same observer');
+  assert.deepEqual(result.cancelRounds[1], { round: 1, action: 'stop-tasks', requested: ['a1'],
+    stopped: 1, remaining: 0 });
+});
+
+test('an idle root with a running child still stops the child tasks', async () => {
+  const f = await setup();
+  const calls = [];
+  let tree = cancelTree([runningChild('leaf one', 'a1')]);
+  const adapter = await bound(f, cancelDeps(f, { current: () => tree,
+    host: {
+      interrupt: async () => { calls.push('interrupt'); return { interrupted: false, status: 'not-running' }; },
+      stopBackgroundTasks: async () => { calls.push('stop'); tree = { settled: true, running: false,
+        nodes: tree.nodes.map(node => ({ ...node, status: 'ended' })) }; return { stopped: [{}], remaining: [] }; },
+    } }));
+  await f.setStatus('idle');
+  const result = await adapter.cancel();
+  assert.deepEqual(calls, ['stop'], 'an idle root is not interrupted, but its child is stopped');
+  assert.equal(result.cancelRequested, true);
+  assert.equal(result.treeSettled, true);
+});
+
+test('a handback that wakes the root is interrupted again', async () => {
+  const f = await setup();
+  const order = [];
+  let interrupts = 0;
+  let tree = cancelTree([runningChild('leaf one', 'a1')], { nodes: [
+    { sessionId: 'logical', parentSessionId: null, status: 'running' }, runningChild('leaf one', 'a1')] });
+  const adapter = await bound(f, cancelDeps(f, { current: () => tree,
+    host: {
+      interrupt: async () => {
+        interrupts += 1;
+        order.push(`interrupt-${interrupts}`);
+        // the second interrupt ends the turn the handback woke
+        if (interrupts >= 2) tree = { settled: true, running: false,
+          nodes: [{ sessionId: 'logical', parentSessionId: null, status: 'ended' }] };
+        return { interrupted: true };
+      },
+      stopBackgroundTasks: async () => {
+        order.push('stop');
+        // the child's handback leaves the root running one short turn
+        tree = cancelTree([], { nodes: [{ sessionId: 'logical', parentSessionId: null, status: 'running' }] });
+        return { stopped: [{}], remaining: [] };
+      },
+    } }));
+  await f.setStatus('busy');
+  const result = await adapter.cancel();
+  assert.deepEqual(order, ['interrupt-1', 'stop', 'interrupt-2']);
+  assert.equal(result.cancelRequested, true);
+  assert.equal(result.treeSettled, true);
+});
+
+test('a host that cannot stop tasks says so instead of pretending', async () => {
+  const f = await setup();
+  let tree = cancelTree([runningChild('leaf one', 'a1')]);
+  const adapter = await bound(f, cancelDeps(f, { current: () => tree, host: { stopBackgroundTasks: undefined } }));
+  await f.setStatus('idle');
+  const result = await adapter.cancel();
+  assert.equal(result.stopTasksUnsupported, true);
+  assert.equal(result.cancelRequested, false, 'nothing reached the host for the running child');
+  assert.equal(result.treeSettled, false);
+  assert.equal(result.cancelRounds.filter(entry => entry.action === 'stop-tasks-unsupported').length, 3);
+});
+
+test('cancel needs no native work when the first send never happened', async () => {
+  const f = await setup();
+  const calls = [];
+  const adapter = await createClaudeBackend(f.record, cancelDeps(f, { current: () => cancelTree([]),
+    host: { interrupt: async () => { calls.push('interrupt'); return { interrupted: true }; },
+      stopBackgroundTasks: async () => { calls.push('stop'); return {}; } } }));
+  await adapter.create();
+  assert.equal((await adapter.cancel()).cancelRequested, true);
+  assert.deepEqual(calls, []);
 });

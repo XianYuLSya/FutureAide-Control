@@ -11,6 +11,9 @@ import { emptyClaudeProjection, observeClaudeTranscript, claudeTurn, CLAUDE_FILE
 
 const METHODS = ['probe', 'create', 'beginTask', 'observe', 'history', 'answer', 'deliver',
   'receipt', 'turn', 'models', 'model', 'selectModel', 'cancel', 'destroy', 'cursor'];
+// Rounds of "interrupt the root, stop the owned background tasks, observe again".
+// A handback can wake the root once per child, so this must never be a single pass.
+const CANCEL_ROUNDS = 3;
 const failure = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
 const samePath = (a, b) => typeof a === 'string' && typeof b === 'string'
   && path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
@@ -319,17 +322,61 @@ export async function createClaudeBackend(record, deps = {}) {
       return lockedHost(() => host.selectModel({ ...input,
         ...(state.binding ? { nativeSessionId: state.binding.sessionId } : {}) }, hostOptions()));
     },
+    // Whole task-tree cancellation in native order: interrupt the root so it
+    // cannot launch another child, stop every owned background task that is still
+    // running, then observe again — a child's handback wakes the root for a short
+    // turn, and that turn is interrupted in the next round. `cancelRequested` only
+    // says the request reached the host; whether the tree really stopped is this
+    // same observer's verdict, never the adapter's guess.
     async cancel() {
       const state = await recoverFirstBinding(stateForTask());
-      if (!state.binding) return { cancelRequested: !Object.values(state.requests ?? {}).some(request => request.attempted) };
-      const native = await nativeSession(state);
-      if (native.status === 'idle') {
-        const observed = await refresh();
-        if (observed.tree?.settled === true) return { cancelRequested: true };
+      if (!state.binding) {
+        const attempted = Object.values(state.requests ?? {}).some(request => request.attempted);
+        return { cancelRequested: !attempted }; // never dispatched: nothing native exists
       }
-      const result = await lockedHost(() => host.interrupt({ nativeSessionId: state.binding.sessionId }, hostOptions()));
-      if (result.interrupted !== true) return { cancelRequested: false, ...result };
-      return { cancelRequested: true }; // the shared layer still waits for the entire tree
+      const canStopTasks = typeof host.stopBackgroundTasks === 'function';
+      const rounds = [];
+      let observed, gone = false;
+      for (let round = 1; round <= CANCEL_ROUNDS; round += 1) {
+        try {
+          const native = await nativeSession(state);
+          if (native.status !== 'idle') {
+            const interrupted = await lockedHost(() => host.interrupt({ nativeSessionId: state.binding.sessionId }, hostOptions()));
+            rounds.push({ round, action: 'interrupt-root', status: native.status,
+              interrupted: interrupted?.interrupted === true });
+          }
+          observed = await refresh();
+          const targets = (treeModule?.claudeTreeStopTargets?.(observed.tree) ?? [])
+            .filter(target => typeof target.taskId === 'string' && target.status !== 'ended')
+            .map(target => target.taskId);
+          if (targets.length && !canStopTasks) {
+            rounds.push({ round, action: 'stop-tasks-unsupported', requested: targets });
+          } else if (targets.length) {
+            // Scope-owned: the panel is this session's own, so no title or
+            // task-name matching is used to choose the rows.
+            const stop = await lockedHost(() => host.stopBackgroundTasks({
+              nativeSessionId: state.binding.sessionId }, hostOptions()));
+            rounds.push({ round, action: 'stop-tasks', requested: targets,
+              ...(stop?.status ? { status: stop.status } : {}),
+              stopped: (stop?.stopped ?? []).length, remaining: (stop?.remaining ?? []).length });
+          }
+          observed = await refresh();
+        } catch (error) {
+          if (error.code !== 'claude-session-unavailable') throw error;
+          gone = true; // no native process means no running child is left
+          break;
+        }
+        if (observed?.tree?.settled === true) break;
+        const after = await nativeSession(state).catch(() => ({ status: 'idle' }));
+        if (after.status === 'idle' && observed?.tree?.running !== true) break; // converged
+      }
+      const requested = gone || observed?.tree?.settled === true
+        || rounds.some(entry => entry.interrupted === true || entry.action === 'stop-tasks');
+      return { cancelRequested: requested, cancelRounds: rounds,
+        ...(observed?.tree ? { treeSettled: observed.tree.settled === true,
+          treeRunning: observed.tree.running === true } : {}),
+        ...(canStopTasks ? {} : { stopTasksUnsupported: true }),
+        ...(gone ? { reason: 'session-process-gone' } : {}) };
     },
     async destroy() {
       const state = await recoverFirstBinding(stateForTask());

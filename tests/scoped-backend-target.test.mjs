@@ -6,12 +6,24 @@ import { fileURLToPath } from 'node:url';
 import { createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
-import { BACKEND_METHODS, normalizeTarget, targetOf } from '../src/agent-backend.mjs';
+import { BACKEND_METHODS, normalizeTarget, targetOf, resolveBackend } from '../src/agent-backend.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const A = '11111111-1111-4111-8111-111111111111';
 const extra = threadId => ({ _meta: { threadId } });
 const CLAUDE_MODEL = { provider: 'anthropic', model: 'claude-opus-5-5' };
+
+test('default loader connects the real Codex adapter without an injected factory', async () => {
+  const backend = await resolveBackend({ target: 'codex-desktop', workspace }, { deps: {
+    host: { probe: async () => ({ identity: { application: 'codex-desktop' }, missing: [] }) },
+    readCodexReportStatus: async () => ({ ready: true }),
+    readCodexReportState: async () => ({ questions: [], reports: [] }),
+  } });
+  assert.equal(backend.target, 'codex-desktop');
+  const probe = await backend.probe();
+  assert.deepEqual(probe.methods, BACKEND_METHODS);
+  assert.equal(probe.reportProtocol, 1);
+});
 
 async function rejection(promise) {
   try { await promise; } catch (error) { return error; }

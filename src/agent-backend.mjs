@@ -167,16 +167,21 @@ export function assertBackend(backend, target) {
 
 async function adapterFactory(target, adapters = {}) {
   if (typeof adapters?.[target] === 'function') return adapters[target];
-  if (target !== 'claude-desktop') return undefined;
+  const entry = {
+    'claude-desktop': ['./claude-backend.mjs', 'createClaudeBackend'],
+    'codex-desktop': ['./codex-backend.mjs', 'createCodexBackend'],
+  }[target];
+  if (!entry) return undefined;
+  const moduleUrl = new URL(entry[0], import.meta.url);
   let module;
-  try { module = await import('./claude-backend.mjs'); }
+  try { module = await import(moduleUrl.href); }
   catch (error) {
     // Only the absent adapter file falls back to not-ready; a broken adapter must
     // surface its own error instead of looking like a missing backend.
-    if (error?.code === 'ERR_MODULE_NOT_FOUND' && String(error.message).includes('claude-backend')) return undefined;
+    if (error?.code === 'ERR_MODULE_NOT_FOUND' && error.url === moduleUrl.href) return undefined;
     throw error;
   }
-  return module.createClaudeBackend;
+  return module[entry[1]];
 }
 
 /**

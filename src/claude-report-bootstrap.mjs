@@ -104,9 +104,11 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     if (state.client) { try { await state.client.close(); } catch { /* already gone */ } state.client = undefined; }
     state.client = await connect(state.url);
   };
-  // A monitor restart invalidates the old MCP client even though the port answers
-  // health again: its socket and session are gone. Any transport failure therefore
-  // discards the client, and the next prepare builds a fresh one.
+  // The loopback transport is stateless: no session id, one transport per POST, so
+  // a restarted monitor needs no session migration and a fresh request works. What
+  // can still go wrong is a client whose own transport has closed (a pooled socket
+  // to a dead process), which would otherwise be reused forever; a transport
+  // failure therefore discards the client and the next prepare builds a new one.
   const discardClient = async () => {
     const client = state.client;
     state.client = undefined;

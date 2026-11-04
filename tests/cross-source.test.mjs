@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, writeFile, appendFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile, appendFile } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
@@ -18,7 +18,7 @@ const THREAD = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture({ adapters = {}, onPollComplete,
+async function fixture({ adapters = {}, onPollComplete, captureFiles,
   clientFactory = () => { throw new Error('no DSH host is needed for these cases'); }, startSharedMonitor = () => true } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
@@ -32,10 +32,11 @@ async function fixture({ adapters = {}, onPollComplete,
       : { accepted: true }),
     backendAdapters: adapters,
     ...(onPollComplete ? { onPollComplete } : {}),
+    ...(captureFiles ? { captureFiles } : {}),
     startSharedMonitor,
     removeTree: async () => {},
   });
-  return { service, store };
+  return { service, store, stateDirectory };
 }
 
 test('owner ids are namespaced per source and never collide', () => {
@@ -394,6 +395,131 @@ test('a once child cleans itself and its files and native history survive in the
     assert.deepEqual(historical.tree.nodes.map(n => n.agentPath), [['parent'], ['parent', 'once']]);
   } finally { f.service.close(); }
 });
+
+// --- Workspace snapshots: files a shell wrote, not a file tool ------------------
+
+/** A capture whose two answers stand for the task's start and end snapshots. */
+function snapshotSource(root, before, after) {
+  const answers = [before, after];
+  const source = async () => answers[Math.min(source.calls++, answers.length - 1)];
+  source.calls = 0;
+  source.root = root;
+  return source;
+}
+
+const snapshot = (root, files) => ({ available: true, workspace: root, files });
+
+test('a task keeps its workspace baseline beside the agent state and ends with unconfirmed changes', async () => {
+  const root = path.join(workspace, '.runtime', 'tests', 'workspace-snapshot-fixture');
+  const confirmed = path.join(root, 'confirmed.txt');
+  const shellWritten = path.join(root, 'shell-written.txt');
+  const captureFiles = snapshotSource(root, snapshot(root, { 'confirmed.txt': { code: ' M', stamp: '1000:5' } }),
+    snapshot(root, { 'confirmed.txt': { code: ' M', stamp: '2000:9' }, 'shell-written.txt': { code: '??', stamp: '2000:7' } }));
+  const base = fakeBackend({ changes: [{ path: confirmed, operation: 'write' }] });
+  let finalSubmitted = false;
+  const f = await fixture({ captureFiles, adapters: { 'claude-desktop': record => ({ ...base(record),
+    observe: async () => ({ ...await base(record).observe(), reports: finalSubmitted
+      ? [{ id: 'final-snapshot', taskId: record.task.taskId, message: 'files written', final: true, createdAt: new Date().toISOString() }]
+      : [] }) }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'writer', ownerId: ownerIdFor(THREAD), sessionId: 'session-writer',
+      name: 'writer', state: 'idle', task: undefined, workspace: root }));
+    assert.equal((await f.service.send({ name: 'writer', message: 'write files' }, extra(THREAD))).queued, true);
+    assert.equal(captureFiles.calls, 0, 'queuing never waits for a snapshot');
+    await f.service.list(extra(THREAD));
+    assert.equal(captureFiles.calls, 0, 'list reads stored state only and never runs a snapshot');
+    await f.service.poll('writer');
+    assert.equal(captureFiles.calls, 1, 'the baseline is taken once, with the first dispatch');
+    const record = f.store.get('writer');
+    const saved = JSON.parse(await readFile(path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId,
+      'workspace-baseline.json'), 'utf8'));
+    assert.equal(saved.taskId, record.task.taskId, 'the baseline names the task it belongs to');
+    assert.deepEqual(saved.capture.files, { 'confirmed.txt': { code: ' M', stamp: '1000:5' } });
+    assert.equal(JSON.stringify(record).includes('1000:5'), false, 'the snapshot is never copied into the record body');
+
+    finalSubmitted = true;
+    await f.service.poll('writer');
+    const finished = f.store.get('writer');
+    assert.equal(finished.state, 'idle');
+    assert.equal(finished.task.workspace.coverage.source, 'git-status-diff');
+    assert.equal(finished.task.workspace.coverage.complete, false);
+    assert.match(finished.task.workspace.coverage.limitation, /other processes or other assistants/);
+    const changes = await f.service.changes({ name: 'writer' }, extra(THREAD));
+    const shell = changes.changes.find(change => change.path === shellWritten);
+    assert.deepEqual(shell, { path: shellWritten, operation: 'create', source: 'workspace-diff',
+      attribution: 'unconfirmed', agentPath: ['writer'] });
+    assert.equal(changes.changes.filter(change => change.path === confirmed).length, 1,
+      'a path the file tools already confirmed is not counted twice');
+    assert.equal(changes.coverage.workspace.source, 'git-status-diff');
+    assert.equal(changes.coverage.workspace.reason, undefined);
+    assert.equal(captureFiles.calls, 2, 'one baseline and one closing snapshot per task');
+    // The finished task keeps its snapshot changes in the same history entry a caller
+    // already reads with task=1.
+    await f.service.send({ name: 'writer', message: 'next task' }, extra(THREAD));
+    const historical = await f.service.changes({ name: 'writer', task: 1 }, extra(THREAD));
+    assert.ok(historical.changes.some(change => change.path === shellWritten && change.attribution === 'unconfirmed'));
+    assert.equal(historical.coverage.workspace.source, 'git-status-diff');
+  } finally { f.service.close(); }
+});
+
+test('a running task computes workspace changes on demand and persists nothing', async () => {
+  const root = path.join(workspace, '.runtime', 'tests', 'workspace-live-fixture');
+  const shellWritten = path.join(root, 'shell-written.txt');
+  const captureFiles = snapshotSource(root, snapshot(root, {}),
+    snapshot(root, { 'shell-written.txt': { code: '??', stamp: '2000:7' } }));
+  const base = fakeBackend();
+  const f = await fixture({ captureFiles, adapters: { 'claude-desktop': record => base(record) } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'live', ownerId: ownerIdFor(THREAD), sessionId: 'session-live',
+      name: 'live', state: 'idle', task: undefined, workspace: root }));
+    await f.service.send({ name: 'live', message: 'write files' }, extra(THREAD));
+    await f.service.poll('live');
+    assert.equal(f.store.get('live').state, 'awaiting_report', 'the task has not finished yet');
+    const computed = await f.service.changes({ name: 'live' }, extra(THREAD));
+    assert.deepEqual(computed.changes.map(change => change.path), [shellWritten]);
+    assert.equal(computed.changes[0].attribution, 'unconfirmed');
+    assert.equal(f.store.get('live').task.workspace, undefined, 'an on-demand comparison is not saved');
+    const again = await f.service.changes({ name: 'live' }, extra(THREAD));
+    assert.deepEqual(again.changes.map(change => change.path), [shellWritten]);
+    assert.equal(captureFiles.calls, 3, 'each running read recaptures instead of reusing a saved answer');
+    await f.service.list(extra(THREAD));
+    assert.equal(captureFiles.calls, 3, 'list stays free of snapshots while the task runs');
+  } finally { f.service.close(); }
+});
+
+test('a failed or unusable snapshot never blocks delivery and states its reason', async () => {
+  const root = path.join(workspace, '.runtime', 'tests', 'workspace-failure-fixture');
+  const scenarios = [
+    { name: 'broken', capture: async () => { throw new Error('git status failed hard'); } },
+    { name: 'nogit', capture: async () => ({ available: false, reason: 'not-a-repository' }) },
+  ];
+  for (const scenario of scenarios) {
+    const base = fakeBackend();
+    const f = await fixture({ captureFiles: scenario.capture, adapters: { 'claude-desktop': record => base(record) } });
+    try {
+      await f.service.list(extra(THREAD));
+      f.store.insert(taskRecord({ agentId: scenario.name, ownerId: ownerIdFor(THREAD), sessionId: `session-${scenario.name}`,
+        name: scenario.name, state: 'idle', task: undefined, workspace: root }));
+      await f.service.send({ name: scenario.name, message: 'work' }, extra(THREAD));
+      await f.service.poll(scenario.name);
+      const record = f.store.get(scenario.name);
+      record.task.reports.push({ id: `report-${scenario.name}`, taskId: record.task.taskId, message: 'done',
+        final: true, createdAt: new Date().toISOString(), delivery: { id: `notice-${scenario.name}`, state: 'pending' } });
+      f.store.save(record);
+      await f.service.poll(scenario.name);
+      const finished = f.store.get(scenario.name);
+      assert.equal(finished.state, 'idle', `${scenario.name}: the task still finishes`);
+      assert.equal(finished.task.reports[0].delivery.state, 'delivered', `${scenario.name}: the report is still delivered`);
+      assert.deepEqual(finished.task.workspace.changes, []);
+      assert.equal(finished.task.workspace.coverage.complete, false);
+      assert.equal(finished.task.workspace.coverage.reason,
+        scenario.name === 'broken' ? 'capture-failed' : 'not-a-repository', `${scenario.name}: the reason is visible`);
+    } finally { f.service.close(); }
+  }
+});
+
 
 test('Codex poll consumes submissions atomically while ask remains answerable through its backend', async () => {
   const adapter = (record, deps) => createCodexBackend(record, { ...deps, host: {

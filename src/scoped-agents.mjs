@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
-import { lstat, open, realpath, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
@@ -16,6 +16,7 @@ import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
 import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './report-endpoint.mjs';
 import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
   TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
+import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
@@ -90,13 +91,42 @@ function rootSummary(view) {
     && ['completed', 'failed', 'cancelled'].includes(summary.state) ? summary : undefined;
 }
 
-function attributedChanges(record, view) {
+// What a workspace comparison can and cannot see. It is stated wherever the covered
+// files are, because a short list next to a silent claim of completeness is misleading.
+const WORKSPACE_LIMITATION = 'Compared before and after the task with git status, not watched live: edits made meanwhile by other processes or other assistants look identical, and paths covered by .gitignore or outside a git repository are invisible.';
+const workspaceCoverage = reason => ({ source: 'git-status-diff', complete: false,
+  limitation: WORKSPACE_LIMITATION, ...(reason ? { reason } : {}) });
+// Windows paths are case-insensitive, so a confirmed and a snapshotted spelling of the
+// same file must not both survive.
+const pathKey = value => {
+  const resolved = path.resolve(String(value));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+};
+
+/**
+ * Snapshot entries are unconfirmed: they name a path that changed, not an agent's own
+ * write. A path the target's file tools already reported is the same change, so the
+ * snapshot copy is dropped rather than counted twice.
+ */
+function withWorkspaceChanges(changes, workspace, name) {
+  const found = workspace?.changes;
+  if (!Array.isArray(found) || !found.length) return changes;
+  const known = new Set(changes.map(change => pathKey(change.path)));
+  const extra = found.filter(change => !known.has(pathKey(change.path)))
+    .map(change => ({ path: change.path, operation: change.operation, source: 'workspace-diff',
+      attribution: 'unconfirmed', agentPath: [name] }));
+  return [...changes, ...extra];
+}
+
+function attributedChanges(record, view, workspace = record.task?.workspace) {
   const tree = ownedTree(record, view);
-  if (!tree.nodes.length) return (view.changes ?? []).map(change => ({ ...change, agentPath: [record.name] }));
-  return tree.nodes.flatMap(({ node, agentPath }) => (node.changes ?? []).map(change => {
-    const { sessionId, parentSessionId, agentId, ...file } = change;
-    return { ...file, agentPath };
-  }));
+  const changes = tree.nodes.length
+    ? tree.nodes.flatMap(({ node, agentPath }) => (node.changes ?? []).map(change => {
+        const { sessionId, parentSessionId, agentId, ...file } = change;
+        return { ...file, agentPath };
+      }))
+    : (view.changes ?? []).map(change => ({ ...change, agentPath: [record.name] }));
+  return withWorkspaceChanges(changes, workspace, record.name);
 }
 
 function publicTree(record, view) {
@@ -111,11 +141,17 @@ function publicTree(record, view) {
       coverage: node.coverage ?? 'Not observed' })) };
 }
 
-function treeCoverage(record, view) {
+function treeCoverage(record, view, workspace) {
   const { nodes } = ownedTree(record, view);
+  // The workspace entry says what a zero count does not: whether a snapshot was even
+  // taken, and why not when it was not.
+  const covered = workspace ?? record.task?.workspace?.coverage ?? workspaceCoverage('not-captured');
+  const own = typeof view.coverage === 'object' && view.coverage ? view.coverage
+    : { note: view.coverage ?? 'Not observed yet; zero known files is not a complete filesystem audit.' };
   return nodes.length > 1 ? { scope: `${hostLabel(record)} task tree`,
-    nodes: nodes.map(({ node, agentPath }) => ({ agentPath, coverage: node.coverage ?? 'Not observed' })) }
-    : view.coverage ?? 'Not observed yet; zero known files is not a complete filesystem audit.';
+    nodes: nodes.map(({ node, agentPath }) => ({ agentPath, coverage: node.coverage ?? 'Not observed' })),
+    workspace: covered }
+    : { ...own, workspace: covered };
 }
 
 function publicResult(record, { fullResult = false } = {}) {
@@ -243,6 +279,7 @@ export function createScopedAgents(config, {
   codexToolsStatus = undefined,
   codexProbeRegistration = undefined,
   reportReadyTimeoutMs = 2000,
+  captureFiles = captureWorkspace,
   onPollComplete = () => {},
 } = {}) {
   const clients = new Map();
@@ -252,6 +289,56 @@ export function createScopedAgents(config, {
   let draining = false;
   let monitorUnavailableSince, monitorError;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
+  const workspaceBaselineFile = record => path.join(agentDirectory(record), 'workspace-baseline.json');
+  // The snapshot is started before the dispatch is written and awaited after it, so
+  // git runs while the target is being handed the task instead of in front of it.
+  // It is kept beside the agent's own state: the record body is saved on every poll
+  // and is far too large to carry a file list.
+  function startWorkspaceBaseline(record) {
+    const taskId = record.task?.taskId;
+    if (!taskId) return undefined;
+    const pending = Promise.resolve()
+      .then(() => captureFiles(record.workspace))
+      .catch(() => ({ available: false, reason: 'capture-failed' }));
+    return { taskId, pending };
+  }
+
+  async function saveWorkspaceBaseline(record, baseline) {
+    if (!baseline) return;
+    try {
+      const capture = await baseline.pending;
+      const file = workspaceBaselineFile(record);
+      await mkdir(path.dirname(file), { recursive: true });
+      await writeFile(file, JSON.stringify({ taskId: baseline.taskId, workspace: record.workspace,
+        capturedAt: now(), capture }), 'utf8');
+    } catch { /* best effort: a missing snapshot only costs coverage, never the task */ }
+  }
+
+  async function readWorkspaceBaseline(record) {
+    try {
+      const saved = JSON.parse(await readFile(workspaceBaselineFile(record), 'utf8'));
+      return saved?.taskId === record.task?.taskId ? saved : undefined;
+    } catch { return undefined; }
+  }
+
+  /**
+   * The task's workspace changes, computed once its tree has settled. Anything that
+   * keeps the comparison from being trustworthy is reported as coverage rather than
+   * thrown, because the report itself must still be delivered.
+   */
+  async function workspaceDiff(record) {
+    const baseline = await readWorkspaceBaseline(record);
+    if (!baseline) return { changes: [], coverage: workspaceCoverage('no-baseline') };
+    if (baseline.capture?.available !== true) {
+      return { changes: [], coverage: workspaceCoverage(baseline.capture?.reason ?? 'capture-failed') };
+    }
+    let after;
+    try { after = await captureFiles(record.workspace); }
+    catch { return { changes: [], coverage: workspaceCoverage('capture-failed') }; }
+    if (after?.available !== true) return { changes: [], coverage: workspaceCoverage(after?.reason ?? 'capture-failed') };
+    const changes = diffWorkspace(baseline.capture, after);
+    return { changes, coverage: workspaceCoverage(), ...(changes.truncated ? { truncated: true } : {}) };
+  }
   const settings = record => ({ ...config, target: targetOf(record), workspace: record.workspace,
     stateDirectory: agentDirectory(record), codexThreadId: undefined, futureaideSessionId: undefined });
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
@@ -1040,8 +1127,11 @@ export function createScopedAgents(config, {
   }
 
   async function beginTask(record) {
-    const observed = await negotiateTree(record, true);
-    await sendDispatch(record, record.task.message, 'task', [], undefined, observed);
+    const baseline = startWorkspaceBaseline(record);
+    try {
+      const observed = await negotiateTree(record, true);
+      await sendDispatch(record, record.task.message, 'task', [], undefined, observed);
+    } finally { await saveWorkspaceBaseline(record, baseline); }
   }
 
   async function resolveAnswer(record, answer) {
@@ -1227,6 +1317,17 @@ export function createScopedAgents(config, {
     store.save(record);
     const delivered = await deliverReports(record);
     if (final && final.treeSettledConfirmed) {
+      // Compared only after the tree settled and only once, because polls repeat this
+      // block until delivery ends. The report never waits for git and a failed
+      // comparison is coverage, not an error.
+      if (!task.workspace) {
+        task.workspace = await workspaceDiff(record);
+        if (task.result) {
+          task.result.changes = attributedChanges(record, view);
+          task.result.coverage = treeCoverage(record, view);
+        }
+        store.save(record);
+      }
       if (delivered) return finishDeliveredReport(record);
       record.state = record.callbackBlocked && ['failed', 'cancelled'].includes(task.result.state)
         && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled)) ? task.result.state : 'delivery_pending';
@@ -1606,10 +1707,15 @@ export function createScopedAgents(config, {
             coverage: historical.coverage, tree: historical.tree ?? historical.result?.tree };
         }
         try { await observe(record); store.save(record); } catch (error) { record.error = safeError(error); }
+        // A running task has no stored comparison yet, so it is computed for this
+        // answer only: an unfinished task must not look like a query that changed it.
+        const live = record.task && !record.task.workspace ? await workspaceDiff(record) : undefined;
+        const changes = attributedChanges(record, record.observation ?? {});
         // The composed view already carries every managed descendant's attributed
         // changes under its own agentPath, so no second walk happens here.
-        return { name, task: 0, changes: attributedChanges(record, record.observation ?? {}),
-          tree: publicTree(record, record.observation ?? {}), coverage: treeCoverage(record, record.observation ?? {}),
+        return { name, task: 0, changes: withWorkspaceChanges(changes, live, record.name),
+          tree: publicTree(record, record.observation ?? {}),
+          coverage: treeCoverage(record, record.observation ?? {}, live?.coverage),
           stale: Boolean(record.error || record.observation?.stale), ...(record.error ? { error: record.error } : {}) };
       });
     },

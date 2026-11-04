@@ -1074,18 +1074,22 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
     const row = running[0];
     attempted.add(row.index);
     if (row.title) attempted.add(row.title);
-    const attempt = await ui.taskStop({ match: row.rowText, index: row.index })
-      .catch(error => ({ clicked: false, code: error.code, message: error.message }));
+    const attempt = await ui.taskStop({ title: row.title, match: row.rowText, index: row.index })
+      .catch(error => ({ clicked: false, code: error.code ?? 'task-stop-refused', message: error.message,
+        detail: error.detail ?? null, rowsSeen: error.detail?.value?.rows ?? null }));
     stopped.push({
       index: row.index,
+      title: row.title ?? null,
       rowText: row.rowText,
       rowName: row.rowName,
+      matchedBy: attempt?.matchedBy ?? null,
       clicked: Boolean(attempt?.clicked),
       busySeen: Boolean(attempt?.busySeen),
       doneSeen: Boolean(attempt?.doneSeen),
       state: attempt?.doneSeen ? 'stopped' : (attempt?.busySeen ? 'stopping' : 'requested'),
       at: attempt?.at,
-      ...(attempt?.clicked ? {} : { error: { code: attempt?.code ?? 'task-stop-refused', message: attempt?.message } }),
+      ...(attempt?.clicked ? {} : { error: { code: attempt?.code ?? 'task-stop-refused', message: attempt?.message,
+        detail: attempt?.detail ?? null } }),
     });
     // refresh: the panel only shows tasks that exist when it is opened
     const again = await ui.tasksPanel({ title, mode: 'refresh' })
@@ -1094,6 +1098,10 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
     panelOpened += 1;
   }
   const remaining = runningTaskRows(rows, targets);
+  // A refusal is reported as itself: the caller has to see why the host would not
+  // press, not just that fewer rows remain than before.
+  const refused = stopped.filter(entry => entry.clicked === false);
+  const clickedCount = stopped.length - refused.length;
   const archiveOnly = remaining.length > 0 && remaining.every(row => STOP_ARCHIVE_NAME.test(String(row.rowText ?? '')));
   return {
     nativeSessionId,
@@ -1115,6 +1123,13 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
     stopped,
     remaining: remaining.map(row => ({ index: row.index, rowText: row.rowText })),
     ...(archiveOnly ? { archiveOnly: true, stoppedNothing: true } : {}),
+    clickedCount,
+    refused,
+    ...(stopped.length > 0 && clickedCount === 0 ? {
+      status: 'stop-refused',
+      firstRefusal: refused[0]?.error ?? null,
+      detail: 'The host refused every press; the rows it saw are in each refusal, so the locator can be corrected instead of retried blindly.',
+    } : {}),
     rootInterruptRequired: true,
     verifiedBy: ['panel-stop-button'],
     ...INTERRUPT_SCOPE_NOTE,

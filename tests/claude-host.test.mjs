@@ -1709,3 +1709,26 @@ test('a marker already written twice is uncertain, never a fresh start', async (
     assert.equal(submitted, false, 'nothing is sent while the earlier delivery is uncertain');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+test('a refused press is reported with the rows the host actually saw', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const seen = [{ index: 0, title: 'Cancel child A', rowText: 'Cancel child A | Cancel child A 6分钟', running: true, enabled: true, done: false }];
+  const driver = uiDriver({
+    tasksPanel: () => ({ opened: true, entry: '后台任务 3', rows: seen }),
+    taskStop: input => {
+      throw Object.assign(new Error('no stoppable row matches title ' + input.title), {
+        code: 'task-not-found', detail: { value: { rows: seen, wanted: input } } });
+    },
+  });
+  try {
+    const result = await stopBackgroundTasks({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive });
+    assert.equal(result.clickedCount, 0);
+    assert.equal(result.status, 'stop-refused');
+    assert.equal(result.firstRefusal.code, 'task-not-found');
+    assert.equal(result.refused.length >= 1, true);
+    assert.deepEqual(result.refused[0].error.code, 'task-not-found');
+    assert.deepEqual(result.firstRefusal.detail.value.rows.map(row => row.title), ['Cancel child A'],
+      'the refusal carries what the host saw, so the locator can be fixed');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

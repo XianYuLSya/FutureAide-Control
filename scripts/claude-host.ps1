@@ -987,22 +987,43 @@ try {
       # One row, chosen by its own text; a name shared by several rows is refused
       # rather than clicking the first one.
       $match = [string]$payload.match
+      $title = [string]$payload.title
       $index = $payload.index
       $rows = @(Get-TaskRows)
-      $candidates = @($rows | Where-Object { -not $_.busy -and -not $_.done -and $_.enabled })
-      if ($null -ne $index) { $candidates = @($candidates | Where-Object { $_.index -eq [int]$index }) }
-      if ($match) {
+      $stoppable = @($rows | Where-Object { -not $_.busy -and -not $_.done -and $_.enabled })
+      # A row is addressed by its own title first: the row order can change between
+      # two reads of the panel, so a position is only a tie breaker.
+      $candidates = $stoppable
+      $matchedBy = 'none'
+      if ($title) {
+        $needle = $title.ToLowerInvariant()
+        $byTitle = @($stoppable | Where-Object { ([string]$_.title).ToLowerInvariant() -eq $needle })
+        if ($byTitle.Count -eq 0) {
+          $byTitle = @($stoppable | Where-Object { ([string]$_.title).ToLowerInvariant().Contains($needle) })
+        }
+        if ($byTitle.Count -ge 1) { $candidates = $byTitle; $matchedBy = 'title' }
+      }
+      if ($candidates.Count -gt 1 -and $null -ne $index) {
+        $byIndex = @($candidates | Where-Object { $_.index -eq [int]$index })
+        if ($byIndex.Count -eq 1) { $candidates = $byIndex; $matchedBy = $(if ($matchedBy -eq 'none') { 'index' } else { $matchedBy + '+index' }) }
+      }
+      if ($matchedBy -eq 'none' -and $match) {
         $needle = $match.ToLowerInvariant()
-        $candidates = @($candidates | Where-Object { (($_.rowText + ' ' + $_.rowName).ToLowerInvariant()).Contains($needle) })
+        $byText = @($stoppable | Where-Object { (($_.rowText + ' ' + $_.rowName).ToLowerInvariant()).Contains($needle) })
+        if ($byText.Count -ge 1) { $candidates = $byText; $matchedBy = 'text' }
       }
       if ($candidates.Count -eq 0) {
-        Write-Result @{ ok = $false; code = 'task-not-found'; message = ('no running row matches ' + $match)
-          value = @{ rows = (Get-TaskRowSummary $rows) } }
+        Write-Result @{ ok = $false; code = 'task-not-found'
+          message = ('no stoppable row matches title ' + $title + ' / text ' + $match)
+          value = @{ rows = (Get-TaskRowSummary $rows); stoppable = (Get-TaskRowSummary $stoppable)
+            wanted = @{ title = $title; match = $match; index = $index } } }
         break
       }
-      if ($candidates.Count -gt 1 -and -not $match) {
-        Write-Result @{ ok = $false; code = 'task-ambiguous'; message = 'several running rows and no text match'
-          value = @{ rows = (Get-TaskRowSummary $rows) } }
+      if ($candidates.Count -gt 1) {
+        Write-Result @{ ok = $false; code = 'task-ambiguous'
+          message = ('several stoppable rows match title ' + $title + '; candidates: ' + (($candidates | ForEach-Object { $_.title }) -join ' | '))
+          value = @{ rows = (Get-TaskRowSummary $rows); candidates = (Get-TaskRowSummary $candidates)
+            wanted = @{ title = $title; match = $match; index = $index } } }
         break
       }
       $row = $candidates[0]
@@ -1025,7 +1046,7 @@ try {
       Write-Result @{ ok = [bool]$click.clicked
         code = $(if ($click.clicked) { $null } else { 'task-stop-click-unavailable' })
         message = $(if ($click.clicked) { $null } else { [string]$click.reason })
-        value = @{ index = $row.index; buttonName = $row.buttonName; rowName = $row.rowName
+        value = @{ index = $row.index; title = $row.title; matchedBy = $matchedBy; buttonName = $row.buttonName; rowName = $row.rowName
           before = $before; after = $after; busySeen = $busySeen; doneSeen = $doneSeen
           method = $click.method; at = (Get-Date).ToUniversalTime().ToString('o') } }
     }

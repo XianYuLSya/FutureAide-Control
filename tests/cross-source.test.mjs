@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, appendFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { createServer } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { claudeBindingStale, claudeNoticeReceipt, createScopedAgents } from '../src/scoped-agents.mjs';
+import { claudeBindingStale, claudeNoticeReceipt, claudeNoticeRequestId, createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { createCodexBackend } from '../src/codex-backend.mjs';
 import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
@@ -680,4 +682,55 @@ test('a recovered receipt clears stale dispatch errors and completed legacy erro
     f.store.save(current);
     assert.equal((await f.service.list(extra(THREAD))).items[0].error, undefined);
   } finally { f.service.close(); }
+});
+
+test('a Codex final reaches Claude through a legal native id and recovers its receipt without rewriting report identity', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const directory = await mkdtemp(path.join(workspace, '.runtime', 'tests', 'notice-pipe-'));
+  const socketPath = `\\\\.\\pipe\\futureaide-notice-test-${randomUUID()}`;
+  const binding = { pid: process.pid, sessionId: randomUUID(), procStart: '1', pidDomain: 'win32:test',
+    workspace, directory, socketPath, recordFile: path.join(directory, 'record.json'), transcriptFile: path.join(directory, 'transcript.jsonl') };
+  await writeFile(binding.recordFile, JSON.stringify({ ...binding, cwd: workspace,
+    entrypoint: 'claude-desktop', messagingSocketPath: socketPath }));
+  await writeFile(binding.transcriptFile, '');
+  await writeFile(path.join(directory, `${binding.pid}.${createHash('sha256').update(socketPath).digest('hex')}.key`),
+    JSON.stringify({ peerToken: 'a'.repeat(32), procStart: binding.procStart, pidDomain: binding.pidDomain }));
+  const received = [];
+  const server = createServer({ allowHalfOpen: true }, socket => {
+    let data = '';
+    socket.setEncoding('utf8'); socket.on('data', chunk => {
+      data += chunk;
+      if (!data.endsWith('\n') || data.trim().split('\n').length < 2) return;
+      const frame = data.trim().split('\n').map(line => JSON.parse(line)).find(item => item.type === 'user');
+      data = '';
+      received.push(frame);
+      appendFile(binding.transcriptFile, JSON.stringify({ sessionId: binding.sessionId, type: 'user', uuid: frame.uuid,
+        message: frame.message }) + '\n').then(() => socket.end(), error => socket.destroy(error));
+    });
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
+  try {
+    const ownerId = ownerIdForSource('claude-desktop', binding.sessionId);
+    f.store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId: binding.sessionId, workspace, binding });
+    const reportId = 'submission:submission-f19a44d65e454235a643e7ce556e7c2e';
+    const noticeId = `report-${reportId}`;
+    const report = { id: reportId, taskId: 'task-notice', final: true, message: 'verified final artifact', treeSettledConfirmed: true,
+      delivery: { id: noticeId, state: 'unknown', error: { code: 'operation-failed', message: 'claude-request-id-invalid' } } };
+    const task = { ...completedInput('notice', [report]), result: { state: 'completed', reply: report.message } };
+    f.store.insert(taskRecord({ agentId: 'notice', ownerId, sessionId: 'session-notice', name: 'notice',
+      target: 'codex-desktop', state: 'delivery_pending', task }));
+    await f.service.poll('notice');
+    assert.equal(received.length, 1, JSON.stringify(f.store.get('notice')));
+    assert.match(received[0].uuid, /^[a-zA-Z0-9-]{1,100}$/);
+    assert.equal(received[0].uuid, claudeNoticeRequestId(noticeId));
+    assert.equal(claudeNoticeRequestId('legal-notice-1'), 'legal-notice-1');
+    const pending = f.store.get('notice'); pending.task.reports[0].delivery.nextAttemptAt = 0; f.store.save(pending);
+    await f.service.poll('notice');
+    const finished = f.store.get('notice');
+    assert.equal(finished.task.reports[0].id, reportId);
+    assert.equal(finished.task.reports[0].delivery.id, noticeId);
+    assert.equal(finished.task.reports[0].delivery.state, 'delivered');
+    assert.equal(finished.task.reports[0].delivery.receipt.requestId, received[0].uuid);
+    assert.equal(received.length, 1, 'read-back never resends the written notice');
+  } finally { await new Promise(resolve => server.close(resolve)); f.service.close(); }
 });

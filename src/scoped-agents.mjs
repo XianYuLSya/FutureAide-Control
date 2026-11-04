@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, open, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { createControl, endedState, modelTurnError } from './control.mjs';
@@ -195,6 +195,9 @@ export async function transcriptCursor(binding) {
  * @param {object} binding Native transport binding.
  * @param {{id: string, cursor?: number}} notice Persisted notice; its cursor advances.
  */
+export const claudeNoticeRequestId = id => /^[a-zA-Z0-9-]{1,100}$/.test(id)
+  ? id : `notice-${createHash('sha256').update(id).digest('hex')}`;
+
 export async function findClaudeReceipt(binding, notice) {
   let cursor = Number.isSafeInteger(notice.cursor) ? notice.cursor : 0;
   for (let page = 0; page < CLAUDE_PAGES_PER_POLL; page++) {
@@ -204,7 +207,7 @@ export async function findClaudeReceipt(binding, notice) {
       if (!String(error?.message ?? '').includes('line-exceeds-page') || CLAUDE_PAGE_BYTES >= CLAUDE_MAX_PAGE_BYTES) throw error;
       read = await readClaudeEvents(binding, { offset: cursor, maxBytes: CLAUDE_MAX_PAGE_BYTES });
     }
-    const matched = claudeNoticeReceipt(read.deliveries, notice.id);
+    const matched = claudeNoticeReceipt(read.deliveries, claudeNoticeRequestId(notice.id));
     const next = Number.isSafeInteger(read.offset) ? read.offset : cursor;
     notice.cursor = next;
     if (matched) return matched;
@@ -872,6 +875,10 @@ export function createScopedAgents(config, {
     notice.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(notice.attempts, 5));
     const marker = `<!-- futureaide-control:${notice.id} -->`;
     const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
+    // This exact legacy failure happened before sendClaude opened a socket. It
+    // can resume with the mapped native id; other unknown outcomes stay read-only.
+    if (claude && claudeNoticeRequestId(notice.id) !== notice.id
+        && notice.error?.message === 'claude-request-id-invalid') notice.state = 'pending';
     if (notice.state === 'unknown' || notice.state === 'sending') {
       try {
         if (claude) {
@@ -915,7 +922,7 @@ export function createScopedAgents(config, {
         // Remember where the transcript ends before writing: the receipt can only
         // appear after this point, so later polls start here instead of rescanning.
         notice.cursor = await transcriptCursor(binding).catch(() => undefined);
-        const send = target => sendClaude(target, `${text}\n\n${marker}`, { requestId: notice.id });
+        const send = target => sendClaude(target, `${text}\n\n${marker}`, { requestId: claudeNoticeRequestId(notice.id) });
         let sent;
         try { sent = await send(binding); }
         catch (error) {

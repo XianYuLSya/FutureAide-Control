@@ -468,27 +468,44 @@ test('asynchronous monitor spawn errors retain the task without crashing MCP', a
 });
 
 test('a delayed monitor spawn failure cannot overwrite concurrent task state or a newer error', async () => {
-  let rejectSpawn;
-  const f = await fixture({ startSharedMonitor: () => new Promise((_resolve, reject) => { rejectSpawn = reject; }) });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    for (const state of ['cleaning', 'delivery_pending']) {
+  // One name per state: a record that has been persisted as `cleaning` can never be
+  // moved out of it again (RosterStore.save keeps it cleaning and closed), so the
+  // concurrent state under test has to start from a record that is not already
+  // closed. Delaying the spawn rejection is what makes the race real.
+  const pendingSpawn = () => {
+    let reject;
+    const promise = new Promise((_resolve, fail) => { reject = fail; });
+    return { promise, fail: error => reject(error) };
+  };
+  for (const state of ['delivery_pending', 'cleaning']) {
+    const spawn = pendingSpawn();
+    const f = await fixture({ startSharedMonitor: () => spawn.promise });
+    try {
+      await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
       const initial = f.record(); initial.state = 'running'; f.store.save(initial);
       const resumed = f.service.resume();
       const fresh = f.record(); fresh.state = state;
       fresh.task = { message: `Concurrent ${state}`, result: { reply: 'New result' }, dispatches: [] };
       f.store.save(fresh);
-      rejectSpawn(Object.assign(new Error('delayed failure'), { code: 'EACCES' }));
+      spawn.fail(Object.assign(new Error('delayed failure'), { code: 'EACCES' }));
       await resumed;
-      assert.equal(f.record().state, state);
+      assert.equal(f.record().state, state, 'the concurrent state survives the late failure');
       assert.equal(f.record().task.result.reply, 'New result');
       assert.equal(f.record().error.code, 'EACCES');
-    }
+    } finally { f.service.close(); }
+  }
+
+  const spawn = pendingSpawn();
+  const f = await fixture({ startSharedMonitor: () => spawn.promise });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const initial = f.record(); initial.state = 'running'; f.store.save(initial);
     const resumed = f.service.resume();
     const fresh = f.record(); fresh.error = { code: 'new-owner' }; f.store.save(fresh);
-    rejectSpawn(new Error('old launcher failure'));
+    spawn.fail(new Error('old launcher failure'));
     await resumed;
     assert.equal(f.record().error.code, 'new-owner', 'a late failure never masks a newer recorded error');
+    assert.equal(f.record().state, 'running', 'the failure writes only its own error field');
     f.store.setError('removed-agent', { code: 'EACCES' });
   } finally { f.service.close(); }
 });

@@ -274,9 +274,16 @@ test('codex-desktop readiness comes from the registration probe, never from a se
       tools: ['ask_parent', 'report_parent'], sessionVerified: false }) });
   try {
     const status = await registered.service.status(extra(A));
-    assert.deepEqual(probes[0], { workspace, configPath: path.join(registered.stateDirectory, 'config.json'),
-      serverName: 'futureaide-dev' }, 'the probe is asked about this project and the DEV entry');
+    // The entry is matched by the exact build and the shared roster, not by a
+    // fixed server name, so the probe is asked about this project's workspace and
+    // config file and nothing is pinned by name.
+    assert.deepEqual(probes[0], { workspace, configPath: path.join(registered.stateDirectory, 'config.json') },
+      'the probe is asked about this project and its own config file');
+    assert.equal('serverName' in probes[0], false,
+      'readiness never depends on a hard-coded MCP entry name');
     assert.equal(status.backends['codex-desktop'].ready, true);
+    assert.equal(status.backends['codex-desktop'].registered, true,
+      'readiness is the registration probe answer, not a session');
     assert.equal(status.backends['codex-desktop'].sessionVerified ?? false, false,
       'a registration alone never claims a native session was verified');
   } finally { registered.service.close(); }

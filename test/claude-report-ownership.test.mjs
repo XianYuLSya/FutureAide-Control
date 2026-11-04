@@ -115,11 +115,14 @@ test('ownership needs the shared store, not a stand-in object', () => {
     /requires the shared RosterStore/);
 });
 
-test('the surface re-reads ownership on every tools/list (server side only)', async () => {
+test('the surface lists one static table and re-reads ownership on every call (server side only)', async () => {
   // The session exists before the plugin knows its native id, so the first
-  // tools/list may arrive with no binding. On the server side nothing is cached:
-  // once `binding.sessionId` is written the next list carries both tools. Whether
-  // a Claude client re-asks at all is client behaviour and is settled by one real
+  // tools/list may arrive with no binding. Listing never waits for one: the table
+  // is the same for every verified caller and the role is enforced per call, so an
+  // unbound session sees both tools and is refused with not-owned-session when it
+  // uses them. Ownership itself is never cached: once `binding.sessionId` is
+  // written the same call is accepted with the task it belongs to. Whether a
+  // Claude client re-asks at all is client behaviour and is settled by one real
   // G2 run — this test claims nothing about it.
   const store = new RosterStore(':memory:');
   const agentId = 'agent-' + randomUUID().replace(/-/g, '');
@@ -132,11 +135,17 @@ test('the surface re-reads ownership on every tools/list (server side only)', as
   const client = new Client({ name: 'late-binding-test', version: '1.0.0' });
   await client.connect(new StreamableHTTPClientTransport(new URL(service.url)));
   try {
-    assert.deepEqual((await client.listTools()).tools, [], 'an unbound session gets no tool');
+    assert.deepEqual((await client.listTools()).tools.map(tool => tool.name).sort(),
+      ['ask_parent', 'report_parent'], 'an unbound session still gets the static table');
+    // Listing is not permission: the same session is refused when it uses the tool.
+    const refused = await client.callTool({ name: 'ask_parent', arguments: { message: 'now?' } });
+    assert.equal(refused.isError, true);
+    assert.equal(JSON.parse(refused.content[0].text).error.code, 'not-owned-session');
     store.saveBackendState(agentId, { binding: { sessionId }, cursor: { throughSeq: 0 } });
     const after = await client.listTools();
     assert.deepEqual(after.tools.map(tool => tool.name).sort(), ['ask_parent', 'report_parent']);
     const result = await client.callTool({ name: 'ask_parent', arguments: { message: 'now?' } });
+    assert.notEqual(result.isError, true, 'the same call is accepted once the binding lands');
     assert.equal(JSON.parse(result.content[0].text).taskId, 9);
     assert.equal(service.stats.unowned >= 1 && service.stats.owned >= 1, true);
   } finally {
@@ -145,7 +154,7 @@ test('the surface re-reads ownership on every tools/list (server side only)', as
   }
 });
 
-test('the HTTP service with real ownership answers the owned session and lists nothing for others', async () => {
+test('the HTTP service with real ownership answers the owned session and refuses strangers at call time', async () => {
   const { store, agentId } = fixture();
   const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', via: 'pid' };
   const service = await startHttpService({ port: 0, resolveOwned: own({ store }),
@@ -177,8 +186,14 @@ test('the HTTP service with real ownership answers the owned session and lists n
     await client.close();
 
     const stranger = await open(outsider.url);
-    assert.deepEqual((await stranger.listTools()).tools, []);
-    await assert.rejects(stranger.callTool({ name: 'report_parent', arguments: { message: 'hello' } }));
+    // The table is static for a verified caller, so hiding it is no longer the
+    // boundary; the refusal has to happen on the call itself.
+    assert.deepEqual((await stranger.listTools()).tools.map(tool => tool.name).sort(),
+      ['ask_parent', 'report_parent'], 'a verified session sees the same table whether or not it is owned');
+    const refused = await stranger.callTool({ name: 'report_parent', arguments: { message: 'hello' } });
+    assert.equal(refused.isError, true);
+    assert.equal(JSON.parse(refused.content[0].text).error.code, 'not-owned-session');
+    assert.deepEqual(store.get(agentId).task.reports ?? [], [], 'the refused call recorded nothing');
     await stranger.close();
   } finally {
     await service.close();

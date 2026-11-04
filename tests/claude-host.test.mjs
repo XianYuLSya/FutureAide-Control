@@ -592,8 +592,11 @@ test('a selection the host does not show is never reported as accepted', async (
       }), env: host1.env, isAlive: host1.isAlive, timeoutMs: 120, pollMs: 20 });
     assert.equal(stuck.accepted, false);
     assert.equal(stuck.status, 'unconfirmed');
-    await assert.rejects(selectModel({ nativeSessionId: SESSION, model: 'claude-opus-5-5' }, { driver: createNullDriver() }),
-      { code: 'ui-driver-unavailable' });
+    // The fixture's own registered session, so the refusal below comes from the
+    // missing UI driver and not from whatever this machine happens to have registered.
+    await assert.rejects(selectModel({ nativeSessionId: SESSION, model: 'claude-opus-5-5' },
+      { driver: createNullDriver(), env: host1.env, isAlive: host1.isAlive }),
+    { code: 'ui-driver-unavailable' });
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 // ------------------------------------------------------------------- probe

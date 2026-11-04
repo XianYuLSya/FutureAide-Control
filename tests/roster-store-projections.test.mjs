@@ -84,3 +84,18 @@ test('lifecycle scans use covering fields and immediately reflect direct roster 
     assert.ok(!JSON.stringify(candidate).includes('_SECRET'));
   } finally { store.close(); }
 });
+
+test('an explicit repeat cancel reopens native verification for newly observed background work', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const record = largeRecord(); record.state = 'cancelled'; delete record.sleep;
+    Object.assign(record.task, { cancelRequested: true, cancelVerified: true, cancelTreeSettled: true, cancelPending: false });
+    store.insert(record);
+    assert.equal(store.requestCancel(record), true);
+    const current = store.get(record.agentId);
+    assert.equal(current.state, 'running');
+    assert.equal(current.task.cancelPending, true);
+    assert.equal(current.task.cancelTreeSettled, false);
+    assert.equal(current.task.taskId, record.task.taskId);
+  } finally { store.close(); }
+});

@@ -24,9 +24,11 @@ const launched = (id, description, { background = true, agentId } = {}) => [
   assistant('', [toolUse(id, 'Agent', { description, prompt: 'hi', ...(background ? {} : { run_in_background: false }) })]),
   toolResult('', id, { toolUseResult: { agentId, ...(background ? { isAsync: true, status: 'async_launched' } : { status: 'completed' }) } })];
 
-async function fixture(t) {
-  const root = await mkdtemp(path.join(tmpdir(), 'claude-tree-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+async function fixture(t, { retainInProject = false } = {}) {
+  const base = retainInProject ? path.resolve('.runtime/tests') : tmpdir();
+  await mkdir(base, { recursive: true });
+  const root = await mkdtemp(path.join(base, 'claude-tree-'));
+  if (!retainInProject) t.after(() => rm(root, { recursive: true, force: true }));
   const sessionId = '9f1c1b0e-1111-4a2b-9c3d-000000000001';
   const project = path.join(root, 'projects', '-D-Work-project');
   const sessionDirectory = path.join(project, sessionId);
@@ -54,6 +56,46 @@ async function rootProjection(f) {
   await observeClaudeTranscript(f.binding, projection, { workspace: f.root, agentId: 'root-native' });
   return projection;
 }
+
+test('background shells outlive finished root and Agent turns until exact native task notifications', async t => {
+  const f = await fixture(t, { retainInProject: true });
+  const shellResult = (toolId, taskId, agentId) => line({ type: 'user', sessionId: f.sessionId,
+    isSidechain: Boolean(agentId), ...(agentId ? { agentId } : {}), message: { role: 'user', content: [{
+      type: 'tool_result', tool_use_id: toolId, content: `Command running in background with ID: ${taskId}. Output is being written to: task.output.` }] } });
+  await writeFile(f.subagent('a1'), assistant(f.sessionId,
+    [toolUse('shell-child', 'PowerShell', { run_in_background: true, description: 'Owned background wait' })], { sidechain: true, agentId: 'a1' })
+    + shellResult('shell-child', 'bg-child', 'a1') + reply(f.sessionId, 'turn ended, shell still running', { sidechain: true, agentId: 'a1', stopReason: 'end_turn' }));
+  await writeFile(f.meta('a1'), JSON.stringify({ finished: true, toolUseId: 'agent-launch' }));
+  await f.writeRoot([...launched('agent-launch', 'worker', { background: false, agentId: 'a1' }),
+    assistant('', [toolUse('shell-root', 'Bash', { run_in_background: true })]), shellResult('shell-root', 'bg-root'),
+    reply('', 'root ended', { stopReason: 'end_turn' })]);
+  const projection = await rootProjection(f);
+  let value = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'idle' }));
+  assert.equal(value.tree.settled, false);
+  assert.deepEqual(value.tree.nodes.map(node => node.status), ['running', 'running']);
+  assert.deepEqual(claudeTreeStopTargets(value.tree).filter(target => target.kind === 'background-tool').map(target => target.taskId), ['bg-root', 'bg-child']);
+  // An already-persisted old projection at EOF must replay the newly supported
+  // receipt once without resetting its task/report cursor.
+  const cursor = projection.throughSeq;
+  delete projection.backgroundTools;
+  delete value.state.nodes.a1.projection.backgroundTools;
+  await observeClaudeTranscript(f.binding, projection, { workspace: f.root });
+  value = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'idle', state: value.state }));
+  assert.equal(projection.throughSeq, cursor);
+  assert.equal(value.tree.settled, false);
+  const notice = (taskId, status, toolId) => line({ type: 'queue-operation', operation: 'enqueue', sessionId: f.sessionId,
+    content: `<task-notification>\n<task-id>${taskId}</task-id>\n<tool-use-id>${toolId}</tool-use-id>\n<status>${status}</status>\n</task-notification>` });
+  await appendFile(f.transcriptFile, notice('a1', 'completed', 'agent-launch'));
+  await observeClaudeTranscript(f.binding, projection, { workspace: f.root });
+  value = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'idle', state: value.state }));
+  assert.equal(value.tree.settled, false, 'Agent completion never completes its own shell task');
+  await appendFile(f.transcriptFile, notice('bg-root', 'completed', 'shell-root') + notice('bg-child', 'killed', 'shell-child'));
+  await observeClaudeTranscript(f.binding, projection, { workspace: f.root });
+  value = await observeClaudeTree(f.binding, projection, treeOptions(f, { nativeStatus: 'idle', state: value.state }));
+  assert.equal(value.tree.settled, true);
+  assert.equal(value.tree.nodes[1].backgroundTools[0].status, 'stopped');
+  assert.equal(value.tree.nodes[0].backgroundTools[0].status, 'completed');
+});
 
 test('a foreground Agent result pairs one child transcript and settles the tree', async t => {
   const f = await fixture(t);

@@ -183,7 +183,7 @@ export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576
     // A full page with no complete line cannot advance. Fail explicitly so an
     // observer does not reread the same bytes forever; it may choose a larger page.
     if (!complete && bytesRead === maxBytes) throw new Error('claude-transcript-line-exceeds-page');
-    const events = [], deliveries = [];
+    const events = [], deliveries = [], taskNotifications = [];
     let badLines = 0, lineStart = 0;
     while (lineStart < complete) {
       const lineEnd = buffer.indexOf(10, lineStart);
@@ -198,6 +198,16 @@ export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576
       // Busy-session inbox messages are attachments, not user messages. Native
       // source_uuid correlates them without asking the model to echo our marker.
       const attachment = event.attachment;
+      const notification = event.type === 'queue-operation' && typeof event.content === 'string'
+        ? event.content : event.type === 'attachment' && attachment?.origin?.kind === 'task-notification'
+          ? attachment.prompt : undefined;
+      if (typeof notification === 'string' && notification.trimStart().startsWith('<task-notification>')) {
+        const taskId = /<task-id>([A-Za-z0-9_-]+)<\/task-id>/.exec(notification)?.[1];
+        const status = /<status>(completed|failed|killed|stopped)<\/status>/.exec(notification)?.[1];
+        if (taskId && status) taskNotifications.push({ taskId, status: status === 'killed' ? 'stopped' : status,
+          toolUseId: /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(notification)?.[1], seq, timestamp: event.timestamp,
+          evidence: 'native-task-notification' });
+      }
       const enqueued = event.type === 'queue-operation' && event.operation === 'enqueue'
         && typeof event.content === 'string'
         ? /^<cross-session-message from-name="FutureAide Control">\r?\n\[FutureAide request ([A-Za-z0-9-]{1,100})\]\r?\n/.exec(event.content) : null;
@@ -234,6 +244,6 @@ export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576
           isError: c.is_error === true, receipt: c.is_error === true ? undefined : reportReceipt(c.content),
           metadata: toolMetadata(event.toolUseResult), summary: textOf(c.content).slice(0, 2000) })) : [] });
     }
-    return { events, deliveries, badLines, offset: offset + complete, size, hasMore: offset + complete < size };
+    return { events, deliveries, taskNotifications, badLines, offset: offset + complete, size, hasMore: offset + complete < size };
   } finally { await handle.close(); }
 }

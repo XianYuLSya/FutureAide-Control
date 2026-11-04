@@ -215,6 +215,10 @@ function childStatus(entry) {
     return { status: 'unverified', evidence: 'agent-pairing-mismatch',
       activity: 'the native agent meta names a different Agent tool than the one that launched it' };
   }
+  if (entry.projection.backgroundTaskBackfill) return { status: 'unverified', evidence: 'background-task-backfill', activity: 'reading native background-task receipts' };
+  if (Object.values(entry.projection.backgroundTools ?? {}).some(task => task.status === 'running')) {
+    return { status: 'running', evidence: 'native-background-tool-running', activity: 'background shell work is still running' };
+  }
   if (entry.meta?.finished === true) {
     return { status: 'ended', evidence: 'agent-meta-finished', endSeq: entry.projection.throughSeq ?? 0,
       activity: entry.meta.agentType ? `finished: ${entry.meta.agentType}` : 'native agent meta reports finished' };
@@ -333,7 +337,7 @@ async function readNativeMeta(entry) {
 export async function observeClaudeTree(binding, rootProjection, {
   logicalSessionId, agentId, name, workspace, state = {}, taskId, nativeStatus,
   readEvents = readClaudeEvents, maxNodes = Number.POSITIVE_INFINITY,
-  maxDepth = Number.POSITIVE_INFINITY,
+  maxDepth = Number.POSITIVE_INFINITY, backgroundTaskStates = [],
 } = {}) {
   if (typeof logicalSessionId !== 'string' || !logicalSessionId) {
     throw fail('claude-tree-root-required', 'A logical session id is required to name the root of the task tree.');
@@ -345,13 +349,26 @@ export async function observeClaudeTree(binding, rootProjection, {
   const { files, unindexed } = await indexSubagentTranscripts(subagentsRoot);
   const treeState = normalizeState(state);
   const options = { workspace };
+  const reconcileBackground = projection => {
+    const notices = { ...(rootProjection.backgroundTaskNotifications ?? {}), ...(projection.backgroundTaskNotifications ?? {}) };
+    for (const task of Object.values(projection.backgroundTools ?? {})) {
+      const notice = notices[task.taskId];
+      const external = backgroundTaskStates.find(value => value.taskId === task.taskId && value.evidence === 'native-task-panel');
+      const terminal = notice && (!notice.toolUseId || notice.toolUseId === task.toolUseId) ? notice : external;
+      if (terminal && ['completed', 'failed', 'stopped'].includes(terminal.status)) Object.assign(task,
+        { status: terminal.status, endedSeq: terminal.seq, evidence: terminal.evidence, observedAt: terminal.observedAt });
+    }
+    return Object.values(projection.backgroundTools ?? {});
+  };
+  const rootBackground = reconcileBackground(rootProjection);
 
   const rootPending = openTools(rootProjection);
   const rootCompleted = (rootProjection.completions ?? []).at(-1);
   // The native registry is authoritative about the root turn: after an interrupt
   // a pending tool result can stay unanswered forever, while registry 'idle' (or a
   // recorded completion, including the interrupt marker) proves the turn stopped.
-  const rootStopped = typeof nativeStatus === 'string' ? nativeStatus === 'idle' : Boolean(rootCompleted);
+  const rootStopped = !rootProjection.backgroundTaskBackfill && !rootBackground.some(task => task.status === 'running')
+    && (typeof nativeStatus === 'string' ? nativeStatus === 'idle' : Boolean(rootCompleted));
   const nodes = [{ sessionId: logicalSessionId, parentSessionId: null,
     name: typeof name === 'string' && name ? name : null, mode: 'root', depth: 0,
     nativeAgentId: agentId ?? null,
@@ -359,13 +376,14 @@ export async function observeClaudeTree(binding, rootProjection, {
     activity: rootPending.length && !rootStopped ? `tool: ${rootPending.at(-1).name}` : rootProjection.activity ?? 'unknown',
     changes: rootProjection.changes ?? [], coverage: CLAUDE_FILE_COVERAGE,
     messages: rootProjection.messages ?? [], lastSeq: rootProjection.throughSeq ?? 0,
-    pendingAgentTools: pendingAgentTools(rootProjection) }];
+    pendingAgentTools: pendingAgentTools(rootProjection), backgroundTools: rootBackground }];
   const order = [];
   let budget = Number.isFinite(maxNodes) ? Math.max(0, Math.floor(maxNodes)) : Number.POSITIVE_INFINITY;
   let truncated = 0;
 
   const pushNode = (entry, parentSessionId, depth) => {
     const known = entry ?? { agentId: undefined, projection: emptyClaudeProjection('claude-tree-unknown') };
+    const backgroundTools = reconcileBackground(known.projection);
     const status = childStatus(known);
     nodes.push({ sessionId: claudeNodeId(known.agentId), parentSessionId,
       name: known.name ?? null, mode: known.background ? 'background-subagent' : 'foreground-subagent',
@@ -375,7 +393,7 @@ export async function observeClaudeTree(binding, rootProjection, {
       changes: known.projection.changes ?? [], coverage: nodeCoverage(known),
       messages: known.projection.messages ?? [], lastSeq: known.projection.throughSeq ?? 0,
       evidence: status.evidence, ...(status.endSeq !== undefined ? { endSeq: status.endSeq } : {}),
-      pendingAgentTools: pendingAgentTools(known.projection), background: known.background === true });
+      pendingAgentTools: pendingAgentTools(known.projection), background: known.background === true, backgroundTools });
   };
 
   // A node is placed only by an explicit native pair: its own meta.toolUseId is
@@ -548,13 +566,18 @@ export function claudeTreeFiles(treeState) {
  * as its `<session>/tasks/<agentId>.output` file). This function stops nothing.
  */
 export function claudeTreeStopTargets(tree) {
-  return (tree?.nodes ?? []).filter(node => node.status !== 'ended')
+  const nodes = tree?.nodes ?? [];
+  const tools = nodes.flatMap(node => (node.backgroundTools ?? []).filter(task => task.status === 'running')
+    .map(task => ({ taskId: task.taskId, kind: 'background-tool', toolName: task.toolName,
+      description: task.description, sessionId: node.sessionId, name: task.description ?? node.name,
+      depth: node.depth ?? 0, status: 'running', evidence: task.evidence })));
+  return [...nodes.filter(node => node.status !== 'ended')
     .map(node => ({ sessionId: node.sessionId, name: node.name ?? null, depth: node.depth ?? 0,
       status: node.status, evidence: node.evidence ?? null,
       // The root is stopped by the session interrupt; a child by its task id.
       ...(node.parentSessionId
         ? (typeof node.nativeAgentId === 'string' ? { taskId: node.nativeAgentId } : {})
-        : { root: true }) }));
+        : { root: true }) })), ...tools];
 }
 
 /**

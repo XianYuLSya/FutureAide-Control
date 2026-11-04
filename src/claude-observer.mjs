@@ -16,7 +16,7 @@ const FILE_TOOLS = new Map([['Write', 'create'], ['Edit', 'edit'], ['MultiEdit',
 
 export function emptyClaudeProjection(taskId, { throughSeq = 0, currentModel } = {}) {
   return { taskId, throughSeq, currentModel, messages: [], messagesOmitted: 0, pendingTools: {},
-    completedTools: [], successfulTools: [], agentTools: {}, changes: [], reports: [], questions: [], deliveries: {}, children: {},
+    completedTools: [], successfulTools: [], agentTools: {}, backgroundTools: {}, backgroundTaskNotifications: {}, changes: [], reports: [], questions: [], deliveries: {}, children: {},
     completions: [], badLines: 0, activity: 'idle' };
 }
 
@@ -45,6 +45,17 @@ function completeTool(projection, result, event, { workspace, agentId, reportToo
   projection.successfulTools = projection.successfulTools.slice(-512);
   const kind = reportTools[use.name];
   const receipt = result.receipt;
+  if (['PowerShell', 'Bash'].includes(use.name)) {
+    const taskId = /^Command running in background with ID: ([A-Za-z0-9_-]+)\./.exec(result.summary ?? '')?.[1];
+    if (taskId) (projection.backgroundTools ??= {})[taskId] = {
+      taskId, toolUseId: use.id, toolName: use.name, description: use.input?.description,
+      status: 'running', startedSeq: event.seq,
+      evidence: 'native-background-tool-receipt' };
+  }
+  if (use.name === 'TaskStop' && typeof use.input?.task_id === 'string') {
+    const task = projection.backgroundTools?.[use.input.task_id];
+    if (task) Object.assign(task, { status: 'stopped', endedSeq: event.seq, evidence: 'native-task-stop-result' });
+  }
   if (kind && receipt?.accepted === true && receipt.taskId === projection.taskId
       && (!receipt.agentId || receipt.agentId === agentId)
       && typeof use.input?.message === 'string' && use.input.message.trim()) {
@@ -84,6 +95,9 @@ function completeTool(projection, result, event, { workspace, agentId, reportToo
 export function projectClaudePage(projection, page, { workspace, agentId, requestIds = [],
   reportTools = CLAUDE_REPORT_TOOLS } = {}) {
   const known = new Set(requestIds);
+  for (const notification of page.taskNotifications ?? []) {
+    (projection.backgroundTaskNotifications ??= {})[notification.taskId] = notification;
+  }
   for (const delivery of page.deliveries ?? []) if (known.has(delivery.requestId)) {
     const previous = projection.deliveries[delivery.requestId];
     if (!previous || previous.stage !== 'inserted') projection.deliveries[delivery.requestId] = delivery;
@@ -124,6 +138,20 @@ export function projectClaudePage(projection, page, { workspace, agentId, reques
 
 /** Bounded pages, persisted byte cursor, no full-file reread on the hot path. */
 export async function observeClaudeTranscript(binding, projection, options = {}) {
+  // Existing saved projections already consumed these receipts before this
+  // field existed. Backfill only the new native-task evidence once, retaining
+  // the original task/report cursor and continuing bounded pages if necessary.
+  if (!projection.backgroundTools) {
+    const backfill = projection.backgroundTaskBackfill ?? emptyClaudeProjection(projection.taskId);
+    const recovered = await observeClaudeTranscript(binding, backfill, options);
+    if (recovered.hasMore) {
+      projection.backgroundTaskBackfill = backfill;
+      return { projection, hasMore: true };
+    }
+    projection.backgroundTools = backfill.backgroundTools;
+    projection.backgroundTaskNotifications = backfill.backgroundTaskNotifications;
+    delete projection.backgroundTaskBackfill;
+  }
   const read = options.readEvents ?? readClaudeEvents;
   let page, pages = 0;
   do {

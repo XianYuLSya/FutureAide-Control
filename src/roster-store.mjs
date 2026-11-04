@@ -311,7 +311,7 @@ export class RosterStore {
     if (!result.changes) throw new Error('This subagent instance has already been removed.');
   }
   requestCancel(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.task.cancelRequested',json('true'),'$.state','running'),'$.nextAttemptAt')
+    return this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.task.cancelRequested',json('true'),'$.task.cancelPending',json('true'),'$.task.cancelTreeSettled',json('false'),'$.state','running'),'$.nextAttemptAt')
       WHERE id=? AND owner=? AND name=? AND json_extract(body,'$.sessionId')=? AND json_extract(body,'$.task.taskId')=?
       AND coalesce(json_extract(body,'$.closed'),0)=0 AND coalesce(json_extract(body,'$.state'),'') NOT IN ('cleaning','cleanup_failed')`)
       .run(record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;

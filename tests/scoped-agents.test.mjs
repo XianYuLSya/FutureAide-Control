@@ -17,7 +17,7 @@ const extra = threadId => ({ _meta: { threadId } });
 // Retire the shared listener's leases whatever holder claimed them.
 const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
-async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels } = {}) {
+async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -143,6 +143,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
       store.claimLease('idle-monitor:ready', 'fixture-monitor', 60000);
       return true;
     }),
+    ...(captureFiles ? { captureFiles } : {}),
     ...(monitorFailureGraceMs !== undefined ? { monitorFailureGraceMs } : {}), removeTree: async directory => { removed.push(directory); },
   });
   const record = (name = 'artist', thread = A) => store.named(ownerIdFor(thread), name);
@@ -303,6 +304,23 @@ test('a proven pre-write read failure resumes the original dispatch; historical 
   await f.service.poll(saved.agentId);
   assert.equal(attempts, 2);
   f.store.close();
+});
+
+test('a dispatch never waits for the workspace snapshot, even when the capture never returns', async () => {
+  const f = await fixture({ captureFiles: () => new Promise(() => {}) });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    let timer;
+    const watchdog = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('the dispatch waited for the snapshot')), 5000);
+      timer.unref();
+    });
+    const sent = await Promise.race([f.service.send({ name: 'artist', message: 'work' }, extra(A)), watchdog])
+      .finally(() => clearTimeout(timer));
+    assert.equal(sent.accepted, true, 'the task was dispatched while the snapshot was still running');
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.record().task.message, 'work');
+  } finally { f.service.close(); }
 });
 
 test('settled awaiting-report monitor sleeps and a supplement wakes the same task', async () => {

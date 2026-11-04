@@ -50,8 +50,10 @@ function textMessage(message) {
 function stableHost(identity) {
   return { application: identity.application ?? null, dataRoot: path.resolve(identity.dataRoot ?? '') };
 }
+// The compact view keeps the one label that stops a snapshot guess reading as a confirmed write.
 const fileSummary = change => ({ path: change.path, operation: change.operation,
-  ...(change.agentPath ? { agentPath: change.agentPath } : {}) });
+  ...(change.agentPath ? { agentPath: change.agentPath } : {}),
+  ...(change.attribution === 'unconfirmed' ? { attribution: change.attribution } : {}) });
 const compactText = (value, length) => typeof value === 'string' && value.length > length ? value.slice(0, length) + '…' : value;
 
 // Native IDs stay internal. Even a malformed snapshot cannot expose an unrelated
@@ -167,7 +169,7 @@ function publicResult(record, { fullResult = false } = {}) {
       ...(task.finishedAt ? { finishedAt: task.finishedAt } : {}),
       ...(task.result ? { result: { state: task.result.state,
         ...(fullResult ? { reply: task.result.reply } : { summary: compactText(task.result.reply, 800) }),
-        files: (task.result.changes ?? []).map(fileSummary), coverage: task.result.coverage } } : {}) } : null,
+        files: (task.result.changes ?? []).slice(0, 12).map(fileSummary), coverage: task.result.coverage } } : {}) } : null,
     activity: view.activity ?? (record.state === 'idle' ? 'Waiting for a task' : record.state),
     changes: { count: changes.length, files: changes.slice(0, 12).map(fileSummary),
       coverage: treeCoverage(record, view),
@@ -285,15 +287,18 @@ export function createScopedAgents(config, {
   const clients = new Map();
   const operationBackends = new WeakMap();
   const inflight = new Map(), monitorInflight = new Map();
+  // A snapshot write started by a dispatch is not awaited by it, so its promise is kept
+  // per task: reading the baseline and shutting down both wait for it here.
+  const baselineWrites = new Map();
   const nextPollAt = new Map();
   let draining = false;
   let monitorUnavailableSince, monitorError;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
   const workspaceBaselineFile = record => path.join(agentDirectory(record), 'workspace-baseline.json');
-  // The snapshot is started before the dispatch is written and awaited after it, so
-  // git runs while the target is being handed the task instead of in front of it.
-  // It is kept beside the agent's own state: the record body is saved on every poll
-  // and is far too large to carry a file list.
+  // The snapshot is started before the dispatch is written and saved after it without
+  // being awaited, so git runs next to the dispatch instead of in front of it. It is
+  // kept beside the agent's own state: the record body is saved on every poll and is
+  // far too large to carry a file list.
   function startWorkspaceBaseline(record) {
     const taskId = record.task?.taskId;
     if (!taskId) return undefined;
@@ -314,6 +319,19 @@ export function createScopedAgents(config, {
     } catch { /* best effort: a missing snapshot only costs coverage, never the task */ }
   }
 
+  /**
+   * Hand the snapshot write to the roster instead of the dispatching caller: git keeps
+   * running while the target already has its task, and every reader waits on the map.
+   * saveWorkspaceBaseline swallows its own errors, so these promises never reject.
+   */
+  function trackWorkspaceBaseline(record, baseline) {
+    if (!baseline) return;
+    const taskId = baseline.taskId;
+    const write = saveWorkspaceBaseline(record, baseline)
+      .finally(() => { if (baselineWrites.get(taskId) === write) baselineWrites.delete(taskId); });
+    baselineWrites.set(taskId, write);
+  }
+
   async function readWorkspaceBaseline(record) {
     try {
       const saved = JSON.parse(await readFile(workspaceBaselineFile(record), 'utf8'));
@@ -327,6 +345,9 @@ export function createScopedAgents(config, {
    * thrown, because the report itself must still be delivered.
    */
   async function workspaceDiff(record) {
+    // The write outlives the dispatch that started it, so the file may still be missing.
+    const pending = baselineWrites.get(record.task?.taskId);
+    if (pending) await pending;
     const baseline = await readWorkspaceBaseline(record);
     if (!baseline) return { changes: [], coverage: workspaceCoverage('no-baseline') };
     if (baseline.capture?.available !== true) {
@@ -1131,7 +1152,7 @@ export function createScopedAgents(config, {
     try {
       const observed = await negotiateTree(record, true);
       await sendDispatch(record, record.task.message, 'task', [], undefined, observed);
-    } finally { await saveWorkspaceBaseline(record, baseline); }
+    } finally { trackWorkspaceBaseline(record, baseline); }
   }
 
   async function resolveAnswer(record, answer) {
@@ -1631,7 +1652,8 @@ export function createScopedAgents(config, {
         return { name: record.name, accepted: false, queued: true, state: record.state,
           ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
       };
-      try { return await withName(extra, name, async record => {
+      // Named so the busy retry below runs exactly this body against a fresh record.
+      const operation = async record => {
         enteredOperation = true;
         const closing = ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'];
         if (record.closed || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
@@ -1677,10 +1699,15 @@ export function createScopedAgents(config, {
           ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
           ...(error ? { error } : {}),
           ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
-      }, { waitMs: 0 }); } catch (error) {
+      };
+      try { return await withName(extra, name, operation, { waitMs: 0 }); } catch (error) {
         if (enteredOperation || error.code !== 'agent-busy') throw error;
         const owner = await context(extra);
         const record = named(owner, name);
+        // A poll holds this lock for one round only, so waiting for it is cheap. Queuing
+        // here would hand a supplement to a task that has already ended, and report that
+        // as "the task changed, stopped" for a dispatch the next round would accept.
+        if (record.state === 'delivery_pending') return withName(extra, name, operation);
         return enqueue(record);
       }
     },
@@ -1936,6 +1963,9 @@ export function createScopedAgents(config, {
     async drainPolls() {
       draining = true;
       await Promise.allSettled([...monitorInflight.values(), ...inflight.values()]);
+      // A baseline write survives the poll that started it; a shutdown that only waited
+      // for polls could close the database with half a snapshot still being written.
+      while (baselineWrites.size) await Promise.allSettled([...baselineWrites.values()]);
     },
     async ensureIdleMonitor() {
       const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();

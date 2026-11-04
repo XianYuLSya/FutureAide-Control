@@ -23,10 +23,14 @@ export function canSleep(record, queued, treeSettled) {
  * local transcript read, so a name may keep doing that every round for a few tries.
  */
 export function awaitingReceipt(record) {
-  const notices = [...(record.task?.reports ?? []).map(report => report.delivery),
-    ...Object.values(record.task?.questionNotices ?? {})];
-  return notices.some(notice => notice && ['unknown', 'sending'].includes(notice.state)
-    && (notice.attempts ?? 0) < 5);
+  const unread = notice => notice && ['unknown', 'sending'].includes(notice.state)
+    && (notice.attempts ?? 0) < 5;
+  if ((record.task?.reports ?? []).some(report => unread(report.delivery))) return true;
+  // Only a question that is still pending gets a notice written for it, so an answered
+  // question's notice can never settle: counting it would keep this name awake for the
+  // rest of the task on one stale receipt.
+  return (record.observation?.questions ?? []).some(question => question.state === 'pending'
+    && unread(record.task?.questionNotices?.[question.id]));
 }
 
 export function hasPendingDelivery(record) {

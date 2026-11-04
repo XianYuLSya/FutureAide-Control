@@ -7,12 +7,18 @@ import path from 'node:path';
 
 const STATUS_TIMEOUT_MS = 5000;
 const MAX_PATHS = 5000;
-const MAX_CHANGES = 500;
+const MAX_CHANGES = 200;
 const MAX_STATUS_BYTES = 16 << 20;
+// One stat per dirty path is a filesystem round trip, so a snapshot of a large tree
+// costs more in latency than in bytes; running a bounded batch at a time keeps that
+// cost off the dispatch path without opening thousands of handles at once.
+const STAT_BATCH = 32;
 
 // --no-optional-locks keeps this read-only status from taking the index lock that a
-// git command the user runs at the same time needs.
-const statusArgs = workspace => ['--no-optional-locks', '-C', workspace, 'status', '--porcelain=v1', '-z', '--untracked-files=all'];
+// git command the user runs at the same time needs. The pathspec keeps a project that
+// is one folder of a larger repository from reporting the rest of that repository.
+const statusArgs = workspace => ['--no-optional-locks', '-C', workspace, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.'];
+const topLevelArgs = workspace => ['-C', workspace, 'rev-parse', '--show-toplevel'];
 
 const execGitStatus = (file, args, options) => new Promise((resolve, reject) => {
   execFile(file, args, options, (error, stdout) => error ? reject(error) : resolve(stdout));
@@ -69,27 +75,33 @@ const stampOf = async (file, stat) => {
 export async function captureWorkspace(workspace, { exec = execGitStatus, stat = statPath } = {}) {
   if (typeof workspace !== 'string' || !workspace) return { available: false, reason: 'no-workspace' };
   const root = path.resolve(workspace);
+  const options = { timeout: STATUS_TIMEOUT_MS, windowsHide: true, maxBuffer: MAX_STATUS_BYTES, encoding: 'utf8' };
   let stdout;
-  try {
-    stdout = await exec('git', statusArgs(root),
-      { timeout: STATUS_TIMEOUT_MS, windowsHide: true, maxBuffer: MAX_STATUS_BYTES, encoding: 'utf8' });
-  } catch (error) { return { available: false, reason: failureReason(error) }; }
+  try { stdout = await exec('git', statusArgs(root), options); }
+  catch (error) { return { available: false, reason: failureReason(error) }; }
   if (typeof stdout !== 'string') return { available: false, reason: 'git-failed' };
   const entries = parseStatus(stdout);
   // A tree that large is a checkout in motion or generated output: statting every
   // path would cost more than the answer is worth.
   if (entries.length > MAX_PATHS) return { available: false, reason: 'too-many-paths' };
+  // Porcelain paths stay relative to the repository root whatever directory git ran in.
+  let top;
+  try { top = String(await exec('git', topLevelArgs(root), options)).trim(); }
+  catch (error) { return { available: false, reason: failureReason(error) }; }
+  if (!top) return { available: false, reason: 'git-failed' };
   const files = {};
-  for (const entry of entries) {
-    files[entry.path] = { code: entry.code, stamp: await stampOf(path.resolve(root, entry.path), stat) };
+  for (let index = 0; index < entries.length; index += STAT_BATCH) {
+    const batch = entries.slice(index, index + STAT_BATCH);
+    const stamps = await Promise.all(batch.map(entry => stampOf(path.resolve(top, entry.path), stat)));
+    batch.forEach((entry, offset) => { files[entry.path] = { code: entry.code, stamp: stamps[offset] }; });
   }
-  return { available: true, workspace: root, files };
+  return { available: true, workspace: top, files };
 }
 
 /**
  * Compare two snapshots of the same workspace. A path that became clean again was
  * still touched during the task, so it is reported rather than dropped.
- * @returns {Array<{path: string, operation: string}>} Sorted, at most 500 entries;
+ * @returns {Array<{path: string, operation: string}>} Sorted, at most 200 entries;
  *   `truncated` marks a clipped result.
  */
 export function diffWorkspace(before, after) {

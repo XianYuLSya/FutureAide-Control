@@ -431,16 +431,17 @@ test('a task keeps its workspace baseline beside the agent state and ends with u
     assert.equal(captureFiles.calls, 0, 'list reads stored state only and never runs a snapshot');
     await f.service.poll('writer');
     assert.equal(captureFiles.calls, 1, 'the baseline is taken once, with the first dispatch');
-    const record = f.store.get('writer');
-    const saved = JSON.parse(await readFile(path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId,
-      'workspace-baseline.json'), 'utf8'));
-    assert.equal(saved.taskId, record.task.taskId, 'the baseline names the task it belongs to');
-    assert.deepEqual(saved.capture.files, { 'confirmed.txt': { code: ' M', stamp: '1000:5' } });
-    assert.equal(JSON.stringify(record).includes('1000:5'), false, 'the snapshot is never copied into the record body');
 
     finalSubmitted = true;
     await f.service.poll('writer');
+    // The snapshot write is not awaited by the dispatch, so it is read back only after a
+    // reader that waits for it has run: the closing comparison in the poll above.
     const finished = f.store.get('writer');
+    const saved = JSON.parse(await readFile(path.join(f.stateDirectory, 'scoped', finished.ownerId, finished.agentId,
+      'workspace-baseline.json'), 'utf8'));
+    assert.equal(saved.taskId, finished.task.taskId, 'the baseline names the task it belongs to');
+    assert.deepEqual(saved.capture.files, { 'confirmed.txt': { code: ' M', stamp: '1000:5' } });
+    assert.equal(JSON.stringify(finished).includes('1000:5'), false, 'the snapshot is never copied into the record body');
     assert.equal(finished.state, 'idle');
     assert.equal(finished.task.workspace.coverage.source, 'git-status-diff');
     assert.equal(finished.task.workspace.coverage.complete, false);
@@ -454,6 +455,10 @@ test('a task keeps its workspace baseline beside the agent state and ends with u
     assert.equal(changes.coverage.workspace.source, 'git-status-diff');
     assert.equal(changes.coverage.workspace.reason, undefined);
     assert.equal(captureFiles.calls, 2, 'one baseline and one closing snapshot per task');
+    const listed = (await f.service.list(extra(THREAD))).items.find(item => item.name === 'writer');
+    assert.equal(listed.changes.files.find(change => change.path === shellWritten).attribution, 'unconfirmed',
+      'the compact list must not present a guess as a confirmed write');
+    assert.equal(listed.changes.files.find(change => change.path === confirmed).attribution, undefined);
     // The finished task keeps its snapshot changes in the same history entry a caller
     // already reads with task=1.
     await f.service.send({ name: 'writer', message: 'next task' }, extra(THREAD));
@@ -1074,6 +1079,39 @@ test('a caller that already read the final report orders the next task without w
     assert.equal(current.history[0].taskId, 'task-settle');
     assert.equal(current.history[0].reports[0].delivery.state, 'delivered');
     assert.equal(sent.queued, true);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a busy delivery_pending name waits for the poll lock instead of queueing onto a finished task', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    pendingReport(f, claude, 'busy', { state: 'unknown' });
+    await receiptIn(claude, 'notice-busy');
+    // A poll round holds this lock while it delivers and settles, so the dispatch below
+    // must wait for it: queueing would attach a supplement to a task that has ended.
+    let release;
+    const held = f.store.locked('busy', () => new Promise(resolve => { release = resolve; }));
+    const waits = [], lock = f.store.locked.bind(f.store);
+    f.store.locked = (key, action, options) => { waits.push(options?.waitMs ?? 'default'); return lock(key, action, options); };
+    try {
+      const sending = f.service.send({ name: 'busy', message: 'next order' }, claudeCaller(claude.sessionId))
+        .then(value => ({ value }), error => ({ error }));
+      // A second lock attempt exists only after the first one was refused by the held
+      // lease, so this waits for the retry instead of guessing a delay.
+      for (let tick = 0; tick < 1000 && waits.length < 2; tick++) await new Promise(resolve => setImmediate(resolve));
+      release(); await held;
+      const { value, error } = await sending;
+      assert.equal(error, undefined, 'a lock held for one poll round is never reported as a stopped task');
+      assert.equal(value.queued, true);
+      const current = f.store.get('busy');
+      assert.equal(current.task.message, 'next order');
+      assert.equal(current.state, 'running');
+      assert.equal(current.history.at(-1).taskId, 'task-busy', 'the settled task moved to history');
+      assert.equal(current.history.at(-1).reports[0].delivery.state, 'delivered');
+      assert.equal(claude.received.length, 0, 'the receipt is read back, never written again');
+    } finally { f.store.locked = lock; }
   } finally { await claude.close(); f.service.close(); }
 });
 

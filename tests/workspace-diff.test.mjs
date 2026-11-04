@@ -91,6 +91,17 @@ test('Chinese paths survive the snapshot and the diff unchanged', async () => {
   assert.deepEqual(changes.map(change => change.operation), ['create', 'update']);
 });
 
+test('a project inside a larger repository sees only its own folder, at its real paths', async () => {
+  const root = await repository({ 'app/tracked.txt': 'one', 'other/outside.txt': 'one' });
+  const app = path.join(root, 'app');
+  const before = await captureWorkspace(app);
+  await writeFile(path.join(app, 'tracked.txt'), 'two plus more');
+  await writeFile(path.join(app, 'added.txt'), 'new');
+  await writeFile(path.join(root, 'other', 'outside.txt'), 'changed elsewhere');
+  const after = await captureWorkspace(app);
+  assert.deepEqual(operations(diffWorkspace(before, after), root), [['app/added.txt', 'create'], ['app/tracked.txt', 'update']]);
+});
+
 test('a directory that is not a git repository is unavailable, never an error', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'wsdiff-nongit-'));
   assert.deepEqual(await captureWorkspace(root), { available: false, reason: 'not-a-repository' });
@@ -105,7 +116,7 @@ test('a timed-out status call is reported with the flags that keep it read-only'
   } });
   assert.deepEqual(capture, { available: false, reason: 'timeout' });
   assert.equal(seen.file, 'git');
-  assert.deepEqual(seen.args, ['--no-optional-locks', '-C', path.resolve(root), 'status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  assert.deepEqual(seen.args, ['--no-optional-locks', '-C', path.resolve(root), 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--', '.']);
   assert.equal(seen.options.timeout, 5000);
   assert.equal(seen.options.windowsHide, true);
 });
@@ -130,14 +141,14 @@ test('a status with too many paths is refused before any file is statted', async
   assert.equal(stats, 0);
 });
 
-test('a diff is clipped at 500 entries and says so', async () => {
+test('a diff is clipped at 200 entries and says so', async () => {
   const files = Object.fromEntries(Array.from({ length: 600 }, (_, index) => [
     `f${String(index).padStart(4, '0')}.txt`, { code: '??', stamp: '1:1' }]));
   const root = path.join(workspace, '.runtime', 'tests', 'wsdiff-clip');
   const changes = diffWorkspace({ available: true, workspace: root, files: {} }, { available: true, workspace: root, files });
-  assert.equal(changes.length, 500);
+  assert.equal(changes.length, 200);
   assert.equal(changes.truncated, true);
-  assert.equal(path.basename(changes.at(-1).path), 'f0499.txt');
+  assert.equal(path.basename(changes.at(-1).path), 'f0199.txt');
   const small = diffWorkspace({ available: true, workspace: root, files: {} },
     { available: true, workspace: root, files: { 'only.txt': { code: '??', stamp: '1:1' } } });
   assert.equal(small.truncated, undefined, 'a complete diff carries no truncation mark');

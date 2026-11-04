@@ -43,6 +43,15 @@ test('an unread receipt keeps a name awake only while its retries are still freq
   value.task.questionNotices.q.attempts = 5;
   assert.equal(canSleep(value, [], settled), true);
 });
+test('an answered question’s stale notice never keeps the name awake', () => {
+  const value = record(), settled = (_r, view) => view.tree.settled && !view.tree.running;
+  // Answering stops the notice from being delivered at all, so its record stays unknown
+  // for the rest of the task: counting it would deny this name every later sleep.
+  value.observation.questions.push({ id: 'q', state: 'answered' });
+  value.task.questionNotices = { q: { state: 'unknown', attempts: 1 } };
+  assert.equal(awaitingReceipt(value), false);
+  assert.equal(canSleep(value, [], settled), true);
+});
 test('shared monitor retries pending or unknown deliveries with at most two concurrent polls', async () => {
   const records = Array.from({ length: 5 }, (_, index) => ({ ...record(), agentId: `agent-${index}`,
     sleep: { taskId: 'task-a' }, task: { ...record().task, reports: [{ delivery: { state: index % 2 ? 'unknown' : 'pending' } }] } }));

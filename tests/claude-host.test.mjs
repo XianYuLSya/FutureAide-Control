@@ -1534,3 +1534,76 @@ test('a workspace trust question is a visible retryable stop, not an unknown', a
       });
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+// ------------------------- the window lock covers only the window work
+
+test('the lock covers the launch, the pre-submit hook and the send, not the wait', async () => {
+  const host1 = await host({ sessions: [] });
+  const order = [];
+  let lockDepth = 0;
+  let lockDepthAtSubmit = null;
+  let lockDepthAtBound = null;
+  const marker = markerLine('request-lock', 'fa-lock-20261104');
+  const driver = uiDriver({
+    openNewSession: async () => { order.push('open'); return { navigated: true, prefilled: true, strategy: 'deep-link-code-new-protocol' }; },
+    submit: async () => {
+      order.push('submit');
+      lockDepthAtSubmit = lockDepth;
+      await host1.write(record(), [enqueueLine(`work\n\n${marker}`)]);
+      return { method: 'enter-on-prefilled-composer' };
+    },
+  });
+  try {
+    const result = await createFirstTurn({ workspace: CWD, requestId: 'request-lock', message: 'work', bindingNonce: 'fa-lock-20261104' }, {
+      env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 3000, pollMs: 20,
+      withUiLock: async action => {
+        lockDepth += 1;
+        try { return await action(); } finally { lockDepth -= 1; }
+      },
+      onBeforeSubmit: async () => { order.push('before'); },
+      onBound: async () => { lockDepthAtBound = lockDepth; },
+    });
+    assert.equal(result.created, true);
+    assert.deepEqual(order, ['open', 'before', 'submit'], 'the hook runs between launch and send');
+    assert.equal(lockDepthAtSubmit, 1, 'the send happens inside the lock');
+    assert.equal(lockDepthAtBound, 0, 'waiting for the marker happens outside the lock');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a failing pre-submit hook stops the send inside the lock', async () => {
+  const host1 = await host({ sessions: [] });
+  let submitted = false;
+  const driver = uiDriver({
+    openNewSession: async () => ({ navigated: true, prefilled: true }),
+    submit: async () => { submitted = true; return { method: 'enter-on-prefilled-composer' }; },
+  });
+  try {
+    await assert.rejects(
+      createFirstTurn({ workspace: CWD, requestId: 'request-hook', message: 'work', bindingNonce: 'fa-hook-20261104' }, {
+        env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 500, pollMs: 20,
+        onBeforeSubmit: async () => { throw Object.assign(new Error('cannot record the attempt'), { code: 'attempt-not-recorded' }); },
+      }),
+      error => error.code === 'attempt-not-recorded');
+    assert.equal(submitted, false, 'nothing is sent when the attempt cannot be recorded');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a launch that never navigates reports an attempt that never happened', async () => {
+  const host1 = await host({ sessions: [] });
+  let submitted = false;
+  const driver = uiDriver({
+    openNewSession: async () => ({ navigated: false, blocked: 'workspace-trust-prompt' }),
+    submit: async () => { submitted = true; return { method: 'enter-on-prefilled-composer' }; },
+  });
+  try {
+    const result = await createFirstTurn({ workspace: CWD, requestId: 'request-nonav', message: 'work', bindingNonce: 'fa-nonav-20261104' },
+      { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 500, pollMs: 20 });
+    assert.equal(result.created, false);
+    assert.equal(result.attempted, false);
+    assert.equal(result.retryable, true);
+    assert.equal(result.visible, true);
+    assert.equal(result.reason, 'workspace-trust-prompt');
+    assert.equal(submitted, false);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

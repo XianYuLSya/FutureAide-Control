@@ -737,6 +737,14 @@ export async function createFirstTurn({
   folderLabel = undefined,
   trustWorkspace = false,
   onBound = undefined,
+  // The caller owns the window lock, because the window is shared with every other
+  // session name. Only the part that touches the window runs inside it; waiting for
+  // the native session and its marker happens outside, so a slow confirmation does
+  // not block other names.
+  withUiLock = undefined,
+  // Runs inside the lock, immediately before the single send, which is the moment a
+  // delivery becomes real. A caller records its attempt here.
+  onBeforeSubmit = undefined,
 } = {}) {
   const directory = await assertWorkspace(workspace);
   const request = assertRequestId(requestId);
@@ -761,19 +769,35 @@ export async function createFirstTurn({
   // first message is not truncated: the page is opened without a prompt and the
   // whole text is filled into the host's own composer before one send.
   const prefillViaLink = payload.length <= DEEP_LINK_PROMPT_LIMIT;
-  const launch = await ui.openNewSession({ workspace: directory, prompt: payload, allowDeepLink, allowExecutable,
-    trustWorkspace, prefill: prefillViaLink, ...(folderLabel ? { folderLabel } : {}) });
-  // No keystroke is sent into a page that did not become the new session: input
-  // in an unidentified page could reach somebody else's conversation.
-  if (launch?.navigated === false) {
+  const runLocked = typeof withUiLock === 'function' ? withUiLock : (action => action());
+  const attempt = await runLocked(async () => {
+    const opened = await ui.openNewSession({ workspace: directory, prompt: payload, allowDeepLink, allowExecutable,
+      trustWorkspace, prefill: prefillViaLink, ...(folderLabel ? { folderLabel } : {}) });
+    // No keystroke is sent into a page that did not become the new session: input
+    // in an unidentified page could reach somebody else's conversation.
+    if (opened?.navigated === false) {
+      return { attempted: false, launch: opened,
+        blocked: opened?.blocked === 'workspace-trust-prompt' ? 'workspace-trust-prompt' : 'launch-not-navigated' };
+    }
+    if (typeof onBeforeSubmit === 'function') {
+      await onBeforeSubmit({ workspace: directory, requestId: request, bindingNonce: nonce, launch: opened });
+    }
+    const sent = await ui.submit({ prompt: payload, prefilled: opened?.prefilled === true, trustWorkspace });
+    return { attempted: true, launch: opened, submitted: sent };
+  });
+  const launch = attempt.launch;
+  const submitted = attempt.submitted;
+  if (attempt.attempted === false) {
+    // Nothing was typed and nothing was sent, so this is a visible stop the caller
+    // can repeat, not an unknown outcome.
     return {
-      created: false, status: 'unconfirmed',
-      reason: launch?.blocked === 'workspace-trust-prompt' ? 'workspace-trust-prompt' : 'launch-not-navigated',
+      created: false, status: 'unconfirmed', attempted: false, retryable: true, visible: true,
+      reason: attempt.blocked,
       requestId: request, bindingNonce: nonce, workspace: directory, evidence: { launch }, startedAt,
+      detail: 'The draft never became a new session, so nothing was typed or sent.',
       elapsedMs: Date.now() - Date.parse(startedAt),
     };
   }
-  const submitted = await ui.submit({ prompt: payload, prefilled: launch?.prefilled === true, trustWorkspace });
 
   const deadline = Date.now() + timeoutMs;
   let observed;

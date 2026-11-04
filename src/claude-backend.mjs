@@ -390,7 +390,7 @@ export async function createClaudeBackend(record, deps = {}) {
       }
       const canStopTasks = typeof host.stopBackgroundTasks === 'function';
       const rounds = [];
-      let observed, unavailable = false, refusedRound = false;
+      let observed, unavailable = false, refusedRound = false, stoppedOnce = false;
       for (let round = 1; round <= CANCEL_ROUNDS; round += 1) {
         try {
           const native = await nativeSession(state);
@@ -425,9 +425,12 @@ export async function createClaudeBackend(record, deps = {}) {
                 ...(row?.error ? { error: row.error } : {}) })) } : {}) });
             // A refusal means the host cannot press right now: report it once
             // instead of burning the remaining rounds on the same panel.
+            stoppedOnce = true;
             if (clickedRows.length === 0) refusedRound = true;
           }
-          observed = await refresh({ fresh: true });
+          // Refresh again only when something was actually pressed; otherwise the
+          // observation above is already current.
+          if (stoppedOnce) observed = await refresh({ fresh: true });
           if (refusedRound && observed?.tree?.settled !== true) break; // one honest report, no blind repeats
           observed = await refresh({ fresh: true });
         } catch (error) {

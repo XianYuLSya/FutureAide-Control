@@ -423,6 +423,7 @@ export function createNullDriver(reason = 'ui-driver-unavailable') {
     sessionMenu: refuse,
     deleteSession: refuse,
     readModel: refuse,
+    modelSnapshot: refuse,
     selectModel: refuse,
   };
 }
@@ -529,6 +530,9 @@ export function createPowerShellDriver({
       return run('session-delete', { title, deleteLabel, confirmLabels }, { timeoutMs: Math.max(timeoutMs, 60000) });
     },
     async readModel() { return run('model-read'); },
+    async modelSnapshot(input = {}) {
+      return run('model-snapshot', input, { timeoutMs: Math.max(timeoutMs, 60000) });
+    },
     async selectModel({ label, effortLabel = undefined }) { return run('model-select', { label, effortLabel }); },
   };
 }
@@ -1741,9 +1745,72 @@ export async function readCurrentModel({ nativeSessionId }, {
  * from, so a user draft is never overwritten. No message is ever sent, so this
  * costs no model turn.
  */
+/** Map a control's own text through the catalogue, once, for a whole snapshot. */
+export function describeControl(catalog, raw) {
+  const info = modelInfo(raw ?? undefined);
+  const models = catalog?.models ?? BUILT_IN_MODEL_CATALOG.models;
+  const known = info.label ? models.find(entry => entry.name === info.label) : undefined;
+  const effort = info.effort ? EFFORT_LABELS[info.effort] : undefined;
+  return {
+    raw: raw ?? null,
+    label: info.label ?? null,
+    effortLabel: info.effort ?? null,
+    provider: known ? 'anthropic' : null,
+    model: known?.id ?? null,
+    reasoningEffort: effort ?? null,
+    resolved: Boolean(known) && Boolean(effort),
+  };
+}
+
+/**
+ * Read what the session is set to and what a new draft starts at, in one bridge
+ * call.
+ *
+ * The value is read from the host every time: nothing is cached across tasks, so
+ * a default the user changed a minute ago is still followed. The single call
+ * exists only to avoid paying six process starts and their sleeps for one answer.
+ */
+export async function readModelSnapshot({ nativeSessionId = undefined, workspace = undefined, folderLabel = undefined, wantDefault = true } = {}, {
+  driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive,
+  catalog = undefined, asar = undefined,
+} = {}) {
+  const ui = requireDriver(driver, 'reading the model');
+  if (typeof ui.modelSnapshot !== 'function') throw fail('snapshot-unsupported', 'This driver cannot take a model snapshot.');
+  const record = nativeSessionId
+    ? await resolveNativeSession(nativeSessionId, { env, isAlive }).catch(() => undefined)
+    : undefined;
+  const target = workspace ?? record?.workspace;
+  const started = Date.now();
+  const snapshot = await ui.modelSnapshot({
+    title: record?.name,
+    workspace: target,
+    folderLabel: folderLabel ?? (target ? path.basename(target) : undefined),
+    wantDefault,
+  });
+  const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver: ui, env });
+  const documentName = snapshot?.documentName ?? null;
+  const titleMatches = record?.name ? Boolean(documentName && displayTitle(documentName) === record.name) : undefined;
+  return {
+    nativeSessionId: record?.nativeSessionId ?? null,
+    documentName,
+    titleMatchesRecord: titleMatches,
+    current: describeControl(modelCatalog, snapshot?.current?.raw),
+    default: wantDefault ? describeControl(modelCatalog, snapshot?.default?.raw) : null,
+    navigation: snapshot?.navigation ?? null,
+    notes: snapshot?.notes ?? [],
+    selectionSource: modelCatalog.selectionSource ?? 'global_default',
+    catalogSource: modelCatalog.catalogSource,
+    catalogVersion: modelCatalog.catalogVersion,
+    singleCall: true,
+    elapsedMs: Date.now() - started,
+    verifiedBy: wantDefault ? ['composer-control', 'draft-control'] : ['composer-control'],
+  };
+}
+
 export async function readDefaultModel({
   driver = createNullDriver(), env = process.env, isAlive = defaultIsAlive,
   catalog = undefined, asar = undefined, workspace = undefined, folderLabel = undefined, readOnly = false,
+  batch = true,
 } = {}) {
   const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver, env });
   const ui = requireDriver(driver, 'reading the default model');
@@ -1755,6 +1822,26 @@ export async function readDefaultModel({
     catalogVersion: modelCatalog.catalogVersion,
     selectionSource: modelCatalog.selectionSource ?? 'global_default',
   };
+  // One call answers both questions when the driver can do it; the step-by-step
+  // path below stays for drivers that cannot and for the cases it refuses.
+  if (batch !== false && !readOnly && typeof ui.modelSnapshot === 'function') {
+    const snapshot = await ui.modelSnapshot({ workspace, folderLabel, wantDefault: true }).catch(() => undefined);
+    const notes = snapshot?.notes ?? [];
+    if (snapshot?.default?.raw && !notes.includes('unsent-text-present')) {
+      const control = describeControl(modelCatalog, snapshot.default.raw);
+      if (control.resolved) {
+        return {
+          provider: control.provider, model: control.model, reasoningEffort: control.reasoningEffort,
+          label: control.label, effortLabel: control.effortLabel, resolved: true, verified: true, status: 'read',
+          selectionSource: summary.selectionSource, catalogSource: modelCatalog.catalogSource,
+          catalogVersion: modelCatalog.catalogVersion,
+          evidence: { control: { label: control.label, effort: control.effortLabel, raw: control.raw }, catalog: summary },
+          navigation: { ...snapshot.navigation, previousDocumentName: snapshot.previousDocumentName ?? null },
+          notes, singleCall: true,
+        };
+      }
+    }
+  }
   const startView = await readViewStable(ui);
   // The composer always holds a newline; only trimmed text counts as an unsent draft.
   const composerLength = Number(startView?.composerTrimmedLength ?? startView?.composerLength ?? 0);

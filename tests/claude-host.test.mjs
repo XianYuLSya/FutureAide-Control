@@ -13,6 +13,7 @@ import {
   probeClaudeHost, parseModelControl, modelInfo, resolveModelEvidence, confirmModelAfterTurn, sessionArtifacts,
   displayTitle, pageShowsSession, findCreatedSession, readCurrentModel, labelForModel, interruptEvidence, bindingOf,
   INTERRUPT_MARKER_TOOL, INTERRUPT_MARKERS, INTERRUPT_SCOPE, stopBackgroundTasks, STOP_ARCHIVE_NAME,
+  readModelSnapshot, describeControl,
   MODEL_MENU, EFFORT_LABELS, EFFORT_LABEL_FOR, offeredModelLabels, isOfferedModelLabel, isOfferedEffort,
   loadModelCatalog, BUILT_IN_MODEL_CATALOG, extractModelSelectorConfigs, sliceBalancedArray,
   extractEmbeddedCatalog, readQuotedLiteral, firstTurnBinding, readTranscriptHead, firstInputOf,
@@ -106,6 +107,7 @@ function uiDriver(behaviour = {}) {
     async readModel() { calls.push('readModel'); return behaviour.readModel?.() ?? { raw: '模型：Opus 5.5 最高 3.5× 或更多用量' }; },
     async selectModel(input) { calls.push(['selectModel', input]); return behaviour.selectModel?.(input) ?? { clicked: input.label, observed: input.label }; },
     async tasksPanel(input) { calls.push(['tasksPanel', input]); return behaviour.tasksPanel?.(input) ?? { opened: true, entry: 'tasks', rows: [] }; },
+    async modelSnapshot(input) { calls.push(['modelSnapshot', input]); if (!behaviour.modelSnapshot) throw Object.assign(new Error('refused'), { code: 'snapshot-unsupported' }); return behaviour.modelSnapshot(input); },
     async taskRows() { calls.push('taskRows'); return { rows: behaviour.rows ?? [] }; },
     async taskStop(input) { calls.push(['taskStop', input]); return behaviour.taskStop?.(input) ?? { clicked: true, busySeen: true, doneSeen: true }; },
   };
@@ -1215,5 +1217,71 @@ test('a stop that landed while the host went idle is an interrupt with evidence'
     assert.equal(result.interrupted, true);
     assert.equal(result.status, 'already-stopped');
     assert.deepEqual(result.verifiedBy, ['transcript-interrupt-marker', 'host-stop-control-absent']);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+
+// ------------------------------------- one bridge call instead of six
+
+test('a snapshot answers both questions in a single bridge call', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = uiDriver({
+    modelSnapshot: () => ({ documentName: 'Fixture session - Claude Code', previousDocumentName: 'Fixture session - Claude Code',
+      current: { raw: '模型：Opus 5.5 最高 3.5× 或更多用量' }, default: { raw: '模型：Opus 5.5 中等' },
+      navigation: { navigated: true, draft: 'fresh', restored: 'session' }, notes: ['draft:sidebar'] }),
+  });
+  try {
+    const snapshot = await readModelSnapshot({ nativeSessionId: SESSION }, { env: host1.env, driver,
+      catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(snapshot.singleCall, true);
+    assert.equal(snapshot.current.model, 'claude-opus-5-5');
+    assert.equal(snapshot.current.reasoningEffort, 'max');
+    assert.equal(snapshot.default.model, 'claude-opus-5-5');
+    assert.equal(snapshot.default.reasoningEffort, 'medium');
+    assert.equal(snapshot.default.resolved, true);
+    assert.equal(snapshot.navigation.restored, 'session');
+    assert.equal(snapshot.titleMatchesRecord, true);
+    const bridges = driver.calls.filter(call => Array.isArray(call));
+    assert.deepEqual(bridges.map(call => call[0]), ['modelSnapshot'], 'no view, no reveal, no separate model read');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('readDefaultModel takes the single call and every call reads again', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  let reads = 0;
+  const driver = uiDriver({
+    modelSnapshot: () => ({ documentName: 'Fixture session - Claude Code', current: { raw: '模型：Opus 5.5 最高' },
+      default: { raw: reads++ === 0 ? '模型：Opus 5.5 中等' : '模型：Sonnet 5.5 高' },
+      navigation: { navigated: true, draft: 'fresh', restored: 'session' }, notes: [] }),
+  });
+  try {
+    const first = await readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive,
+      catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(first.singleCall, true);
+    assert.equal(first.model, 'claude-opus-5-5');
+    assert.equal(first.reasoningEffort, 'medium');
+    // a default the user changed a moment ago is followed, because nothing is cached
+    const second = await readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive,
+      catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(second.model, 'claude-sonnet-5-5');
+    assert.equal(second.reasoningEffort, 'high');
+    assert.equal(driver.calls.filter(call => Array.isArray(call) && call[0] === 'modelSnapshot').length, 2);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a driver without the single call still reads the default the long way', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const driver = pageDriver(
+    { documentName: 'Fixture session - Claude Code', messages: 4, composerLength: 1, composerTrimmedLength: 0 },
+    { open: { documentName: 'New session - Claude Code', messages: 0, raw: '模型：Opus 5.5 中等' },
+      reveal: { documentName: 'Fixture session - Claude Code', messages: 4 } },
+  );
+  try {
+    const read = await readDefaultModel({ driver, env: host1.env, isAlive: host1.isAlive,
+      catalog: await loadModelCatalog({ asar: 'missing.asar' }) });
+    assert.equal(read.resolved, true);
+    assert.equal(read.model, 'claude-opus-5-5');
+    assert.equal(read.navigation.navigated, true);
+    assert.equal(read.singleCall, undefined, 'the step-by-step path does not claim a single call');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

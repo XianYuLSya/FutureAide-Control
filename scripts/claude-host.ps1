@@ -561,6 +561,89 @@ try {
       if ($models.Count -eq 0) { Write-Result @{ ok = $true; value = @{ raw = $null } }; break }
       Write-Result @{ ok = $true; value = @{ raw = $models[0].Current.Name } }
     }
+    'model-snapshot' {
+      # One process, one page visit: the control on screen, the control on a fresh
+      # draft for this workspace, and the way back. A caller that needs both pays
+      # one bridge start instead of six, which is where most of the wait came from.
+      $title = [string]$payload.title
+      $workspace = [string]$payload.workspace
+      $folderLabel = [string]$payload.folderLabel
+      $wantDefault = [bool]$payload.wantDefault
+      $notes = @()
+      $view0 = Get-PageSignature $window
+      $previousTitle = ($view0.documentName -replace '\s+-\s+Claude Code$', '')
+      $readModelName = {
+        $found = @(Find-Elements $web.Element $modelPattern 'Button')
+        if ($found.Count -eq 0) { return $null }
+        return $found[0].Current.Name
+      }
+      $currentRaw = & $readModelName
+      $defaultRaw = $null
+      $navigation = @{ navigated = $false; draft = 'none'; restored = 'not-needed' }
+      if ($wantDefault) {
+        $composerTrimmed = $(if ($null -ne $view0.composerValue) { $view0.composerValue.Trim().Length } else { 0 })
+        if ($view0.hasComposer -and $view0.messages -eq 0 -and $composerTrimmed -eq 0) {
+          $defaultRaw = $currentRaw
+          $navigation = @{ navigated = $false; draft = 'in-place'; restored = 'not-needed' }
+        } elseif ($composerTrimmed -gt 0) {
+          $notes += 'unsent-text-present'
+        } else {
+          $opened = $false
+          $anchors = @()
+          if ($folderLabel) {
+            $candidates = @(Find-Elements $web.Element $folderPattern 'Button')
+            foreach ($labelPattern in (Get-FolderLabelPatterns $folderLabel)) {
+              $matched = @($candidates | Where-Object { $_.Current.Name -match $labelPattern })
+              if ($matched.Count -ge 1) { $anchors = $matched; break }
+            }
+          }
+          if ($anchors.Count -eq 1) {
+            Focus-Window $window.Element
+            $click = Invoke-ElementByMouse $anchors[0]
+            if ($click.clicked) {
+              Start-Sleep -Milliseconds 1500
+              $probe = Get-PageSignature $window
+              $opened = ($probe.hasComposer -and $probe.messages -eq 0)
+              if ($opened) { $notes += 'draft:sidebar' }
+            } else { $notes += ('sidebar-click-unavailable:' + [string]$click.reason) }
+          }
+          if (-not $opened -and $workspace) {
+            try {
+              $query = 'claude://code/new?src=external&folder=' + [uri]::EscapeDataString($workspace)
+              $via = Open-DeepLink $query 'protocol' $window.Pid $window.Path
+              Start-Sleep -Milliseconds 1800
+              $probe = Get-PageSignature $window
+              $opened = ($probe.hasComposer -and $probe.messages -eq 0)
+              if ($opened) { $notes += ('draft:deep-link-' + [string]$via) }
+            } catch { $notes += 'deep-link-refused' }
+          }
+          if ($opened) {
+            $defaultRaw = & $readModelName
+            $navigation = @{ navigated = $true; draft = 'fresh'; restored = 'unconfirmed' }
+            $restoreTitle = $(if ($title) { $title } else { $previousTitle })
+            if ($restoreTitle) {
+              $titlePattern = '^' + (Unescape-Pattern $restoreTitle) + '($|\s)'
+              $entries = @(Find-Elements $web.Element $titlePattern 'Button' | Where-Object { $_.Current.Name -notmatch ('\s*' + [char]0x7684 + [char]0x66F4 + [char]0x591A + [char]0x9009 + [char]0x9879 + '$') })
+              if ($entries.Count -gt 0) {
+                $restoreClick = Invoke-ElementByMouse $entries[0]
+                if ($restoreClick.clicked) {
+                  Start-Sleep -Milliseconds 1000
+                  $back = Get-PageSignature $window
+                  if ($back.documentName.StartsWith($restoreTitle)) { $navigation.restored = 'session' }
+                  else { $notes += 'restore-unconfirmed' }
+                } else { $notes += ('restore-click-unavailable:' + [string]$restoreClick.reason) }
+              } else { $notes += 'restore-entry-not-found' }
+            }
+          } else { $notes += 'draft-not-opened' }
+        }
+      }
+      $after = Get-PageSignature $window
+      Write-Result @{ ok = $true; value = @{
+        documentName = $after.documentName; windowHwnd = $window.Hwnd; documents = $web.Documents
+        previousDocumentName = $view0.documentName; stale = $web.Stale
+        current = @{ raw = $currentRaw }; default = @{ raw = $defaultRaw }
+        navigation = $navigation; notes = $notes } }
+    }
     'model-select' {
       $models = Find-Elements $web.Element $modelPattern 'Button'
       if ($models.Count -eq 0) { throw 'model-control-not-found' }

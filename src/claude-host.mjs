@@ -803,18 +803,36 @@ export async function createFirstTurn({
   let observed;
   let bound = false;
   let bindingError;
+  let otherNewSessions = 0;
   while (Date.now() < deadline) {
     const { sessions } = await scanNativeSessions({ env, isAlive });
     const fresh = sessions.filter(session => session.alive && !baseline.has(session.nativeSessionId)
       && samePath(session.workspace, directory));
-    if (fresh.length > 1) {
-      return { created: false, status: 'ambiguous', reason: 'several-new-sessions',
-        candidates: fresh.map(session => session.nativeSessionId), requestId: request, workspace: directory,
-        evidence: { launch, submitted } };
+    // Other names can start their own first turn in the same window at the same
+    // time. A new session belongs to this call only when its own opening carries
+    // this request marker, so the others are ignored and never make this call
+    // ambiguous.
+    const bindings = [];
+    for (const candidate of fresh) {
+      bindings.push({ record: candidate, binding: await firstTurnBinding({ env, record: candidate, marker }) });
     }
-    if (fresh.length === 1) {
-      const record = fresh[0];
-      const binding = await firstTurnBinding({ env, record, marker });
+    const mine = bindings.filter(entry => entry.binding.firstInput?.owned);
+    otherNewSessions = fresh.length - mine.length;
+    if (mine.length === 0 && !observed && bindings.length) {
+      // Remember what a new session looked like, so a timeout can say whether a
+      // session appeared without this marker instead of only that nothing did.
+      const fallback = bindings[bindings.length - 1];
+      observed = { record: fallback.record, file: fallback.binding.file,
+        count: fallback.binding.markerCount, binding: fallback.binding };
+    }
+    if (mine.length > 1) {
+      return { created: false, status: 'ambiguous', reason: 'marker-in-several-sessions',
+        candidates: mine.map(entry => entry.record.nativeSessionId), requestId: request, workspace: directory,
+        marker, evidence: { launch, submitted, otherNewSessions } };
+    }
+    if (mine.length === 1) {
+      const record = mine[0].record;
+      const binding = mine[0].binding;
       const count = binding.markerCount;
       const file = binding.file;
       observed = { record, file, count, binding };
@@ -853,7 +871,7 @@ export async function createFirstTurn({
     created: false, status: 'unconfirmed',
     reason: observed ? `transcript-marker-count-${observed.count}` : 'no-native-session-registered',
     requestId: request, bindingNonce: nonce, workspace: directory,
-    evidence: { launch, submitted,
+    evidence: { launch, submitted, otherNewSessions,
       session: observed ? { nativeSessionId: observed.record.nativeSessionId, markerCount: observed.count,
         firstInput: observed.binding?.firstInput, complete: observed.binding?.complete } : undefined },
     startedAt, elapsedMs: Date.now() - Date.parse(startedAt),

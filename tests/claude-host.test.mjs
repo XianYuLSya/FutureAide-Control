@@ -1607,3 +1607,60 @@ test('a launch that never navigates reports an attempt that never happened', asy
     assert.equal(submitted, false);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+// ------------------------------- two names starting at once, each on its own
+
+const otherSession = (suffix, name) => ({ ...record(), pid: 60000 + suffix.length, sessionId: `other-${suffix}-session`,
+  hostSessionId: `local_other-${suffix}`, name });
+
+test('a second name starting in the same window is not this call being ambiguous', async () => {
+  const host1 = await host({ sessions: [], alive: new Set([61001, 60001]) });
+  const markerA = markerLine('request-a', 'fa-par-a');
+  const markerB = markerLine('request-b', 'fa-par-b');
+  const mineSession = { ...record(), pid: 61001, sessionId: 'mine-a-session', hostSessionId: 'local_mine-a', name: 'Name A' };
+  const other = otherSession('b', 'Name B');
+  const driver = uiDriver({
+    openNewSession: async () => ({ navigated: true, prefilled: true }),
+    submit: async () => {
+      // the other name's first turn lands in the same window at the same moment
+      await host1.write(other, [enqueueLine(`other work\n\n${markerB}`)]);
+      await host1.write(mineSession, [enqueueLine(`my work\n\n${markerA}`)]);
+      return { method: 'enter-on-prefilled-composer' };
+    },
+  });
+  try {
+    const result = await createFirstTurn({ workspace: CWD, requestId: 'request-a', message: 'my work', bindingNonce: 'fa-par-a' },
+      { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 3000, pollMs: 20 });
+    assert.equal(result.created, true, 'the session carrying this marker is chosen');
+    assert.equal(result.nativeSessionId, 'mine-a-session');
+    assert.equal(result.firstInput.hasMarker, true);
+    // and the other session belongs to the other request, not to this one
+    const otherOwned = await findCreatedSession({ workspace: CWD, requestId: 'request-b', bindingNonce: 'fa-par-b' },
+      { env: host1.env, isAlive: host1.isAlive });
+    assert.equal(otherOwned.nativeSessionId, other.sessionId);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('the same marker in two new sessions is ambiguous', async () => {
+  const host1 = await host({ sessions: [], alive: new Set([62001, 62002]) });
+  const marker = markerLine('request-dup', 'fa-dup-20261104');
+  const one = { ...record(), pid: 62001, sessionId: 'dup-one', hostSessionId: 'local_dup-one', name: 'Dup one' };
+  const two = { ...record(), pid: 62002, sessionId: 'dup-two', hostSessionId: 'local_dup-two', name: 'Dup two' };
+  const driver = uiDriver({
+    openNewSession: async () => ({ navigated: true, prefilled: true }),
+    submit: async () => {
+      await host1.write(one, [enqueueLine(`dup\n\n${marker}`)]);
+      await host1.write(two, [enqueueLine(`dup\n\n${marker}`)]);
+      return { method: 'enter-on-prefilled-composer' };
+    },
+  });
+  try {
+    const result = await createFirstTurn({ workspace: CWD, requestId: 'request-dup', message: 'dup', bindingNonce: 'fa-dup-20261104' },
+      { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 1500, pollMs: 20 });
+    assert.equal(result.created, false);
+    assert.equal(result.status, 'ambiguous');
+    assert.equal(result.reason, 'marker-in-several-sessions');
+    assert.equal(result.candidates.length, 2);
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

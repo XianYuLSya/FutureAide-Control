@@ -205,6 +205,10 @@ export function createScopedAgents(config, {
       readClaudeReportStatus: readStatus,
       ensureCodexReports: () => beginCodexReports(record),
       readCodexReportState: () => readCodexReportState(load()),
+      // A Codex child's bridge is anchored on a verified Codex chat, never on a Claude
+      // session id, and the same resolver is offered both ways for its host options.
+      anchorResolver: () => anchorResolver(load()),
+      hostOptions: { anchorResolver: () => anchorResolver(load()) },
     };
   };
   async function ensureReportsReady() {
@@ -284,7 +288,8 @@ export function createScopedAgents(config, {
     // in two applications never collides.
     const caller = trustedCaller(extra);
     const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
-    return store.saveOwner(await resolveCallingContext(extra, { knownOwner: store.owner(ownerId), callCodex, verifyClaude }));
+    return store.saveOwner(await resolveCallingContext(extra,
+      { knownOwner: store.owner(ownerId), callCodex, verifyClaude, bindOwner: bindClaude }));
   }
   /**
    * Records this owner can see: its own, plus every managed descendant that a
@@ -311,6 +316,21 @@ export function createScopedAgents(config, {
   }
 
   /**
+   * Bridge anchor for a Codex Desktop child: a Codex chat this plugin already
+   * verified and saved in this roster, preferring the same project. A Claude session
+   * id is never an anchor, because only a verified chat can carry a Codex bridge.
+   */
+  function anchorResolver(record) {
+    const owners = store.codexOwners();
+    if (!owners.length) {
+      throw Object.assign(new Error('No verified Codex chat is available to anchor this Codex Desktop session.'),
+        { code: 'codex-anchor-unavailable' });
+    }
+    const anchor = owners.find(owner => owner.workspace === record?.workspace) ?? owners[0];
+    return { threadId: anchor.threadId, ownerId: anchor.ownerId, workspace: anchor.workspace };
+  }
+
+  /**
    * Codex-side explicit ask/report arrive through the shared submission queue. The
    * adapter surfaces them as its own questions/reports; the one state machine owns
    * delivery, so no second task or notice machine exists.
@@ -325,15 +345,22 @@ export function createScopedAgents(config, {
     };
   }
   async function beginCodexReports(record) {
-    // A healthy loopback endpoint is not proof that the Codex MCP server registered
-    // ask_parent/report_parent. Only an explicit registration check from the Codex
-    // adapter may report ready; without one the target stays explicitly unready.
+    // A healthy endpoint is not a registration. Only the adapter's probe of a real new
+    // native Codex session may say ready, and it must name both tools; anything else —
+    // including ready:true from an HTTP check — is explicitly not ready.
     if (typeof codexReportReady !== 'function') {
       return { ready: false, registered: false,
         reason: { code: 'codex-tools-not-registered', message: 'This build does not register the Codex-side ask/report tools yet.' } };
     }
-    const value = await codexReportReady(record);
-    return { registered: false, ...value };
+    const value = (await codexReportReady(record)) ?? {};
+    const registered = value.registered === true && Array.isArray(value.tools)
+      && ['ask_parent', 'report_parent'].every(tool => value.tools.includes(tool));
+    if (value.ready === true && !registered) {
+      return { ...value, ready: false, registered: false,
+        reason: { code: 'codex-tools-not-registered',
+          message: 'The endpoint answered, but no new native Codex session reported the ask/report tools.' } };
+    }
+    return { ...value, registered };
   }
 
   /**

@@ -60,7 +60,7 @@ export function threadFromResult(result) {
   return candidates.find(value => value?.thread && typeof value.thread === 'object')?.thread;
 }
 
-async function resolveClaudeOwner(caller, { knownOwner, verifyClaude }) {
+async function resolveClaudeOwner(caller, { knownOwner, verifyClaude, bindOwner }) {
   const nativeSessionId = caller.nativeSessionId.toLowerCase();
   const ownerId = ownerIdForSource('claude-desktop', nativeSessionId);
   if (knownOwner) {
@@ -74,8 +74,17 @@ async function resolveClaudeOwner(caller, { knownOwner, verifyClaude }) {
     throw Object.assign(new Error('The calling Claude session and its project could not be verified.'),
       { code: 'calling-context-unavailable' });
   }
-  return { ownerId, source: 'claude-desktop', nativeSessionId, pid: verified.pid,
-    workspace: await realpath(verified.workspace), createdAt: new Date().toISOString() };
+  const workspace = await realpath(verified.workspace);
+  // Capture this session's own transport binding once, while it is verified, so its
+  // notices never need a discovery pass; it is refreshed only when the session
+  // outgrows it. A caller that is not a managed name just gets its own namescope.
+  let binding;
+  if (typeof bindOwner === 'function') {
+    try { binding = await bindOwner({ pid: verified.pid, sessionId: nativeSessionId, workspace }); }
+    catch { /* Bound lazily by the first notice instead. */ }
+  }
+  return { ownerId, source: 'claude-desktop', nativeSessionId, hostSessionId: nativeSessionId,
+    pid: verified.pid, workspace, ...(binding ? { binding } : {}), createdAt: new Date().toISOString() };
 }
 
 /**
@@ -83,14 +92,14 @@ async function resolveClaudeOwner(caller, { knownOwner, verifyClaude }) {
  * A verified Claude caller takes precedence over the Codex metadata path, and the
  * two owners are namespaced apart.
  */
-export async function resolveCallingContext(extra, { knownOwner, callCodex = invokeCodexTool, verifyClaude } = {}) {
+export async function resolveCallingContext(extra, { knownOwner, callCodex = invokeCodexTool, verifyClaude, bindOwner } = {}) {
   const caller = trustedCaller(extra);
   if (caller) {
     if (typeof verifyClaude !== 'function') {
       throw Object.assign(new Error('This plugin build cannot verify Claude session callers.'),
         { code: 'calling-context-unavailable' });
     }
-    return resolveClaudeOwner(caller, { knownOwner, verifyClaude });
+    return resolveClaudeOwner(caller, { knownOwner, verifyClaude, bindOwner });
   }
   const threadId = callingThread(extra);
   const ownerId = ownerIdFor(threadId);

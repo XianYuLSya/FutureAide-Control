@@ -64,9 +64,10 @@ export async function createCodexBackend(record, deps = {}) {
   return {
     target: 'codex-desktop', labels: { host: 'Codex Desktop', bridge: 'The Codex Desktop bridge' }, requiredMethods: METHODS,
     async probe() {
-      const result = await host.probe();
+      const [result, reportStatus] = await Promise.all([
+        host.probe(), deps.readCodexReportStatus?.(load()),
+      ]);
       if (result.missing?.length) throw fail('codex-backend-not-ready', `Missing native Codex capabilities: ${result.missing.join(', ')}.`);
-      const reportStatus = await deps.readCodexReportStatus?.(load());
       return { identity: result.identity, methods: METHODS, treeProtocol: 1,
         reportProtocol: reportStatus?.ready === true && deps.readCodexReportState ? 1 : null };
     },

@@ -311,20 +311,40 @@ export async function readTranscript(row, previous, requests) {
   } finally { await handle.close(); }
 }
 
+// Status checks reuse short-lived capability observations across adapter instances.
+// This cache never supplies a model selection or admits a dispatch.
+const capabilityProbes = new Map();
+
 export function createCodexHost(options = {}) {
   const home = options.home ?? process.env.CODEX_HOME ?? path.join(homedir(), '.codex');
   const invoke = options.invoke ?? invokeDesktopTool;
   const read = options.readNativeThread ?? (id => readNativeThread(home, id));
   const children = options.readNativeChildren ?? (id => readNativeChildren(home, id));
   const nativeRequest = options.nativeRequest ?? requestCodexNative;
+  const probes = options.discover || options.nativeRequest ? new Map() : capabilityProbes;
+  async function probeCapabilities() {
+    const workspace = options.workspace ?? process.cwd();
+    const key = JSON.stringify([home, workspace]);
+    const cached = probes.get(key);
+    if (cached && cached.expires > Date.now()) return cached.promise;
+    const entry = { expires: Infinity };
+    entry.promise = Promise.all([
+      (options.discover ?? discoverCodexBridge)(),
+      stat(path.join(home, 'state_5.sqlite')),
+      nativeRequest('config/read', { includeLayers: false, cwd: workspace }).then(() => true, () => false),
+    ]).then(([, , nativeAvailable]) => {
+      entry.expires = Date.now() + (nativeAvailable ? options.probeCacheMs ?? 30000 : 5000);
+      return { nativeAvailable };
+    }, error => { probes.delete(key); throw error; });
+    probes.set(key, entry);
+    return entry.promise;
+  }
   return {
     async probe() {
-      await (options.discover ?? discoverCodexBridge)();
-      await stat(path.join(home, 'state_5.sqlite'));
+      const { nativeAvailable } = await probeCapabilities();
       const missing = [];
       if (!options.contextThreadId && !options.anchorResolver && !options.createViaUi) missing.push('native-first-create-without-codex-anchor');
-      try { await nativeRequest('config/read', { includeLayers: false, cwd: options.workspace ?? process.cwd() }); }
-      catch { if (!options.destroyViaUi) missing.push('native-owned-tree-delete'); }
+      if (!nativeAvailable && !options.destroyViaUi) missing.push('native-owned-tree-delete');
       return { identity: { application: 'codex-desktop', home }, missing };
     },
     readDefaultModel: input => readDefaultModel({ home, ...input, readEffectiveConfig: options.readEffectiveConfig

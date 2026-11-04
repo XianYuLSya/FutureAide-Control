@@ -7,6 +7,26 @@ import { randomUUID } from 'node:crypto';
 import { createCodexHost, createDesktopToolBridge, emptyProjection, readTranscript, readDefaultModel, readCodexMcpRegistration, markerLine } from '../src/codex-host.mjs';
 
 const directory = () => fileURLToPath(new URL(`../clean/validation/codex/${randomUUID()}/`, import.meta.url));
+test('status shares capability checks while each default-model read stays live', async () => {
+  const home = directory(); await mkdir(home, { recursive: true });
+  await writeFile(path.join(home, 'state_5.sqlite'), '');
+  let discovered = 0, nativeReads = 0, selected = 'first';
+  const host = createCodexHost({ home, contextThreadId: 'anchor',
+    discover: async () => { discovered++; },
+    nativeRequest: async () => { nativeReads++; return { model: selected, reasoningEffort: 'max' }; } });
+  await Promise.all([host.probe(), host.probe()]);
+  await host.probe();
+  assert.equal(discovered, 1); assert.equal(nativeReads, 1);
+  assert.equal((await host.readDefaultModel({ workspace: home })).model, 'first');
+  selected = 'second';
+  assert.equal((await host.readDefaultModel({ workspace: home })).model, 'second');
+  assert.equal(nativeReads, 3);
+  const uncached = createCodexHost({ home, contextThreadId: 'anchor', probeCacheMs: 0,
+    discover: async () => { discovered++; }, nativeRequest: async () => ({}) });
+  await uncached.probe(); await uncached.probe();
+  assert.equal(discovered, 3);
+});
+
 test('native transcript cursor admits exact marker, keeps partial line and attributes FileChange', async () => {
   const dir = directory(); await mkdir(dir, { recursive: true }); const file = path.join(dir, 'events.jsonl');
   const marker = markerLine('r', 'nonce');

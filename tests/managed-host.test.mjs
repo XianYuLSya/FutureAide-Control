@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { apply, createManagedHost } from '../src/host-plugin.mjs';
+import { apply, createHostHandler, createManagedHost } from '../src/host-plugin.mjs';
 
 // Fixtures remain in the project's clean directory. No test deletes or moves files.
 async function fixture() {
@@ -46,7 +46,7 @@ async function fixture() {
     ]);
     const guards = [];
     const tools = { register: definition => definitions.set(definition.name, definition),
-      get: name => definitions.get(name), guard: guard => guards.push(guard),
+      get: name => definitions.get(name), guard: guard => guards.push(guard), schemas: () => [],
       view: () => ({ restrictableNames: new Set(definitions.keys()) }),
       restrict: ({ deny }) => deny.forEach(name => definitions.delete(name)) };
     const agent = { id, status: 'idle', options: options.agentOptions,
@@ -431,4 +431,135 @@ test('host publishes private discovery directly and keeps its process instance i
   assert.equal(first.application, 'dsh');
   assert.equal(first.dataRoot, f.root);
   assert.equal(first.pid, process.pid);
+});
+
+// DSH 0.2.2 dropped sessionController.inspect; the query service reads the same
+// stored session. Nothing else about the fixture changes.
+function newHostShape(f) {
+  delete f.services.sessionController.inspect;
+  f.services.sessionQuery.readSession = async id => ({ session: f.stored.get(id), events: f.sessions.get(id)?.events ?? [] });
+  f.services.sessionController.resolveAgent = async id =>
+    ({ agent: (await f.ctx.agents.resume({ resumeSessionId: id, setup: async () => {} })).agent });
+}
+
+test('a host without sessionController.inspect resumes, reads, and deletes through the query service', async () => {
+  const f = await fixture(), input = identity(f.workspace);
+  newHostShape(f);
+  const host = f.create();
+  await host.managedCreate(input);
+  await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  const agent = f.live.get(input.sessionId);
+  agent.session.events.push({ seq: 0, type: 'turn/start' },
+    { seq: 1, type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'first reply' }] } } },
+    { seq: 2, type: 'turn/end', data: { reason: { kind: 'completed' } } });
+  agent.session.seq = 3;
+
+  // Tree inspection reads the stored events.
+  assert.equal((await host.managedStatus(input)).tree.running, false);
+
+  // History reads one node of the durable tree.
+  f.services.subagents.listDescendants = async () => [{ kind: 'child', id: 'child', parentId: input.sessionId, mode: 'continuable' }];
+  f.stored.set('child', { id: 'child', cwd: f.workspace });
+  f.sessions.set('child', { events: [{ seq: 0, type: 'assistant/message', data: { id: 'child' } }] });
+  assert.deepEqual((await host.managedHistory({ ...input, targetSessionId: 'child' })).events,
+    [{ seq: 0, type: 'assistant/message', data: { id: 'child' } }]);
+
+  // The bridge endpoints read the same way.
+  const handler = createHostHandler(f.ctx, 'a'.repeat(64),
+    { stateDirectory: path.join(f.root, 'managed'), store: f.store, removeDirectory: f.removeDirectory });
+  const cursor = await handler('historyCursor', { args: { token: 'a'.repeat(64), sessionId: input.sessionId, workspace: f.workspace } });
+  assert.equal(cursor.ok, true, JSON.stringify(cursor));
+  assert.equal(cursor.value.throughSeq, 2);
+
+  // Activation recovers a cold session from its stored header.
+  f.live.delete(input.sessionId);
+  f.live.delete(input.sessionId);
+  const activated = await handler('capabilities', { args: { token: 'a'.repeat(64), sessionId: input.sessionId,
+    workspace: f.workspace, activate: true } });
+  assert.equal(activated.ok, true, JSON.stringify(activated));
+  assert.equal(activated.value.activated, true);
+  assert.equal(activated.value.sessionId, input.sessionId);
+
+  // Cleanup reads a descendant's stored header before removing it.
+  f.live.delete(input.sessionId);
+  f.sessions.delete('child');
+  await mkdir(path.join(f.root, 'sessions', 'project', 'child'), { recursive: true });
+  const destroyed = await host.managedDestroy({ ...input, taskId: 'task-a' });
+  assert.equal(destroyed.destroyed, true);
+  assert.deepEqual(f.removed.map(directory => path.basename(directory)).sort(), ['child', input.sessionId].sort());
+  assert.equal(f.records.size, 0);
+});
+
+test('the old inspect shape still reads a stored session when the query service has no reader', async () => {
+  const f = await fixture(), input = identity(f.workspace), host = f.create();
+  delete f.services.sessionQuery.readSession;
+  await host.managedCreate(input);
+  await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  f.services.sessionController.inspect = async id => ({ meta: f.stored.get(id), events: [{ seq: 7, type: 'assistant/message', data: { id } }] });
+  assert.deepEqual((await host.managedHistory({ ...input, targetSessionId: input.sessionId })).events,
+    [{ seq: 7, type: 'assistant/message', data: { id: input.sessionId } }]);
+});
+
+test('a host with neither reader refuses explicitly instead of failing obscurely', async () => {
+  const f = await fixture(), input = identity(f.workspace), host = f.create();
+  delete f.services.sessionController.inspect;
+  delete f.services.sessionQuery.readSession;
+  await host.managedCreate(input);
+  await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  await assert.rejects(host.managedHistory({ ...input, targetSessionId: input.sessionId }),
+    error => error.controlCode === 'managed-session-inspection-unavailable');
+  const handler = createHostHandler(f.ctx, 'a'.repeat(64),
+    { stateDirectory: path.join(f.root, 'managed'), store: f.store, removeDirectory: f.removeDirectory });
+  const cursor = await handler('historyCursor', { args: { token: 'a'.repeat(64), sessionId: input.sessionId, workspace: f.workspace } });
+  assert.equal(cursor.ok, false);
+  assert.equal(cursor.error.code, 'managed-session-inspection-unavailable');
+});
+
+test('an unexpected host failure is noted outside the managed state directory without the token', async () => {
+  const f = await fixture(), input = identity(f.workspace);
+  const stateDirectory = path.join(f.root, 'managed');
+  await f.create().managedCreate(input);
+  f.live.delete(input.sessionId);
+  f.services.sessionController.resolveAgent = async () => { throw new Error('native agent factory exploded'); };
+  const handler = createHostHandler(f.ctx, 'b'.repeat(64), { stateDirectory, store: f.store, removeDirectory: f.removeDirectory });
+  const result = await handler('capabilities', { args: { token: 'b'.repeat(64), sessionId: input.sessionId,
+    workspace: f.workspace, activate: true } });
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.error.code, 'host-operation-failed', 'the answer stays the generic failure');
+  const noteFile = path.join(path.dirname(stateDirectory), 'host-last-error.json');
+  const note = JSON.parse(await readFile(noteFile, 'utf8'));
+  assert.equal(note.endpoint, 'capabilities');
+  assert.match(note.message, /native agent factory exploded/);
+  assert.equal(JSON.stringify(note).includes('b'.repeat(64)), false, 'the bridge credential is never written');
+  assert.equal(path.dirname(noteFile), path.dirname(stateDirectory));
+  assert.notEqual(path.dirname(noteFile), stateDirectory, 'the listener watches the managed directory');
+  await assert.rejects(stat(path.join(stateDirectory, 'host-last-error.json')), /ENOENT/,
+    'nothing is written inside the directory the monitor watches');
+});
+
+test('a refusal with a control code and a failed write leave no note', async () => {
+  const f = await fixture(), input = identity(f.workspace);
+  const stateDirectory = path.join(f.root, 'managed');
+  const handler = createHostHandler(f.ctx, 'c'.repeat(64), { stateDirectory, store: f.store, removeDirectory: f.removeDirectory });
+  await f.create().managedCreate(input);
+  f.live.delete(input.sessionId);
+  delete f.services.sessionController.inspect;
+  delete f.services.sessionQuery.readSession;
+  const refused = await handler('capabilities', { args: { token: 'c'.repeat(64), sessionId: input.sessionId,
+    workspace: f.workspace, activate: true } });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error.code, 'managed-session-inspection-unavailable');
+  await assert.rejects(readFile(path.join(path.dirname(stateDirectory), 'host-last-error.json'), 'utf8'), /ENOENT/,
+    'a known refusal is not an unexpected host failure');
+
+  // A note that cannot be written changes nothing about the answer.
+  const blocked = path.join(f.root, 'a-file.txt');
+  await writeFile(blocked, 'not a directory');
+  f.services.sessionController.inspect = async () => { throw new Error('second explosion'); };
+  const unwritable = createHostHandler(f.ctx, 'd'.repeat(64), { stateDirectory: path.join(blocked, 'managed'),
+    store: f.store, removeDirectory: f.removeDirectory });
+  const result = await unwritable('capabilities', { args: { token: 'd'.repeat(64), sessionId: input.sessionId,
+    workspace: f.workspace, activate: true } });
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, 'host-operation-failed');
 });

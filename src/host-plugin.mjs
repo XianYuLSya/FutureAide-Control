@@ -18,6 +18,25 @@ export const FINAL_REPORT_CONTRACT = 'Write a final report for a controlling age
 
 export const QUESTION_CONTRACT = 'State the decision you need, the options and your recommendation in a few lines, '
   + 'so it can be answered without reading your work.';
+/**
+ * Read one stored session as { header, events }. DSH 0.2.2 removed
+ * sessionController.inspect in favour of the session query service. Every read goes
+ * through here and both are accepted, because the desktop app updates on its own schedule.
+ * @param {(name: string) => object} get Host service lookup.
+ * @param {string} sessionId Live or persisted session id.
+ */
+async function readStoredSession(get, sessionId) {
+  const controller = get('sessionController');
+  if (typeof controller?.inspect === 'function') {
+    const inspected = await controller.inspect(sessionId);
+    return { header: inspected?.meta ?? inspected?.header, events: inspected?.events };
+  }
+  const query = get('sessionQuery');
+  if (typeof query?.readSession !== 'function') reject('managed-session-inspection-unavailable');
+  const stored = await query.readSession(sessionId);
+  return { header: stored?.session, events: stored?.events };
+}
+
 /** Read the durable descendant catalog; diagnostics never authorize cleanup. */
 export async function readManagedTree(subagents, agents, root, changesBySession = {}) {
   if (typeof subagents?.listDescendants !== 'function') throw new Error('managed-tree-unavailable');
@@ -58,6 +77,74 @@ export const name = 'futureaide-control-host';
 export const inject = ['connection', 'webServer', 'agents', 'sessions'];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+
+/**
+ * Every DSH internal this plugin borrows, taken from the calls in this file rather
+ * than from memory: DSH 0.2.2 renamed one of them and only a real host showed it.
+ * `scope` marks a service that belongs to an agent's composition instead of the
+ * bridge context, so a check without a live agent can skip it. `choices` lists
+ * implementations that are interchangeable, and only losing all of them counts.
+ */
+export const DSH_INTERNALS = Object.freeze([
+  { service: 'sessionController', members: ['agents.composeAgent'] },
+  { choices: [{ service: 'sessionController', member: 'resolveAgent' }, { service: 'apiProxy', member: 'sessions.list' }] },
+  // 0.2.2 dropped sessionController.inspect in favour of the query service.
+  { choices: [{ service: 'sessionController', member: 'inspect' }, { service: 'sessionQuery', member: 'readSession' }] },
+  { service: 'sessionQuery', members: ['_observations.cache.delete', '_observations.cache.has'] },
+  { service: 'sessionPersistence', members: ['resolveCurrentLog', 'stat', 'config.root'] },
+  { service: 'workspaceRegistry', members: ['resolveByPath', 'create', 'get', 'list'] },
+  { service: 'subagents', members: ['listDescendants', 'waitForChildren', 'drainDescendants'] },
+  { service: 'agentDefaultModel', members: ['currentSelection'], optional: true },
+  { service: 'sessionProjectionCache', members: ['requireTable'], optional: true },
+  { service: 'spillStore', optional: true },
+  { service: 'tools', members: ['register', 'guard'], scope: 'agent' },
+  { service: 'agentPresets', members: ['generationFor'], scope: 'agent' },
+  { service: 'loader', members: ['unwrapExports'], scope: 'agent' },
+  { service: 'sessionProjections', members: ['snapshot'], scope: 'agent', optional: true },
+  { service: 'sandboxPolicy', members: ['resolve'], scope: 'agent', optional: true },
+  { service: 'sandbox', optional: true, scope: 'agent' },
+  { service: 'approval', members: ['overrideOf'], scope: 'agent', optional: true },
+  { service: 'permissionPresets', members: ['current'], scope: 'agent', optional: true },
+  { service: 'planMode', optional: true, scope: 'agent' },
+  { service: 'systemPrompt', optional: true, scope: 'agent' },
+]);
+
+const memberOf = (value, path) => path.split('.').reduce((current, key) => current?.[key], value);
+
+/**
+ * Check the catalogue against a live host. It reports names, not behaviour: a host
+ * that renames an internal should say so at ping time instead of failing a task
+ * later.
+ * @param {(name: string) => object} get Host service lookup.
+ * @param {(name: string) => object} [agentGet] Agent-scope lookup, when an agent exists.
+ * @returns {{missing: string[]}} What this host does not provide.
+ */
+export function checkHostCompatibility(get, agentGet) {
+  const missing = [];
+  const read = (service, scope) => {
+    const lookup = scope === 'agent' ? agentGet : get;
+    if (typeof lookup !== 'function') return undefined;
+    try { return lookup(service); } catch { return undefined; }
+  };
+  for (const entry of DSH_INTERNALS) {
+    // An agent-scope service cannot be judged without an agent to ask.
+    if (entry.scope === 'agent' && typeof agentGet !== 'function') continue;
+    if (entry.choices) {
+      const present = entry.choices.some(choice => memberOf(read(choice.service, entry.scope), choice.member) !== undefined);
+      if (!present) missing.push(entry.choices.map(choice => `${choice.service}.${choice.member}`).join(' or '));
+      continue;
+    }
+    // An optional service is a bonus: its absence or partial shape changes no answer.
+    if (entry.optional) continue;
+    const value = read(entry.service, entry.scope);
+    if (entry.members) {
+      for (const member of entry.members) if (memberOf(value, member) === undefined) missing.push(`${entry.service}.${member}`);
+      continue;
+    }
+    if (value === undefined || value === null) missing.push(entry.service);
+  }
+  return { missing };
+}
 
 function managedId(value) {
   if (!ID.test(value ?? '')) reject('invalid-managed-identity');
@@ -234,7 +321,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         let cached = runtime.treeInspections.get(key);
         if (!cached || cached.taskId !== record.taskId || cached.seq !== agent.session.seq) {
           const inspectedSeq = agent.session.seq;
-          const inspected = await service('sessionController')?.inspect(record.sessionId);
+          const inspected = await storedSession(record.sessionId);
           if (!Array.isArray(inspected?.events) || agent.session.seq !== inspectedSeq) throw new Error('managed-tree-unavailable');
           const taskEvents = inspected.events.filter(event => Number.isSafeInteger(event.seq) && event.seq > after);
           const end = taskEvents.findLastIndex(event => event.type === 'turn/end');
@@ -395,6 +482,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     };
     if (fresh) agentCtx.on('session/event', (...args) => binding.event(...args));
   }
+  const storedSession = sessionId => readStoredSession(service, sessionId);
   async function activate(record, { fresh = false } = {}) {
     const key = keyOf(record);
     const owned = handles.get(key);
@@ -419,8 +507,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       handle = await owner.agents.create({ sessionId: record.sessionId, agentOptions: record.model,
         meta: { cwd: record.workspace, ...(record.agentPreset ? { agentPreset: record.agentPreset } : {}) }, setup });
     } else {
-      const inspected = await controller.inspect(record.sessionId);
-      const header = inspected?.meta ?? inspected?.header;
+      const { header } = await storedSession(record.sessionId);
       if (header?.id !== record.sessionId || !canonicalEqual(await realpath(header.cwd), record.workspace)) reject('managed-session-mismatch');
       handle = await owner.agents.resume({ resumeSessionId: record.sessionId, agentOptions: record.model, setup });
     }
@@ -555,7 +642,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       try { nodes = await readManagedTree(service('subagents'), owner.agents, root, record.descendantChanges); }
       catch { reject('managed-tree-unverified'); }
       if (!nodes.some(node => node.sessionId === target)) reject('managed-session-mismatch');
-      const inspected = await service('sessionController')?.inspect(target);
+      const inspected = await storedSession(target);
       if (!Array.isArray(inspected?.events)) reject('managed-history-unavailable');
       return { events: inspected.events };
     }); },
@@ -657,8 +744,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         for (const node of nodes.slice().reverse()) {
           const candidate = node.sessionId === record.sessionId ? record : { ...record, sessionId: node.sessionId, cleanup: undefined };
           if (candidate !== record) {
-            const inspected = await service('sessionController')?.inspect(node.sessionId);
-            const header = inspected?.meta ?? inspected?.header;
+            const { header } = await storedSession(node.sessionId);
             if (header?.id !== node.sessionId || typeof header.cwd !== 'string') reject('managed-tree-unverified');
             const relative = path.relative(record.workspace, await realpath(header.cwd));
             if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) reject('managed-tree-unverified');
@@ -757,8 +843,7 @@ async function resolveAgent(ctx, sessionId, workspace, activate) {
   if (!agent && activate) {
     const controller = ctx.get('sessionController');
     if (controller) {
-      const inspected = await controller.inspect(sessionId);
-      const header = inspected?.header ?? inspected?.meta;
+      const { header } = await readStoredSession(name => ctx.get(name), sessionId);
       if (!await inWorkspace(header?.cwd, workspace)) reject('workspace-mismatch');
       const result = await controller.resolveAgent(sessionId);
       if (result.error) reject('agent-unavailable');
@@ -784,13 +869,9 @@ async function resolveAgent(ctx, sessionId, workspace, activate) {
 /** Return a durable ordinary session's final event sequence without loading its Agent. */
 async function historyCursor(ctx, sessionId, workspace) {
   if (!ID.test(sessionId ?? '')) reject('invalid-session');
-  const controller = ctx.get('sessionController');
-  if (!controller || typeof controller.inspect !== 'function') reject('history-cursor-unavailable');
-  const inspected = await controller.inspect(sessionId);
-  const header = inspected?.meta ?? inspected?.header;
+  const { header, events } = await readStoredSession(name => ctx.get(name), sessionId);
   if (!await inWorkspace(header?.cwd, workspace)) reject('workspace-mismatch');
   if (header?.origin === 'subagent') reject('subagent-owned');
-  const events = inspected?.events;
   if (!Array.isArray(events)) reject('history-cursor-unavailable');
   const event = events.findLast(value => Number.isSafeInteger(value?.seq) && value.seq >= 0);
   return { sessionId, throughSeq: event?.seq ?? -1 };
@@ -849,6 +930,21 @@ export function capabilitySnapshot(agent, { activated = false } = {}) {
   };
 }
 
+/**
+ * Keep the last unexpected host failure beside the managed state. The caller only ever
+ * receives a generic code, so without this the real cause of a failed resume or status
+ * is lost. Local file only, and a failure to write it never changes the answer.
+ */
+async function noteHostFailure(stateDirectory, endpoint, error) {
+  if (typeof stateDirectory !== 'string' || !stateDirectory) return;
+  try {
+    await writeFile(path.join(path.dirname(stateDirectory), 'host-last-error.json'), JSON.stringify({
+      at: new Date().toISOString(), endpoint, name: error?.name, code: error?.code,
+      message: String(error?.message ?? error).slice(0, 2000), stack: String(error?.stack ?? '').slice(0, 6000),
+    }), { mode: 0o600 });
+  } catch { /* Diagnostics must never change the answer. */ }
+}
+
 /** Build the fixed authenticated host methods; no arbitrary tool execution is exposed. */
 export function createHostHandler(ctx, token, options = {}) {
   if (!/^[a-f0-9]{64}$/.test(token ?? '')) throw new Error('Invalid host bridge credential.');
@@ -862,11 +958,13 @@ export function createHostHandler(ctx, token, options = {}) {
       if (managed && MANAGED_METHODS.includes(endpoint)) return { ok: true, value: await managed[endpoint](input) };
       if (!['capabilities', 'historyCursor', 'ping'].includes(endpoint)) reject('unknown-method');
       if (endpoint === 'ping') return { ok: true, value: { version: 1, revision: options.revision ?? null, ...(managed ? { treeProtocol: 1, reportProtocol: 1 } : {}),
-        methods: ['capabilities', 'historyCursor', ...(managed ? MANAGED_METHODS : [])], pid: process.pid } };
+        methods: ['capabilities', 'historyCursor', ...(managed ? MANAGED_METHODS : [])], pid: process.pid,
+        compatibility: checkHostCompatibility(name => ctx.get(name)) } };
       if (endpoint === 'historyCursor') return { ok: true, value: await historyCursor(ctx, input.sessionId, input.workspace) };
       const { agent, activated } = await resolveAgent(ctx, input.sessionId, input.workspace, input.activate === true);
       return { ok: true, value: capabilitySnapshot(agent, { activated }) };
     } catch (error) {
+      if (!error.controlCode) await noteHostFailure(options.stateDirectory, endpoint, error);
       return { ok: false, error: { code: error.controlCode ?? 'host-operation-failed',
         message: error.controlCode ?? 'The host operation failed; no private runtime configuration is returned.' } };
     }

@@ -771,12 +771,19 @@ export function createScopedAgents(config, {
     if (!host) return { ready: false, connected: false, treeProtocol: null, reportProtocol: null,
       reason: safeError(status.hostError ?? { message: 'The DSH host is not reachable.' }) };
     const connected = status.dshConnected === true;
-    const entry = { ready: connected && host.treeProtocol === TREE_PROTOCOL && host.reportProtocol === REPORT_PROTOCOL,
+    // A host that renamed one of the internals this plugin borrows answers ping but
+    // cannot run a task; saying which ones at status time is the whole point.
+    const missingInternals = Array.isArray(host.compatibility?.missing) ? host.compatibility.missing : [];
+    const entry = { ready: connected && host.treeProtocol === TREE_PROTOCOL && host.reportProtocol === REPORT_PROTOCOL
+        && missingInternals.length === 0,
       connected, treeProtocol: host.treeProtocol ?? null, reportProtocol: host.reportProtocol ?? null,
-      ...(connected ? {} : { missing: METHODS.filter(method => !host.methods?.includes(method)) }) };
+      ...(connected ? {} : { missing: METHODS.filter(method => !host.methods?.includes(method)) }),
+      ...(missingInternals.length ? { missingInternals } : {}) };
     if (!connected) entry.reason = { code: 'managed-host-required', message: 'Install the current managed DSH bridge.' };
     else if (entry.treeProtocol !== TREE_PROTOCOL) entry.reason = safeError(treeProtocolError());
     else if (entry.reportProtocol !== REPORT_PROTOCOL) entry.reason = safeError(reportProtocolError());
+    else if (missingInternals.length) entry.reason = { code: 'dsh-internals-changed',
+      message: `This DSH host no longer provides ${missingInternals.join(', ')}. Update the FutureAide Control plugin for this DSH version.` };
     return entry;
   }
 

@@ -40,8 +40,11 @@ async function copyTree(source, destination) {
   } else throw new Error('Unsupported installation source: ' + source);
 }
 
-/** Update only owned table keys, preserving unrelated config and comments. */
-export function upsertTomlTable(contents, segments, values) {
+/**
+ * Update only owned table keys, preserving unrelated config and comments. Keys in
+ * keep are written when missing and otherwise left as the user set them.
+ */
+export function upsertTomlTable(contents, segments, values, { keep = [] } = {}) {
   const lines = contents.split(/\r?\n/);
   const table = segments.map(value => JSON.stringify(value)).join('.');
   const headers = lines.flatMap((line, index) => {
@@ -65,8 +68,8 @@ export function upsertTomlTable(contents, segments, values) {
   for (const [key, value] of Object.entries(values)) {
     const index = body.findIndex(line => new RegExp('^\\s*' + key + '\\s*=').test(line));
     const replacement = key + ' = ' + JSON.stringify(value);
-    if (index >= 0) body[index] = replacement;
-    else body.push(replacement);
+    if (index < 0) body.push(replacement);
+    else if (!keep.includes(key)) body[index] = replacement;
   }
   return [...lines.slice(0, start + 1), ...body, ...lines.slice(end)].join('\n');
 }
@@ -271,7 +274,9 @@ export async function installPlugin({
   const original = await readOptional(codexConfig);
   const configured = upsertTomlTable(upsertTomlTable(original, ['marketplaces', MARKETPLACE], {
     source_type: 'local', source: marketplaceRoot,
-  }), ['plugins', pluginId], { enabled: true });
+  // Reinstalling is how upgrades happen, so it must not undo a plugin the user turned
+  // off: a machine wired through [mcp_servers] would otherwise get a second server.
+  }), ['plugins', pluginId], { enabled: true }, { keep: ['enabled'] });
   if (configured !== original) {
     if (original) {
       const backup = path.join(runtime, 'rollback', Date.now() + '-codex');

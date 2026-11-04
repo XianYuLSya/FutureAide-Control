@@ -69,6 +69,29 @@ test('installation binds an absolute runtime and preserves unrelated Codex confi
   assert.equal(hostCalls, 2);
 });
 
+test('reinstalling leaves a plugin the user turned off turned off, and a first install enables it', async () => {
+  const temp = await fixture();
+  const sourceRoot = path.join(temp, 'package');
+  await json(path.join(sourceRoot, '.codex-plugin', 'plugin.json'), {
+    name: 'futureaide-control', version: '0.3.0', skills: './skills/', mcpServers: './.mcp.json',
+  });
+  await mkdir(path.join(sourceRoot, 'src'), { recursive: true });
+  await writeFile(path.join(sourceRoot, 'src', 'mcp-server.mjs'), '// fixture');
+  await mkdir(path.join(sourceRoot, 'skills', 'futureaide-control'), { recursive: true });
+  await writeFile(path.join(sourceRoot, 'skills', 'futureaide-control', 'SKILL.md'), '# fixture');
+  const install = codexHome => installPlugin({ sourceRoot, codexHome, dshHome: path.join(temp, 'dsh'), skipClaude: true,
+    verifyRuntime: async () => {}, connectHost: async () => ({ ready: true }) });
+  // A machine wired through [mcp_servers] keeps the plugin off, so Codex sees one server.
+  const wired = path.join(temp, 'wired');
+  await mkdir(wired, { recursive: true });
+  await writeFile(path.join(wired, 'config.toml'), '[plugins."futureaide-control@futureaide-control"]\nenabled = false\n');
+  await install(wired);
+  assert.match(await readFile(path.join(wired, 'config.toml'), 'utf8'), /\[plugins\."futureaide-control@futureaide-control"\]\r?\nenabled = false/);
+  const fresh = path.join(temp, 'fresh');
+  await install(fresh);
+  assert.match(await readFile(path.join(fresh, 'config.toml'), 'utf8'), /\["?plugins"?\."futureaide-control@futureaide-control"\]\r?\nenabled = true/);
+});
+
 test('an existing quoted/unquoted owned table is updated without duplicate tables', () => {
   const original = '[plugins."futureaide-control@futureaide-control"]\nenabled = false\n\n[other]\nenabled = false\n';
   const updated = upsertTomlTable(original, ['plugins', 'futureaide-control@futureaide-control'], { enabled: true });

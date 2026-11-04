@@ -272,14 +272,42 @@ test('cleanup failure keeps its record, retries release only once, and a lost su
   assert.equal(result.destroyed, true);
   assert.equal(f.records.size, 0);
   assert.equal(f.checkpoints.has(input.sessionId), false);
-  assert.equal(f.indexed.has(input.sessionId), false);
   assert.equal(f.observed.has(input.sessionId), false);
+  // The search index reconciles itself before answering, so a stale row may outlive
+  // the delete; it must neither keep the name alive nor make cleanup look unfinished.
+  assert.equal(f.indexed.has(input.sessionId), true);
   assert.deepEqual(f.project.sessionIds, []);
   assert.deepEqual(f.disposed, [input.sessionId]);
   assert.equal(f.removed.length, 1);
   assert.equal((await host.managedDestroy(input)).alreadyDestroyed, true);
   // The injected deletion adapter records the exact native directory; it does not delete fixture files.
   assert.equal(path.basename(f.removed[0]), input.sessionId);
+});
+
+test('a retry cannot claim a finished delete when the host can no longer verify it', async () => {
+  const f = await fixture(), host = f.create(), input = identity(f.workspace);
+  await host.managedCreate(input);
+  await host.managedDestroy(input);
+  f.services.sessionQuery._observations = {};
+  await assert.rejects(host.managedDestroy(input), error => error.controlCode === 'managed-cleanup-verification-unavailable');
+});
+
+test('destroy never queues behind the search index and tolerates a stale index row', async () => {
+  const f = await fixture(), host = f.create(), input = identity(f.workspace);
+  await host.managedCreate(input);
+  let reconciled = 0;
+  // The shared query queue never answers: destroy must not need it.
+  f.services.sessionQuery._serialized = () => new Promise(() => {});
+  f.services.sessionQuery._reconcile = async () => { reconciled++; };
+  const guard = new Promise((_, reject) => setTimeout(() => reject(new Error('destroy waited for the search index')), 2000).unref());
+  const result = await Promise.race([host.managedDestroy(input), guard]);
+  assert.equal(result.destroyed, true);
+  assert.equal(reconciled, 0, 'reconciliation is the search path’s job, not cleanup’s');
+  assert.equal(f.observed.has(input.sessionId), false, 'the live observation is still dropped');
+  assert.equal(f.indexed.has(input.sessionId), true, 'the derived row stays for the next search to reconcile');
+  const retried = await Promise.race([host.managedDestroy(input), guard]);
+  assert.equal(retried.alreadyDestroyed, true, 'a stale index row cannot keep the name alive');
+  assert.equal(reconciled, 0);
 });
 
 test('interrupted cleanup rebuilds its plan from the cold durable tree without resuming an agent', async () => {

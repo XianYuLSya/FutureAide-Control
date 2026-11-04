@@ -1100,9 +1100,13 @@ export function createScopedAgents(config, {
       return { name: record.name, deleted: true, sessionDataRemoved: true };
     } catch (error) {
       const current = store.get(record.agentId);
-      if (current && error.code === 'agent-busy' && targetOf(record) !== 'dsh') {
+      // An uncertain destroy is a write whose outcome is unknown, not a failed cleanup:
+      // the host may already be finishing it. A busy or queued child makes the parent
+      // wait the same way. Neither is reported as an error, or a queued cleanup would
+      // be listed as failed.
+      if (current && (error.uncertain === true || error.code === 'agent-busy')) {
         current.state = 'cleaning'; current.closed = true; current.error = safeError(error); deferRetry(current); store.save(current);
-        return { name: record.name, deleted: false, queued: true, state: 'cleaning', error: safeError(error) };
+        return { name: record.name, deleted: false, queued: true, state: 'cleaning' };
       }
       if (current) { current.state = 'cleanup_failed'; current.closed = true; current.error = safeError(error); store.save(current); }
       return { name: record.name, deleted: false, state: 'cleanup_failed', error: safeError(error) };
@@ -1685,7 +1689,11 @@ export function createScopedAgents(config, {
     async delete({ name }, extra) {
       const owner = await context(extra);
       const record = named(owner, name);
-      if (targetOf(record) === 'dsh') return withName(extra, name, current => clearRecord(current));
+      if (targetOf(record) === 'dsh') {
+        const result = await withName(extra, name, current => clearRecord(current));
+        if (result.queued) await ensureWorker(store.get(record.agentId), { wake: true });
+        return result;
+      }
       const queued = store.requestCleanup(record);
       if (queued) await ensureWorker(store.get(record.agentId), { wake: true });
       return { name, deleted: false, queued, state: queued ? 'cleaning' : 'removed' };

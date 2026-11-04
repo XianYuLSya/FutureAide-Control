@@ -18,20 +18,21 @@ const THREAD = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture({ adapters = {}, onPollComplete } = {}) {
+async function fixture({ adapters = {}, onPollComplete,
+  clientFactory = () => { throw new Error('no DSH host is needed for these cases'); }, startSharedMonitor = () => true } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'cross-'));
   const store = new RosterStore(':memory:');
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
     store,
-    clientFactory: () => { throw new Error('no DSH host is needed for these cases'); },
+    clientFactory,
     callCodex: async (threadId, tool) => (tool === 'read_thread'
       ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } }
       : { accepted: true }),
     backendAdapters: adapters,
     ...(onPollComplete ? { onPollComplete } : {}),
-    startSharedMonitor: () => true,
+    startSharedMonitor,
     removeTree: async () => {},
   });
   return { service, store };
@@ -919,6 +920,96 @@ test('a crashed session leaves its record behind and the notice still finds wher
     assert.equal(claude.received.length, 1, JSON.stringify(f.store.get('crashed').task.reports[0].delivery));
     assert.notEqual(f.store.owner(ownerId).binding.socketPath, dead.socketPath);
   } finally { await claude.close(); f.service.close(); }
+});
+
+// --- DSH cleanup outcomes: an unknown write queues, a refused destroy fails ---------
+
+/** A DSH host whose only interesting answer is what its managedDestroy call returns. */
+function fakeClient({ destroy }) {
+  return {
+    connectionIdentity: async () => ({ application: 'dsh', dataRoot: workspace }),
+    hostStatus: async () => ({ methods: [], treeProtocol: 1, reportProtocol: 1 }),
+    managedDestroy: async args => destroy(args),
+  };
+}
+
+test('a DSH destroy whose write outcome is unknown stays queued instead of failing cleanup', async () => {
+  let attempts = 0;
+  const client = fakeClient({ destroy: async () => {
+    attempts++;
+    // The client gave up on a slow host: the delete may or may not have happened.
+    if (attempts === 1) throw Object.assign(new Error('The FutureAide write outcome is unknown.'), { code: 'timeout', uncertain: true });
+    return { destroyed: true };
+  } });
+  let monitors = 0;
+  const f = await fixture({ clientFactory: () => client, startSharedMonitor: () => { monitors++; return true; } });
+  try {
+    f.store.insert(taskRecord({ agentId: 'agent-dsh-unknown', ownerId: ownerIdFor(THREAD), sessionId: 'session-dsh-unknown',
+      name: 'unknown', target: 'dsh', nativeDestroyed: false }));
+    const queued = await f.service.delete({ name: 'unknown' }, extra(THREAD));
+    assert.equal(queued.deleted, false);
+    assert.equal(queued.queued, true);
+    assert.equal(queued.state, 'cleaning', 'the host may still be finishing its own cleanup');
+    assert.equal(queued.error, undefined, 'a queued cleanup is never reported as a failure');
+    const record = f.store.get('agent-dsh-unknown');
+    assert.equal(record.state, 'cleaning');
+    assert.equal(record.nextAttemptAt > Date.now(), true, 'the retry is deferred, not dropped');
+    assert.equal(monitors > 0, true, 'a queued cleanup has a listener to retry it, whatever the caller does next');
+    record.nextAttemptAt = 0; f.store.save(record);
+    assert.equal((await f.service.poll('agent-dsh-unknown')).deleted, true);
+    assert.equal(f.store.get('agent-dsh-unknown'), undefined, 'the name is removed once the host confirms');
+    assert.equal(attempts, 2);
+  } finally { f.service.close(); }
+});
+
+test('a DSH destroy the host does not confirm stays a visible cleanup failure', async () => {
+  const client = fakeClient({ destroy: async () => ({ destroyed: false, message: 'DSH has not confirmed complete session cleanup.' }) });
+  const f = await fixture({ clientFactory: () => client });
+  try {
+    f.store.insert(taskRecord({ agentId: 'agent-dsh-refused', ownerId: ownerIdFor(THREAD), sessionId: 'session-dsh-refused',
+      name: 'refused', target: 'dsh', nativeDestroyed: false }));
+    const failed = await f.service.delete({ name: 'refused' }, extra(THREAD));
+    assert.equal(failed.deleted, false);
+    assert.equal(failed.state, 'cleanup_failed');
+    assert.match(failed.error.message, /has not confirmed complete session cleanup/);
+    assert.equal(f.store.get('agent-dsh-refused').state, 'cleanup_failed', 'a refused destroy stays listed and retryable');
+  } finally { f.service.close(); }
+});
+
+test('a DSH parent waits while its child’s cleanup is queued instead of failing', async () => {
+  const rootId = 'agent-' + 'a'.repeat(32), childId = 'agent-' + 'b'.repeat(32);
+  const client = fakeClient({ destroy: async ({ agentId }) => {
+    if (agentId === childId) throw Object.assign(new Error('The FutureAide write outcome is unknown.'), { code: 'timeout', uncertain: true });
+    return { destroyed: true };
+  } });
+  const f = await fixture({ clientFactory: () => client });
+  try {
+    f.store.insert(taskRecord({ agentId: rootId, ownerId: ownerIdFor(THREAD), sessionId: 'session-root', name: 'root', target: 'dsh' }));
+    f.store.insert(taskRecord({ agentId: childId, ownerId: ownerIdFor(THREAD), sessionId: 'session-child', name: 'child',
+      target: 'dsh', parentAgentId: rootId, nativeDestroyed: false }));
+    const queued = await f.service.delete({ name: 'root' }, extra(THREAD));
+    assert.equal(queued.queued, true);
+    assert.equal(queued.state, 'cleaning', 'a child that queued is not a parent failure');
+    assert.equal(queued.error, undefined);
+    assert.equal(f.store.get(rootId).state, 'cleaning');
+    assert.equal(f.store.get(childId).state, 'cleaning');
+  } finally { f.service.close(); }
+});
+
+test('a child held by its own poll makes a DSH parent wait instead of failing', async () => {
+  const rootId = 'agent-' + 'c'.repeat(32), childId = 'agent-' + 'd'.repeat(32);
+  const client = fakeClient({ destroy: async () => ({ destroyed: true }) });
+  const f = await fixture({ clientFactory: () => client });
+  try {
+    f.store.insert(taskRecord({ agentId: rootId, ownerId: ownerIdFor(THREAD), sessionId: 'session-root', name: 'root', target: 'dsh' }));
+    f.store.insert(taskRecord({ agentId: childId, ownerId: ownerIdFor(THREAD), sessionId: 'session-child', name: 'child', target: 'dsh', parentAgentId: rootId }));
+    let release;
+    const holding = f.store.locked(childId, () => new Promise(resolve => { release = resolve; }));
+    const queued = await f.service.delete({ name: 'root' }, extra(THREAD));
+    assert.equal(queued.queued, true, JSON.stringify(queued));
+    assert.equal(f.store.get(rootId).state, 'cleaning');
+    release(); await holding;
+  } finally { f.service.close(); }
 });
 
 test('status does not trust a record left behind by a dead process', async () => {

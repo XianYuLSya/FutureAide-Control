@@ -430,9 +430,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     const workspace = registry?.get(record.workspaceId);
     if (typeof workspace?.detachSession !== 'function') reject('managed-cleanup-workspace-unsupported');
     if (projectionCache && typeof projectionCache.requireTable?.()?.delete !== 'function') reject('managed-cleanup-cache-unsupported');
-    if (query && (typeof query._serialized !== 'function' || typeof query._ensureReady !== 'function'
-        || typeof query._reconcile !== 'function' || typeof query._requireDb !== 'function'
-        || typeof query._observations?.cache?.delete !== 'function')) reject('managed-cleanup-query-unsupported');
+    if (query && typeof query._observations?.cache?.delete !== 'function') reject('managed-cleanup-query-unsupported');
     if (agent) await owner.sessions.flush(agent.session);
     const log = await persistence.resolveCurrentLog(record.sessionId);
     if (typeof log !== 'string' || path.basename(path.dirname(log)) !== record.sessionId) reject('managed-cleanup-path-unavailable');
@@ -596,16 +594,12 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
             || registry.list().some(project => project.sessionIds.includes(input.sessionId))
             || registry.pinnedSessionIds?.includes(input.sessionId) || registry.archivedSessionIds?.includes(input.sessionId)
             || service('sessionProjectionCache')?.requireTable().get(input.sessionId)) reject('managed-agent-not-found');
+        // Index rows are derived data and may outlive a finished delete until the next
+        // search reconciles them, so they never prove cleanup unfinished; only the live
+        // observation still answering for the session does.
         const query = service('sessionQuery');
-        if (query && (typeof query._serialized !== 'function' || typeof query._ensureReady !== 'function'
-            || typeof query._requireDb !== 'function')) reject('managed-cleanup-verification-unavailable');
+        if (query && typeof query._observations?.cache?.has !== 'function') reject('managed-cleanup-verification-unavailable');
         if (query?._observations?.cache?.has(input.sessionId)) reject('managed-cleanup-incomplete');
-        if (typeof query?._serialized === 'function') await query._serialized(undefined, async () => {
-          await query._ensureReady(undefined);
-          const db = query._requireDb();
-          if (db.prepare('SELECT id FROM persisted_sessions WHERE id = ?').get(input.sessionId)
-              || db.prepare('SELECT id FROM temp.live_sessions WHERE id = ?').get(input.sessionId)) reject('managed-cleanup-incomplete');
-        });
         return { sessionId: input.sessionId, released: true, dataDeleted: true, destroyed: true, alreadyDestroyed: true };
       }
       if (record.treeProtocol === 1 && input.treeProtocol !== 1) reject('managed-tree-protocol-required');
@@ -682,13 +676,10 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         for (const field of ['headers', 'sessionPaths', 'invalidSessionPaths', 'missingSessionPaths']) registry[field]?.delete(cleanup.sessionId);
       }
       const query = service('sessionQuery');
-      if (typeof query?._serialized === 'function' && typeof query?._reconcile === 'function') {
-        await query._serialized(undefined, async () => {
-          for (const cleanup of record.cleanupTree) query._observations.cache.delete(cleanup.sessionId);
-          await query._ensureReady(undefined);
-          await query._reconcile(undefined);
-        });
-      }
+      // Every search reconciles the index before it answers, so a deleted session can
+      // never come back from it; forcing that full scan here takes minutes and holds
+      // the shared query queue. Only the observation cache is cleared.
+      for (const cleanup of record.cleanupTree) query?._observations?.cache?.delete(cleanup.sessionId);
       for (const cleanup of record.cleanupTree) if (await persistence.stat(cleanup.sessionId)) reject('managed-cleanup-incomplete');
       await (writes.get(key) ?? Promise.resolve());
       await storage.remove(key);

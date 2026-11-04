@@ -919,6 +919,24 @@ export async function interrupt({ nativeSessionId }, {
   const since = before.events.at(-1)?.timestamp ?? new Date().toISOString();
   const press = await ui.interrupt();
 
+  // No stop control next to the prompt box means this session is not generating:
+  // there is nothing to press and nothing to wait for. Waiting for a marker that
+  // cannot appear only costs the whole timeout, and the registry can look busy
+  // because of background children, so it is not the signal either. The tree is
+  // not claimed settled: a background child can still be running and is stopped
+  // through the task panel.
+  if (press?.stopButtonFound === false) {
+    return {
+      interrupted: false, cancelled: true, status: 'idle-no-turn', reason: 'no-stop-control',
+      mayStillHaveChildren: true,
+      note: 'The composer has no stop control, so this session is not generating. A background child can still be running; stop it through the task panel before treating the tree as settled.',
+      nativeSessionId, method: press?.method,
+      stopControl: { method: press?.method, name: press?.stopButtonName ?? null, ancestry: press?.ancestry ?? null },
+      verifiedBy: ['host-stop-control-absent'], revealed: visible.revealed,
+      scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE,
+    };
+  }
+
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const now = await readTranscriptEvents(file);
@@ -935,35 +953,28 @@ export async function interrupt({ nativeSessionId }, {
   // No interrupt record. If the host was already idle there was nothing to stop,
   // which still satisfies a cancel request; that is stated, not dressed up as an
   // interrupt.
-  const afterwards = await resolveNativeSession(nativeSessionId, { env, isAlive }).catch(() => record);
-  const idle = press?.stopButtonFound === false && String(afterwards?.status ?? '').toLowerCase() === 'idle';
-  if (idle) {
-    // The turn can already have ended because the stop landed between the press
-    // and this read. The record is written a moment after the press, so one short
-    // settle and a second read is what tells the two cases apart.
-    await sleep(Math.max(pollMs, 250));
-    const settled = await readTranscriptEvents(file);
-    const landed = interruptEvidence(settled.events, since);
-    if (landed) {
-      return { interrupted: true, cancelled: true, status: 'already-stopped', nativeSessionId,
-        method: press?.method, verifiedBy: ['transcript-interrupt-marker', 'host-stop-control-absent'],
-        evidence: landed, revealed: visible.revealed, scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
-    }
-    return { interrupted: false, cancelled: true, status: 'idle-no-turn', reason: 'no-running-turn',
-      // The composer stop control appears while this session generates. Its absence
-      // with an idle registry does not prove the tree is quiet: background children
-      // can still be running, and they are stopped through the task panel.
-      mayStillHaveChildren: true,
-      note: 'No stop control and an idle registry. A background child can still be running; check the task panel before treating the tree as settled.',
-      nativeSessionId, method: press?.method,
-      verifiedBy: ['host-stop-control-absent', 'registry-idle'], revealed: visible.revealed,
-      stopControl: { method: press?.method, name: press?.stopButtonName ?? null, ancestry: press?.ancestry ?? null },
+  // A pressed stop can land just after the poll window: the record is written a
+  // moment later, so read once more before calling the result unconfirmed.
+  await sleep(Math.max(pollMs, 250));
+  const settled = await readTranscriptEvents(file);
+  const landed = interruptEvidence(settled.events, since);
+  if (landed) {
+    return { interrupted: true, cancelled: true, status: 'already-stopped', nativeSessionId,
+      method: press?.method, verifiedBy: ['transcript-interrupt-marker',
+        ...(press?.stopButtonFound === false ? ['host-stop-control-absent'] : [])],
+      evidence: landed, revealed: visible.revealed, stopControl: { method: press?.method,
+        name: press?.stopButtonName ?? null, ancestry: press?.ancestry ?? null },
       scope: INTERRUPT_SCOPE, ...INTERRUPT_SCOPE_NOTE };
   }
+  // A stop was pressed, so this session was generating when it was pressed. No
+  // record and an idle registry now is not evidence that the press took effect, so
+  // that stays unconfirmed rather than being dressed up as nothing to do.
+  const afterwards = await resolveNativeSession(nativeSessionId, { env, isAlive }).catch(() => record);
   return { interrupted: false, cancelled: false, status: 'unconfirmed', reason: 'interrupt-marker-not-written',
     nativeSessionId, method: press?.method, revealed: visible.revealed,
     stopControl: { method: press?.method, name: press?.stopButtonName ?? null, ancestry: press?.ancestry ?? null },
-    evidence: { since, transcriptFile: file, stopButtonFound: press?.stopButtonFound } };
+    evidence: { since, transcriptFile: file, stopButtonFound: press?.stopButtonFound,
+      registryStatus: afterwards?.status ?? null } };
 }// ------------------------------------------------- background tasks (children)
 
 /** The one control a task row offers, and the states it moves through. */

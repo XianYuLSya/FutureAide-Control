@@ -1208,7 +1208,7 @@ test('a stop that landed while the host went idle is an interrupt with evidence'
     interrupt: async () => {
       // the record lands just after the caller gave up polling
       setTimeout(() => { host1.append(SESSION, [userLine(INTERRUPT_MARKER)]).catch(() => {}); }, 120);
-      return { method: 'stop-button', stopButtonFound: false };
+      return { method: 'stop-button:mouse', stopButtonFound: true, stopButtonName: '停止' };
     },
   });
   try {
@@ -1217,7 +1217,7 @@ test('a stop that landed while the host went idle is an interrupt with evidence'
       { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 60, pollMs: 20 });
     assert.equal(result.interrupted, true);
     assert.equal(result.status, 'already-stopped');
-    assert.deepEqual(result.verifiedBy, ['transcript-interrupt-marker', 'host-stop-control-absent']);
+    assert.deepEqual(result.verifiedBy, ['transcript-interrupt-marker']);
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 
@@ -1482,11 +1482,15 @@ test('an idle session without a stop control says children may still be running'
   const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
   const driver = uiDriver({ interrupt: () => ({ method: 'stop-button', stopButtonFound: false }) });
   try {
-    const result = await interrupt({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 220, pollMs: 20 });
+    const started = Date.now();
+    const result = await interrupt({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive, timeoutMs: 5000, pollMs: 20 });
+    const elapsed = Date.now() - started;
     assert.equal(result.interrupted, false);
     assert.equal(result.status, 'idle-no-turn');
+    assert.equal(result.reason, 'no-stop-control');
     assert.equal(result.mayStillHaveChildren, true);
     assert.match(result.note, /task panel/);
+    assert.ok(elapsed < 1500, 'a session without a stop control answers without waiting for its timeout: ' + elapsed + 'ms');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
 

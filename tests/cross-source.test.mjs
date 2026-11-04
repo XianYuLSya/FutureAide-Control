@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { claudeBindingStale, claudeNoticeReceipt, createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
+import { createCodexBackend } from '../src/codex-backend.mjs';
 import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
 import { claudeTrustedCaller, registerScopedTools, scopedManagement } from '../src/mcp-server.mjs';
 
@@ -190,7 +191,8 @@ function fakeBackend({ nodes = [], changes = [], historyText = id => 'history:' 
     deliver: async () => ({ accepted: true }),
     receipt: async () => undefined,
     turn: async () => ({ state: 'ended' }),
-    models: async () => ({ models: [MODEL], default: MODEL }),
+    models: async () => ({ default: MODEL, routableProviders: [MODEL.provider],
+      groups: [{ id: MODEL.provider, models: [{ id: MODEL.model }] }] }),
     model: async () => MODEL,
     selectModel: async () => ({ accepted: true }),
     cancel: async () => ({ cancelRequested: true }),
@@ -211,6 +213,12 @@ const taskRecord = (overrides) => ({ state: 'awaiting_report', created: true, na
   lifetime: 'persistent', target: 'claude-desktop', workspace, createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(), history: [], task: { taskId: 'task-' + overrides.name, message: 'work',
     state: 'running', startedAt: new Date().toISOString(), dispatches: [], answers: [], reports: [] }, ...overrides });
+
+const completedInput = (name, reports = []) => ({ taskId: `task-${name}`, message: 'work', state: 'running',
+  treeProtocol: 1, reportProtocol: 1, startedAt: new Date().toISOString(), answers: [], reports,
+  dispatches: [{ requestId: `request-${name}`, state: 'completed', accepted: true }] });
+const finalReport = name => ({ id: `final-${name}`, taskId: `task-${name}`, message: `${name} done`, final: true,
+  delivery: { id: `notice-${name}`, state: 'pending' } });
 
 test('a same-named descendant never enters this chat’s namespace or list', async () => {
   const owner = ownerIdFor(THREAD);
@@ -308,5 +316,128 @@ test('children are cleaned first; a child failure keeps the parent retryable', a
     assert.equal(f.store.count(), 0);
     assert.deepEqual(backend.calls.destroy.filter(id => id === childId).length, 2, 'the child was retried, not re-destroyed after success');
     assert.equal(backend.calls.destroy.filter(id => id === rootId).length, 1, 'the parent destroyed exactly once');
+  } finally { f.service.close(); }
+});
+
+test('three managed levels settle after persistent child finals and pending notices finish', async () => {
+  const backend = fakeBackend({ changes: [{ path: 'work.txt', operation: 'write' }] });
+  const f = await fixture({ adapters: { 'claude-desktop': backend } });
+  try {
+    await f.service.list(extra(THREAD));
+    await f.service.list(extra(OTHER));
+    for (const [name, parent] of [['root', undefined], ['child', 'root'], ['grand', 'child']]) {
+      f.store.insert(taskRecord({ agentId: name, ownerId: ownerIdFor(name === 'root' ? THREAD : OTHER),
+        sessionId: `session-${name}`, name, parentAgentId: parent,
+        task: completedInput(name, [finalReport(name)]) }));
+    }
+    await f.service.poll('root');
+    assert.equal(f.store.get('root').task.result, undefined);
+    const before = await f.service.changes({ name: 'root' }, extra(THREAD));
+    assert.deepEqual(before.tree.nodes.map(n => n.agentPath), [['root'], ['root', 'child'], ['root', 'child', 'grand']]);
+    await f.service.poll('grand');
+    assert.equal(f.store.get('grand').state, 'idle');
+    await f.service.poll('child');
+    assert.equal(f.store.get('child').state, 'idle');
+    // An idle native tree alone is insufficient while a child's notice is pending.
+    const child = f.store.get('child');
+    child.task.reports.push({ id: 'late', taskId: child.task.taskId, message: 'notice', final: false, delivery: { state: 'pending' } });
+    f.store.save(child);
+    await f.service.poll('root');
+    assert.equal(f.store.get('root').task.result, undefined);
+    child.task.reports.at(-1).delivery.state = 'delivered'; f.store.save(child);
+    await f.service.poll('root');
+    assert.equal(f.store.get('root').state, 'idle');
+    assert.equal(f.store.get('root').task.reports[0].delivery.state, 'delivered');
+    assert.equal(f.store.get('root').closed, undefined);
+    assert.equal(f.store.get('root').task.result.changes.length, 3);
+  } finally { f.service.close(); }
+});
+
+test('a once child cleans itself and its files and native history survive in the parent task', async () => {
+  const backend = fakeBackend({ changes: [{ path: 'child.txt', operation: 'write' }], historyText: () => 'completed child history' });
+  const f = await fixture({ adapters: { 'claude-desktop': backend } });
+  try {
+    await f.service.list(extra(THREAD)); await f.service.list(extra(OTHER));
+    f.store.insert(taskRecord({ agentId: 'parent', ownerId: ownerIdFor(THREAD), sessionId: 'session-parent', name: 'parent',
+      task: completedInput('parent') }));
+    f.store.insert(taskRecord({ agentId: 'once', ownerId: ownerIdFor(OTHER), sessionId: 'session-once', name: 'once',
+      parentAgentId: 'parent', lifetime: 'once', nativeDestroyed: false, task: completedInput('once', [finalReport('once')]) }));
+    const staleParent = f.store.get('parent');
+    await f.service.poll('once');
+    assert.equal(f.store.get('once'), undefined, 'the child completed its own automatic cleanup');
+    assert.equal(backend.calls.destroy.length, 1);
+    f.store.save(staleParent);
+    assert.equal(f.store.get('parent').task.childSnapshots.length, 1, 'an old parent save cannot lose the handoff');
+    const changes = await f.service.changes({ name: 'parent' }, extra(THREAD));
+    assert.ok(changes.changes.some(c => c.path === 'child.txt' && c.agentPath.join('/') === 'parent/once'));
+    const inspected = await f.service.inspect({ name: 'parent' }, extra(THREAD));
+    assert.equal(inspected.tree.nodes[1].messages[0].content, 'completed child history');
+    assert.equal(JSON.stringify(inspected).includes('"sessionId"'), false);
+    const parent = f.store.get('parent'); parent.task.reports.push(finalReport('parent')); f.store.save(parent);
+    await f.service.poll('parent');
+    const finished = f.store.get('parent');
+    assert.equal(finished.state, 'idle');
+    await f.service.send({ name: 'parent', message: 'next task' }, extra(THREAD));
+    const historical = await f.service.changes({ name: 'parent', task: 1 }, extra(THREAD));
+    assert.ok(historical.changes.some(c => c.agentPath.join('/') === 'parent/once'));
+    assert.deepEqual(historical.tree.nodes.map(n => n.agentPath), [['parent'], ['parent', 'once']]);
+  } finally { f.service.close(); }
+});
+
+test('Codex poll consumes submissions atomically while ask remains answerable through its backend', async () => {
+  const adapter = (record, deps) => createCodexBackend(record, { ...deps, host: {
+    probe: async () => ({ identity: { application: 'codex-desktop' }, missing: [] }),
+    readDefaultModel: async () => ({ provider: 'openai', model: 'test' }),
+  } });
+  const f = await fixture({ adapters: { 'codex-desktop': adapter } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'codex', ownerId: ownerIdFor(THREAD), sessionId: 'logical-codex', name: 'codex',
+      target: 'codex-desktop', task: completedInput('codex') }));
+    for (const [id, kind] of [['ask-1', 'ask'], ['report-1', 'report']]) f.store.enqueueSubmission({ id,
+      ownerId: ownerIdFor(THREAD), agentId: 'codex', taskId: 'task-codex', kind, message: `${kind} text` });
+    const save = f.store.save.bind(f.store);
+    const record = f.store.get('codex');
+    f.store.save = () => { throw new Error('injected transaction failure'); };
+    assert.throws(() => f.store.saveAndConsumeSubmissions(record, ['ask-1', 'report-1']), /transaction failure/);
+    f.store.save = save;
+    assert.equal(f.store.pendingSubmissions('codex', 'task-codex').length, 2);
+    await f.service.poll('codex');
+    assert.equal(f.store.pendingSubmissions('codex', 'task-codex').length, 0);
+    assert.equal(f.store.get('codex').state, 'awaiting_input');
+    assert.equal(f.store.get('codex').task.reports.length, 1);
+    assert.equal(f.store.get('codex').observation.questions[0].message, 'ask text');
+    assert.equal((await f.service.answer({ name: 'codex', message: 'answer text' }, extra(THREAD))).answered, true);
+    assert.deepEqual(f.store.backendState('codex').answeredQuestionIds, ['submission:ask-1']);
+    const inspected = await f.service.inspect({ name: 'codex' }, extra(THREAD));
+    assert.deepEqual(inspected.questions, []);
+    assert.equal(f.store.get('codex').task.reports.length, 1, 'the consumed report is not duplicated');
+  } finally { f.service.close(); }
+});
+
+test('cancelPending keeps the monitor advancing a late handback until the native tree settles', async () => {
+  let cancels = 0;
+  const base = fakeBackend();
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record), cancel: async () => {
+    cancels++;
+    return { cancelRequested: true, cancelPending: cancels < 3, remainingTasks: cancels < 3 ? ['late-handback'] : [], treeSettled: cancels >= 3 };
+  } }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'cancel', ownerId: ownerIdFor(THREAD), sessionId: 'session-cancel', name: 'cancel',
+      task: completedInput('cancel') }));
+    await f.service.cancel({ name: 'cancel' }, extra(THREAD));
+    await f.service.poll('cancel');
+    assert.equal(cancels, 2);
+    assert.equal(f.store.get('cancel').task.cancelVerified, true);
+    assert.equal(f.store.get('cancel').task.cancelPending, true);
+    assert.equal(f.store.get('cancel').state, 'running');
+    assert.equal(f.store.get('cancel').observation.tree.settled, false);
+    await f.service.poll('cancel');
+    assert.equal(cancels, 3, 'verified cancellation still advances while cancelPending is true');
+    assert.equal(f.store.get('cancel').state, 'cancelled');
+    assert.equal(f.store.get('cancel').task.cancelTreeSettled, true);
+    await f.service.poll('cancel');
+    assert.equal(cancels, 3, 'settled cancellation no longer calls the backend');
   } finally { f.service.close(); }
 });

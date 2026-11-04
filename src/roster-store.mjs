@@ -285,10 +285,13 @@ export class RosterStore {
     record.updatedAt = new Date().toISOString();
     // A watcher or sender can wake without the operation lock. Never restore a
     // sleep marker from an older in-memory poll after that atomic wake.
-    const input = "CASE WHEN json_type(body,'$.sleep') IS NULL THEN json_remove(?1,'$.sleep') WHEN json_extract(body,'$.sleep.wakePending')=1 AND json_extract(body,'$.sleep.taskId')=json_extract(?1,'$.sleep.taskId') THEN json_set(?1,'$.sleep.wakePending',json('true')) ELSE ?1 END";
+    const sleeping = "CASE WHEN json_type(body,'$.sleep') IS NULL THEN json_remove(?1,'$.sleep') WHEN json_extract(body,'$.sleep.wakePending')=1 AND json_extract(body,'$.sleep.taskId')=json_extract(?1,'$.sleep.taskId') THEN json_set(?1,'$.sleep.wakePending',json('true')) ELSE ?1 END";
+    // Children can finish while their parent holds an older in-memory view.
+    // Preserve the atomic handoff for this task when that parent next saves.
+    const input = `CASE WHEN json_extract(body,'$.task.taskId')=json_extract(?1,'$.task.taskId') AND json_type(body,'$.task.childSnapshots')='array' THEN json_set(${sleeping},'$.task.childSnapshots',json_extract(body,'$.task.childSnapshots')) ELSE ${sleeping} END`;
     const result = this.db.prepare(`UPDATE agents SET body=CASE
       WHEN json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId') AND json_extract(body,'$.task.cancelRequested')=1
-      THEN json_set(${input},'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(${input},'$.task.cancelRequested')=1 THEN json_extract(${input},'$.state') ELSE 'running' END)
+      THEN json_set(${input},'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.task.cancelPending',json(CASE WHEN json_extract(body,'$.task.cancelPending')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(${input},'$.task.cancelRequested')=1 THEN json_extract(${input},'$.state') ELSE 'running' END)
       WHEN json_extract(${input},'$.state')='idle' AND json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId')
         AND EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND status IN ('queued','sending','unknown'))
       THEN json_set(${input},'$.state','running') ELSE ${input} END
@@ -309,10 +312,10 @@ export class RosterStore {
       AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=json_extract(agents.body,'$.task.taskId') AND status IN ('queued','sending','unknown','blocked'))`)
       .run(record.agentId, record.ownerId, record.task?.taskId).changes === 1;
   }
-  confirmCancel(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'))
+  confirmCancel(record, result = {}) {
+    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'),'$.task.cancelPending',json(?))
       WHERE id=? AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.task.cancelRequested')=1`)
-      .run(record.agentId, record.task?.taskId).changes === 1;
+      .run(result.cancelPending === true ? 'true' : 'false', record.agentId, record.task?.taskId).changes === 1;
   }
   // Update only the error, and never overwrite a different error that a later
   // attempt already recorded, so a delayed spawn failure cannot mask new state.
@@ -342,11 +345,34 @@ export class RosterStore {
       .run(id, ownerId, agentId, taskId, kind, message, final ? 1 : 0, created).changes === 1;
   }
   pendingSubmissions(agentId, taskId) {
+    return this.submissions(agentId, taskId, true);
+  }
+  submissions(agentId, taskId, pendingOnly = false) {
     return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created FROM submissions
-      WHERE agent=? AND task=? AND state='pending' ORDER BY created`)
+      WHERE agent=? AND task=? ${pendingOnly ? "AND state='pending'" : ''} ORDER BY created`)
       .all(agentId, taskId)
       .map(row => ({ id: row.id, ownerId: row.owner, agentId: row.agent, taskId: row.task,
         kind: row.kind, message: row.message, final: row.final === 1, created: row.created }));
+  }
+  saveAndConsumeSubmissions(record, ids) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.save(record);
+      for (const id of ids) this.consumeSubmission(id);
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
+  }
+  saveChildSnapshot(parentId, taskId, snapshot) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const parent = this.get(parentId);
+      if (parent?.task?.taskId === taskId) {
+        const snapshots = [...(parent.task.childSnapshots ?? []).filter(item => item.agentId !== snapshot.agentId), snapshot];
+        this.db.prepare("UPDATE agents SET body=json_set(body,'$.task.childSnapshots',json(?)) WHERE id=?")
+          .run(JSON.stringify(snapshots), parentId);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   /** Consume once: false means another poll already took it. */
   consumeSubmission(id) {

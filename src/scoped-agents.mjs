@@ -82,7 +82,7 @@ function ownedTree(record, view) {
 }
 
 function treeSettled(record, view) {
-  return view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
+  return !record.task?.cancelPending && view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
 }
 
 function rootSummary(view) {
@@ -404,7 +404,7 @@ export function createScopedAgents(config, {
    */
   function readCodexReportState(record) {
     if (!record?.task) return { questions: [], reports: [] };
-    const pending = store.pendingSubmissions(record.agentId, record.task.taskId);
+    const pending = store.submissions(record.agentId, record.task.taskId);
     // Both lists carry the task they belong to: the Codex backend filters by taskId, so
     // a question without it would be dropped before the shared layer ever saw it.
     return {
@@ -515,15 +515,14 @@ export function createScopedAgents(config, {
 
   /**
    * Fold pending explicit submissions into the task: a report becomes a task
-   * report, an ask becomes a pending question. The row is consumed first, so two
-   * concurrent polls can never process the same submission twice.
+   * report, an ask becomes a pending question. Task changes and consumption commit
+   * together; the durable submission remains readable by the Codex backend.
    */
   function absorbSubmissions(record) {
     const pending = store.pendingSubmissions(record.agentId, record.task.taskId);
     if (!pending.length) return;
     let changed = false;
     for (const item of pending) {
-      if (!store.consumeSubmission(item.id)) continue;
       changed = true;
       if (item.kind === 'report') {
         record.task.reports ??= [];
@@ -540,7 +539,7 @@ export function createScopedAgents(config, {
         record.state = 'awaiting_input';
       }
     }
-    if (changed) store.save(record);
+    if (changed) store.saveAndConsumeSubmissions(record, pending.map(item => item.id));
   }
   async function withName(extra, name, action, options) {
     const owner = await context(extra);
@@ -654,12 +653,12 @@ export function createScopedAgents(config, {
       name: node.sessionId === record.sessionId ? record.name : node.name,
       backendKey: record.agentId, nativeSessionId: node.sessionId }));
     const managed = new Map([[record.agentId, { record, backend: await backendFor(record), rootKey: record.sessionId }]]);
-    let settled = own.tree?.settled === true;
-    let running = own.tree?.running === true;
+    let settled = own.tree?.settled === true && !record.task?.cancelPending;
+    let running = own.tree?.running === true || record.task?.cancelPending === true;
     for (const child of store.descendantsOf([record.agentId])) {
       const parentEntry = managed.get(child.parentAgentId);
       if (!parentEntry) continue;
-      const parentKey = keyOf(child.parentAgentId, parentEntry.rootKey);
+      const parentKey = parentEntry.rootKey;
       const entry = { record: child, backend: undefined, view: undefined, rootKey: keyOf(child.agentId, child.sessionId) };
       managed.set(child.agentId, entry);
       try {
@@ -682,13 +681,30 @@ export function createScopedAgents(config, {
           backendKey: child.agentId, nativeSessionId: child.sessionId, synthetic: true });
       }
       const pendingReports = (child.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
-      const busy = Boolean(child.task) && (!child.closed || pendingReports
-        || ACTIVE.has(child.state) || child.state === 'cleanup_failed');
+      const pendingQuestions = (entry.view?.questions ?? []).some(question => question.state === 'pending');
+      const busy = Boolean(child.task) && (pendingReports || pendingQuestions
+        || ACTIVE.has(child.state) || child.state === 'cleanup_failed'
+        || !['completed', 'failed', 'cancelled'].includes(child.task.state));
       const childSettled = !child.task
         ? true
         : entry.view?.tree?.settled === true && entry.view?.tree?.running === false && !busy;
       settled = settled && childSettled;
       running = running || entry.view?.tree?.running === true || busy;
+    }
+    // Removed one-shot children remain part of this task's evidence. Live records
+    // take precedence while cleanup is in progress or being retried.
+    for (const entry of managed.values()) {
+      const latest = store.get(entry.record.agentId);
+      const snapshots = latest?.task?.taskId === entry.record.task?.taskId
+        ? latest?.task?.childSnapshots : entry.record.task?.childSnapshots;
+      for (const snapshot of snapshots ?? []) {
+        if (managed.has(snapshot.agentId)) continue;
+        const snapshotKey = native => `${snapshot.agentId}:${native}`;
+        for (const node of snapshot.nodes ?? []) nodes.push({ ...node,
+          sessionId: snapshotKey(node.sessionId),
+          parentSessionId: node.parentSessionId ? snapshotKey(node.parentSessionId) : entry.rootKey,
+          archived: true });
+      }
     }
     const composed = { ...own, tree: { ...(own.tree ?? {}), nodes, settled, running } };
     composed.managed = managed;
@@ -766,8 +782,9 @@ export function createScopedAgents(config, {
       store.save(record);
       const result = await (await checkHost(record)).cancel();
       if (result.cancelRequested === true) {
-        store.confirmCancel(record);
+        store.confirmCancel(record, result);
         record.task.cancelVerified = true;
+        record.task.cancelPending = result.cancelPending === true;
         store.save(record);
       }
     }
@@ -938,16 +955,13 @@ export function createScopedAgents(config, {
       for (const child of store.childrenOf(record.agentId)) {
         const current = store.get(child.agentId);
         if (!current || current.agentId === record.agentId) continue;
-        // A one-shot child hands its terminal evidence to the parent's current task
-        // snapshot before it is removed, so the parent keeps the tree, files and
-        // history it was created from even after the child's record is gone.
-        if (current.lifetime === 'once') await keepChildSnapshot(record, current);
         const verdict = await clearRecord(current);
         if (verdict?.deleted !== true) {
           throw Object.assign(new Error(`The managed subagent “${current.name}” could not be cleaned; this name stays listed so cleanup can be retried.`),
             { code: 'child-cleanup-failed', child: current.name, childError: verdict?.error });
         }
       }
+      if (record.lifetime === 'once' && record.parentAgentId) await keepChildSnapshot(record);
       if (!record.nativeDestroyed) {
         const backend = await checkHost(record);
         const result = await backend.destroy();
@@ -981,19 +995,24 @@ export function createScopedAgents(config, {
    * Keep a one-shot child's terminal tree, files and history inside the parent's
    * current task snapshot, in the fields the task already has. No second state machine.
    */
-  async function keepChildSnapshot(parent, child) {
-    const current = store.get(parent.agentId);
-    if (!current?.task) return;
-    const observation = child.observation ?? {};
-    const snapshot = { name: child.name, agentPath: managedPath(child), target: targetOf(child),
-      state: child.state, taskId: child.task?.taskId,
-      tree: publicTree(child, observation),
-      changes: attributedChanges(child, observation),
-      coverage: treeCoverage(child, observation),
-      history: (child.history ?? []).slice(-20).map(task => ({ message: compactText(task.message, 240), state: task.state,
-        startedAt: task.startedAt, finishedAt: task.finishedAt })) };
-    current.task.childSnapshots = [...(current.task.childSnapshots ?? []).filter(item => item.name !== child.name), snapshot];
-    store.save(current);
+  async function keepChildSnapshot(child) {
+    const parent = store.get(child.parentAgentId);
+    if (!parent?.task) return;
+    const view = child.nativeDestroyed ? child.observation ?? {} : await observe(child);
+    const nodes = [];
+    for (const { node } of ownedTree(child, view).nodes) {
+      const saved = { ...node };
+      if (!saved.archivedHistory && !child.nativeDestroyed) {
+        const backend = view.managed?.get(node.backendKey)?.backend ?? await backendFor(child);
+        const page = await backend.history({ targetSessionId: node.nativeSessionId ?? node.sessionId,
+          running: false, maxMessages: 100 });
+        saved.archivedHistory = { messages: page.messages ?? [], hasMore: page.hasMore === true,
+          ...(page.note ? { note: page.note } : {}) };
+      }
+      nodes.push(saved);
+    }
+    store.saveChildSnapshot(parent.agentId, parent.task.taskId,
+      { agentId: child.agentId, taskId: child.task?.taskId, nodes });
   }
 
   // Only persisted report_parent calls may wake the parent chat.
@@ -1009,8 +1028,11 @@ export function createScopedAgents(config, {
   async function finishDeliveredReport(record) {
     const task = record.task;
     const current = store.get(record.agentId);
-    if (current?.task?.taskId === task.taskId && current.task.cancelRequested) task.cancelRequested = true;
-    if (task.cancelRequested && (!task.cancelVerified || !task.cancelTreeSettled)) {
+    if (current?.task?.taskId === task.taskId && current.task.cancelRequested) {
+      task.cancelRequested = true;
+      task.cancelPending = current.task.cancelPending === true;
+    }
+    if (task.cancelRequested && (!task.cancelVerified || task.cancelPending || !task.cancelTreeSettled)) {
       record.state = task.state = 'running';
       store.save(record);
       return publicResult(record);
@@ -1173,9 +1195,15 @@ export function createScopedAgents(config, {
       // Explicit ask/report that a Codex-side tool wrote into the shared queue join
       // the same task as questions/reports before anything else looks at them.
       if (task) absorbSubmissions(record);
-      if (task?.cancelRequested && !task.cancelVerified) {
+      if (task?.cancelRequested && (!task.cancelVerified || task.cancelPending)) {
         const result = await (await checkHost(record)).cancel();
-        if (result.cancelRequested === true) { store.confirmCancel(record); task.cancelAccepted = true; task.cancelVerified = true; store.save(record); }
+        if (result.cancelRequested === true) {
+          store.confirmCancel(record, result);
+          task.cancelAccepted = true; task.cancelVerified = true;
+          task.cancelPending = result.cancelPending === true;
+          if (task.cancelPending) task.cancelTreeSettled = false;
+          store.save(record);
+        }
       }
       if (task && store.supplements(record.agentId).length) await drainSupplements(record);
       // Never migrate an automatic result into an explicit report or cleanup.
@@ -1437,6 +1465,12 @@ export function createScopedAgents(config, {
         const backend = await backendFor(record);
         for (let index = 0; index < nodes.length; index++) {
           const { node } = nodes[index];
+          if (node.archived) {
+            const page = node.archivedHistory ?? { messages: [], hasMore: false };
+            Object.assign(tree.nodes[index], { ...page, messages: page.messages.slice(-maxMessages),
+              hasMore: page.hasMore || page.messages.length > maxMessages });
+            continue;
+          }
           const owner = node.backendKey && node.backendKey !== record.agentId ? view.managed?.get(node.backendKey) : undefined;
           const nodeBackend = owner?.backend ?? backend;
           const targetSessionId = node.nativeSessionId ?? node.sessionId;
@@ -1476,7 +1510,7 @@ export function createScopedAgents(config, {
       if (!store.requestCancel(record)) return { name, accepted: false, state: store.get(record.agentId)?.state ?? 'removed' };
       try {
         const result = await (await checkHost(record)).cancel();
-        if (result.cancelRequested === true) store.confirmCancel(record);
+        if (result.cancelRequested === true) store.confirmCancel(record, result);
         // Descendants on any application stop with their parent; each keeps its own
         // record and report, so nothing is dropped from the tree.
         for (const child of store.descendantsOf([record.agentId])) {
@@ -1486,7 +1520,7 @@ export function createScopedAgents(config, {
               const current = store.get(child.agentId);
               if (!current || current.closed || !store.requestCancel(current)) return;
               const cancelled = await (await checkHost(current)).cancel();
-              if (cancelled.cancelRequested === true) store.confirmCancel(current);
+              if (cancelled.cancelRequested === true) store.confirmCancel(current, cancelled);
             });
           } catch { /* its own poll reports the failure on that record. */ }
         }

@@ -188,7 +188,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 后台 worker 异步启动失败的修补是另一个独立缺陷。安装配置下，新启动的 MCP 进程会在 `.runtime/diagnostics/` 记录精简生命周期日志，包含进程、工具名和聊天身份，不包含任务正文、结果或凭据。
 
-**安装范围**：`install.ps1` 目前只准备 Codex 插件与本机 DSH 主机桥接。Claude 项目的 bootstrap 与 Codex Desktop 注册尚未纳入一键安装；新机器安装后需分别配置。本机已完成三目标正式接入：Codex 的 `futureaide` 与 Claude 项目的 `futureaide-report` 都指向同一正式目录和状态库，旧开发注册已退役。日常调用不需要重新运行安装器。
+**安装范围**：`install.ps1` 现在准备三样东西：Codex 插件、本机 DSH 主机桥接，以及 Claude 的**用户级插件**。安装器在 `.runtime/claude-marketplace` 生成一个只含清单、MCP 配置和 skill 的薄插件（运行目录仍以绝对路径指向 D 盘），随后依次执行 `claude plugin marketplace add … --scope user` 与 `claude plugin install futureaide-control@futureaide --scope user`。注册是用户级的，Claude 在**任何项目**发起的会话都能按名字调用 DSH 子代理，不必为每个项目单独写 `.mcp.json`。Claude 只在新开会话时加载插件，安装前已打开的会话不会自动生效，需要新开一个。找不到 `claude` 命令或注册失败都不影响 Codex 安装，返回值里 `claude.registered` 会是 `false` 并带原因；桌面端自带的 `claude.exe` 不在 PATH 时可用 `-ClaudeCli <path>` 指定，不想改 Claude 环境时用 `-SkipClaude`。插件从 D 盘原地加载，重新运行安装器重新生成文件即完成升级。Codex Desktop 注册尚未纳入一键安装。本机已完成三目标正式接入：Codex 的 `futureaide` 与 Claude 的 `futureaide-report` 都指向同一正式目录和状态库，旧开发注册已退役。日常调用不需要重新运行安装器。
 
 ## 本机验证现状（2026-11-04）
 

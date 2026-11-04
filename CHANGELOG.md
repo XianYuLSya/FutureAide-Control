@@ -15,10 +15,11 @@
 - 修复子代理结束后后台 PowerShell/Bash 命令被遗漏的问题：后台任务参与树结算与取消，以原生任务通知确认停止。
 - 修复补充消息重试阻挡已有报告与问题的推进；Codex 进程发现使用系统 PowerShell 绝对路径，不依赖 Claude 的 PATH。
 - 增加任务父级及生命周期索引，避免监控完整解析历史；Codex 就绪探测短时复用，每次真实派发仍读取当前默认模型。
+- `install.ps1` 现在把 FutureAide Control 注册为 Claude 的**用户级插件**：在 `.runtime/claude-marketplace` 生成只含清单、MCP 配置和 skill 的薄插件（用绝对路径指向 D 盘运行目录），再依次执行 `claude plugin marketplace add … --scope user` 与 `claude plugin install futureaide-control@futureaide --scope user`。任何项目的 Claude 会话都能按名字调用 DSH 子代理，新开会话时生效；找不到 `claude` 或注册失败不影响 Codex 安装，可用 `-ClaudeCli <path>` 指定桌面端自带的 `claude.exe`，或用 `-SkipClaude`、环境变量 `CLAUDE_CLI` 控制。
 
 本机验证（2026-11-04）：正式入口的 12 工具与三目标实际可用。正向 Claude 完成 create/send → ask/answer → Write → 显式 final → once 原生删除、产物保留；反向 Claude → Codex 完成普通回复留在同任务、补充、问答、原生 apply_patch、显式 final、once 原生 thread/delete（SQLite 与 rollout 消失）并回到 Claude。长期 Claude 跨任务保留口令并生成精确产物，下一次输入跟随宿主当前默认档位。公共取消停止 Claude → Codex → DSH 混合树；后台 shell 最小复验收到原生 stopped 通知并在自然结束前退出。性能实测 status 暖调用 9933ms → 37ms；4 running/39 sleeping 时监控单核 CPU 94.7% → 30.1%。细节与证据见 [README](README.md#本机验证现状2026-11-04)。
 
-安装器仍只准备 Codex 插件与 DSH 桥接；本机桌面目标已接好，其他机器的 Claude bootstrap 与 Codex 注册尚需单独配置。未实机验证整应用退出再打开后的自动恢复，本次原请求恢复和监控切换保留原任务身份。
+安装器的 Claude 注册只生成薄插件，运行目录与状态仍在本机 D 盘；Codex Desktop 注册不在安装器内，其他机器尚需单独配置。未实机验证整应用退出再打开后的自动恢复，本次原请求恢复和监控切换保留原任务身份。
 
 ## 0.5.7 — 2026-11-01 · 默认模型跟随与派单去重
 

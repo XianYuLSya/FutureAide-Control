@@ -2,7 +2,9 @@
 param(
     [string]$CodexHome,
     [string]$DshHome,
-    [switch]$SkipHost
+    [string]$ClaudeCli,
+    [switch]$SkipHost,
+    [switch]$SkipClaude
 )
 $ErrorActionPreference = 'Stop'
 if ([IO.Path]::GetPathRoot($PSScriptRoot).TrimEnd('\') -ieq 'C:') {
@@ -36,6 +38,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'node_modules\@modelco
 $installerArgs = @((Join-Path $PSScriptRoot 'scripts\install-plugin.mjs'))
 if ($CodexHome) { $installerArgs += @('--codex-home', $CodexHome) }
 if ($DshHome) { $installerArgs += @('--dsh-home', $DshHome) }
+if ($ClaudeCli) { $installerArgs += @('--claude-cli', $ClaudeCli) }
 if ($SkipHost) { $installerArgs += '--skip-host' }
+if ($SkipClaude) { $installerArgs += '--skip-claude' }
 & $nodePath @installerArgs
 if ($LASTEXITCODE -ne 0) { throw 'FutureAide Control setup is incomplete. See the error above.' }

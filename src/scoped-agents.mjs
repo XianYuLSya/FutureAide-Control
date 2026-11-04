@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, realpath, rm } from 'node:fs/promises';
+import { lstat, open, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
@@ -156,6 +156,55 @@ const CLAUDE_STALE_BINDING = ['claude-session-changed', 'claude-process-replaced
 export const claudeBindingStale = error =>
   CLAUDE_STALE_BINDING.some(code => String(error?.message ?? error ?? '').includes(code));
 
+const CLAUDE_PAGE_BYTES = 1 << 20;
+const CLAUDE_MAX_PAGE_BYTES = 16 << 20;
+const CLAUDE_PAGES_PER_POLL = 8;
+
+/**
+ * Complete-line byte cursor at the current end of a transcript: where a new notice
+ * starts looking for its receipt. Only a small tail window is read, so a long parent
+ * chat costs the same as an empty one.
+ */
+export async function transcriptCursor(binding) {
+  const handle = await open(binding.transcriptFile, 'r');
+  try {
+    const { size } = await handle.stat();
+    const window = Math.min(size, 64 * 1024);
+    if (!window) return 0;
+    const buffer = Buffer.alloc(window);
+    await handle.read(buffer, 0, window, size - window);
+    const lastBreak = buffer.lastIndexOf(10);
+    // A tail with no line break cannot be a cursor; start over rather than misalign.
+    return lastBreak === -1 ? 0 : size - window + lastBreak + 1;
+  } finally { await handle.close(); }
+}
+
+/**
+ * Follow one notice's page window for its own request id, advancing the saved cursor
+ * as it goes. Pages continue on the next poll instead of rescanning history, and a
+ * line longer than a page retries at the reader's 16MiB ceiling.
+ * @param {object} binding Native transport binding.
+ * @param {{id: string, cursor?: number}} notice Persisted notice; its cursor advances.
+ */
+export async function findClaudeReceipt(binding, notice) {
+  let cursor = Number.isSafeInteger(notice.cursor) ? notice.cursor : 0;
+  for (let page = 0; page < CLAUDE_PAGES_PER_POLL; page++) {
+    let read;
+    try { read = await readClaudeEvents(binding, { offset: cursor, maxBytes: CLAUDE_PAGE_BYTES }); }
+    catch (error) {
+      if (!String(error?.message ?? '').includes('line-exceeds-page') || CLAUDE_PAGE_BYTES >= CLAUDE_MAX_PAGE_BYTES) throw error;
+      read = await readClaudeEvents(binding, { offset: cursor, maxBytes: CLAUDE_MAX_PAGE_BYTES });
+    }
+    const matched = claudeNoticeReceipt(read.deliveries, notice.id);
+    const next = Number.isSafeInteger(read.offset) ? read.offset : cursor;
+    notice.cursor = next;
+    if (matched) return matched;
+    if (read.hasMore !== true || next <= cursor) return undefined;
+    cursor = next;
+  }
+  return undefined;
+}
+
 /** Name-addressed operations; owner and native identifiers never come from tool arguments. */
 export function createScopedAgents(config, {
   store = new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
@@ -206,6 +255,9 @@ export function createScopedAgents(config, {
       readClaudeReportStatus: readStatus,
       ensureCodexReports: () => beginCodexReports(record),
       readCodexReportState: () => readCodexReportState(load()),
+      // The Codex probe reads its protocol readiness only; this must never start a
+      // session, so it is the same read-only evidence status uses.
+      readCodexReportStatus: () => readCodexReportStatus(record),
       // A Codex child's bridge is anchored on a verified Codex chat, never on a Claude
       // session id, and the same resolver is offered both ways for its host options.
       anchorResolver: () => anchorResolver(load()),
@@ -367,6 +419,19 @@ export function createScopedAgents(config, {
     if (typeof codexToolsStatus !== 'function') return { registered: false };
     try { return (await codexToolsStatus(record)) ?? { registered: false }; }
     catch (error) { return { registered: false, reason: safeError(error) }; }
+  }
+  /**
+   * Read-only status for the Codex backend's own probe, which fills reportProtocol
+   * from it. `ready` means the ask/report registration is configured and startable
+   * for this project — creation needs nothing more, because its first session does not
+   * exist yet. `registered` is the stronger live-tool evidence a real session adds,
+   * and status readiness uses that. Neither is ever inferred from HTTP health.
+   */
+  async function readCodexReportStatus(record) {
+    const value = await readCodexToolsStatus(record);
+    const registered = provenRegistration(value);
+    const configured = value?.configured === true || registered;
+    return { ...value, ready: configured, configured, registered };
   }
   /** Both tool names, proven by whichever evidence the adapter has. */
   function provenRegistration(value) {
@@ -634,7 +699,9 @@ export function createScopedAgents(config, {
           // The native receipt is the request id itself: our envelope uuid survives
           // as the queue/attachment/user uuid. Transcript text is truncated at 8k,
           // so a long report's trailing marker is never reliable — deliveries are.
-          const settled = claudeNoticeReceipt((await readClaudeEvents(await claudeNoticeBinding(owner), { offset: 0 })).deliveries, notice.id);
+          // The scan starts at this notice's own cursor, so a long parent chat is
+          // never rescanned and a page boundary simply continues on the next poll.
+          const settled = await findClaudeReceipt(await claudeNoticeBinding(owner), notice);
           Object.assign(notice, settled
             ? { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined }
             : { state: 'unknown' });
@@ -665,12 +732,20 @@ export function createScopedAgents(config, {
         // branch finds our request id in the native deliveries. A definite channel
         // failure stays 'pending'. The cached binding is reused; only a binding the
         // session outgrew is refreshed, and the parent session is never replaced.
-        const send = binding => sendClaude(binding, `${text}\n\n${marker}`, { requestId: notice.id });
+        const binding = await claudeNoticeBinding(owner);
+        // Remember where the transcript ends before writing: the receipt can only
+        // appear after this point, so later polls start here instead of rescanning.
+        notice.cursor = await transcriptCursor(binding).catch(() => undefined);
+        const send = target => sendClaude(target, `${text}\n\n${marker}`, { requestId: notice.id });
         let sent;
-        try { sent = await send(await claudeNoticeBinding(owner)); }
+        try { sent = await send(binding); }
         catch (error) {
+          // A binding is refreshed only when the write provably failed before it
+          // happened; a written/uncertain channel is never retried here.
           if (!claudeBindingStale(error)) throw error;
-          sent = await send(await refreshClaudeBinding(owner));
+          const fresh = await refreshClaudeBinding(owner);
+          notice.cursor = await transcriptCursor(fresh).catch(() => undefined);
+          sent = await send(fresh);
         }
         if (sent?.status === 'failed') Object.assign(notice, { state: 'pending', error: { message: 'The Claude inbox rejected this notice before acceptance.' } });
         else Object.assign(notice, { state: 'unknown', error: undefined });

@@ -261,6 +261,37 @@ function Send-Keys([string]$keys) {
   [System.Windows.Forms.SendKeys]::SendWait($keys)
 }
 
+function Assert-InputWindow($window) {
+  Add-Win32
+  $expected = [IntPtr]$window.Current.NativeWindowHandle
+  if ($expected -eq [IntPtr]::Zero -or [FutureAideHost.Win32]::GetForegroundWindow() -ne $expected) {
+    throw 'input-window-not-foreground'
+  }
+}
+
+function Get-DispatchMarker([string]$prompt) {
+  $match = [regex]::Match($prompt, '(?m)^\[FutureAide Control request [a-zA-Z0-9-]{1,100} \u00b7 binding [A-Za-z0-9._:-]{8,80}\]')
+  if (-not $match.Success) { throw 'dispatch-marker-missing' }
+  return $match.Value
+}
+
+function Assert-ComposerMarker([string]$value, [string]$marker) {
+  if ([string]::IsNullOrEmpty($marker) -or -not $value.Contains($marker)) { throw 'composer-request-marker-mismatch' }
+}
+
+function Close-OpenMenus($windowElement) {
+  # A click outside a Chromium popup only dismisses it; it does not activate
+  # the sidebar underneath. Close observed menus before a navigation click.
+  for ($level = 0; $level -lt 3; $level++) {
+    $currentWeb = Get-WebRoot $windowElement
+    $menus = @(Find-Elements $currentWeb.Element '' 'Menu' | Where-Object { Test-ElementVisible $_ })
+    if ($menus.Count -eq 0) { return }
+    Focus-Window $windowElement
+    Send-Keys '{ESC}'
+    Start-Sleep -Milliseconds 120
+  }
+}
+
 function Unescape-Pattern([string]$value) {
   return [regex]::Escape($value)
 }
@@ -636,6 +667,7 @@ try {
     'submit' {
       $script:SubmitAttempted = $false
       $script:SubmitStage = 'preflight'
+      $dispatchMarker = Get-DispatchMarker ([string]$payload.prompt)
       $signature = Get-PageSignature $window
       if ($signature.trustPrompt -and $payload.trustWorkspace) {
         $trustButtons = Find-Elements $web.Element ([string]$payload.trustPattern) 'Button'
@@ -673,6 +705,7 @@ try {
           }
         }
         $script:SubmitStage = 'composer-paste'
+        Assert-InputWindow $window.Element
         Send-Keys '^v'
         $typed = $true
         # A long message is pasted whole; wait until the composer really holds it
@@ -687,8 +720,10 @@ try {
       }
       $after = Get-ComposerValue $web.Element
       if ($null -ne $after -and $after.Trim().Length -eq 0) { throw 'composer-still-empty' }
+      Assert-ComposerMarker ([string]$after) $dispatchMarker
       $composerLength = $(if ($null -ne $after) { $after.Length } else { 0 })
       if ($expected -gt 0 -and $composerLength -lt [int]($expected * 0.95)) { throw 'composer-paste-incomplete' }
+      Assert-InputWindow $window.Element
       $script:SubmitStage = 'enter'
       $script:SubmitAttempted = $true
       Send-Keys '{ENTER}'
@@ -757,6 +792,8 @@ try {
       $folderLabel = [string]$payload.folderLabel
       $wantDefault = [bool]$payload.wantDefault
       $notes = @()
+      Close-OpenMenus $window.Element
+      $web = Get-WebRoot $window.Element
       $view0 = Get-PageSignature $window
       $previousTitle = ($view0.documentName -replace '\s+-\s+Claude Code$', '')
       # The current control must be read from the page of the session the caller
@@ -860,26 +897,60 @@ try {
         navigation = $navigation; notes = $notes } }
     }
     'model-select' {
-      $models = Find-Elements $web.Element $modelPattern 'Button'
-      if ($models.Count -eq 0) { throw 'model-control-not-found' }
-      Invoke-Element $models[0] | Out-Null
-      Start-Sleep -Milliseconds 450
       $label = [string]$payload.label
-      $options = Find-Elements $web.Element ('^' + (Unescape-Pattern $label)) ''
-      if ($options.Count -eq 0) { Send-Keys '{ESC}'; throw "model-option-not-found:$label" }
-      Invoke-Element $options[0] | Out-Null
-      Start-Sleep -Milliseconds 500
       $effortClicked = $null
       $effortLabel = [string]$payload.effortLabel
-      if ($effortLabel) {
-        $efforts = Find-Elements $web.Element ('^' + (Unescape-Pattern $effortLabel)) ''
-        if ($efforts.Count -gt 0) {
-          $effortClicked = $efforts[0].Current.Name
-          Invoke-Element $efforts[0] | Out-Null
-          Start-Sleep -Milliseconds 500
-        }
+      function Open-ModelMenu {
+        $currentWeb = Get-WebRoot $window.Element
+        $models = @(Find-Elements $currentWeb.Element $modelPattern 'Button' | Where-Object { Test-ElementVisible $_ })
+        if ($models.Count -ne 1) { throw 'model-control-not-unique' }
+        $beforeName = $models[0].Current.Name
+        $clicked = Invoke-ElementByMouse $models[0]
+        if (-not $clicked.clicked) { throw 'model-menu-not-opened' }
+        Start-Sleep -Milliseconds 250
+        return $beforeName
       }
-      $after = Find-Elements $web.Element $modelPattern 'Button'
+      Close-OpenMenus $window.Element
+      Focus-Window $window.Element
+      try {
+        $beforeName = Open-ModelMenu
+        if ($beforeName -notmatch ([regex]::Escape($label) + '(\s|$)')) {
+          $web = Get-WebRoot $window.Element
+          $options = @(Find-Elements $web.Element ('^' + (Unescape-Pattern $label) + '(\s|$)') 'RadioButton' | Where-Object { Test-ElementVisible $_ })
+          if ($options.Count -ne 1) { throw "model-option-not-unique:$label" }
+          Invoke-ElementByMouse $options[0] | Out-Null
+          Start-Sleep -Milliseconds 250
+          if ($effortLabel) { Close-OpenMenus $window.Element; Open-ModelMenu | Out-Null }
+        }
+        if ($effortLabel) {
+          $web = Get-WebRoot $window.Element
+          $effortMenuPattern = '^(' + (ZH @(0x601D,0x8003,0x5F3A,0x5EA6)) + '|Thinking effort|Reasoning effort)(\s|$)'
+          $effortMenus = @(Find-Elements $web.Element $effortMenuPattern 'MenuItem' | Where-Object { Test-ElementVisible $_ })
+          if ($effortMenus.Count -ne 1) { throw 'effort-submenu-not-unique' }
+          # Chromium advertises ExpandCollapse here, but Expand() did not open
+          # this submenu on the installed host. Its observed clickable row does.
+          Invoke-ElementByMouse $effortMenus[0] | Out-Null
+          Start-Sleep -Milliseconds 250
+          $web = Get-WebRoot $window.Element
+          $efforts = @(Find-Elements $web.Element ('^' + (Unescape-Pattern $effortLabel) + '(\s|$)') 'RadioButton' | Where-Object { Test-ElementVisible $_ })
+          if ($efforts.Count -ne 1) { throw "effort-option-not-unique:$effortLabel" }
+          $effortClicked = $efforts[0].Current.Name
+          Invoke-ElementByMouse $efforts[0] | Out-Null
+          # Do not dismiss a still-transitioning submenu: wait for the composer
+          # to reflect the selection before sending Escape to any leftover menu.
+          $deadline = (Get-Date).AddSeconds(3)
+          $selectionObserved = $false
+          do {
+            Start-Sleep -Milliseconds 150
+            $web = Get-WebRoot $window.Element
+            $controls = @(Find-Elements $web.Element $modelPattern 'Button' | Where-Object { Test-ElementVisible $_ })
+            $selectionObserved = @($controls | Where-Object { $_.Current.Name -match ([regex]::Escape($label) + '\s+' + [regex]::Escape($effortLabel) + '(\s|$)') }).Count -gt 0
+          } while (-not $selectionObserved -and (Get-Date) -lt $deadline)
+          if (-not $selectionObserved) { throw 'effort-selection-not-observed' }
+        }
+      } finally { Close-OpenMenus $window.Element }
+      $web = Get-WebRoot $window.Element
+      $after = @(Find-Elements $web.Element $modelPattern 'Button' | Where-Object { Test-ElementVisible $_ })
       Write-Result @{ ok = $true; value = @{
         clicked = $label
         effortClicked = $effortClicked

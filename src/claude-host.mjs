@@ -518,7 +518,8 @@ export function createPowerShellDriver({
     async readSessionArgs({ pid }) { return run('session-args', { pid }); },
     async clickButton({ namePattern }) { return run('click-button', { namePattern }); },
     async submit({ prompt, prefilled, trustWorkspace = false } = {}) {
-      return run('submit', { prompt, prefilled, trustWorkspace });
+      // Native paste verification can take 25 seconds before Enter is attempted.
+      return run('submit', { prompt, prefilled, trustWorkspace }, { timeoutMs: Math.max(timeoutMs, 45000) });
     },
     async interrupt() { return run('interrupt'); },
     async revealSession({ hostSessionId, title, allowDeepLink = true, launchVia = 'protocol' }) {

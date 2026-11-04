@@ -66,3 +66,21 @@ test('native-only rosters use an indexed empty descendant lookup and preserve cl
     assert.deepEqual(store.descendantsOf(['agent-large']).map(row => row.agentId), ['child']);
   } finally { store.close(); }
 });
+
+test('lifecycle scans use covering fields and immediately reflect direct roster writes', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    store.insert(largeRecord());
+    const plan = store.db.prepare("EXPLAIN QUERY PLAN SELECT json_extract(body,'$.state'),json_extract(body,'$.task.reports') FROM agents INDEXED BY agents_lifecycle").all();
+    assert.ok(plan.some(row => /COVERING INDEX agents_lifecycle/.test(row.detail)), JSON.stringify(plan));
+    // A separate plugin connection can write body directly; no cache-invalidation
+    // protocol is needed to see a changed delivery, wake or task state.
+    store.db.prepare("UPDATE agents SET body=json_remove(json_set(body,'$.state','running','$.task.reports[0].delivery.state','delivered'),'$.sleep') WHERE id=?").run('agent-large');
+    const candidate = store.listWorkerCandidates()[0];
+    assert.equal(candidate.state, 'running');
+    assert.equal(candidate.task.reports[0].delivery.state, 'delivered');
+    assert.equal(store.hasSleeping(), false);
+    assert.deepEqual(store.listSleeping(), []);
+    assert.ok(!JSON.stringify(candidate).includes('_SECRET'));
+  } finally { store.close(); }
+});

@@ -17,6 +17,11 @@ export class RosterStore {
       CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(owner,name));
       CREATE INDEX IF NOT EXISTS agents_parent ON agents(json_extract(body,'$.parentAgentId'),name);
+      CREATE INDEX IF NOT EXISTS agents_lifecycle ON agents(
+        json_extract(body,'$.sessionId'),json_extract(body,'$.state'),json_extract(body,'$.closed'),
+        json_extract(body,'$.callbackBlocked'),json_extract(body,'$.sleep'),json_extract(body,'$.task.taskId'),
+        json_extract(body,'$.task.reports'),json_extract(body,'$.task.cancelRequested'),
+        json_extract(body,'$.task.cancelVerified'),json_extract(body,'$.task.cancelTreeSettled'),id,owner,name);
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -188,8 +193,11 @@ export class RosterStore {
   // These projections keep periodic checks and shared-monitor scans independent
   // of task/report/history body size. Full records are loaded only for an agent
   // whose worker or delivery poll is actually about to run.
+  // The covering expression index stores these fields at write time. Selecting
+  // json_extract alone still reparses every large body unless the scan uses it;
+  // SQLite maintains it even when another/older connection updates the roster.
   hasSleeping() {
-    return this.db.prepare("SELECT 1 AS found FROM agents WHERE json_type(body,'$.sleep')='object' LIMIT 1").get() !== undefined;
+    return this.db.prepare("SELECT 1 AS found FROM agents INDEXED BY agents_lifecycle WHERE json_type(json_extract(body,'$.sleep'))='object' LIMIT 1").get() !== undefined;
   }
   listSleeping() {
     return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
@@ -201,7 +209,7 @@ export class RosterStore {
       EXISTS (SELECT 1 FROM supplements AS queued WHERE queued.agent=agents.id
         AND queued.task=json_extract(agents.body,'$.task.taskId')
         AND queued.status IN ('queued','sending','unknown')) AS hasSupplement
-      FROM agents WHERE json_type(body,'$.sleep')='object' ORDER BY name`).all().map(row => ({
+      FROM agents INDEXED BY agents_lifecycle WHERE json_type(json_extract(body,'$.sleep'))='object' ORDER BY name`).all().map(row => ({
       agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
       task: row.taskId == null ? undefined : { taskId: row.taskId,
         ...(row.cancelRequested ? { cancelRequested: true } : {}),
@@ -228,15 +236,14 @@ export class RosterStore {
     return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
       json_extract(body,'$.state') AS state, json_extract(body,'$.closed') AS closed, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
       json_extract(body,'$.sleep') AS sleep, json_extract(body,'$.task.taskId') AS taskId,
-      (SELECT coalesce(json_group_array(coalesce(json_extract(value,'$.delivery.state'),'')),'[]')
-        FROM json_each(agents.body,'$.task.reports')) AS deliveries
-      FROM agents ORDER BY name`).all().map(row => ({
+      json_extract(body,'$.task.reports') AS reports
+      FROM agents INDEXED BY agents_lifecycle ORDER BY name`).all().map(row => ({
       agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
       ...(row.closed ? { closed: true } : {}),
       ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
       ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
       ...(row.taskId == null ? {} : { task: { taskId: row.taskId,
-        reports: JSON.parse(row.deliveries).map(delivery => ({ delivery: { state: delivery } })) } }),
+        reports: (JSON.parse(row.reports ?? '[]') ?? []).map(report => ({ delivery: { state: report.delivery?.state ?? '' } })) } }),
     }));
   }
   insert(record) {

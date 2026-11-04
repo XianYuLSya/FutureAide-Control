@@ -509,6 +509,37 @@ test('one slow monitor name does not hold up another and shutdown drains the sin
   } finally { releaseSlow(); await f.service.drainPolls(); f.service.close(); }
 });
 
+test('a 123-name retained roster serves HTTP during a scan without loading idle histories', async () => {
+  const { startHttpService } = await import('../src/claude-report-server.mjs');
+  const base = fakeBackend();
+  let observed = 0;
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+    observe: async () => { observed++; return base(record).observe(); } }) } });
+  const http = await startHttpService({ port: 0 });
+  const gets = new Set(), get = f.store.get.bind(f.store);
+  f.store.get = id => { gets.add(id); return get(id); };
+  try {
+    const retained = 'x'.repeat(416000);
+    for (let i = 0; i < 123; i++) {
+      const name = `scale-${String(i).padStart(3, '0')}`;
+      f.store.insert(taskRecord({ agentId: name, name, ownerId: ownerIdFor(THREAD), sessionId: `session-${name}`,
+        state: i < 45 ? 'awaiting_report' : 'idle', task: completedInput(name), history: [{ message: retained }] }));
+    }
+    const url = `http://127.0.0.1:${http.port}/healthz`;
+    await (await fetch(url)).json();
+    let observedAtHealth;
+    const health = fetch(url).then(async response => { assert.equal((await response.json()).ok, true); observedAtHealth = observed; });
+    const start = performance.now();
+    await f.service.monitorScan();
+    await health;
+    await f.service.drainPolls();
+    assert.ok(observedAtHealth < 45, `HTTP waited for all ${observedAtHealth} polls`);
+    assert.equal(observed, 45);
+    assert.equal([...gets].some(id => Number(id.slice(6)) >= 45), false, 'idle history bodies were never loaded');
+    process.stdout.write(`scale: 123 names / 51 MB, HTTP after ${observedAtHealth} of 45 observations, scan+drain ${Math.round(performance.now() - start)}ms\n`);
+  } finally { await f.service.drainPolls(); await http.close(); f.service.close(); }
+});
+
 test('pre-delivery failures back off visibly, while ambiguous delivery is never sent again', async () => {
   let beginFailures = 1, modelFailures = 1, begins = 0, models = 0, sends = 0;
   const base = fakeBackend();

@@ -53,3 +53,16 @@ test('pending delivery projection honors report delivery and question notice sta
     assert.deepEqual(store.listPendingDeliveries(), []);
   } finally { store.close(); }
 });
+
+test('native-only rosters use an indexed empty descendant lookup and preserve closed projections', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    store.insert({ ...largeRecord(), closed: true });
+    assert.equal(store.listWorkerCandidates()[0].closed, true);
+    const plan = store.db.prepare("EXPLAIN QUERY PLAN SELECT body FROM agents WHERE json_extract(body,'$.parentAgentId')=? ORDER BY name").all('agent-large');
+    assert.ok(plan.some(row => /USING INDEX agents_parent/.test(row.detail)), JSON.stringify(plan));
+    assert.deepEqual(store.descendantsOf(['agent-large']), []);
+    store.insert({ ...largeRecord(), agentId: 'child', name: 'child', parentAgentId: 'agent-large' });
+    assert.deepEqual(store.descendantsOf(['agent-large']).map(row => row.agentId), ['child']);
+  } finally { store.close(); }
+});

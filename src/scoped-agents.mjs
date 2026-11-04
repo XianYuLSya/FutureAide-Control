@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { setImmediate as yieldToIO } from 'node:timers/promises';
 import { lstat, open, realpath, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { createControl, endedState, modelTurnError } from './control.mjs';
@@ -1724,6 +1725,13 @@ export function createScopedAgents(config, {
       const candidates = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
       let busy = inflight.size > 0 || monitorInflight.size > 0;
       for (const candidate of candidates) {
+        if (!needsPoll(candidate)) continue;
+        busy = true;
+        if (monitorInflight.has(candidate.agentId) || nextPollAt.get(candidate.agentId) > Date.now()) continue;
+        // Large retained histories must not turn resolved-promise polls into a
+        // single uninterrupted CPU burst that starves the shared HTTP listener.
+        await yieldToIO();
+        if (draining) break;
         const record = store.get(candidate.agentId);
         if (!record || !needsPoll(record)) continue;
         busy = true;

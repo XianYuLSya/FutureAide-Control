@@ -16,6 +16,7 @@ export class RosterStore {
     this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(owner,name));
+      CREATE INDEX IF NOT EXISTS agents_parent ON agents(json_extract(body,'$.parentAgentId'),name);
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
@@ -225,12 +226,13 @@ export class RosterStore {
   }
   listWorkerCandidates() {
     return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
-      json_extract(body,'$.state') AS state, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
+      json_extract(body,'$.state') AS state, json_extract(body,'$.closed') AS closed, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
       json_extract(body,'$.sleep') AS sleep, json_extract(body,'$.task.taskId') AS taskId,
       (SELECT coalesce(json_group_array(coalesce(json_extract(value,'$.delivery.state'),'')),'[]')
         FROM json_each(agents.body,'$.task.reports')) AS deliveries
       FROM agents ORDER BY name`).all().map(row => ({
       agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
+      ...(row.closed ? { closed: true } : {}),
       ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
       ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
       ...(row.taskId == null ? {} : { task: { taskId: row.taskId,

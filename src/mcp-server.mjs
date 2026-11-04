@@ -10,9 +10,26 @@ import { CODEX_THREAD_ID } from './codex-target.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
 import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 import { TRUSTED_CALLER } from './calling-context.mjs';
+import { compactChanges, compactCreate, compactInspect, compactList, compactStatus, compactWait } from './tool-view.mjs';
+import { FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
 
-const name = z.string().min(1).max(80).describe('Subagent name in this Codex chat. Names in other chats are unrelated.');
+const name = z.string().min(1).max(80).describe('Subagent name in this chat. Names in other chats are unrelated.');
 const message = z.string().min(1).max(100000).describe('Task, update, or answer text. Pass it directly; do not create a communication file.');
+const detail = z.boolean().optional().describe('Return the complete service structure instead of the compact default. It is much longer, so ask for it only when an omitted field is needed.');
+
+// Compact views are small by construction; this keeps boundedOutput's guarantee that
+// one answer can never exceed the transport-sized limit, without paying for indentation.
+// A view may offer a smaller answer still (a roster reduced to its size), which beats
+// collapsing every entry into one unreadable preview.
+const COMPACT_MAXIMUM = 40000;
+function compactOutput(value, smaller) {
+  const json = JSON.stringify(value);
+  if (json.length <= COMPACT_MAXIMUM) return json;
+  const reduced = smaller ? JSON.stringify(smaller()) : undefined;
+  if (reduced !== undefined && reduced.length <= COMPACT_MAXIMUM) return reduced;
+  return JSON.stringify({ truncated: true, totalCharacters: json.length, preview: json.slice(0, COMPACT_MAXIMUM),
+    hint: 'Request fewer messages or fewer names.' });
+}
 
 /**
  * Wrap one tool registration: resolve the service, hand the handler a trusted
@@ -22,7 +39,7 @@ const message = z.string().min(1).max(100000).describe('Task, update, or answer 
  */
 function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics } = {}) {
   const resolve = typeof service === 'function' ? service : async () => service;
-  return (tool, description, inputSchema, action, readOnly = false, destructive = false) => server.registerTool(tool, {
+  return (tool, description, inputSchema, action, readOnly = false, destructive = false, view) => server.registerTool(tool, {
     description, inputSchema,
     annotations: { readOnlyHint: readOnly, destructiveHint: destructive, idempotentHint: readOnly, openWorldHint: !readOnly },
   }, async (args, extra) => {
@@ -30,7 +47,14 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
     try {
       const trusted = (await extraFor(extra)) ?? extra;
       const result = await action(await resolve(), args, trusted);
-      return { content: [{ type: 'text', text: boundedOutput(result) }],
+      // isError is read from the full result: a compact view must never hide a real failure.
+      // A view may also shape the detail answer (inspect's node filter lives there),
+      // so both paths receive the arguments.
+      const text = view === undefined ? boundedOutput(result)
+        : args?.detail === true
+          ? (view.detail ? boundedOutput(view.detail(result, args)) : boundedOutput(result))
+          : compactOutput(view(result, args), view.reduced ? () => view.reduced(result, args) : undefined);
+      return { content: [{ type: 'text', text }],
         ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
@@ -39,7 +63,7 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
 }
 
 /**
- * The ten name-addressed management tools, registered on any MCP server that has a
+ * The eleven name-addressed management tools, registered on any MCP server that has a
  * service and can supply a trusted caller context: the stdio server for this chat and
  * the loopback report service for a verified Claude caller. The Codex-side
  * ask_parent/report_parent are registered by the stdio server alone, so a surface that
@@ -49,23 +73,34 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
  */
 export function registerScopedTools(server, options = {}) {
   const register = toolRegistrar(server, options);
-  register('futureaide_status', 'Check this chat context, the local DSH connection, and per-target readiness in backends (dsh, claude-desktop, codex-desktop). The plugin obtains chat and project automatically. A target reports ready:false with a reason when its adapter is missing or its protocols are unfinished; that is not a fallback and no model turn or session is started to find out.', {}, (s, _a, e) => s.status(e), true);
+  // Only genuinely read-only tools use this: a creation or dispatch must keep its
+  // own annotations, or a host might auto-approve a write as a read.
+  const registerView = (tool, description, inputSchema, action, view) =>
+    register(tool, description, inputSchema, action, true, false, view);
+  registerView('futureaide_status', 'Check this chat context, the local DSH connection, and per-target readiness in backends (dsh, claude-desktop, codex-desktop). The plugin obtains chat and project automatically. A target reports ready:false with a reason when its adapter is missing or its protocols are unfinished; that is not a fallback and no model turn or session is started to find out. The answer states readiness without the advertised method lists; pass detail: true for the complete backend entries.', { detail }, (s, _a, e) => s.status(e), compactStatus);
+  register('futureaide_run_agent', 'Start a subagent’s work in one call: create the name if it does not exist, then send the task; an existing name simply receives the message. This is the default way to begin work, one call instead of create plus send. Omit name to have one generated. Results return to this chat through the subagent’s own ask_parent questions and report_parent reports, so do not poll; accepted or queued is a receipt, not completion. lifetime is once (the default) or persistent, and target picks the application for a new name: dsh (the default), claude-desktop or codex-desktop. An existing name keeps its own target and lifetime; a conflicting explicit value is refused rather than running on another application. A new name whose first send fails still returns created:true with that name and its error: the name exists, so call list before deciding whether to send again, and never rename and rerun the task. queued:true means locally saved — do not resend; retrying:true means the original request awaits background recovery, so the caller need not resend; unknown means inspect the original receipt and recipient before deciding whether a retry is safe.', {
+    name: name.optional(), message, lifetime: z.enum(['once', 'persistent']).optional()
+      .describe('Lifetime for a new name. Defaults to once. An existing name keeps its own lifetime and a conflicting explicit value is refused.'),
+    target: z.enum(['dsh', 'claude-desktop', 'codex-desktop']).optional()
+      .describe('Execution target bound to a new name. Defaults to dsh. An existing name keeps its own target and a conflicting explicit value is refused; it never falls back to another backend.'),
+  }, (s, a, e) => s.run({ name: a.name, message: a.message, lifetime: a.lifetime, target: a.target }, e));
   register('futureaide_create_agent', 'Create a named subagent in the current project, without running a model. target picks the application that runs it, once, at creation: dsh (the default), claude-desktop or codex-desktop; every later call addresses the subagent by name only. A target whose adapter is not installed is refused instead of substituting DSH. once removes session data after an explicitly submitted final report is delivered and the tree settles; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
     name, lifetime: z.enum(['once', 'persistent']),
     target: z.enum(['dsh', 'claude-desktop', 'codex-desktop']).optional().describe('Execution target bound to this name. Defaults to dsh. A target that is unavailable here fails explicitly; it never falls back to another backend.'),
-  }, (s, a, e) => s.create(a, e));
+  }, (s, a, e) => s.create(a, e), false, false, compactCreate);
   register('futureaide_send_agent', 'Assign a task or send an update to a named subagent. Managed dispatch and monitoring read only the session this name is bound to (DSH, Claude Desktop or Codex Desktop), not the full session list. queued:true means locally saved; do not resend. retrying:true means the original request awaits background recovery; the caller need not resend. unknown means inspect the original receipt and recipient before any retry; never blindly repeat. accepted:true means the target accepted the request, not that work is complete. Use list for queue status or changes/inspect for details. A waiting subagent treats this as its answer. Only explicit questions and reports return to this chat; ordinary replies and idle trees never notify it.', { name, message }, (s, a, e) => s.send(a, e));
   register('futureaide_answer_agent', 'Answer the named subagent’s pending question directly. The plugin continues its original task once; no exchange ID, command, or text file is needed.', { name, message }, (s, a, e) => s.answer(a, e));
-  register('futureaide_list_agents', 'Show only this chat’s subagents, including current task, descendant tree, activity, questions, attributed file changes, delivery and cleanup state. Deep history is unnecessary for ordinary supervision.', {}, (s, _a, e) => s.list(e), true);
-  register('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, submit a report, await a report, or need attention. Other work may proceed concurrently; a timeout does not cancel a task.', {
-    names: z.array(name).min(1).max(50).optional(), timeout_seconds: z.number().int().min(0).max(45).optional(),
-  }, (s, a, e) => s.wait({ names: a.names, timeoutSeconds: a.timeout_seconds ?? 0 }, e), true);
-  register('futureaide_agent_changes', 'Read observed file changes across a named subagent’s tree, attributed by agentPath, without reading conversations. Coverage and uncertain attribution are explicit. task=0 selects the current/latest task; 1 selects the preceding task.', {
-    name, task: z.number().int().min(0).optional(),
-  }, (s, a, e) => s.changes(a, e), true);
-  register('futureaide_inspect_agent', 'Inspect a named subagent and its descendants’ conversations, tools, and task history when deeper supervision is needed.', {
-    name, max_messages: z.number().int().min(1).max(100).optional(),
-  }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), true);
+  registerView('futureaide_list_agents', 'Show only this chat’s subagents: name, state, lifetime, current task, pending questions, the latest report, the changed-file count and a team roster. A name that has descendants answers with team: one line per member carrying its relative path, state, activity while running and file count, capped at 30 rows and summarised by {more:n} beyond that. The default view is compact; coverage, timestamps, per-node details and the full result text are omitted. The file count includes unconfirmed paths and is paired with their own total, so the two are never added together. Pass detail: true for the complete structure when those fields are needed. Deep history is unnecessary for ordinary supervision.', { detail }, (s, _a, e) => s.list(e), compactList);
+  registerView('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, submit a report, await a report, or need attention. Other work may proceed concurrently; a timeout does not cancel a task. Entries are compact by default, as in list; pass detail: true for the complete structure.', {
+    names: z.array(name).min(1).max(50).optional(), timeout_seconds: z.number().int().min(0).max(45).optional(), detail,
+  }, (s, a, e) => s.wait({ names: a.names, timeoutSeconds: a.timeout_seconds ?? 0 }, e), compactWait);
+  registerView('futureaide_agent_changes', 'Read observed file changes across a named subagent’s tree, attributed by agentPath, without reading conversations. Each path keeps only its operation, plus agentPath below the root and attribution when a before/after comparison found it; pass detail: true for the complete entries, including any before/after content. Coverage is stated as one sentence, and unconfirmed paths are called out. task=0 selects the current/latest task; 1 selects the preceding task, and its task text is kept so the answer says which task it is.', {
+    name, task: z.number().int().min(0).optional(), detail,
+  }, (s, a, e) => s.changes(a, e), compactChanges);
+  registerView('futureaide_inspect_agent', 'Inspect a named subagent and its descendants’ conversations, tools, and task history when deeper supervision is needed. Each tree node carries its own messages once; message text longer than 4000 characters is truncated and marked truncated: true. Pass node to read one member only: the team path a list shows (for example "teamlead/frontend", or "subagent#2" when two members share a name) or a member name; a path wins and a shortened path with "…" is matched by its prefix. A name that fits several nodes is refused with the paths that work. Every other node keeps its name and status. Pass detail: true for the complete service structure, which this tool does not clip; node still filters it.', {
+    name, max_messages: z.number().int().min(1).max(100).optional(), detail,
+    node: z.string().min(1).max(200).optional().describe('Read only this tree node: its name or its team path from list. Other nodes are returned as name and status.'),
+  }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), compactInspect);
   register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
   register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing the managed session data of its target (DSH, Claude Desktop or Codex Desktop) and the private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
   return server;
@@ -89,8 +124,8 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
   // to the name that owns it. The caller is its own chat metadata, never a tool
   // argument, so no chat id can be supplied by a model.
   const parentMessage = z.string().min(1).max(100000).describe('Message for the managed parent of this chat. Pass it directly; never a chat id, path, or internal number.');
-  register('ask_parent', 'Ask the parent of this managed Codex subagent a question. The caller is identified from this chat itself, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer.', { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
-  register('report_parent', 'Submit an explicit report from this managed Codex subagent to its parent. The caller is identified from this chat itself. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true.', {
+  register('ask_parent', 'Ask the parent of this managed Codex subagent a question. The caller is identified from this chat itself, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer. ' + QUESTION_CONTRACT, { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
+  register('report_parent', 'Submit an explicit report from this managed Codex subagent to its parent. The caller is identified from this chat itself. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true. ' + FINAL_REPORT_CONTRACT, {
     message: parentMessage,
     final: z.boolean().optional().describe('Submit as the final report. Omitting it submits a progress report and keeps the task open.'),
   }, (s, a, e) => s.submitToParent({ kind: 'report', message: a.message, final: a.final === true }, e));

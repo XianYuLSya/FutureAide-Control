@@ -243,7 +243,7 @@ test('model failure is visible in list wait and inspect without callbacks or red
     await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
     assert.notEqual(f.record().task.taskId, r.task.taskId);
     assert.equal((await f.service.list(extra(A))).items[0].error, undefined);
-    assert.deepEqual(f.record().history[0].dispatches[0].failure, failed.error);
+    assert.deepEqual(f.store.historyFor(f.record().agentId)[0].dispatches[0].failure, failed.error);
     f.finish();
     const completed = await f.service.poll(r.agentId);
     assert.equal(completed.state, 'awaiting_report');
@@ -525,6 +525,127 @@ test('names and all operations are scoped by native chat metadata; create uses n
   assert.equal((await f.service.list(extra(B))).items.length, 1);
   assert.deepEqual((await f.service.wait({ names: ['artist'], timeoutSeconds: 0 }, extra(A))).notListed, ['artist']);
   f.service.close();
+});
+
+test('run creates a missing name and sends its task in one call', async () => {
+  const f = await fixture();
+  try {
+    const result = await f.service.run({ message: 'draw the diagram' }, extra(A));
+    assert.match(result.name, /^助手-[0-9a-f]{4}$/, 'an unnamed run gets a generated name');
+    assert.equal(result.created, true);
+    assert.equal(result.reused, undefined);
+    assert.equal(result.lifetime, 'once');
+    assert.equal(result.accepted, true);
+    assert.equal(result.state, 'running');
+    assert.equal('target' in result, false, 'dsh is the default and is not restated');
+    assert.equal(f.record(result.name).task.message, 'draw the diagram');
+    assert.equal(f.sends.length, 1, 'one call, one dispatch');
+  } finally { f.service.close(); }
+});
+
+test('run continues an existing name instead of creating a second one', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const result = await f.service.run({ name: 'artist', message: 'second task', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    assert.equal(result.reused, true);
+    assert.equal(result.created, undefined, 'an existing name is never reported as created: false');
+    assert.equal(result.lifetime, 'persistent');
+    assert.equal(result.accepted, true);
+    assert.equal(f.record('artist').task.message, 'second task');
+    assert.equal(f.sends.length, 1);
+  } finally { f.service.close(); }
+});
+
+test('run refuses a target or lifetime that differs from the existing name', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await assert.rejects(f.service.run({ name: 'artist', message: 'x', target: 'claude-desktop' }, extra(A)),
+      /already bound to DSH/, 'the refusal names the application this name belongs to');
+    await assert.rejects(f.service.run({ name: 'artist', message: 'x', lifetime: 'once' }, extra(A)),
+      /already a persistent subagent/);
+    assert.equal(f.sends.length, 0, 'nothing was sent to the wrong binding');
+    assert.equal(f.record('artist').task, undefined);
+  } finally { f.service.close(); }
+});
+
+test('run returns a failed creation as-is and never sends into it', async () => {
+  const f = await fixture();
+  try {
+    f.offline(true);
+    const result = await f.service.run({ name: 'newcomer', message: 'x' }, extra(A));
+    assert.equal(result.created, false);
+    assert.ok(result.error, 'the creation failure keeps its own error');
+    assert.equal(f.sends.length, 0, 'a name that never connected receives nothing');
+    assert.equal(result.name, 'newcomer');
+  } finally { f.service.close(); }
+});
+
+test('run keeps a created name when the first send throws', async () => {
+  const f = await fixture();
+  const hostStatus = f.api.hostStatus;
+  let probes = 0;
+  // Creation probes the host once; the send that follows fails its own probe.
+  f.api.hostStatus = async () => { probes += 1;
+    if (probes > 1) throw Object.assign(new Error('The DSH host probe failed.'), { code: 'host-probe-failed' });
+    return hostStatus(); };
+  try {
+    const result = await f.service.run({ message: 'x' }, extra(A));
+    assert.equal(result.created, true);
+    assert.equal(result.accepted, false);
+    assert.equal(result.error.code, 'host-probe-failed');
+    assert.match(result.name, /^助手-[0-9a-f]{4}$/, 'the generated name is handed back, not lost');
+    assert.ok(f.record(result.name), 'the created name stays in this chat’s list');
+    assert.equal(f.sends.length, 0);
+  } finally { f.service.close(); }
+});
+
+test('list reports an exact unconfirmed total although it lists only twelve paths', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'sweep' }, extra(A));
+    const record = f.record();
+    f.sessions.get(record.sessionId).changes = Array.from({ length: 20 }, (unused, index) => ({
+      path: `file-${index}.mjs`, operation: 'update', ...(index < 5 ? { attribution: 'unconfirmed' } : {}) }));
+    await f.service.poll(record.agentId);
+    const listed = (await f.service.list(extra(A))).items[0];
+    assert.equal(listed.changes.count, 20);
+    assert.equal(listed.changes.files.length, 12, 'the answer still lists twelve file summaries');
+    assert.equal(listed.changes.unconfirmed, 5, 'the unconfirmed total is counted over all 20 paths');
+  } finally { f.service.close(); }
+});
+
+test('a clipped workspace comparison is reported as truncated coverage', async () => {
+  let captures = 0;
+  // The baseline is empty; the comparison then finds more paths than one answer may list.
+  const captureFiles = async () => {
+    captures += 1;
+    const files = captures === 1 ? {}
+      : Object.fromEntries(Array.from({ length: 210 }, (unused, index) => [`file-${index}.mjs`, { code: ' M', stamp: '1' }]));
+    return { available: true, workspace: '/workspace', files };
+  };
+  const f = await fixture({ captureFiles });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'sweep' }, extra(A));
+    const snapshot = await f.service.changes({ name: 'artist' }, extra(A));
+    assert.equal(snapshot.changes.length, 200, 'the comparison is still clipped for the answer');
+    assert.equal(snapshot.coverage.workspace.truncated, true, 'and the clipping is stated in coverage');
+    assert.ok(snapshot.changes.every(change => change.attribution === 'unconfirmed'));
+  } finally { f.service.close(); }
+});
+
+test('run names a closing name instead of guessing what send meant', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    f.store.save({ ...f.record(), state: 'cleaning', closed: true });
+    await assert.rejects(f.service.run({ name: 'artist', message: 'x' }, extra(A)),
+      error => error.code === 'name-closing' && /leaves list/.test(error.message));
+    assert.equal(f.sends.length, 0, 'a name on its way out receives nothing');
+  } finally { f.service.close(); }
 });
 
 test('one-shot asks directly, resumes once, and clears only after confirmed result delivery', async () => {
@@ -1347,7 +1468,7 @@ test('a cancelled persistent agent starts a new task in the same session, while 
     await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
     assert.equal(f.record().sessionId, old.sessionId);
     assert.notEqual(f.record().task.taskId, oldTask);
-    assert.equal(f.record().history[0].taskId, oldTask);
+    assert.equal(f.store.historyFor(f.record().agentId)[0].taskId, oldTask);
     assert.equal(f.sends.length, 2);
     await f.service.create({ name: 'once', lifetime: 'once' }, extra(A));
     await f.service.send({ name: 'once', message: 'one task' }, extra(A));

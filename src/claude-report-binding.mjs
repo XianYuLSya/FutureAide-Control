@@ -196,6 +196,9 @@ export function bindPendingCreation(store, { agentId, caller, requestId, binding
         AND coalesce(json_extract(a.body,'$.closed'),0) = 0
         AND lower(json_extract(a.body,'$.workspace')) = lower(?5))`)
     .run(JSON.stringify(binding), agentId, bindingNonce, requestId, caller.cwd);
+  // This writes backend_state without going through the store, so the listener's
+  // projection of Claude bindings has to be told explicitly.
+  if (result.changes === 1) store.dropProjections();
   return result.changes === 1 ? binding : undefined;
 }
 

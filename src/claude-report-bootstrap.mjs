@@ -26,6 +26,9 @@ import { RosterStore } from './roster-store.mjs';
 
 export const BOOTSTRAP_NAME = 'futureaide-report';
 export const BOOTSTRAP_VERSION = '1.0.0';
+// Never faster than this: the comparison lists the service's tools over the loopback
+// transport, and a tight loop would poll the monitor for nothing.
+export const TOOL_CHECK_MIN_MS = 30000;
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -47,13 +50,15 @@ export function mayRetry(name) {
 
 /**
  * A tools-only MCP server that forwards list and call to the loopback service, so
- * the 12 tools are defined in exactly one place. The usage instructions come from
+ * the 13 tools are defined in exactly one place. The usage instructions come from
  * that same service, never from a copy kept here.
- * @param {{fetchTools: Function, callTool: Function, instructions?: string}} options
+ * @param {{fetchTools: Function, callTool: Function, instructions?: string, listChanged?: boolean}} options
  */
-export function createForwardServer({ fetchTools, callTool, instructions }) {
+export function createForwardServer({ fetchTools, callTool, instructions, listChanged = true }) {
   const server = new Server({ name: BOOTSTRAP_NAME, version: BOOTSTRAP_VERSION },
-    { capabilities: { tools: {} },
+    // listChanged lets a session learn about a new tool after the plugin updates,
+    // instead of needing a new chat to see it.
+    { capabilities: { tools: listChanged ? { listChanged: true } : {} },
       ...(typeof instructions === 'string' && instructions ? { instructions } : {}) });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await fetchTools() }));
   server.setRequestHandler(CallToolRequestSchema, async request => {
@@ -73,7 +78,7 @@ export function createForwardServer({ fetchTools, callTool, instructions }) {
  * of tools that always fail.
  */
 export async function startColdStartBridge({ configPath = process.env.DSH_CONTROL_CONFIG, env = process.env,
-  waitMs = 10000, pollMs = 250, log = message => process.stderr.write(`[futureaide-report] ${message}\n`),
+  waitMs = 10000, pollMs = 250, toolCheckMs = 45000, log = message => process.stderr.write(`[futureaide-report] ${message}\n`),
   load = loadConfig, status = readReportStatus, ensure = ensureSharedMonitor,
   storeFor = config => new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
   connect = async url => {
@@ -140,7 +145,7 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     await connectClient();
   };
 
-  // The twelve tools stay the service's own: nothing is defined here.
+  // The thirteen tools stay the service's own: nothing is defined here.
   const fetchTools = async () => {
     await prepare();
     try {
@@ -190,20 +195,63 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
   // cached: every later list or call prepares again and can recover.
   let ready = false;
   try { await prepare(); ready = true; } catch (error) { log(`${error?.code ?? 'unavailable'}: ${error.message}`); }
-  const tools = ready ? await fetchTools().then(list => list.length).catch(() => 0) : 0;
+  const initialTools = ready ? await fetchTools().catch(() => []) : [];
+  const tools = initialTools.length;
   // The service own usage rules ride along, so a bridged session keeps the same
   // reporting guidance it would get over HTTP. Nothing is copied or rewritten here.
   let instructions;
   try { instructions = state.client?.getInstructions?.(); } catch { instructions = undefined; }
   const server = createForwardServer({ fetchTools, callTool, instructions });
+
+  // A tool name or schema that changed since the last look is announced, so a
+  // session that is already open picks the new table up without a restart.
+  const signatureOf = list => JSON.stringify(list.map(tool => [tool.name, tool.description ?? '', tool.inputSchema ?? null]));
+  let signature = signatureOf(initialTools);
+  // The comparison must never start anything: every Claude chat holds one of these
+  // timers, and a check that woke the monitor would keep an otherwise idle install
+  // from ever returning to zero background processes. It reads only a service that
+  // is already serving; a real call is what brings the monitor back, and this then
+  // resumes by itself.
+  // The comparison opens its own short-lived connection: borrowing the session's
+  // client would let a failed list discard it in the middle of a real write and turn
+  // that write into write-outcome-unknown. The transport is stateless, so the extra
+  // connection costs nothing.
+  const listWhileServing = async () => {
+    if (!(await serviceReady())) return undefined;
+    const client = await connect(state.url);
+    try {
+      const { tools: listed } = await client.listTools();
+      return Array.isArray(listed) ? listed : [];
+    } finally {
+      try { await client.close(); } catch { /* the check owns nothing durable */ }
+    }
+  };
+  const checkToolList = async () => {
+    const list = await listWhileServing();
+    if (list === undefined) return false;
+    const next = signatureOf(list);
+    const changed = next !== signature;
+    signature = next;
+    // Awaited so a broken transport rejects this promise instead of escaping as an
+    // unhandled rejection that would take the bridge down.
+    if (changed) await server.sendToolListChanged();
+    return changed;
+  };
+  // A failed comparison is logged and nothing else: the tool calls it rides beside
+  // keep working, and the next round tries again.
+  const timer = setInterval(() => { void checkToolList().catch(error => log(`tool list check failed (${error?.code ?? error?.message ?? error})`)); },
+    Math.max(TOOL_CHECK_MIN_MS, toolCheckMs));
+  timer.unref?.();
+
   if (ready) log(`bridging ${tools} tool(s) to ${state.url}`);
   const close = async () => {
+    clearInterval(timer);
     const client = state.client; state.client = undefined;
     try { await client?.close(); } catch { /* ignore */ }
     const store = state.store; state.store = undefined;
     try { store?.close?.(); } catch { /* ignore */ }
   };
-  return { server, ready, tools, port: state.port, url: state.url, close };
+  return { server, ready, tools, port: state.port, url: state.url, close, checkToolList };
 }
 
 async function main() {

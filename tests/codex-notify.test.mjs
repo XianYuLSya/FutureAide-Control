@@ -280,3 +280,17 @@ test('candidates outside this desktop are never probed or selected', { skip: !wi
     /bridge is unavailable/);
   assert.equal(probes, 0);
 });
+
+test('bridge discovery is reused instead of inspecting every process per attempt', async () => {
+  const { discoverCodexBridge, forgetCodexBridge } = await import('../src/codex-notify.mjs');
+  forgetCodexBridge();
+  let inspections = 0;
+  const inspect = async () => { inspections += 1; return { hosted: [], legacy: [], candidates: [] }; };
+  const first = await discoverCodexBridge({ inspect, cache: true }).catch(error => error);
+  const second = await discoverCodexBridge({ inspect, cache: true }).catch(error => error);
+  assert.equal(inspections, 1, 'two discoveries, one inspection');
+  assert.equal(second, first, 'and the same answer');
+  forgetCodexBridge();
+  await discoverCodexBridge({ inspect, cache: true }).catch(() => {});
+  assert.equal(inspections, 2, 'a forgotten bridge is inspected again');
+});

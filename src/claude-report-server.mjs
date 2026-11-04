@@ -32,6 +32,7 @@ import { z } from 'zod';
 import { resolveSocketCaller, resolveStdioCaller } from './claude-caller-identity.mjs';
 import { adoptFirstListBinding } from './claude-report-binding.mjs';
 import { createReportOwnership } from './claude-report-ownership.mjs';
+import { FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
 
 export const SERVER_NAME = 'futureaide-report';
 export const SERVER_VERSION = '0.1.0';
@@ -41,7 +42,7 @@ export const REPORT_TOOL_NAMES = Object.freeze(['ask_parent', 'report_parent']);
 
 export const INSTRUCTIONS = `FutureAide managed session bridge.
 
-This server exists for one purpose: a Claude Desktop session owned by FutureAide Control reports to, and asks, the Codex parent chat that created it. It also carries the shared management tools, so any verified Claude session can create and supervise named subagents. Your session is identified from the connection itself; no session id, chat id, name or route is accepted as an argument, so never look for one.
+This server exists for one purpose: a Claude Desktop session owned by FutureAide Control reports to, and asks, the parent chat that created it. It also carries the shared management tools, so any verified Claude session can create and supervise named subagents. Your session is identified from the connection itself; no session id, chat id, name or route is accepted as an argument, so never look for one.
 
 Only a session this plugin manages may ask or report. Any other session that calls these two tools is refused with not-owned-session and nothing is sent, and its own parent never hears about the attempt.
 
@@ -182,7 +183,8 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, manageme
     .describe('Report or question text. Pass it directly; do not create a file to communicate.');
 
   server.registerTool('ask_parent', {
-    description: 'Ask the Codex parent chat a question you cannot decide yourself. Returns accepted once the question is queued for the parent; end your turn and the answer arrives as a new message in this session. Ordinary replies and the end of a turn never reach the parent, so this tool is the only way to ask. Only a session this plugin manages may use it; any other session is refused with not-owned-session and nothing is sent.',
+    description: 'Ask the parent chat a question you cannot decide yourself. Returns accepted once the question is queued for the parent; end your turn and the answer arrives as a new message in this session. Ordinary replies and the end of a turn never reach the parent, so this tool is the only way to ask. Only a session this plugin manages may use it; any other session is refused with not-owned-session and nothing is sent. '
+      + QUESTION_CONTRACT,
     inputSchema: { message },
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
   }, async (args, extra) => {
@@ -191,7 +193,8 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, manageme
   });
 
   server.registerTool('report_parent', {
-    description: 'Submit a progress report (final false, the default) or the final deliverable (final true) of the current task to the Codex parent chat. Returns accepted once the report is queued; accepted is not delivery or reading. Only explicit reports reach the parent: ordinary assistant text and turn ends notify nobody. Submit final once, after the work is finished and verified, and submit no reports for that task afterwards. Only a session this plugin manages may use it; any other session is refused with not-owned-session and nothing is sent.',
+    description: 'Submit a progress report (final false, the default) or the final deliverable (final true) of the current task to the parent chat. Returns accepted once the report is queued; accepted is not delivery or reading. Only explicit reports reach the parent: ordinary assistant text and turn ends notify nobody. Submit final once, after the work is finished and verified, and submit no reports for that task afterwards. Only a session this plugin manages may use it; any other session is refused with not-owned-session and nothing is sent. '
+      + FINAL_REPORT_CONTRACT,
     inputSchema: {
       message,
       final: z.boolean().optional().describe('true submits the final deliverable of this task. Omit or false for a progress report.'),
@@ -204,7 +207,7 @@ export function createClaudeReportServer({ resolveCaller, resolveOwned, manageme
 
   // The same server also carries the shared name-addressed management tools when
   // the host supplies their registrar, so one Claude session drives DSH, Claude
-  // Desktop and Codex Desktop exactly as a Codex chat does. Reports and questions
+  // Desktop and Codex Desktop exactly as any calling chat does. Reports and questions
   // stay the owned child's own path and are unaffected by that registration.
   if (typeof management === 'function') {
     management({ server, caller: async () => resolveCaller(),

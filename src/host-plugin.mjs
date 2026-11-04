@@ -1,6 +1,23 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+
+// The report and question contract shared by every surface. This plugin may import
+// only Node builtins, so the text is kept here literally; tests/report-contract.test.mjs
+// asserts it is word for word the copy in src/report-contract.mjs.
+export const FINAL_REPORT_CONTRACT = 'Write a final report for a controlling agent that will spot-check it, not re-read your work. '
+  + 'Use these labelled parts in the language of the task, and leave out a part only when it is empty. '
+  + 'Result: done, partly done or blocked, in one sentence. '
+  + 'Changes: file:line and what changed, one line each, at most 10; give the total if there are more. '
+  + 'Verified: the commands you ran with their numbers, and whether the check fails without the change. '
+  + 'Not verified: what you could not check; never present an assumption as a result. '
+  + 'Decisions: only choices the controlling agent must make. '
+  + 'Stay under about 300 words. Do not restate the task or narrate your process. '
+  + 'Put long material in a file and name it. '
+  + 'A lead that ran a team sends one summary of the team\'s result, not each member\'s report.';
+
+export const QUESTION_CONTRACT = 'State the decision you need, the options and your recommendation in a few lines, '
+  + 'so it can be answered without reading your work.';
 /** Read the durable descendant catalog; diagnostics never authorize cleanup. */
 export async function readManagedTree(subagents, agents, root, changesBySession = {}) {
   if (typeof subagents?.listDescendants !== 'function') throw new Error('managed-tree-unavailable');
@@ -282,7 +299,8 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     if (fresh) tools.guard(exec => binding.guard(exec));
     binding.questionTool = {
       name: 'ask_parent',
-      description: 'Ask the controlling Codex agent a question needed for your current task. Provide the question directly. This ends the current turn; the answer will resume this same task. Do not create a file or run a command to communicate.',
+      description: 'Ask the controlling agent a question needed for your current task. Provide the question directly. This ends the current turn; the answer will resume this same task. Do not create a file or run a command to communicate. '
+        + QUESTION_CONTRACT,
       parameters: { type: 'object', properties: { message: { type: 'string', minLength: 1, maxLength: 100000 } }, required: ['message'], additionalProperties: false },
       output: { schema: { type: 'object', properties: { waiting: { type: 'boolean' } }, required: ['waiting'], additionalProperties: false },
         render: () => [{ type: 'text', text: 'Your question has been sent to the controlling agent. Wait for its answer; the original task remains active.' }] },
@@ -302,7 +320,8 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     if (fresh) tools.register({ ...binding.questionTool, execute: (args, exec) => binding.questionTool.execute(args, exec) });
     binding.reportTool = {
       name: 'report_parent',
-      description: 'Send a report to your controlling Codex agent. Set final to true for the completed task deliverable. Descendants report to their native parent.',
+      description: 'Send a report to your controlling agent. Set final to true for the completed task deliverable. Descendants report to their native parent. '
+        + FINAL_REPORT_CONTRACT,
       parameters: { type: 'object', properties: { message: { type: 'string', minLength: 1, maxLength: 100000 }, final: { type: 'boolean', default: false } }, required: ['message'], additionalProperties: false },
       output: { schema: { type: 'object', properties: { accepted: { type: 'boolean' }, final: { type: 'boolean' } }, required: ['accepted', 'final'], additionalProperties: false },
         render: () => [{ type: 'text', text: 'Your report was recorded for delivery to the controlling agent.' }] },

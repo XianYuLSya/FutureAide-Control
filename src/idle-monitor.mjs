@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { hasPendingDelivery } from './idle-monitor-eligibility.mjs';
+
+// A cached sleeping state is re-read at least this often even when the file looks
+// unchanged: a host write of the same length inside the same timestamp tick would
+// otherwise leave a name asleep with no upper bound on how long.
+const CACHE_TTL_MS = 30000;
 
 export function idleSignal(value) {
   return JSON.stringify([value.taskId ?? null, value.throughSeq ?? -1,
@@ -9,7 +14,7 @@ export function idleSignal(value) {
     (value.reports ?? []).map(item => [item.id, item.final])]);
 }
 
-export async function scanSleeping(store, directory, wake, failures = new Map()) {
+export async function scanSleeping(store, directory, wake, failures = new Map(), cache = new Map(), { ttlMs = CACHE_TTL_MS } = {}) {
   const sleeping = typeof store.listSleeping === 'function'
     ? store.listSleeping()
     : store.list().filter(item => item.sleep);
@@ -23,14 +28,28 @@ export async function scanSleeping(store, directory, wake, failures = new Map())
       await wake(record.agentId, record.sleep.taskId);
       continue;
     }
-    const key = createHash('sha256').update(`${record.ownerId}\n${record.agentId}`).digest('hex');
+    const key = cache.get(`key:${record.agentId}`)
+      ?? createHash('sha256').update(`${record.ownerId}\n${record.agentId}`).digest('hex');
+    cache.set(`key:${record.agentId}`, key);
     try {
-      const state = JSON.parse(await readFile(path.join(directory, `${key}.json`), 'utf8'));
-      if (state.ownerId !== record.ownerId || state.agentId !== record.agentId || state.sessionId !== record.sleep.sessionId
-          || state.taskId !== record.sleep.taskId) continue;
+      // The host rewrites this file when the sleeping state changes and leaves it
+      // alone otherwise, so an unchanged size and timestamp means an unchanged
+      // signal: re-reading and re-parsing it cannot decide anything new.
+      const file = path.join(directory, `${key}.json`);
+      const info = await stat(file);
+      const stamp = `${info.size}:${info.mtimeMs}`;
+      let state = cache.get(`state:${record.agentId}`);
+      if (!state || state.stamp !== stamp || Date.now() - state.readAt >= ttlMs) {
+        state = { stamp, readAt: Date.now(), value: JSON.parse(await readFile(file, 'utf8')) };
+        cache.set(`state:${record.agentId}`, state);
+      }
+      const value = state.value;
+      if (value.ownerId !== record.ownerId || value.agentId !== record.agentId || value.sessionId !== record.sleep.sessionId
+          || value.taskId !== record.sleep.taskId) continue;
       failures.delete(record.agentId);
-      if (idleSignal(state) !== record.sleep.signal) await wake(record.agentId, record.sleep.taskId);
+      if (idleSignal(value) !== record.sleep.signal) await wake(record.agentId, record.sleep.taskId);
     } catch {
+      cache.delete(`state:${record.agentId}`);
       // A host write can be partial; preserve the baseline. Repeated unreadable
       // state falls back to the ordinary worker instead of sleeping forever.
       const since = failures.get(record.agentId) ?? Date.now();

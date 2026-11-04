@@ -394,8 +394,11 @@ export function createScopedAgents(config, {
   function readCodexReportState(record) {
     if (!record?.task) return { questions: [], reports: [] };
     const pending = store.pendingSubmissions(record.agentId, record.task.taskId);
+    // Both lists carry the task they belong to: the Codex backend filters by taskId, so
+    // a question without it would be dropped before the shared layer ever saw it.
     return {
-      questions: pending.filter(item => item.kind === 'ask').map(item => ({ id: `submission:${item.id}`, state: 'pending', message: item.message })),
+      questions: pending.filter(item => item.kind === 'ask').map(item => ({ id: `submission:${item.id}`,
+        taskId: record.task.taskId, state: 'pending', message: item.message, createdAt: item.created })),
       reports: pending.filter(item => item.kind === 'report').map(item => ({ id: `submission:${item.id}`,
         taskId: record.task.taskId, message: item.message, final: item.final, createdAt: item.created })),
     };

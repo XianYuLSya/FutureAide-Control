@@ -68,10 +68,10 @@
 //   readCodexReportStatus() Same evidence, read-only, for probe()/status; it fills
 //                         reportProtocol. Never starts anything, never sends a turn.
 //                         -> {ready, registered, tools?, evidence?, reason?}
-//   readCodexReportState() The pending explicit ask/report this name received.
-//                         -> {questions:[{id,state,message}], reports:[{id,taskId,message,
-//                         final,createdAt}]}; read-only. Consumption belongs to the
-//                         shared state machine, which owns the one queue.
+//   readCodexReportState() The pending explicit ask/report this name received. Both
+//                         lists carry taskId (the backend filters by it).
+//                         -> {questions:[{id,taskId,state,message,createdAt}],
+//                         reports:[{id,taskId,message,final,createdAt}]}; read-only.
 //   anchorResolver()      Bridge anchor for the child: a Codex chat this roster already
 //                         verified, preferring the same workspace. The object
 //                         {threadId, ownerId, workspace} is the contract (hosts extract

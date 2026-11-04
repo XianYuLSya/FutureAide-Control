@@ -4,7 +4,7 @@
 
 让 Codex 和 Claude Desktop 都能按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务；调用方也可以把 Claude Desktop 或 Codex Desktop 当作被调用目标（实验性）。插件自动识别当前聊天和项目；每个调用方有自己的名单。
 
-> **0.5.10（2026-11-04）**：适配 DSH 0.2.2，单次读类工具调用从约 3.5 秒降到约 0.5 秒。主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 与 Claude Desktop 作为被调用目标（`target: 'codex-desktop'`、`'claude-desktop'`）仍是实验性的：功能在，后续继续完善，本版不按完成计。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
+> **0.5.11（2026-11-04）**：派单结果和提问都能传回来了：助手没交最终报告时会被提醒一次，DSH 自带的提问工具会被拦下并转到 `ask_parent`。同时适配 DSH 0.2.2，单次读类工具调用从约 3.5 秒降到约 0.5 秒。主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 与 Claude Desktop 作为被调用目标（`target: 'codex-desktop'`、`'claude-desktop'`）仍是实验性的：功能在，后续继续完善，本版不按完成计。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
 
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：助手用 `ask_parent` 提问，父级按名字回答；显式 `report_parent` 决定何时回包，正文只转发它提交的内容。
@@ -142,7 +142,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 | `futureaide_cancel_agent` | 停止当前任务及所属后代，清除未执行输入，保留上下文 |
 | `futureaide_delete_agent` | 关闭代理及所属后代，清除会话数据，保留项目产物 |
 
-受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。两者的说明里带着同一份回报契约：`report_parent` 要求按 Result / Changes / Verified / Not verified / Decisions 分段、控制在 300 词内，团队长只汇总一份；`ask_parent` 要求写清要定的决定、选项与建议。Claude、Codex、DSH 三侧用的是同一段文本。
+受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。DSH 助手的一轮结束却没有 final 报告时，插件会在同一任务里提醒它一次（主控侧不产生通知，任务保持 running）；失败或取消的轮次不提醒，提醒后仍没有 final 就正常停在 `awaiting_report`，同一任务不会重复提醒。Claude 与 Codex 目标的补充走各自持久队列，这次未加此提醒。两者的说明里带着同一份回报契约：`report_parent` 要求按 Result / Changes / Verified / Not verified / Decisions 分段、控制在 300 词内，团队长只汇总一份；`ask_parent` 要求写清要定的决定、选项与建议。Claude、Codex、DSH 三侧用的是同一段文本。
 
 上级看全队只用一次 `futureaide_list_agents`：有下属的名字返回 `team`，后代每人一行（相对根、可寻址的 `path`、状态、运行时活动、文件数，文件数封顶时显示 `12+`），最多 30 行，超出以 `{more:n}` 收尾；两个成员同名时第二个起用 `名字#2`、`名字#3`。宿主读不到树时条目带 `treeError` 且没有 `team`——那是未知，不是“没有下属”。需要某个成员的对话时用 `futureaide_inspect_agent({name, node})`：`node` 取 `team` 里的路径（如 `"团队长/前端"`、`"subagent#2"`）或成员名，路径优先；被省略成 `…` 的路径按前缀匹配；同名命中多个成员时以 `node-ambiguous` 拒绝并给出可用路径，其余节点只留名字和状态。整份答案仍超长时先把每个 `team` 换成 `teamSize` 计数并加一条提示，再超才退化成 preview。
 

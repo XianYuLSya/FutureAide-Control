@@ -13,7 +13,7 @@ const THREAD = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture() {
+async function fixture({ adapters = {} } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'cross-'));
@@ -24,6 +24,7 @@ async function fixture() {
     callCodex: async (threadId, tool) => (tool === 'read_thread'
       ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } }
       : { accepted: true }),
+    backendAdapters: adapters,
     startSharedMonitor: () => true,
     removeTree: async () => {},
   });
@@ -127,8 +128,10 @@ test('a managed name created from another managed session follows the parent tre
 
     assert.deepEqual(store.descendantsOf([rootId]).map(item => item.name), ['child', 'deep'], 'the closure crosses owners');
     const listed = await service.list(extra(THREAD));
-    assert.deepEqual(listed.items.map(item => [item.name, item.parent ?? null]),
-      [['root', null], ['child', 'root'], ['deep', 'child']], 'the chat sees its whole cross-application tree');
+    // 0.5.7 list: this chat's own names, each with its own tree. A descendant belongs
+    // inside that tree, never as an extra entry in this chat's list.
+    assert.deepEqual(listed.items.map(item => item.name), ['root'], 'only own names are listed');
+    assert.equal(store.count(), 3, 'the descendants still exist as their own records');
 
     const deleted = await service.delete({ name: 'root' }, extra(THREAD));
     assert.equal(deleted.deleted, true);
@@ -163,3 +166,147 @@ test('a name created by a managed parent records its parent and an unmanaged cal
   } finally { service.close(); }
 });
 
+
+// --- Shared-tree cases: composition, addressing, cleanup ordering ---------------
+
+const MODEL = { provider: 'anthropic', model: 'claude-sonnet-4-5' };
+
+/** A backend whose native tree, changes and destroy behaviour the test controls. */
+function fakeBackend({ nodes = [], changes = [], historyText = id => 'history:' + id, failDestroyTimes = 0, failWhen = () => true } = {}) {
+  const calls = { destroy: [], history: [] };
+  const attempts = new Map();
+  const factory = record => ({
+    labels: { host: 'DSH', bridge: 'The test backend' },
+    probe: async () => ({ identity: { workspace }, methods: [], treeProtocol: 1, reportProtocol: 1 }),
+    create: async () => ({ sessionId: record.sessionId, modelRequestsStarted: 0 }),
+    beginTask: async () => ({ treeProtocol: 1, reportProtocol: 1 }),
+    observe: async () => ({ sessionId: record.sessionId, taskId: record.task?.taskId, running: false, throughSeq: 1,
+      questions: [], reports: [], changes,
+      tree: { settled: true, running: false, nodes: nodes.length ? nodes
+        : [{ sessionId: record.sessionId, parentSessionId: null, name: record.name, status: 'idle', activity: 'idle', changes, coverage: 'Observed' }] } }),
+    history: async ({ targetSessionId }) => { calls.history.push(targetSessionId);
+      return { messages: [{ role: 'assistant', content: historyText(targetSessionId) }], hasMore: false }; },
+    answer: async () => ({ consumedQuestionIds: [] }),
+    deliver: async () => ({ accepted: true }),
+    receipt: async () => undefined,
+    turn: async () => ({ state: 'ended' }),
+    models: async () => ({ models: [MODEL], default: MODEL }),
+    model: async () => MODEL,
+    selectModel: async () => ({ accepted: true }),
+    cancel: async () => ({ cancelRequested: true }),
+    destroy: async () => {
+      calls.destroy.push(record.agentId);
+      const used = (attempts.get(record.agentId) ?? 0) + 1;
+      attempts.set(record.agentId, used);
+      if (failWhen(record) && used <= failDestroyTimes) return { destroyed: false, message: 'injected destroy failure' };
+      return { destroyed: true };
+    },
+    cursor: async () => ({ offset: 0 }),
+  });
+  factory.calls = calls;
+  return factory;
+}
+
+const taskRecord = (overrides) => ({ state: 'awaiting_report', created: true, nativeDestroyed: true,
+  lifetime: 'persistent', target: 'claude-desktop', workspace, createdAt: new Date().toISOString(),
+  updatedAt: new Date().toISOString(), history: [], task: { taskId: 'task-' + overrides.name, message: 'work',
+    state: 'running', startedAt: new Date().toISOString(), dispatches: [], answers: [], reports: [] }, ...overrides });
+
+test('a same-named descendant never enters this chat’s namespace or list', async () => {
+  const owner = ownerIdFor(THREAD);
+  const alpha = 'agent-' + '1'.repeat(32);
+  const beta = 'agent-' + '2'.repeat(32);
+  const f = await fixture({ adapters: { 'claude-desktop': fakeBackend() } });
+  try {
+    f.store.insert(taskRecord({ agentId: alpha, ownerId: owner, sessionId: 'session-alpha', name: 'alpha' }));
+    f.store.insert(taskRecord({ agentId: beta, ownerId: owner, sessionId: 'session-beta', name: 'beta' }));
+    // Both roots have a descendant called reviewer, each under its own session owner.
+    for (const [parent, native] of [[alpha, 'native-alpha'], [beta, 'native-beta']]) {
+      f.store.insert(taskRecord({ agentId: 'agent-' + parent.slice(6, 12) + 'f'.repeat(26), ownerId: ownerIdForSource('claude-desktop', native),
+        sessionId: 'session-' + native, name: 'reviewer', target: 'claude-desktop', parentAgentId: parent }));
+    }
+    const listed = await f.service.list(extra(THREAD));
+    assert.deepEqual(listed.items.map(item => item.name).sort(), ['alpha', 'beta'], 'descendants stay out of the list');
+    const missing = await f.service.inspect({ name: 'reviewer' }, extra(THREAD)).then(() => null, error => error);
+    assert.equal(missing.code, 'agent-not-found', 'a descendant name is not addressable from this chat');
+    await f.service.delete({ name: 'alpha' }, extra(THREAD));
+    assert.equal(f.store.list(ownerIdForSource('claude-desktop', 'native-beta')).length, 1,
+      'closing one root leaves the other root’s child alone');
+  } finally { f.service.close(); }
+});
+
+test('one composed view: a running descendant keeps the root from finishing', async () => {
+  const owner = ownerIdFor(THREAD);
+  const rootId = 'agent-' + '3'.repeat(32);
+  const childId = 'agent-' + '4'.repeat(32);
+  const f = await fixture({ adapters: { 'claude-desktop': fakeBackend() } });
+  try {
+    f.store.insert(taskRecord({ agentId: rootId, ownerId: owner, sessionId: 'session-root', name: 'root',
+      state: 'awaiting_report', task: { taskId: 'task-root', message: 'work', state: 'running',
+        startedAt: new Date().toISOString(), dispatches: [], answers: [],
+        reports: [{ id: 'report-1', taskId: 'task-root', message: 'root done', final: true, createdAt: new Date().toISOString(),
+          delivery: { id: 'report-d1', state: 'pending' } }] } }));
+    f.store.insert(taskRecord({ agentId: childId, ownerId: ownerIdForSource('claude-desktop', 'native-kid'),
+      sessionId: 'session-child', name: 'child', parentAgentId: rootId, state: 'running' }));
+    await f.service.poll(rootId);
+    const after = f.store.get(rootId);
+    assert.equal(after.task.result, undefined, 'the root never confirms a final while a descendant is still running');
+    assert.ok(!after.closed, 'and it is not cleaned up');
+    // The descendant’s work appears inside the root’s own tree, with the path.
+    const changes = await f.service.changes({ name: 'root' }, extra(THREAD));
+    assert.ok(changes.tree.nodes.length >= 2, 'both applications are in one tree');
+    assert.equal(changes.tree.settled, false, 'the composed tree is not settled while a child runs');
+  } finally { f.service.close(); }
+});
+
+test('inspect and changes expose the mixed tree without internal ids', async () => {
+  const owner = ownerIdFor(THREAD);
+  const rootId = 'agent-' + '5'.repeat(32);
+  const childId = 'agent-' + '6'.repeat(32);
+  const nodes = [{ sessionId: 'session-root', parentSessionId: null, name: 'root', status: 'idle', activity: 'idle',
+    changes: [{ path: 'src/root.ts', operation: 'edit' }], coverage: 'Observed' }];
+  const childNodes = [{ sessionId: 'session-child', parentSessionId: null, name: 'child', status: 'idle', activity: 'idle',
+    changes: [{ path: 'src/child.ts', operation: 'edit' }], coverage: 'Observed' }];
+  const f = await fixture({ adapters: { 'claude-desktop': record => {
+    const factory = fakeBackend(record.name === 'root' ? { nodes } : { nodes: childNodes });
+    return factory(record);
+  } } });
+  try {
+    f.store.insert(taskRecord({ agentId: rootId, ownerId: owner, sessionId: 'session-root', name: 'root' }));
+    f.store.insert(taskRecord({ agentId: childId, ownerId: ownerIdForSource('claude-desktop', 'native-kid2'),
+      sessionId: 'session-child', name: 'child', parentAgentId: rootId }));
+    const changes = await f.service.changes({ name: 'root' }, extra(THREAD));
+    assert.deepEqual(changes.changes.map(change => change.agentPath.join('/')).sort(), ['root', 'root/child'],
+      'both applications’ files are attributed by path');
+    const inspected = await f.service.inspect({ name: 'root' }, extra(THREAD));
+    assert.deepEqual(inspected.tree.nodes.map(node => node.agentPath.join('/')), ['root', 'root/child']);
+    assert.ok(inspected.tree.nodes.every(node => Array.isArray(node.messages)), 'each node carries its own history');
+    const serialized = JSON.stringify(inspected);
+    assert.equal(/"(nativeSessionId|backendKey|socketPath|transcriptFile|recordFile)"/.test(serialized), false,
+      'no internal id or binding leaves the shared layer');
+  } finally { f.service.close(); }
+});
+
+test('children are cleaned first; a child failure keeps the parent retryable', async () => {
+  const owner = ownerIdFor(THREAD);
+  const rootId = 'agent-' + '7'.repeat(32);
+  const childId = 'agent-' + '8'.repeat(32);
+  const backend = fakeBackend({ failDestroyTimes: 1, failWhen: record => record.name === 'child' });
+  const f = await fixture({ adapters: { 'claude-desktop': backend } });
+  try {
+    f.store.insert(taskRecord({ agentId: rootId, ownerId: owner, sessionId: 'session-root', name: 'root', nativeDestroyed: false }));
+    f.store.insert(taskRecord({ agentId: childId, ownerId: ownerIdForSource('claude-desktop', 'native-kid3'),
+      sessionId: 'session-child', name: 'child', parentAgentId: rootId, nativeDestroyed: false, lifetime: 'once' }));
+    const failed = await f.service.delete({ name: 'root' }, extra(THREAD));
+    assert.equal(failed.deleted, false, 'the parent reports the child failure');
+    assert.equal(f.store.get(rootId).state, 'cleanup_failed', 'and stays listed for a retry');
+    assert.ok(f.store.get(childId), 'the child that could not be destroyed is still there');
+    assert.equal(backend.calls.destroy.includes(rootId), false, 'the parent native session was not destroyed yet');
+
+    const retried = await f.service.delete({ name: 'root' }, extra(THREAD));
+    assert.equal(retried.deleted, true);
+    assert.equal(f.store.count(), 0);
+    assert.deepEqual(backend.calls.destroy.filter(id => id === childId).length, 2, 'the child was retried, not re-destroyed after success');
+    assert.equal(backend.calls.destroy.filter(id => id === rootId).length, 1, 'the parent destroyed exactly once');
+  } finally { f.service.close(); }
+});

@@ -357,9 +357,9 @@ export function createScopedAgents(config, {
     return { own, all: [...own, ...store.descendantsOf(own.map(record => record.agentId))] };
   }
   function named(owner, name) {
-    const wanted = assertName(name);
-    const { own, all } = visibleRecords(owner.ownerId);
-    const record = own.find(item => item.name === wanted) ?? all.find(item => item.name === wanted);
+    // Addressable names are this chat's own, exactly as in 0.5.7: a descendant's name
+    // belongs to the session that created it and never hijacks this chat's namespace.
+    const record = store.named(owner.ownerId, assertName(name));
     if (!record) throw Object.assign(new Error(`No subagent named “${name}” exists in this chat.`), { code: 'agent-not-found' });
     return record;
   }
@@ -609,16 +609,79 @@ export function createScopedAgents(config, {
     return ready;
   }
 
-  async function observe(record) {
+  /** The record's own backend observation, exactly as its host reported it. */
+  async function observeOwn(record) {
     const backend = await checkHost(record);
     const observed = await backend.observe();
     if (observed.sessionId !== record.sessionId || (record.task && observed.taskId !== record.task.taskId)) {
       throw new Error('The host returned a different subagent task.');
     }
     if (record.task?.treeProtocol === TREE_PROTOCOL && !observed.tree) throw treeProtocolError(hostLabel(record));
-    record.observation = { ...observed, capturedAt: now() };
-    record.error = undefined;
     return observed;
+  }
+
+  /**
+   * One view for the whole managed tree: the record's own native tree plus every
+   * managed descendant's native tree, each child's native root hanging under the
+   * parent's own node. Everything downstream (settled, public shape, changes,
+   * coverage, finish gate, history snapshots, inspect) reads this view and nothing
+   * else, so no interface grows its own tree logic.
+   *
+   * The root's questions and reports stay the root's own: a child's questions and
+   * reports are delivered through that child's own state machine, never folded into
+   * the root's report.
+   */
+  async function observe(record) {
+    const own = await observeOwn(record);
+    const keyOf = (agentId, native) => agentId === record.agentId ? native : `${agentId}:${native}`;
+    const nodes = (own.tree?.nodes ?? []).map(node => ({ ...node,
+      name: node.sessionId === record.sessionId ? record.name : node.name,
+      backendKey: record.agentId, nativeSessionId: node.sessionId }));
+    const managed = new Map([[record.agentId, { record, backend: await backendFor(record), rootKey: record.sessionId }]]);
+    let settled = own.tree?.settled === true;
+    let running = own.tree?.running === true;
+    for (const child of store.descendantsOf([record.agentId])) {
+      const parentEntry = managed.get(child.parentAgentId);
+      if (!parentEntry) continue;
+      const parentKey = keyOf(child.parentAgentId, parentEntry.rootKey);
+      const entry = { record: child, backend: undefined, view: undefined, rootKey: keyOf(child.agentId, child.sessionId) };
+      managed.set(child.agentId, entry);
+      try {
+        entry.backend = await backendFor(child);
+        entry.view = child.task ? await entry.backend.observe() : undefined;
+      } catch (error) { entry.error = safeError(error); }
+      const childNodes = entry.view?.tree?.nodes ?? [];
+      if (childNodes.length) {
+        entry.rootKey = keyOf(child.agentId, child.sessionId);
+        for (const node of childNodes) nodes.push({ ...node,
+          sessionId: keyOf(child.agentId, node.sessionId),
+          parentSessionId: node.parentSessionId ? keyOf(child.agentId, node.parentSessionId) : parentKey,
+          name: node.sessionId === child.sessionId ? child.name : node.name,
+          backendKey: child.agentId, nativeSessionId: node.sessionId });
+      } else {
+        // A managed child with no native tree of its own still belongs in the tree, so
+        // an unfinished child can never let the parent settle early.
+        nodes.push({ sessionId: entry.rootKey, parentSessionId: parentKey, name: child.name,
+          status: child.closed ? 'closed' : child.state, activity: child.state, changes: [], coverage: 'Not observed',
+          backendKey: child.agentId, nativeSessionId: child.sessionId, synthetic: true });
+      }
+      const pendingReports = (child.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
+      const busy = Boolean(child.task) && (!child.closed || pendingReports
+        || ACTIVE.has(child.state) || child.state === 'cleanup_failed');
+      const childSettled = !child.task
+        ? true
+        : entry.view?.tree?.settled === true && entry.view?.tree?.running === false && !busy;
+      settled = settled && childSettled;
+      running = running || entry.view?.tree?.running === true || busy;
+    }
+    const composed = { ...own, tree: { ...(own.tree ?? {}), nodes, settled, running } };
+    composed.managed = managed;
+    // Everything persisted stays plain data: backends and the managed map are live
+    // objects and must never reach the roster.
+    const { managed: _managed, ...storable } = composed;
+    record.observation = { ...storable, capturedAt: now() };
+    record.error = undefined;
+    return composed;
   }
 
   function sameModel(left, right) {
@@ -846,10 +909,29 @@ export function createScopedAgents(config, {
     store.save(record);
   }
 
+  /**
+   * Close one name and everything created beneath it. Children go first: a child that
+   * cannot be cleaned keeps the parent in cleanup_failed (still listed, still retryable)
+   * instead of vanishing from the roster while its session survives. A child already in
+   * cleanup_failed is retried too — closed is not the same as cleaned.
+   */
   async function clearRecord(record, { autoClaimed = false } = {}) {
     record.state = 'cleaning'; record.closed = true;
     if (!autoClaimed) store.save(record);
     try {
+      for (const child of store.childrenOf(record.agentId)) {
+        const current = store.get(child.agentId);
+        if (!current || current.agentId === record.agentId) continue;
+        // A one-shot child hands its terminal evidence to the parent's current task
+        // snapshot before it is removed, so the parent keeps the tree, files and
+        // history it was created from even after the child's record is gone.
+        if (current.lifetime === 'once') await keepChildSnapshot(record, current);
+        const verdict = await clearRecord(current);
+        if (verdict?.deleted !== true) {
+          throw Object.assign(new Error(`The managed subagent “${current.name}” could not be cleaned; this name stays listed so cleanup can be retried.`),
+            { code: 'child-cleanup-failed', child: current.name, childError: verdict?.error });
+        }
+      }
       if (!record.nativeDestroyed) {
         const backend = await checkHost(record);
         const result = await backend.destroy();
@@ -871,19 +953,31 @@ export function createScopedAgents(config, {
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       store.remove(record);
       forgetBackend(record);
-      // Managed descendants created beneath this name close with it, whichever
-      // application runs them; each child keeps its own cleanup verdict.
-      for (const child of store.childrenOf(record.agentId)) {
-        if (child.closed) continue;
-        const current = store.get(child.agentId);
-        if (current) await clearRecord(current);
-      }
       return { name: record.name, deleted: true, sessionDataRemoved: true };
     } catch (error) {
       const current = store.get(record.agentId);
       if (current) { current.state = 'cleanup_failed'; current.closed = true; current.error = safeError(error); store.save(current); }
       return { name: record.name, deleted: false, state: 'cleanup_failed', error: safeError(error) };
     }
+  }
+
+  /**
+   * Keep a one-shot child's terminal tree, files and history inside the parent's
+   * current task snapshot, in the fields the task already has. No second state machine.
+   */
+  async function keepChildSnapshot(parent, child) {
+    const current = store.get(parent.agentId);
+    if (!current?.task) return;
+    const observation = child.observation ?? {};
+    const snapshot = { name: child.name, agentPath: managedPath(child), target: targetOf(child),
+      state: child.state, taskId: child.task?.taskId,
+      tree: publicTree(child, observation),
+      changes: attributedChanges(child, observation),
+      coverage: treeCoverage(child, observation),
+      history: (child.history ?? []).slice(-20).map(task => ({ message: compactText(task.message, 240), state: task.state,
+        startedAt: task.startedAt, finishedAt: task.finishedAt })) };
+    current.task.childSnapshots = [...(current.task.childSnapshots ?? []).filter(item => item.name !== child.name), snapshot];
+    store.save(current);
   }
 
   // Only persisted report_parent calls may wake the parent chat.
@@ -1283,11 +1377,11 @@ export function createScopedAgents(config, {
     },
     async list(extra) {
       const owner = await context(extra);
-      for (const record of visibleRecords(owner.ownerId).all) await ensureWorker(record);
-      const records = visibleRecords(owner.ownerId).all;
-      const names = new Map(records.map(record => [record.agentId, record.name]));
+      // Own names only, each with its own composed tree; managed descendants appear
+      // inside that tree, never as extra entries in this chat's list.
+      for (const record of store.list(owner.ownerId)) await ensureWorker(record);
+      const records = store.list(owner.ownerId);
       return { items: records.map(record => ({ ...publicResult(record),
-        ...(record.parentAgentId ? { parent: names.get(record.parentAgentId) ?? null } : {}),
         monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping') : (monitorAlive(store) ? 'running' : 'stopped'),
         supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
     },
@@ -1300,15 +1394,9 @@ export function createScopedAgents(config, {
             coverage: historical.coverage, tree: historical.tree ?? historical.result?.tree };
         }
         try { await observe(record); store.save(record); } catch (error) { record.error = safeError(error); }
-        // Descendants on any application belong to this tree; their changes are
-        // attributed with their own agentPath instead of disappearing from it.
-        const changes = attributedChanges(record, record.observation ?? {});
-        for (const child of store.descendantsOf([record.agentId])) {
-          if (!child.task) continue;
-          try { await observe(child); store.save(child); } catch (error) { child.error = safeError(error); }
-          changes.push(...attributedChanges(child, child.observation ?? {}));
-        }
-        return { name, task: 0, changes,
+        // The composed view already carries every managed descendant's attributed
+        // changes under its own agentPath, so no second walk happens here.
+        return { name, task: 0, changes: attributedChanges(record, record.observation ?? {}),
           tree: publicTree(record, record.observation ?? {}), coverage: treeCoverage(record, record.observation ?? {}),
           stale: Boolean(record.error || record.observation?.stale), ...(record.error ? { error: record.error } : {}) };
       });
@@ -1326,42 +1414,26 @@ export function createScopedAgents(config, {
         const tree = publicTree(record, inspectionView);
         const nodes = ownedTree(record, inspectionView).nodes;
         let rootHistory, rootError;
+        // Every node — this record's own sessions and managed descendants on any
+        // application — reads its history through the backend that owns it. The public
+        // shape stays the existing tree.nodes[].messages/agentPath/depth; internal ids
+        // and bindings never leave this loop.
         const backend = await backendFor(record);
-        // Cross-application descendants: each is inspected through its own backend and
-        // tagged with its managed path (root/child/grand), never resolved by name, so
-        // same-named records at different depths stay distinct.
-        const descendants = [];
-        for (const child of store.descendantsOf([record.agentId])) {
-          const agentPath = managedPath(child);
-          const entry = { agentPath, name: child.name, target: targetOf(child), state: child.state };
-          try {
-            const childView = await observe(child);
-            store.save(child);
-            const childBackend = await backendFor(child);
-            const childNodes = ownedTree(child, childView).nodes.length ? ownedTree(child, childView).nodes
-              : [{ node: { sessionId: child.sessionId, parentSessionId: null, status: childView.status } }];
-            const sessions = [];
-            for (const { node } of childNodes) {
-              try {
-                const page = await childBackend.history({ targetSessionId: node.sessionId,
-                  running: node.status === 'running', maxMessages });
-                sessions.push({ sessionId: node.sessionId, status: node.status, messages: page?.messages ?? [],
-                  hasMore: page?.hasMore === true, ...(page?.note ? { note: page.note } : {}) });
-              } catch (error) { sessions.push({ sessionId: node.sessionId, status: node.status, error: safeError(error) }); }
-            }
-            descendants.push({ ...entry, sessions });
-          } catch (error) { descendants.push({ ...entry, error: safeError(error) }); }
-        }        for (let index = 0; index < nodes.length; index++) {
+        for (let index = 0; index < nodes.length; index++) {
           const { node } = nodes[index];
+          const owner = node.backendKey && node.backendKey !== record.agentId ? view.managed?.get(node.backendKey) : undefined;
+          const nodeBackend = owner?.backend ?? backend;
+          const targetSessionId = node.nativeSessionId ?? node.sessionId;
+          if (node.synthetic && !owner?.view) { tree.nodes[index].status = tree.nodes[index].status ?? node.status; continue; }
           try {
             const dispatch = node.sessionId === record.sessionId ? record.task?.dispatches?.at(-1) : undefined;
             // Upgrade old failed records from this inspection's own page, and only
             // when it contains this task's original request. The backend reads its
             // own native history: no target format is parsed in this shared layer.
             const upgrade = dispatch?.state === 'failed' && !dispatch.failure;
-            const page = await backend.history({ targetSessionId: node.sessionId, running: node.status === 'running',
+            const page = await nodeBackend.history({ targetSessionId, running: node.status === 'running',
               maxMessages, ...(upgrade ? { requestId: dispatch.requestId, afterSeq: dispatch.afterSeq ?? -1 } : {}) });
-            if (!Array.isArray(page?.messages)) throw Object.assign(new Error(`${backend.labels?.bridge ?? `The ${targetOf(record)} backend`} returned invalid session history.`), { code: 'invalid-response' });
+            if (!Array.isArray(page?.messages)) throw Object.assign(new Error(`${nodeBackend.labels?.bridge ?? `The ${targetOf(record)} backend`} returned invalid session history.`), { code: 'invalid-response' });
             if (upgrade && page.failure) { dispatch.failure = page.failure; store.save(record); }
             const selected = { messages: page.messages, hasMore: page.hasMore === true,
               ...(page.note ? { note: page.note } : {}) };
@@ -1375,13 +1447,7 @@ export function createScopedAgents(config, {
         return { ...publicResult(record), ...(rootHistory ?? {}), ...(rootError ? { error: rootError } : {}),
           reports: { ...publicResult(record).reports, items: (record.task?.reports ?? []).map(report => ({ message: report.message, final: report.final, delivery: report.delivery.state })) },
           tree,
-          // Descendants on another application are inspected through their own
-          // backend and reported by their position in the managed graph, so a direct
-          // child and a same-named grandchild never shadow each other and no internal
-          // binding is exposed.
-          ...(descendants.length ? { descendants } : {}),
-          inspectionIncomplete: tree.nodes.some(node => node.error !== undefined)
-            || descendants.some(item => item.error || item.sessions?.some(page => page.error)),
+          inspectionIncomplete: tree.nodes.some(node => node.error !== undefined),
           historyCount: record.history.length,
           history: record.history.slice(-20).reverse().map((task, index) => ({ task: index + 1, message: compactText(task.message, 240),
             state: task.state, startedAt: task.startedAt, finishedAt: task.finishedAt })) };

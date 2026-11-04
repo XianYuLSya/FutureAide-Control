@@ -294,7 +294,7 @@ test('cancel interrupts the root first, then stops the running child tasks', asy
   assert.equal(result.cancelRequested, true);
   assert.equal(result.treeSettled, true, 'settle comes from the same observer');
   assert.deepEqual({ ...result.cancelRounds[1], detail: undefined }, { round: 1, action: 'stop-tasks',
-    requested: ['a1'], clicked: 1, accepted: 1, rows: 1, remaining: 0, detail: undefined });
+    requested: ['a1'], clicked: 1, rows: 1, remaining: 0, detail: undefined });
   assert.equal(result.cancelRounds[1].detail[0].state, null);
 });
 
@@ -335,7 +335,7 @@ test('a handback that wakes the root is interrupted again', async () => {
         order.push('stop');
         // the child's handback leaves the root running one short turn
         tree = cancelTree([], { nodes: [{ sessionId: 'logical', parentSessionId: null, status: 'running' }] });
-        return { stopped: [{}], remaining: [] };
+        return { stopped: [{ index: 0, rowText: 'leaf one', clicked: true }], remaining: [] };
       },
     } }));
   await f.setStatus('busy');
@@ -354,7 +354,8 @@ test('a host that cannot stop tasks says so instead of pretending', async () => 
   assert.equal(result.stopTasksUnsupported, true);
   assert.equal(result.cancelRequested, false, 'nothing reached the host for the running child');
   assert.equal(result.treeSettled, false);
-  assert.equal(result.cancelRounds.filter(entry => entry.action === 'stop-tasks-unsupported').length, 3);
+  assert.equal(result.cancelRounds.filter(entry => entry.action === 'stop-tasks-unsupported').length, 1,
+    'an unsupported stop is reported once, not repeated');
 });
 
 test('cancel needs no native work when the first send never happened', async () => {
@@ -382,22 +383,26 @@ test('an unobservable session never counts as a stopped tree', async () => {
   assert.equal(result.cancelPending, true);
 });
 
-test('a stop the host reports by state counts even when clicked is false', async () => {
+test('a row state of requested is never read as a successful stop', async () => {
   const f = await setup();
-  let tree = cancelTree([runningChild('leaf one', 'a1')]);
+  const tree = cancelTree([runningChild('leaf one', 'a1')]);
   const adapter = await bound(f, cancelDeps(f, { current: () => tree,
     host: { interrupt: async () => ({ interrupted: false, status: 'not-running' }),
-      stopBackgroundTasks: async () => {
-        tree = { settled: true, running: false, nodes: tree.nodes.map(node => ({ ...node, status: 'ended' })) };
-        return { stopped: [{ index: 0, rowText: 'leaf one', clicked: false, state: 'requested' }], remaining: [] };
-      } } }));
+      stopBackgroundTasks: async () => ({ stopped: [{ index: 0, rowText: 'leaf one', clicked: false,
+        state: 'requested', error: { code: 'task-stop-refused', message: 'the press was refused' } }],
+        remaining: [{ index: 0, rowText: 'leaf one' }], status: 'stop-refused' }) } }));
   await f.setStatus('idle');
   const result = await adapter.cancel();
-  assert.equal(result.cancelRequested, true, 'the host own row state is proof the press went through');
-  const stopRound = result.cancelRounds.find(entry => entry.action === 'stop-tasks');
-  assert.equal(stopRound.accepted, 1);
-  assert.equal(stopRound.clicked, 0);
+  assert.equal(result.cancelRequested, false, 'state:requested is filled even when the press failed');
+  assert.equal(result.cancelPending, true);
+  assert.equal(result.reason, 'no-native-stop-accepted');
+  assert.equal(result.cancelRounds.filter(entry => entry.action === 'stop-tasks').length, 1,
+    'a refused row is reported once, not repeated');
+  const row = result.cancelRounds.find(entry => entry.action === 'stop-tasks').detail[0];
+  assert.deepEqual({ clicked: row.clicked, state: row.state, code: row.error.code },
+    { clicked: false, state: 'requested', code: 'task-stop-refused' });
 });
+
 test('a stop that clicked nothing is not an accepted cancel', async () => {
   const f = await setup();
   const tree = cancelTree([runningChild('leaf one', 'a1')]);

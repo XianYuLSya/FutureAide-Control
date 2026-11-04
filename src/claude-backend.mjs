@@ -390,7 +390,7 @@ export async function createClaudeBackend(record, deps = {}) {
       }
       const canStopTasks = typeof host.stopBackgroundTasks === 'function';
       const rounds = [];
-      let observed, unavailable = false;
+      let observed, unavailable = false, refusedRound = false;
       for (let round = 1; round <= CANCEL_ROUNDS; round += 1) {
         try {
           const native = await nativeSession(state);
@@ -406,24 +406,29 @@ export async function createClaudeBackend(record, deps = {}) {
             .map(target => target.taskId);
           if (targets.length && !canStopTasks) {
             rounds.push({ round, action: 'stop-tasks-unsupported', requested: targets });
+            refusedRound = true; // nothing here will change by asking again
           } else if (targets.length) {
             // Scope-owned: the panel is this session's own, so no title or
             // task-name matching is used to choose the rows.
             const stop = await lockedHost(() => host.stopBackgroundTasks({
               nativeSessionId: state.binding.sessionId }, hostOptions()));
             const rows = stop?.stopped ?? [];
-            // The host's own per-row outcome is the evidence: `clicked` is one way
-            // it reports a press, and its state says the press went through.
-            const accepted = rows.filter(row => row?.clicked === true
-              || ['stopped', 'stopping', 'requested'].includes(row?.state));
+            // Only the host's own click confirmation counts. `state` is filled in
+            // with 'requested' even when the press failed, so it is reported for
+            // diagnosis and never read as success.
+            const clickedRows = rows.filter(row => row?.clicked === true);
             rounds.push({ round, action: 'stop-tasks', requested: targets,
               ...(stop?.status ? { status: stop.status } : {}),
-              clicked: rows.filter(row => row?.clicked === true).length,
-              accepted: accepted.length, rows: rows.length, remaining: (stop?.remaining ?? []).length,
+              clicked: clickedRows.length, rows: rows.length, remaining: (stop?.remaining ?? []).length,
               ...(rows.length ? { detail: rows.slice(0, 8).map(row => ({ index: row?.index,
                 rowText: row?.rowText ?? null, clicked: row?.clicked === true, state: row?.state ?? null,
                 ...(row?.error ? { error: row.error } : {}) })) } : {}) });
+            // A refusal means the host cannot press right now: report it once
+            // instead of burning the remaining rounds on the same panel.
+            if (clickedRows.length === 0) refusedRound = true;
           }
+          observed = await refresh({ fresh: true });
+          if (refusedRound && observed?.tree?.settled !== true) break; // one honest report, no blind repeats
           observed = await refresh({ fresh: true });
         } catch (error) {
           if (error.code !== 'claude-session-unavailable') throw error;
@@ -438,11 +443,11 @@ export async function createClaudeBackend(record, deps = {}) {
       }
       const settled = observed?.tree?.settled === true;
       const interrupted = rounds.some(entry => entry.interrupted === true);
-      const acceptedRound = rounds.some(entry => (entry.accepted ?? 0) > 0);
+      const clickedRound = rounds.some(entry => (entry.clicked ?? 0) > 0);
       const remainingTasks = (treeModule?.claudeTreeStopTargets?.(observed?.tree) ?? [])
         .filter(target => typeof target.taskId === 'string' && target.status !== 'ended')
         .map(target => target.taskId);
-      const requested = settled || interrupted || acceptedRound;
+      const requested = settled || interrupted || clickedRound;
       const cancelPending = !settled
         && (observed?.tree?.running === true || remainingTasks.length > 0 || unavailable);
       return { cancelRequested: requested, cancelPending,

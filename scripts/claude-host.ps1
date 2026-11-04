@@ -1046,7 +1046,8 @@ try {
       Write-Result @{ ok = [bool]$click.clicked
         code = $(if ($click.clicked) { $null } else { 'task-stop-click-unavailable' })
         message = $(if ($click.clicked) { $null } else { [string]$click.reason })
-        value = @{ index = $row.index; title = $row.title; matchedBy = $matchedBy; buttonName = $row.buttonName; rowName = $row.rowName
+        value = @{ clicked = [bool]$click.clicked; clickMethod = [string]$click.method; clickReason = [string]$click.reason
+          index = $row.index; title = $row.title; matchedBy = $matchedBy; buttonName = $row.buttonName; rowName = $row.rowName
           before = $before; after = $after; busySeen = $busySeen; doneSeen = $doneSeen
           method = $click.method; at = (Get-Date).ToUniversalTime().ToString('o') } }
     }

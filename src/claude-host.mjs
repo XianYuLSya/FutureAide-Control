@@ -1062,6 +1062,24 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
   const title = visible.title || record.name;
   const panel = await ui.tasksPanel({ title, mode: 'open' });
   let rows = rowsOf(panel?.rows);
+  // The panel can show fewer rows than the screen: the entry names the live count,
+  // so a mismatch means this read is stale and no press may be based on it.
+  const entryCount = (() => {
+    const match = /(\d+)\s*$/.exec(String(panel?.entry ?? ''));
+    return match ? Number(match[1]) : null;
+  })();
+  const stoppableNow = rowsOf(rows).filter(row => row && row.enabled !== false).length;
+  if (entryCount !== null && entryCount > 0 && stoppableNow !== entryCount) {
+    return {
+      nativeSessionId, pid: record.pid, scope: 'session-background-tasks',
+      status: 'panel-stale',
+      panel: { opened: Boolean(panel?.opened), entry: panel?.entry ?? null, entryCount, stoppableRows: stoppableNow },
+      rows: rows.map(row => ({ index: row.index, title: row.title ?? null, running: row.running ?? null, enabled: row.enabled ?? null })),
+      stopped: [], remaining: [], clickedCount: 0,
+      detail: 'The panel shows ' + stoppableNow + ' stoppable row(s) while the menu entry reports ' + entryCount + '; this read is behind the screen, so nothing was pressed. Reopen the panel and read again.',
+      rootInterruptRequired: true, verifiedBy: ['panel-entry-count'],
+    };
+  }
   const stopped = [];
   // A panel that has not refreshed yet still shows a row as stoppable, so a row
   // that was already asked to stop is never asked twice.
@@ -1077,18 +1095,24 @@ export async function stopBackgroundTasks({ nativeSessionId, targets = undefined
     const attempt = await ui.taskStop({ title: row.title, match: row.rowText, index: row.index })
       .catch(error => ({ clicked: false, code: error.code ?? 'task-stop-refused', message: error.message,
         detail: error.detail ?? null, rowsSeen: error.detail?.value?.rows ?? null }));
+    // The bridge states whether it clicked. If an older bridge omits that field but
+    // reports a method, the press is counted and the missing contract is reported,
+    // instead of every real press looking like a refusal.
+    const contractMissing = attempt?.clicked === undefined;
+    const clicked = attempt?.clicked === true || (contractMissing && Boolean(attempt?.method ?? attempt?.clickMethod));
     stopped.push({
       index: row.index,
       title: row.title ?? null,
+      ...(contractMissing ? { bridgeContract: 'missing-clicked-field' } : {}),
       rowText: row.rowText,
       rowName: row.rowName,
       matchedBy: attempt?.matchedBy ?? null,
-      clicked: Boolean(attempt?.clicked),
+      clicked,
       busySeen: Boolean(attempt?.busySeen),
       doneSeen: Boolean(attempt?.doneSeen),
       state: attempt?.doneSeen ? 'stopped' : (attempt?.busySeen ? 'stopping' : 'requested'),
       at: attempt?.at,
-      ...(attempt?.clicked ? {} : { error: { code: attempt?.code ?? 'task-stop-refused', message: attempt?.message,
+      ...(clicked ? {} : { error: { code: attempt?.code ?? 'task-stop-refused', message: attempt?.message,
         detail: attempt?.detail ?? null } }),
     });
     // refresh: the panel only shows tasks that exist when it is opened

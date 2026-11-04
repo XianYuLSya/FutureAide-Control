@@ -1715,7 +1715,7 @@ test('a refused press is reported with the rows the host actually saw', async ()
   const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
   const seen = [{ index: 0, title: 'Cancel child A', rowText: 'Cancel child A | Cancel child A 6分钟', running: true, enabled: true, done: false }];
   const driver = uiDriver({
-    tasksPanel: () => ({ opened: true, entry: '后台任务 3', rows: seen }),
+    tasksPanel: () => ({ opened: true, entry: '后台任务 1', rows: seen }),
     taskStop: input => {
       throw Object.assign(new Error('no stoppable row matches title ' + input.title), {
         code: 'task-not-found', detail: { value: { rows: seen, wanted: input } } });
@@ -1730,5 +1730,38 @@ test('a refused press is reported with the rows the host actually saw', async ()
     assert.deepEqual(result.refused[0].error.code, 'task-not-found');
     assert.deepEqual(result.firstRefusal.detail.value.rows.map(row => row.title), ['Cancel child A'],
       'the refusal carries what the host saw, so the locator can be fixed');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+
+test('a panel that lags behind the screen is reported instead of clicked', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  // the menu says three tasks; the panel read only shows one stoppable row
+  const rows = [{ index: 0, title: 'Cancel child A', rowText: 'Cancel child A | old', running: true, enabled: true, done: false }];
+  const driver = uiDriver({ tasksPanel: () => ({ opened: true, entry: '后台任务 3', rows }) });
+  try {
+    const result = await stopBackgroundTasks({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive });
+    assert.equal(result.status, 'panel-stale');
+    assert.equal(result.panel.entryCount, 3);
+    assert.equal(result.panel.stoppableRows, 1);
+    assert.equal(result.clickedCount, 0);
+    assert.equal(driver.calls.some(call => Array.isArray(call) && call[0] === 'taskStop'), false,
+      'nothing is pressed from a read that is behind the screen');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});
+
+test('a press counts as clicked even if the bridge omits the flag', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const rows = [{ index: 0, title: 'Cancel child A', rowText: 'Cancel child A | running', running: true, enabled: true, done: false }];
+  const driver = uiDriver({
+    tasksPanel: () => ({ opened: true, entry: '后台任务 1', rows }),
+    // an older bridge returns the press without the clicked field
+    taskStop: () => ({ method: 'mouse', at: '2026-11-04T06:08:57.000Z', busySeen: true, doneSeen: true }),
+  });
+  try {
+    const result = await stopBackgroundTasks({ nativeSessionId: SESSION }, { env: host1.env, driver, isAlive: host1.isAlive });
+    assert.equal(result.clickedCount, 1, 'a reported press is not lost');
+    assert.equal(result.status, undefined);
+    assert.equal(result.stopped[0].bridgeContract, 'missing-clicked-field');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });

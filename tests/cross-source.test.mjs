@@ -654,3 +654,30 @@ test('a returned stop refusal remains visible through observation until native c
     assert.equal((await f.service.list(extra(THREAD))).items[0].error, undefined);
   } finally { f.service.close(); }
 });
+
+test('a recovered receipt clears stale dispatch errors and completed legacy errors stay out of list', async () => {
+  const base = fakeBackend();
+  let sends = 0;
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+    receipt: async () => ({ status: 'accepted', afterSeq: 1 }),
+    deliver: async () => { sends++; throw new Error('recovery must not resend'); },
+  }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    const task = completedInput('recovered');
+    Object.assign(task.dispatches[0], { state: 'unknown', accepted: false, nextAttemptAt: 0, retryAttempts: 2,
+      error: { code: 'codex-native-binding-invalid', message: 'old path failure' } });
+    f.store.insert(taskRecord({ agentId: 'recovered', ownerId: ownerIdFor(THREAD), sessionId: 'session-recovered', name: 'recovered', task }));
+    await f.service.poll('recovered');
+    const current = f.store.get('recovered');
+    assert.equal(current.state, 'awaiting_report');
+    assert.equal(current.task.dispatches[0].state, 'completed');
+    for (const key of ['error', 'nextAttemptAt', 'retryAttempts']) assert.equal(current.task.dispatches[0][key], undefined);
+    assert.equal(sends, 0);
+    assert.equal((await f.service.list(extra(THREAD))).items[0].error, undefined);
+    // Existing completed records need no roster rewrite to stop advertising an old transport error.
+    current.task.dispatches[0].error = { code: 'codex-native-binding-invalid', message: 'legacy error' };
+    f.store.save(current);
+    assert.equal((await f.service.list(extra(THREAD))).items[0].error, undefined);
+  } finally { f.service.close(); }
+});

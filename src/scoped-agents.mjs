@@ -120,7 +120,8 @@ function treeCoverage(record, view) {
 function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
   const lastDispatch = task?.dispatches?.at(-1);
-  const error = record.error ?? task?.cancelError ?? lastDispatch?.failure ?? lastDispatch?.error;
+  const error = record.error ?? task?.cancelError ?? (lastDispatch?.state === 'failed' ? lastDispatch.failure : undefined)
+    ?? (!['completed', 'cancelled'].includes(lastDispatch?.state) ? lastDispatch?.error : undefined);
   const view = record.observation ?? {};
   const changes = attributedChanges(record, view);
   return {
@@ -1182,7 +1183,7 @@ export function createScopedAgents(config, {
       return;
     }
     dispatch.afterSeq = receipt.afterSeq ?? dispatch.afterSeq;
-    if (receipt.status === 'accepted') { dispatch.accepted = true; dispatch.state = 'running'; }
+    if (receipt.status === 'accepted') Object.assign(dispatch, { accepted: true, state: 'running', error: undefined, failure: undefined, nextAttemptAt: undefined, retryAttempts: undefined });
     if (receipt.status === 'rejected') dispatch.state = 'failed';
     if (receipt.status === 'retryable') {
       if (!allowResend) return 'not-sent';
@@ -1219,7 +1220,7 @@ export function createScopedAgents(config, {
           const observed = await (await backendFor(record)).turn({ requestId: prior.requestId,
             afterSeq: prior.afterSeq, timeoutSeconds: 0, maxMessages: 100 });
           if (observed.state === 'ended' && observed.correlation === 'request-id') Object.assign(prior,
-            { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq,
+            { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
               failure: modelTurnError(observed.completionReason) });
         }
         store.save(record);
@@ -1330,7 +1331,7 @@ export function createScopedAgents(config, {
           ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}), timeoutSeconds: 0, maxMessages: 100 });
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
-          Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true,
+          Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
             endSeq: result.endSeq, failure: modelTurnError(result.completionReason) });
         }
       }

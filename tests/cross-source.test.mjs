@@ -922,6 +922,87 @@ test('a crashed session leaves its record behind and the notice still finds wher
   } finally { await claude.close(); f.service.close(); }
 });
 
+// --- A caller that already read the final report settles it before ordering more ---
+
+const claudeCaller = sessionId => ({ _meta: { threadId: THREAD },
+  [TRUSTED_CALLER]: { source: 'claude-desktop', nativeSessionId: sessionId, workspace } });
+
+/** The receipt Claude writes back within milliseconds of accepting a notice. */
+const receiptIn = (claude, noticeId) => appendFile(claude.stale.transcriptFile, JSON.stringify({
+  sessionId: claude.sessionId, type: 'user', uuid: claudeNoticeRequestId(noticeId),
+  message: { content: 'futureaide notice received' } }) + '\n');
+
+test('a caller that already read the final report orders the next task without waiting for delivery', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    pendingReport(f, claude, 'settle', { state: 'unknown' });
+    await receiptIn(claude, 'notice-settle');
+    const sent = await f.service.send({ name: 'settle', message: 'next order' }, claudeCaller(claude.sessionId));
+    assert.equal(claude.received.length, 0, 'the receipt is read back, never written again');
+    const current = f.store.get('settle');
+    assert.equal(current.task.message, 'next order');
+    assert.equal(current.state, 'running');
+    assert.equal(current.history.length, 1, 'the delivered task moved to history');
+    assert.equal(current.history[0].taskId, 'task-settle');
+    assert.equal(current.history[0].reports[0].delivery.state, 'delivered');
+    assert.equal(sent.queued, true);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a final whose receipt has not landed yet still refuses the next task without writing it twice', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    pendingReport(f, claude, 'unread', { state: 'unknown' });
+    const error = await f.service.send({ name: 'unread', message: 'next order' }, claudeCaller(claude.sessionId))
+      .then(() => null, value => value);
+    assert.match(error.message, /final report is waiting for delivery/);
+    assert.equal(claude.received.length, 0, 'an ambiguous write is never sent a second time');
+    const current = f.store.get('unread');
+    assert.equal(current.state, 'delivery_pending');
+    assert.equal(current.task.message, 'work', 'no second task was started');
+    assert.equal(current.task.reports[0].delivery.state, 'unknown');
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('settling a one-shot agent’s final closes it instead of dispatching another task', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    pendingReport(f, claude, 'once-settle', { state: 'unknown' });
+    const record = f.store.get('once-settle'); record.lifetime = 'once'; f.store.save(record);
+    await receiptIn(claude, 'notice-once-settle');
+    const error = await f.service.send({ name: 'once-settle', message: 'next order' }, claudeCaller(claude.sessionId))
+      .then(() => null, value => value);
+    assert.match(error.message, /closing/);
+    assert.equal(f.store.get('once-settle'), undefined, 'the settled one-shot name was cleaned up');
+    assert.equal(claude.received.length, 0);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a sleeping name settles its pending delivery and wakes for the next task', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    pendingReport(f, claude, 'sleepy', { state: 'unknown' });
+    f.store.claimLease('idle-monitor', 'owner', 60000);
+    f.store.claimLease('idle-monitor:ready', 'owner', 60000);
+    assert.equal(f.store.sleep(f.store.get('sleepy'), 'baseline'), true);
+    await receiptIn(claude, 'notice-sleepy');
+    const sent = await f.service.send({ name: 'sleepy', message: 'next order' }, claudeCaller(claude.sessionId));
+    const current = f.store.get('sleepy');
+    assert.equal(current.sleep, undefined, 'the wake cleared the marker before the next dispatch');
+    assert.equal(current.task.message, 'next order');
+    assert.equal(current.state, 'running');
+    assert.equal(sent.queued, true);
+  } finally { await claude.close(); f.service.close(); }
+});
+
 // --- DSH cleanup outcomes: an unknown write queues, a refused destroy fails ---------
 
 /** A DSH host whose only interesting answer is what its managedDestroy call returns. */

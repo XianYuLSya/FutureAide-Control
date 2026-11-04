@@ -4,7 +4,7 @@ import { RosterStore } from '../src/roster-store.mjs';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { canSleep, hasPendingDelivery } from '../src/idle-monitor-eligibility.mjs';
+import { awaitingReceipt, canSleep, hasPendingDelivery } from '../src/idle-monitor-eligibility.mjs';
 import { backgroundBatch, idleSignal, pollSleeping, scanSleeping } from '../src/idle-monitor.mjs';
 
 function record() {
@@ -23,6 +23,25 @@ test('only a verified quiet tree with no unfinished work may sleep', () => {
   assert.equal(hasPendingDelivery(value), false);
   value.observation.questions = []; value.observation.tree.running = true;
   assert.equal(canSleep(value, [], settled), false);
+});
+test('an unread receipt keeps a name awake only while its retries are still frequent', () => {
+  const value = record(), settled = (_r, view) => view.tree.settled && !view.tree.running;
+  value.task.reports = [{ delivery: { state: 'unknown', attempts: 1 } }];
+  assert.equal(awaitingReceipt(value), true);
+  assert.equal(canSleep(value, [], settled), false);
+  value.task.reports[0].delivery.attempts = 5;
+  assert.equal(awaitingReceipt(value), false);
+  assert.equal(canSleep(value, [], settled), true, 'the 30-second batch is as fast as the notice backoff now');
+  value.task.reports[0].delivery.state = 'delivered';
+  assert.equal(awaitingReceipt(value), false);
+  assert.equal(canSleep(value, [], settled), true, 'a delivered report never holds the name');
+  value.task.reports = [];
+  value.observation.questions.push({ id: 'q', state: 'pending' });
+  value.task.questionNotices = { q: { state: 'sending', attempts: 2 } };
+  assert.equal(awaitingReceipt(value), true);
+  assert.equal(canSleep(value, [], settled), false, 'a question notice is read back the same way');
+  value.task.questionNotices.q.attempts = 5;
+  assert.equal(canSleep(value, [], settled), true);
 });
 test('shared monitor retries pending or unknown deliveries with at most two concurrent polls', async () => {
   const records = Array.from({ length: 5 }, (_, index) => ({ ...record(), agentId: `agent-${index}`,

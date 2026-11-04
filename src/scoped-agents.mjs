@@ -1147,6 +1147,27 @@ export function createScopedAgents(config, {
     return true;
   }
 
+  /**
+   * The caller can only order the next task after reading the final report, so that
+   * notice's native receipt is already in the transcript. Re-read it here instead of
+   * waiting for the next 30-second delivery batch. Only a notice whose write outcome
+   * is still ambiguous is re-read this way; delivered and blocked ones are untouched,
+   * so no report is ever written twice.
+   */
+  async function settleDelivery(record) {
+    for (const report of record.task?.reports ?? []) {
+      const notice = report.delivery;
+      if (notice && ['unknown', 'sending'].includes(notice.state)) notice.nextAttemptAt = undefined;
+    }
+    store.save(record);
+    await deliverReports(record);
+    const task = record.task;
+    const final = (task?.reports ?? []).find(report => report.final);
+    // The same finish gate a poll uses, so a settled report closes its task once.
+    if (final?.treeSettledConfirmed && task.result
+        && task.reports.every(report => report.delivery.state === 'delivered')) await finishDeliveredReport(record);
+  }
+
   async function finishDeliveredReport(record) {
     const task = record.task;
     const current = store.get(record.agentId);
@@ -1511,8 +1532,15 @@ export function createScopedAgents(config, {
       };
       try { return await withName(extra, name, async record => {
         enteredOperation = true;
-        if (record.closed || ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'].includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
-        if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait before assigning another task.');
+        const closing = ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'];
+        if (record.closed || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
+        if (record.state === 'delivery_pending') {
+          await settleDelivery(record);
+          // Settling a one-shot agent's final finishes its task and removes the name on
+          // the spot, so the ordinary closing error applies instead of a new dispatch.
+          if (record.closed || !store.get(record.agentId) || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
+          if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait before assigning another task.');
+        }
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
         if (targetOf(record) === 'dsh') await checkHost(record);
         const stoppedTask = record.task && ['cancelled', 'failed'].includes(record.state);

@@ -1,6 +1,8 @@
 # 更新记录
 
-## Unreleased
+## 0.5.9 — 2026-11-04 · 精简输出、团队视图与事件驱动监工
+
+本版让主控用起来更省：一次调用开工，工具默认只回决策需要的信息，一次 `list` 看全整棵树，回报格式统一。名单存储有一次自动迁移，升级后首次打开时在事务内完成，不需要手工操作；要退回旧版本，先把 `agent_history` 回填进记录，否则旧版看不到历史任务。
 
 - 工具输出精简：调用方是模型，答案直接进上下文，所以 `futureaide_status`、`futureaide_create_agent`、`futureaide_list_agents`、`futureaide_wait_agents`、`futureaide_agent_changes`、`futureaide_inspect_agent` 现在返回精简视图。列表条目原本 1～4KB，同一份报告最多重复三遍（`task.result.summary`、`reports.latest.summary` 与正文），现在只保留名字、状态、生命周期、任务、待答问题、最新报告、改动文件计数和树规模：报告文字只出现一次，仍有未送达报告时 `report.pending` 报出数量，只有监控停止时才显示 `monitor`；文件计数包含 unconfirmed 路径并另给精确总数（不受 12 条摘要截断影响）；`inspect` 不再把根节点消息列两遍，超长消息截到 4000 字并标 `truncated: true`；`status` 去掉各后端的 `methods` 列表；`changes` 的覆盖率压成一句话（`note`），历史任务保留其任务文本，比对超过 200 条时在 `coverage.workspace.truncated` 与 note 里写明只列了前 200 条。精简输出不缩进，长度保护与之前一致。
 - 五个读工具（`status`、`list_agents`、`wait_agents`、`agent_changes`、`inspect_agent`）都接受 `detail: true` 取回完整结构；服务层返回结构未变，`isError` 仍按完整结果判定（`created: false`、`ready: false` 等不会被视图掩盖）。

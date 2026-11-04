@@ -40,6 +40,10 @@ export class RosterStore {
     if (!sameCaller || saved.workspace !== owner.workspace) throw new Error('This chat is already bound to another project.');
     return saved;
   }
+  /** A restarted session keeps its owner; only the way to reach it moves. */
+  rebindOwner(id, binding) {
+    this.db.prepare("UPDATE owners SET body=json_set(body,'$.pid',?,'$.binding',json(?)) WHERE id=?").run(binding.pid, JSON.stringify(binding), id);
+  }
   get(id) { const row = this.db.prepare('SELECT body FROM agents WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
   lease(key) { return this.db.prepare('SELECT holder,expires FROM leases WHERE key=?').get(key); }
   wake(id, taskId) {

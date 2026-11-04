@@ -80,13 +80,21 @@ async function findTranscript(root, sessionId) {
   return matches[0];
 }
 
-function currentRecord(binding) {
-  const value = JSON.parse(readFileSync(binding.recordFile, 'utf8'));
+export function currentRecord(binding) {
+  let text;
+  // A record belongs to one process: a restarted session writes a new file under its
+  // new pid and the old one goes away, so a missing file is a changed session.
+  try { text = readFileSync(binding.recordFile, 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') throw new Error('claude-session-changed'); throw error; }
+  const value = JSON.parse(text);
   if (value.sessionId !== binding.sessionId || value.pid !== binding.pid || value.procStart !== binding.procStart
       || value.pidDomain !== binding.pidDomain || value.entrypoint !== 'claude-desktop'
       || !samePath(value.cwd, binding.workspace) || pipeName(value.messagingSocketPath) !== binding.socketPath) {
     throw new Error('claude-session-changed');
   }
+  // A crashed process leaves its record behind, so a matching file alone proves nothing.
+  try { process.kill(value.pid, 0); }
+  catch (error) { if (error.code === 'ESRCH') throw new Error('claude-session-changed'); throw error; }
   return value;
 }
 
@@ -96,7 +104,9 @@ export async function sendClaude(binding, message, { requestId = randomUUID(), t
   if (!['next', 'now'].includes(priority)) throw new Error('claude-priority-invalid');
   currentRecord(binding);
   const keyName = `${binding.pid}.${createHash('sha256').update(binding.socketPath).digest('hex')}.key`;
-  const key = await json(path.join(binding.directory, keyName));
+  const key = await json(path.join(binding.directory, keyName)).catch(error => {
+    throw error.code === 'ENOENT' ? new Error('claude-inbox-key-mismatch') : error;
+  });
   if (!/^[a-f0-9]{32}$/i.test(key.peerToken ?? '') || (key.procStartFt ?? key.procStart) !== binding.procStart
       || key.pidDomain !== binding.pidDomain) throw new Error('claude-inbox-key-mismatch');
   const body = message.replace(/<\/cross-session-message\b/gi, '<\\/cross-session-message');

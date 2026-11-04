@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, writeFile, appendFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
+import { hostname } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { claudeBindingStale, claudeNoticeReceipt, claudeNoticeRequestId, createScopedAgents } from '../src/scoped-agents.mjs';
@@ -794,4 +796,162 @@ test('a Codex final reaches Claude through a legal native id and recovers its re
     assert.equal(finished.task.reports[0].delivery.receipt.requestId, received[0].uuid);
     assert.equal(received.length, 1, 'read-back never resends the written notice');
   } finally { await new Promise(resolve => server.close(resolve)); f.service.close(); }
+});
+
+/**
+ * One Claude session that restarted: the owner still holds the binding of a process
+ * that is gone, and come() brings up the record, key and pipe of the new process.
+ */
+async function restartedClaude() {
+  const root = await mkdtemp(path.join(workspace, '.runtime', 'tests', 'rebind-'));
+  const directory = path.join(root, 'sessions'), project = path.join(root, 'projects', 'p');
+  await mkdir(directory); await mkdir(project, { recursive: true });
+  const sessionId = randomUUID(), socketPath = `\\\\.\\pipe\\futureaide-rebind-${randomUUID()}`;
+  const pidDomain = `win32:${hostname().toLowerCase()}`, transcriptFile = path.join(project, `${sessionId}.jsonl`);
+  const procStart = execFileSync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    `(Get-Process -Id ${process.pid}).StartTime.ToFileTimeUtc().ToString()`], { encoding: 'utf8', windowsHide: true }).trim();
+  await writeFile(transcriptFile, '');
+  const previous = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = root;
+  const received = [];
+  const server = createServer({ allowHalfOpen: true }, socket => {
+    let data = '';
+    socket.setEncoding('utf8'); socket.on('data', chunk => {
+      data += chunk;
+      if (!data.endsWith('\n') || data.trim().split('\n').length < 2) return;
+      const frame = data.trim().split('\n').map(line => JSON.parse(line)).find(item => item.type === 'user');
+      data = '';
+      received.push(frame);
+      appendFile(transcriptFile, JSON.stringify({ sessionId, type: 'user', uuid: frame.uuid, message: frame.message }) + '\n')
+        .then(() => socket.end(), error => socket.destroy(error));
+    });
+  });
+  const recordFile = path.join(directory, `${process.pid}.json`);
+  return { sessionId, received, recordFile,
+    stale: { pid: 999999, sessionId, workspace, directory, transcriptFile, procStart: '1', pidDomain,
+      recordFile: path.join(directory, '999999.json'), socketPath: '\\\\.\\pipe\\futureaide-rebind-gone' },
+    async come() {
+      await writeFile(recordFile, JSON.stringify({ pid: process.pid, sessionId, cwd: workspace, entrypoint: 'claude-desktop',
+        pidDomain, procStart, messagingSocketPath: socketPath, status: 'idle' }));
+      await writeFile(path.join(directory, `${process.pid}.${createHash('sha256').update(socketPath).digest('hex')}.key`),
+        JSON.stringify({ peerToken: 'a'.repeat(32), procStart, pidDomain }));
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, resolve); });
+    },
+    async close() {
+      if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = previous;
+      if (server.listening) await new Promise(resolve => server.close(resolve));
+    } };
+}
+
+function pendingReport(f, claude, name, delivery) {
+  const ownerId = ownerIdForSource('claude-desktop', claude.sessionId);
+  f.store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId: claude.sessionId, workspace, binding: claude.stale });
+  const report = { id: `report-${name}`, taskId: `task-${name}`, final: true, message: 'verified final artifact',
+    treeSettledConfirmed: true, delivery: { id: `notice-${name}`, state: 'pending', ...delivery } };
+  const task = { ...completedInput(name, [report]), result: { state: 'completed', reply: report.message } };
+  f.store.insert(taskRecord({ agentId: name, ownerId, sessionId: `session-${name}`, name, target: 'codex-desktop', state: 'delivery_pending', task }));
+  return ownerId;
+}
+
+const again = (f, name) => { const record = f.store.get(name); record.task.reports[0].delivery.nextAttemptAt = 0; f.store.save(record); return f.service.poll(name); };
+
+test('a report reaches a Claude session that restarted, once, and the new binding is kept', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    const ownerId = pendingReport(f, claude, 'restart');
+    await f.service.poll('restart');
+    assert.equal(claude.received.length, 1, JSON.stringify(f.store.get('restart').task.reports[0].delivery));
+    assert.equal(f.store.owner(ownerId).binding.pid, process.pid, 'the refreshed binding is saved, not just used once');
+    assert.equal(f.store.owner(ownerId).pid, process.pid);
+    await again(f, 'restart');
+    assert.equal(f.store.get('restart').task.reports[0].delivery.state, 'delivered');
+    assert.equal(claude.received.length, 1, 'read-back never resends the written notice');
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a notice stranded by the missing pid record resumes, and a written one stays read-only', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    const enoent = { code: 'ENOENT', message: `ENOENT: no such file or directory, open '${claude.stale.recordFile}'` };
+    pendingReport(f, claude, 'stranded', { state: 'unknown', error: enoent });
+    await f.service.poll('stranded');
+    assert.equal(claude.received.length, 1, 'nothing was written before, so it may be sent');
+    f.store.insert(taskRecord({ agentId: 'written', ownerId: ownerIdForSource('claude-desktop', claude.sessionId), sessionId: 'session-written', name: 'written',
+      target: 'codex-desktop', state: 'delivery_pending', task: { ...completedInput('written', [{ id: 'report-written', taskId: 'task-written', final: true, message: 'sent once',
+        treeSettledConfirmed: true, delivery: { id: 'notice-written', state: 'unknown' } }]), result: { state: 'completed', reply: 'sent once' } } }));
+    await f.service.poll('written');
+    assert.equal(claude.received.length, 1, 'an unknown outcome with no pre-write failure is never sent again');
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a notice waits for a session that is not running, then goes out when it returns', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    pendingReport(f, claude, 'absent');
+    await f.service.poll('absent');
+    const waiting = f.store.get('absent').task.reports[0].delivery;
+    assert.equal(waiting.state, 'pending', 'nothing was written, so this is not an unknown outcome');
+    assert.equal(waiting.error.code, 'callback-target-missing');
+    await claude.come();
+    await again(f, 'absent');
+    assert.equal(claude.received.length, 1);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a crashed session leaves its record behind and the notice still finds where it came back', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    // The dead process's record is still on disk and still matches, so only the pipe fails.
+    const dead = { ...claude.stale, pid: process.pid, recordFile: claude.stale.recordFile };
+    await writeFile(dead.recordFile, JSON.stringify({ pid: dead.pid, sessionId: dead.sessionId, cwd: workspace, entrypoint: 'claude-desktop',
+      pidDomain: dead.pidDomain, procStart: dead.procStart, messagingSocketPath: dead.socketPath }));
+    await writeFile(path.join(dead.directory, `${dead.pid}.${createHash('sha256').update(dead.socketPath).digest('hex')}.key`),
+      JSON.stringify({ peerToken: 'a'.repeat(32), procStart: dead.procStart, pidDomain: dead.pidDomain }));
+    const ownerId = pendingReport(f, { ...claude, stale: dead }, 'crashed');
+    await f.service.poll('crashed');
+    assert.equal(claude.received.length, 1, JSON.stringify(f.store.get('crashed').task.reports[0].delivery));
+    assert.notEqual(f.store.owner(ownerId).binding.socketPath, dead.socketPath);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('status does not trust a record left behind by a dead process', async () => {
+  const f = await fixture();
+  const claude = await restartedClaude();
+  try {
+    const { stale } = claude;
+    await writeFile(stale.recordFile, JSON.stringify({ pid: stale.pid, sessionId: stale.sessionId, cwd: workspace, entrypoint: 'claude-desktop',
+      pidDomain: stale.pidDomain, procStart: stale.procStart, messagingSocketPath: stale.socketPath }));
+    const ownerId = ownerIdForSource('claude-desktop', claude.sessionId);
+    f.store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId: claude.sessionId, workspace, binding: stale });
+    const caller = { [TRUSTED_CALLER]: { source: 'claude-desktop', nativeSessionId: claude.sessionId, workspace } };
+    assert.equal((await f.service.status(caller)).returnChannel, 'unavailable', 'the record matches, but no process stands behind it');
+    await claude.come();
+    assert.equal((await f.service.status(caller)).returnChannel, 'chat-verified');
+    assert.equal(f.store.owner(ownerId).binding.pid, process.pid);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('status proves the way back to a Claude caller instead of assuming it', async () => {
+  const f = await fixture();
+  const claude = await restartedClaude();
+  try {
+    const ownerId = ownerIdForSource('claude-desktop', claude.sessionId);
+    f.store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId: claude.sessionId, workspace, binding: claude.stale });
+    const caller = { [TRUSTED_CALLER]: { source: 'claude-desktop', nativeSessionId: claude.sessionId, workspace } };
+    const absent = await f.service.status(caller);
+    assert.equal(absent.returnChannel, 'unavailable', 'a binding with no live session is not a verified channel');
+    assert.equal(absent.returnChannelError.code, 'callback-target-missing');
+    assert.equal(absent.ready, false);
+    await claude.come();
+    const live = await f.service.status(caller);
+    assert.equal(live.returnChannel, 'chat-verified');
+    assert.equal(f.store.owner(ownerId).binding.pid, process.pid, 'status repairs what it verified');
+  } finally { await claude.close(); f.service.close(); }
 });

@@ -7,7 +7,7 @@ import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
-import { bindClaude, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
+import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-host.mjs';
 import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
@@ -198,6 +198,13 @@ export async function transcriptCursor(binding) {
  */
 export const claudeNoticeRequestId = id => /^[a-zA-Z0-9-]{1,100}$/.test(id)
   ? id : `notice-${createHash('sha256').update(id).digest('hex')}`;
+
+/**
+ * Failures older builds recorded as unknown although sendClaude stops before it opens
+ * a socket: nothing reached the session, so these notices may be sent again.
+ */
+const claudeNeverWritten = notice => notice.error?.code === 'ENOENT'
+  || (claudeNoticeRequestId(notice.id) !== notice.id && notice.error?.message === 'claude-request-id-invalid');
 
 export async function findClaudeReceipt(binding, notice) {
   let cursor = Number.isSafeInteger(notice.cursor) ? notice.cursor : 0;
@@ -885,10 +892,9 @@ export function createScopedAgents(config, {
     notice.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(notice.attempts, 5));
     const marker = `<!-- futureaide-control:${notice.id} -->`;
     const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
-    // This exact legacy failure happened before sendClaude opened a socket. It
-    // can resume with the mapped native id; other unknown outcomes stay read-only.
-    if (claude && claudeNoticeRequestId(notice.id) !== notice.id
-        && notice.error?.message === 'claude-request-id-invalid') notice.state = 'pending';
+    // These exact legacy failures happened before sendClaude opened a socket. They
+    // can resume; other unknown outcomes stay read-only.
+    if (claude && notice.state === 'unknown' && claudeNeverWritten(notice)) notice.state = 'pending';
     if (notice.state === 'unknown' || notice.state === 'sending') {
       try {
         if (claude) {
@@ -933,16 +939,22 @@ export function createScopedAgents(config, {
         // appear after this point, so later polls start here instead of rescanning.
         notice.cursor = await transcriptCursor(binding).catch(() => undefined);
         const send = target => sendClaude(target, `${text}\n\n${marker}`, { requestId: claudeNoticeRequestId(notice.id) });
+        const resend = async () => {
+          const fresh = await refreshClaudeBinding(owner);
+          notice.cursor = await transcriptCursor(fresh).catch(() => undefined);
+          return send(fresh);
+        };
         let sent;
         try { sent = await send(binding); }
         catch (error) {
           // A binding is refreshed only when the write provably failed before it
           // happened; a written/uncertain channel is never retried here.
           if (!claudeBindingStale(error)) throw error;
-          const fresh = await refreshClaudeBinding(owner);
-          notice.cursor = await transcriptCursor(fresh).catch(() => undefined);
-          sent = await send(fresh);
+          sent = await resend();
         }
+        // The pipe never opened, so nothing was written. A session that crashed leaves
+        // its old record behind, and only a fresh lookup finds where it came back.
+        if (sent?.status === 'failed') sent = await resend();
         if (sent?.status === 'failed') Object.assign(notice, { state: 'pending', error: { message: 'The Claude inbox rejected this notice before acceptance.' } });
         else Object.assign(notice, { state: 'unknown', error: undefined });
       } else {
@@ -952,7 +964,11 @@ export function createScopedAgents(config, {
         Object.assign(notice, unavailable ? { state: 'blocked', error: { code: 'native-callback-unavailable' } } : result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
           : { state: 'delivered', deliveredAt: now(), error: undefined });
       }
-    } catch (error) { Object.assign(notice, { state: 'unknown', error: safeError(error) }); }
+    } catch (error) {
+      // sendClaude throws only before its write, and a session that cannot be found was
+      // never written to, so a Claude notice that lands here can be sent again.
+      Object.assign(notice, { state: claude ? 'pending' : 'unknown', error: safeError(error) });
+    }
     store.save(record);
   }
 
@@ -979,7 +995,23 @@ export function createScopedAgents(config, {
     // refreshed, never the conversation it belongs to.
     const binding = await bindClaude({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
     store.saveOwner({ ...(store.owner(owner.ownerId) ?? owner), hostSessionId: owner.nativeSessionId, binding });
+    store.rebindOwner(owner.ownerId, binding);
     return binding;
+  }
+
+  /**
+   * What status may claim about the way back to this caller. A Claude session keeps
+   * its id across a restart but not its process or pipe, so a saved binding proves
+   * nothing until it matches the live record. The caller is verified here, which makes
+   * this the moment to replace a binding it has outgrown.
+   */
+  async function returnChannel(owner) {
+    if (!owner.nativeSessionId) return { returnChannel: 'chat-verified' };
+    try {
+      try { currentRecord(await claudeNoticeBinding(owner)); }
+      catch (error) { if (!claudeBindingStale(error)) throw error; await refreshClaudeBinding(owner); }
+      return { returnChannel: 'chat-verified' };
+    } catch (error) { return { returnChannel: 'unavailable', returnChannelError: safeError(error) }; }
   }
 
   async function prepare(record) {
@@ -1398,7 +1430,7 @@ export function createScopedAgents(config, {
       let owner;
       try {
         owner = await context(extra);
-        Object.assign(status, { contextVerified: true, workspace: owner.workspace, returnChannel: 'chat-verified',
+        Object.assign(status, { contextVerified: true, workspace: owner.workspace, ...await returnChannel(owner),
           agents: typeof store.count === 'function' ? store.count(owner.ownerId) : store.list(owner.ownerId).length });
       } catch (error) { status.contextError = safeError(error); }
       let host;
@@ -1410,7 +1442,8 @@ export function createScopedAgents(config, {
         if (!status.dshConnected) status.hostError = { message: 'Install the current managed DSH bridge.' };
         else if (!status.treeProtocolReady) status.hostError = safeError(treeProtocolError());
       } catch (error) { status.hostError = safeError(error); }
-      status.ready = status.contextVerified && status.dshConnected && status.treeProtocolReady === true && status.reportProtocolReady === true;
+      status.ready = status.contextVerified && status.returnChannel === 'chat-verified' && status.dshConnected
+        && status.treeProtocolReady === true && status.reportProtocolReady === true;
       // Per-target readiness beside the unchanged DSH fields. Neither entry starts
       // a model turn or a session: the DSH probe is the same one above, and the
       // claude-desktop entry imports its adapter and asks probe() only.

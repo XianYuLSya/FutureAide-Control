@@ -14,7 +14,7 @@ const THREAD = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture({ adapters = {} } = {}) {
+async function fixture({ adapters = {}, onPollComplete } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'cross-'));
@@ -26,6 +26,7 @@ async function fixture({ adapters = {} } = {}) {
       ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } }
       : { accepted: true }),
     backendAdapters: adapters,
+    ...(onPollComplete ? { onPollComplete } : {}),
     startSharedMonitor: () => true,
     removeTree: async () => {},
   });
@@ -135,7 +136,8 @@ test('a managed name created from another managed session follows the parent tre
     assert.equal(store.count(), 3, 'the descendants still exist as their own records');
 
     const deleted = await service.delete({ name: 'root' }, extra(THREAD));
-    assert.equal(deleted.deleted, true);
+    assert.equal(deleted.queued, true);
+    assert.equal((await service.poll(rootId)).deleted, true);
     assert.equal(store.count(), 0, 'every managed descendant closes with its parent');
   } finally { service.close(); }
 });
@@ -238,6 +240,7 @@ test('a same-named descendant never enters this chat’s namespace or list', asy
     const missing = await f.service.inspect({ name: 'reviewer' }, extra(THREAD)).then(() => null, error => error);
     assert.equal(missing.code, 'agent-not-found', 'a descendant name is not addressable from this chat');
     await f.service.delete({ name: 'alpha' }, extra(THREAD));
+    await f.service.poll(alpha);
     assert.equal(f.store.list(ownerIdForSource('claude-desktop', 'native-beta')).length, 1,
       'closing one root leaves the other root’s child alone');
   } finally { f.service.close(); }
@@ -283,6 +286,7 @@ test('inspect and changes expose the mixed tree without internal ids', async () 
     f.store.insert(taskRecord({ agentId: rootId, ownerId: owner, sessionId: 'session-root', name: 'root' }));
     f.store.insert(taskRecord({ agentId: childId, ownerId: ownerIdForSource('claude-desktop', 'native-kid2'),
       sessionId: 'session-child', name: 'child', parentAgentId: rootId }));
+    await f.service.poll(childId);
     const changes = await f.service.changes({ name: 'root' }, extra(THREAD));
     assert.deepEqual(changes.changes.map(change => change.agentPath.join('/')).sort(), ['root', 'root/child'],
       'both applications’ files are attributed by path');
@@ -305,13 +309,15 @@ test('children are cleaned first; a child failure keeps the parent retryable', a
     f.store.insert(taskRecord({ agentId: rootId, ownerId: owner, sessionId: 'session-root', name: 'root', nativeDestroyed: false }));
     f.store.insert(taskRecord({ agentId: childId, ownerId: ownerIdForSource('claude-desktop', 'native-kid3'),
       sessionId: 'session-child', name: 'child', parentAgentId: rootId, nativeDestroyed: false, lifetime: 'once' }));
-    const failed = await f.service.delete({ name: 'root' }, extra(THREAD));
+    assert.equal((await f.service.delete({ name: 'root' }, extra(THREAD))).queued, true);
+    const failed = await f.service.poll(rootId);
     assert.equal(failed.deleted, false, 'the parent reports the child failure');
     assert.equal(f.store.get(rootId).state, 'cleanup_failed', 'and stays listed for a retry');
     assert.ok(f.store.get(childId), 'the child that could not be destroyed is still there');
     assert.equal(backend.calls.destroy.includes(rootId), false, 'the parent native session was not destroyed yet');
 
-    const retried = await f.service.delete({ name: 'root' }, extra(THREAD));
+    assert.equal((await f.service.delete({ name: 'root' }, extra(THREAD))).queued, true);
+    const retried = await f.service.poll(rootId);
     assert.equal(retried.deleted, true);
     assert.equal(f.store.count(), 0);
     assert.deepEqual(backend.calls.destroy.filter(id => id === childId).length, 2, 'the child was retried, not re-destroyed after success');
@@ -427,6 +433,8 @@ test('cancelPending keeps the monitor advancing a late handback until the native
     f.store.insert(taskRecord({ agentId: 'cancel', ownerId: ownerIdFor(THREAD), sessionId: 'session-cancel', name: 'cancel',
       task: completedInput('cancel') }));
     await f.service.cancel({ name: 'cancel' }, extra(THREAD));
+    assert.equal(cancels, 0, 'the MCP only persisted the cancellation intent');
+    await f.service.poll('cancel');
     await f.service.poll('cancel');
     assert.equal(cancels, 2);
     assert.equal(f.store.get('cancel').task.cancelVerified, true);
@@ -439,5 +447,168 @@ test('cancelPending keeps the monitor advancing a late handback until the native
     assert.equal(f.store.get('cancel').task.cancelTreeSettled, true);
     await f.service.poll('cancel');
     assert.equal(cancels, 3, 'settled cancellation no longer calls the backend');
+  } finally { f.service.close(); }
+});
+
+test('Desktop first input and immediate supplement queue promptly and each dispatch exactly once', async () => {
+  const sent = [];
+  let instances = 0;
+  const base = fakeBackend();
+  const f = await fixture({ adapters: { 'claude-desktop': record => {
+    instances++;
+    return { ...base(record), deliver: async input => { sent.push(input); return { accepted: true }; } };
+  } } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'queue', ownerId: ownerIdFor(THREAD), sessionId: 'session-queue', name: 'queue', state: 'idle', task: undefined }));
+    assert.equal((await f.service.send({ name: 'queue', message: 'first' }, extra(THREAD))).queued, true);
+    assert.equal((await f.service.send({ name: 'queue', message: 'supplement' }, extra(THREAD))).queued, true);
+    assert.equal(sent.length, 0);
+    assert.equal(instances, 0, 'queuing never probes the host or creates an adapter');
+    await f.service.poll('queue');
+    assert.equal(instances, 1, 'a poll uses one backend instance');
+    await f.service.poll('queue');
+    await f.service.poll('queue');
+    assert.deepEqual(sent.map(input => [input.message, input.kind]), [['first', 'task'], ['supplement', 'supplement']]);
+    assert.notEqual(sent[0].requestId, sent[1].requestId);
+  } finally { f.service.close(); }
+});
+
+test('one slow monitor name does not hold up another and shutdown drains the single in-flight poll', async () => {
+  let enterSlow, releaseSlow, fastDone;
+  const entered = new Promise(resolve => { enterSlow = resolve; });
+  const gate = new Promise(resolve => { releaseSlow = resolve; });
+  const fast = new Promise(resolve => { fastDone = resolve; });
+  let slowCalls = 0, wakes = 0;
+  const base = fakeBackend();
+  const f = await fixture({ onPollComplete: () => wakes++, adapters: { 'claude-desktop': record => ({ ...base(record),
+    deliver: async () => {
+      if (record.name === 'a-slow') { slowCalls++; enterSlow(); await gate; }
+      else fastDone();
+      return { accepted: true };
+    } }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    for (const name of ['a-slow', 'z-fast']) {
+      f.store.insert(taskRecord({ agentId: name, ownerId: ownerIdFor(THREAD), sessionId: `session-${name}`, name, state: 'idle', task: undefined }));
+      await f.service.send({ name, message: 'work' }, extra(THREAD));
+    }
+    assert.equal(await f.service.monitorScan(), true);
+    await entered; await fast;
+    await f.service.monitorScan();
+    assert.equal(slowCalls, 1, 'another round never starts the same name twice');
+    let drained = false;
+    const ending = f.service.drainPolls().then(() => { drained = true; });
+    await Promise.resolve();
+    assert.equal(drained, false, 'shutdown leaves the database open until the native call returns');
+    releaseSlow(); await ending;
+    assert.ok(wakes > 0);
+    assert.equal(f.store.get('z-fast').task.dispatches[0].accepted, true);
+  } finally { releaseSlow(); await f.service.drainPolls(); f.service.close(); }
+});
+
+test('pre-delivery failures back off visibly, while ambiguous delivery is never sent again', async () => {
+  let beginFailures = 1, modelFailures = 1, begins = 0, models = 0, sends = 0;
+  const base = fakeBackend();
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+    beginTask: async () => { begins++; if (beginFailures-- > 0) throw Object.assign(new Error('host busy before begin'), { code: 'agent-busy' }); return { treeProtocol: 1, reportProtocol: 1 }; },
+    models: async () => { models++; if (modelFailures-- > 0) throw Object.assign(new Error('default read busy'), { code: 'agent-busy' }); return base(record).models(); },
+    deliver: async () => { sends++; throw Object.assign(new Error('receipt not yet known'), { uncertain: true, code: 'delivery-unknown' }); },
+    turn: async () => ({ state: 'running' }),
+  }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'retry', ownerId: ownerIdFor(THREAD), sessionId: 'session-retry', name: 'retry', state: 'idle', task: undefined }));
+    await f.service.send({ name: 'retry', message: 'work' }, extra(THREAD));
+    await f.service.poll('retry'); await f.service.poll('retry');
+    assert.equal(begins, 1, 'begin failure is not retried on every scan');
+    assert.ok(f.store.get('retry').nextAttemptAt > Date.now());
+    let r = f.store.get('retry'); r.nextAttemptAt = 0; f.store.save(r);
+    await f.service.poll('retry'); await f.service.poll('retry');
+    assert.equal(models, 1);
+    r = f.store.get('retry');
+    assert.equal(r.task.dispatches[0].state, 'retrying');
+    const waiting = await f.service.wait({ names: ['retry'], timeoutSeconds: 1 }, extra(THREAD));
+    assert.equal(waiting.timedOut, false);
+    assert.equal(waiting.items[0].error.code, 'agent-busy');
+    r.task.dispatches[0].nextAttemptAt = 0; f.store.save(r);
+    await f.service.poll('retry'); await f.service.poll('retry');
+    assert.equal(sends, 1, 'unknown delivery never blindly resends');
+    assert.equal((await f.service.list(extra(THREAD))).items[0].error.code, 'delivery-unknown');
+  } finally { f.service.close(); }
+});
+
+test('parent observation never enters a busy child backend and stale child evidence cannot settle', async () => {
+  const calls = [];
+  const base = fakeBackend();
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+    observe: async () => { calls.push(record.name); return base(record).observe(); },
+  }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    for (const name of ['parent', 'child']) f.store.insert(taskRecord({ agentId: name, ownerId: ownerIdFor(THREAD),
+      sessionId: `session-${name}`, name, parentAgentId: name === 'child' ? 'parent' : undefined,
+      task: completedInput(name) }));
+    const first = await f.service.changes({ name: 'parent' }, extra(THREAD));
+    assert.equal(first.tree.settled, false);
+    assert.deepEqual(calls, ['parent'], 'no missing child observation is filled outside the child lock');
+    await f.service.poll('child');
+    const child = f.store.get('child'); child.state = 'idle'; child.task.state = 'completed'; child.observation.stale = true; f.store.save(child);
+    calls.length = 0;
+    await f.store.locked('child', async () => {
+      const inspected = await f.service.inspect({ name: 'parent' }, extra(THREAD));
+      assert.equal(inspected.tree.settled, false);
+      assert.equal(inspected.tree.nodes[1].error.code, 'agent-busy');
+    });
+    assert.deepEqual(calls, ['parent']);
+  } finally { f.service.close(); }
+});
+
+test('queued Desktop cleanup survives an old poll save and native failure is visible and retryable', async () => {
+  let destroys = 0;
+  const base = fakeBackend();
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record), destroy: async () => {
+    destroys++; return { destroyed: destroys > 1, message: 'native deletion refused' };
+  } }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'delete', ownerId: ownerIdFor(THREAD), sessionId: 'session-delete', name: 'delete', nativeDestroyed: false, task: completedInput('delete') }));
+    const old = f.store.get('delete');
+    const queued = await f.service.delete({ name: 'delete' }, extra(THREAD));
+    assert.equal(queued.queued, true); assert.equal(queued.deleted, false); assert.equal(destroys, 0);
+    old.state = 'running'; f.store.save(old);
+    assert.equal(f.store.get('delete').state, 'cleaning');
+    await f.service.monitorScan();
+    await f.service.poll('delete');
+    assert.equal(f.store.get('delete').state, 'cleanup_failed');
+    assert.match((await f.service.list(extra(THREAD))).items[0].error.message, /native deletion refused/);
+    await f.service.delete({ name: 'delete' }, extra(THREAD));
+    assert.equal((await f.service.poll('delete')).deleted, true);
+    assert.equal(destroys, 2);
+  } finally { await f.service.drainPolls(); f.service.close(); }
+});
+
+test('queued Desktop cancel exposes a host failure, backs off and resumes the same intent', async () => {
+  let cancels = 0;
+  const base = fakeBackend();
+  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record), cancel: async () => {
+    cancels++;
+    if (cancels === 1) throw Object.assign(new Error('cancel host unavailable'), { code: 'host-unavailable' });
+    return { cancelRequested: true, cancelPending: false };
+  } }) } });
+  try {
+    await f.service.list(extra(THREAD));
+    f.store.insert(taskRecord({ agentId: 'stop', ownerId: ownerIdFor(THREAD), sessionId: 'session-stop', name: 'stop', task: completedInput('stop') }));
+    const queued = await f.service.cancel({ name: 'stop' }, extra(THREAD));
+    assert.equal(queued.queued, true); assert.equal(queued.accepted, false); assert.equal(cancels, 0);
+    await f.service.poll('stop'); await f.service.poll('stop');
+    assert.equal(cancels, 1);
+    const r = f.store.get('stop');
+    assert.equal(r.task.cancelRequested, true);
+    assert.equal((await f.service.wait({ names: ['stop'], timeoutSeconds: 1 }, extra(THREAD))).items[0].error.code, 'host-unavailable');
+    r.nextAttemptAt = 0; f.store.save(r);
+    await f.service.poll('stop');
+    assert.equal(cancels, 2);
+    assert.equal(f.store.get('stop').state, 'cancelled');
   } finally { f.service.close(); }
 });

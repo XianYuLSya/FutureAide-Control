@@ -290,6 +290,8 @@ export class RosterStore {
     // Preserve the atomic handoff for this task when that parent next saves.
     const input = `CASE WHEN json_extract(body,'$.task.taskId')=json_extract(?1,'$.task.taskId') AND json_type(body,'$.task.childSnapshots')='array' THEN json_set(${sleeping},'$.task.childSnapshots',json_extract(body,'$.task.childSnapshots')) ELSE ${sleeping} END`;
     const result = this.db.prepare(`UPDATE agents SET body=CASE
+      WHEN json_extract(body,'$.state')='cleaning' AND coalesce(json_extract(${input},'$.state'),'') NOT IN ('cleaning','cleanup_failed')
+      THEN json_set(${input},'$.state','cleaning','$.closed',json('true'))
       WHEN json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId') AND json_extract(body,'$.task.cancelRequested')=1
       THEN json_set(${input},'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.task.cancelPending',json(CASE WHEN json_extract(body,'$.task.cancelPending')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(${input},'$.task.cancelRequested')=1 THEN json_extract(${input},'$.state') ELSE 'running' END)
       WHEN json_extract(${input},'$.state')='idle' AND json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId')
@@ -300,10 +302,15 @@ export class RosterStore {
     if (!result.changes) throw new Error('This subagent instance has already been removed.');
   }
   requestCancel(record) {
-    return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelRequested',json('true'),'$.state','running')
+    return this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.task.cancelRequested',json('true'),'$.state','running'),'$.nextAttemptAt')
       WHERE id=? AND owner=? AND name=? AND json_extract(body,'$.sessionId')=? AND json_extract(body,'$.task.taskId')=?
       AND coalesce(json_extract(body,'$.closed'),0)=0 AND coalesce(json_extract(body,'$.state'),'') NOT IN ('cleaning','cleanup_failed')`)
       .run(record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
+  }
+  requestCleanup(record) {
+    return this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.state','cleaning','$.closed',json('true')),'$.sleep','$.error','$.nextAttemptAt')
+      WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=?`)
+      .run(record.agentId, record.ownerId, record.sessionId).changes === 1;
   }
   claimAutoCleanup(record) {
     return this.db.prepare(`UPDATE agents SET body=json_set(body,'$.closed',json('true'),'$.state','cleaning')

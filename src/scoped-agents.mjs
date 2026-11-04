@@ -122,7 +122,7 @@ function treeCoverage(record, view) {
 function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
   const lastDispatch = task?.dispatches?.at(-1);
-  const error = record.error ?? (lastDispatch?.state === 'failed' ? lastDispatch.failure : undefined);
+  const error = record.error ?? lastDispatch?.failure ?? lastDispatch?.error;
   const view = record.observation ?? {};
   const changes = attributedChanges(record, view);
   return {
@@ -233,8 +233,13 @@ export function createScopedAgents(config, {
   codexToolsStatus = undefined,
   codexProbeRegistration = undefined,
   reportReadyTimeoutMs = 2000,
+  onPollComplete = () => {},
 } = {}) {
   const clients = new Map();
+  const operationBackends = new WeakMap();
+  const inflight = new Map(), monitorInflight = new Map();
+  const nextPollAt = new Map();
+  let draining = false;
   let monitorUnavailableSince, monitorError;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
   const settings = record => ({ ...config, target: targetOf(record), workspace: record.workspace,
@@ -293,9 +298,16 @@ export function createScopedAgents(config, {
   // task id or state never hides behind a cached binding. Only the DSH client
   // (one authenticated connection per agent) is kept.
   async function backendFor(record) {
+    if (operationBackends.has(record)) return operationBackends.get(record);
+    const pending = resolveRecordBackend(record);
+    operationBackends.set(record, pending);
+    try { return await pending; }
+    catch (error) { operationBackends.delete(record); throw error; }
+  }
+  async function resolveRecordBackend(record) {
     const target = targetOf(record);
     const load = () => store.get(record.agentId) ?? record;
-    const deps = adapterDeps(record);
+    const deps = { ...adapterDeps(record), reuseObservation: true };
     if (target === 'dsh') {
       if (!clients.has(record.agentId)) clients.set(record.agentId, clientFactory(settings(record)));
       const client = clients.get(record.agentId);
@@ -305,7 +317,7 @@ export function createScopedAgents(config, {
     }
     return resolveBackend(record, { target, load, deps, adapters: backendAdapters, ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
   }
-  const forgetBackend = record => clients.delete(record.agentId);
+  const forgetBackend = record => { clients.delete(record.agentId); operationBackends.delete(record); };
   // A target without a usable adapter is refused before the name is taken, and is
   // never answered by the DSH path instead. Pre-conditions that would only fail
   // later (unfinished protocols, a tool service that never came up) are settled
@@ -588,6 +600,7 @@ export function createScopedAgents(config, {
   // Does this name still owe the shared monitor a poll? Sleeping names are driven
   // by the monitor's existing DSH host-state wake path instead.
   function needsPoll(record) {
+    if (record?.state === 'cleaning') return true;
     if (!record || record.closed || record.sleep) return false;
     if (ACTIVE.has(record.state)) return true;
     if (store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return true;
@@ -661,11 +674,13 @@ export function createScopedAgents(config, {
       const parentKey = parentEntry.rootKey;
       const entry = { record: child, backend: undefined, view: undefined, rootKey: keyOf(child.agentId, child.sessionId) };
       managed.set(child.agentId, entry);
-      try {
-        entry.backend = await backendFor(child);
-        entry.view = child.task ? await entry.backend.observe() : undefined;
-      } catch (error) { entry.error = safeError(error); }
-      const childNodes = entry.view?.tree?.nodes ?? [];
+      // A child owns its adapter under its own operation lock. Reading its durable
+      // observation never races its request/receipt writes or blocks this parent.
+      const saved = child.observation;
+      entry.view = saved?.sessionId === child.sessionId && saved?.taskId === child.task?.taskId
+        ? saved : undefined;
+      const childNodes = (entry.view?.tree?.nodes ?? []).filter(node => !node.archived
+        && (!node.backendKey || node.backendKey === child.agentId));
       if (childNodes.length) {
         entry.rootKey = keyOf(child.agentId, child.sessionId);
         for (const node of childNodes) nodes.push({ ...node,
@@ -687,7 +702,8 @@ export function createScopedAgents(config, {
         || !['completed', 'failed', 'cancelled'].includes(child.task.state));
       const childSettled = !child.task
         ? true
-        : entry.view?.tree?.settled === true && entry.view?.tree?.running === false && !busy;
+        : entry.view?.capturedAt && !entry.view.stale && entry.view?.tree?.settled === true
+          && entry.view?.tree?.running === false && !busy;
       settled = settled && childSettled;
       running = running || entry.view?.tree?.running === true || busy;
     }
@@ -762,17 +778,28 @@ export function createScopedAgents(config, {
 
   async function dispatchOnce(record, dispatch, observed) {
     const current = store.get(record.agentId);
-    if (current?.task?.taskId !== record.task?.taskId || current.task.cancelRequested) return;
+    if (current?.task?.taskId !== record.task?.taskId || current.closed || current.task.cancelRequested) return;
+    if (dispatch.nextAttemptAt > Date.now()) return;
+    let delivering = false;
     try {
       await followHostModel(record, dispatch, observed);
       // The model this request runs on is given explicitly, so a backend never has to
       // guess it from a catalog default that may have moved since the preflight.
-      const sent = await (await backendFor(record)).deliver({ requestId: dispatch.requestId,
+      const backend = await backendFor(record);
+      delivering = true;
+      const sent = await backend.deliver({ requestId: dispatch.requestId,
         message: dispatch.message, kind: dispatch.kind, model: dispatch.model });
       Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
-        afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined } : {}) });
+        afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined, nextAttemptAt: undefined } : {}) });
+      if (!sent.accepted && ['retryable', 'retrying'].includes(dispatch.state)) {
+        dispatch.state = 'retrying'; deferRetry(dispatch);
+      }
     } catch (error) {
-      Object.assign(dispatch, { state: error.retryableRead === true ? 'retrying' : error.uncertain ? 'unknown' : 'failed', afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
+      const retryable = error.retryableRead === true || (targetOf(record) !== 'dsh' && (!delivering || error.code === 'agent-busy'));
+      const state = targetOf(record) !== 'dsh' && !delivering ? 'retrying'
+        : error.uncertain ? 'unknown' : retryable ? 'retrying' : 'failed';
+      Object.assign(dispatch, { state, afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
+      if (dispatch.state === 'retrying' && targetOf(record) !== 'dsh') deferRetry(dispatch);
     }
     store.save(record);
     const latest = store.get(record.agentId);
@@ -788,6 +815,11 @@ export function createScopedAgents(config, {
         store.save(record);
       }
     }
+  }
+
+  function deferRetry(value) {
+    value.retryAttempts = (value.retryAttempts ?? 0) + 1;
+    value.nextAttemptAt = Date.now() + Math.min(30000, 1000 * 2 ** Math.min(value.retryAttempts, 5));
   }
 
   async function verifyOwner(owner) {
@@ -955,10 +987,13 @@ export function createScopedAgents(config, {
       for (const child of store.childrenOf(record.agentId)) {
         const current = store.get(child.agentId);
         if (!current || current.agentId === record.agentId) continue;
-        const verdict = await clearRecord(current);
+        const verdict = await store.locked(current.agentId, async () => {
+          const fresh = store.get(current.agentId);
+          return fresh ? clearRecord(fresh) : { deleted: true };
+        }, { waitMs: 0 });
         if (verdict?.deleted !== true) {
           throw Object.assign(new Error(`The managed subagent “${current.name}” could not be cleaned; this name stays listed so cleanup can be retried.`),
-            { code: 'child-cleanup-failed', child: current.name, childError: verdict?.error });
+            { code: verdict?.queued ? 'agent-busy' : 'child-cleanup-failed', child: current.name, childError: verdict?.error });
         }
       }
       if (record.lifetime === 'once' && record.parentAgentId) await keepChildSnapshot(record);
@@ -986,6 +1021,10 @@ export function createScopedAgents(config, {
       return { name: record.name, deleted: true, sessionDataRemoved: true };
     } catch (error) {
       const current = store.get(record.agentId);
+      if (current && error.code === 'agent-busy' && targetOf(record) !== 'dsh') {
+        current.state = 'cleaning'; current.closed = true; current.error = safeError(error); deferRetry(current); store.save(current);
+        return { name: record.name, deleted: false, queued: true, state: 'cleaning', error: safeError(error) };
+      }
       if (current) { current.state = 'cleanup_failed'; current.closed = true; current.error = safeError(error); store.save(current); }
       return { name: record.name, deleted: false, state: 'cleanup_failed', error: safeError(error) };
     }
@@ -1101,6 +1140,7 @@ export function createScopedAgents(config, {
 
   async function recoverDispatch(record, dispatch, { allowResend = true } = {}) {
     if (dispatch.accepted || !['sending', 'retrying', 'unknown'].includes(dispatch.state)) return;
+    if (dispatch.nextAttemptAt > Date.now()) return;
     // The backend owns its own receipt format; undefined means this saved intent
     // never reached a native write.
     const receipt = await (await backendFor(record)).receipt({ requestId: dispatch.requestId });
@@ -1188,6 +1228,8 @@ export function createScopedAgents(config, {
   }
 
   async function pollLocked(record) {
+    if (record.nextAttemptAt > Date.now()) return publicResult(record);
+    if (!record.task?.cancelRequested && (record.task?.dispatches ?? []).some(d => !d.accepted && d.state === 'retrying' && d.nextAttemptAt > Date.now())) return publicResult(record);
     if (record.state === 'cleaning') return clearRecord(record);
     if (record.closed || record.state === 'cleanup_failed' || record.state === 'idle') return publicResult(record);
     const task = record.task;
@@ -1225,7 +1267,11 @@ export function createScopedAgents(config, {
       }
       if (!record.created) { await prepare(record); return publicResult(record); }
       if (!task) return publicResult(record);
-      if (!task.dispatches.length && !task.cancelRequested && !task.legacyAutomaticResult) await beginTask(record);
+      if (!task.dispatches.length && !task.cancelRequested && !task.legacyAutomaticResult) {
+        await beginTask(record);
+        record.nextAttemptAt = undefined; record.retryAttempts = 0;
+        if (task.dispatches[0]?.state === 'retrying' && task.dispatches[0].nextAttemptAt > Date.now()) return publicResult(record);
+      }
       else await negotiateTree(record);
       for (const answer of task.answers ?? []) if (!answer.questionIds && !task.cancelRequested) await resolveAnswer(record, answer);
       const view = await observe(record);
@@ -1248,6 +1294,7 @@ export function createScopedAgents(config, {
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
         await recoverDispatch(record, dispatch);
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
+        if (dispatch.state === 'retrying' && dispatch.nextAttemptAt > Date.now()) continue;
         const result = await (await backendFor(record)).turn({ requestId: dispatch.requestId,
           ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}), timeoutSeconds: 0, maxMessages: 100 });
         dispatch.afterSeq ??= result.afterSeq;
@@ -1288,6 +1335,7 @@ export function createScopedAgents(config, {
     } catch (error) {
       record.state = record.task?.result ? 'delivery_pending' : 'reconnecting';
       record.error = safeError(error); record.observation = { ...record.observation, stale: true };
+      if (targetOf(record) !== 'dsh') deferRetry(record);
       forgetBackend(record);
       store.save(record);
       return publicResult(record);
@@ -1380,13 +1428,14 @@ export function createScopedAgents(config, {
         if (record.closed || ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'].includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
         if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait before assigning another task.');
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
-        await checkHost(record);
+        if (targetOf(record) === 'dsh') await checkHost(record);
         const stoppedTask = record.task && ['cancelled', 'failed'].includes(record.state);
         if (!stoppedTask && store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return enqueue(record);
         const pendingReports = (record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
         if (stoppedTask && (record.lifetime === 'once' || pendingReports)) throw new Error('This task stopped; delete the one-shot agent or wait for its submitted reports before reusing a persistent agent.');
         if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
         if (record.task && ACTIVE.has(record.state)) {
+          if (targetOf(record) !== 'dsh' || !record.task.dispatches.length) return enqueue(record);
           await negotiateTree(record);
           const view = await observe(record);
           if ((view.reports ?? []).some(report => report.final)) throw new Error('The agent has already submitted its final report.');
@@ -1396,7 +1445,12 @@ export function createScopedAgents(config, {
           if (record.task) record.history.push({ ...record.task, changes: attributedChanges(record, record.observation ?? {}),
             coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) });
           record.task = { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [] };
-          record.state = 'running'; record.observation = undefined; store.save(record);
+          record.state = 'running'; record.observation = undefined; record.error = undefined;
+          record.nextAttemptAt = undefined; record.retryAttempts = 0; store.save(record);
+          if (targetOf(record) !== 'dsh') {
+            await ensureWorker(record, { wake: true });
+            return { name: record.name, accepted: false, queued: true, state: record.state };
+          }
           try { await beginTask(record); }
           catch (error) { record.state = 'reconnecting'; record.error = safeError(error); store.save(record); }
         }
@@ -1472,7 +1526,7 @@ export function createScopedAgents(config, {
             continue;
           }
           const owner = node.backendKey && node.backendKey !== record.agentId ? view.managed?.get(node.backendKey) : undefined;
-          const nodeBackend = owner?.backend ?? backend;
+          const nodeBackend = backend;
           const targetSessionId = node.nativeSessionId ?? node.sessionId;
           if (node.synthetic && !owner?.view) { tree.nodes[index].status = tree.nodes[index].status ?? node.status; continue; }
           try {
@@ -1481,8 +1535,13 @@ export function createScopedAgents(config, {
             // when it contains this task's original request. The backend reads its
             // own native history: no target format is parsed in this shared layer.
             const upgrade = dispatch?.state === 'failed' && !dispatch.failure;
-            const page = await nodeBackend.history({ targetSessionId, running: node.status === 'running',
-              maxMessages, ...(upgrade ? { requestId: dispatch.requestId, afterSeq: dispatch.afterSeq ?? -1 } : {}) });
+            const request = { targetSessionId, running: node.status === 'running',
+              maxMessages, ...(upgrade ? { requestId: dispatch.requestId, afterSeq: dispatch.afterSeq ?? -1 } : {}) };
+            const page = owner ? await store.locked(owner.record.agentId, async () => {
+              const child = store.get(owner.record.agentId);
+              if (!child) throw Object.assign(new Error('This child finished; inspect the refreshed tree.'), { code: 'agent-removed' });
+              return (await backendFor(child)).history(request);
+            }, { waitMs: 0 }) : await nodeBackend.history(request);
             if (!Array.isArray(page?.messages)) throw Object.assign(new Error(`${nodeBackend.labels?.bridge ?? `The ${targetOf(record)} backend`} returned invalid session history.`), { code: 'invalid-response' });
             if (upgrade && page.failure) { dispatch.failure = page.failure; store.save(record); }
             const selected = { messages: page.messages, hasMore: page.hasMore === true,
@@ -1508,6 +1567,13 @@ export function createScopedAgents(config, {
       const record = named(owner, name);
       if (!record.task || record.closed) return { name, accepted: false, state: record.state };
       if (!store.requestCancel(record)) return { name, accepted: false, state: store.get(record.agentId)?.state ?? 'removed' };
+      if (targetOf(record) !== 'dsh') {
+        for (const child of store.descendantsOf([record.agentId])) {
+          if (!child.closed && child.task && store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
+        }
+        await ensureWorker(store.get(record.agentId), { wake: true });
+        return { name, accepted: false, queued: true, state: 'cancelling' };
+      }
       try {
         const result = await (await checkHost(record)).cancel();
         if (result.cancelRequested === true) store.confirmCancel(record, result);
@@ -1515,6 +1581,10 @@ export function createScopedAgents(config, {
         // record and report, so nothing is dropped from the tree.
         for (const child of store.descendantsOf([record.agentId])) {
           if (child.closed || !child.task) continue;
+          if (targetOf(child) !== 'dsh') {
+            if (store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
+            continue;
+          }
           try {
             await store.locked(child.agentId, async () => {
               const current = store.get(child.agentId);
@@ -1530,7 +1600,14 @@ export function createScopedAgents(config, {
         if (current?.task?.taskId === record.task.taskId) await ensureWorker(current);
       }
     },
-    async delete({ name }, extra) { return withName(extra, name, record => clearRecord(record)); },
+    async delete({ name }, extra) {
+      const owner = await context(extra);
+      const record = named(owner, name);
+      if (targetOf(record) === 'dsh') return withName(extra, name, current => clearRecord(current));
+      const queued = store.requestCleanup(record);
+      if (queued) await ensureWorker(store.get(record.agentId), { wake: true });
+      return { name, deleted: false, queued, state: queued ? 'cleaning' : 'removed' };
+    },
     /**
      * Explicit ask/report from a managed Codex Desktop child, called from that
      * child's own chat. The caller is found from its chat metadata (never a tool
@@ -1573,7 +1650,7 @@ export function createScopedAgents(config, {
           if (!record) { notListed.add(selected.find(item => item.agentId === id).name); continue; }
           items.push(publicResult(record, { fullResult: true }));
         }
-        if (!selectedIds.length || notListed.size || items.some(item => ['awaiting_input', 'awaiting_report', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
+        if (!selectedIds.length || notListed.size || items.some(item => item.error || ['awaiting_input', 'awaiting_report', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
         if (Date.now() >= deadline) break;
         await wait(Math.min(250, deadline - Date.now()));
       } while (true);
@@ -1581,8 +1658,13 @@ export function createScopedAgents(config, {
         ...(notListed.size ? { note: 'These names are not in this chat’s current list. Absence alone does not prove task completion; use the delivered result.' } : {}),
         timedOut: Date.now() >= deadline && items.some(item => item.state === 'running') };
     },
-    async poll(agentId) {
-      return store.locked(agentId, async () => { const record = store.get(agentId); return record ? pollLocked(record) : { removed: true }; });
+    poll(agentId) {
+      if (inflight.has(agentId)) return inflight.get(agentId);
+      if (draining) return Promise.resolve({ draining: true });
+      const work = store.locked(agentId, async () => { const record = store.get(agentId); return record ? pollLocked(record) : { removed: true }; }, { waitMs: 0 })
+        .finally(() => { inflight.delete(agentId); onPollComplete(); });
+      inflight.set(agentId, work);
+      return work;
     },
     async resume() {
       const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
@@ -1599,16 +1681,30 @@ export function createScopedAgents(config, {
     // state machine. The shared monitor calls this each round, and the degraded
     // in-process sweep below reuses it when no monitor can be started.
     async monitorScan() {
+      if (draining) return inflight.size > 0 || monitorInflight.size > 0;
       const candidates = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
-      let busy = false;
+      let busy = inflight.size > 0 || monitorInflight.size > 0;
       for (const candidate of candidates) {
         const record = store.get(candidate.agentId);
         if (!record || !needsPoll(record)) continue;
         busy = true;
-        try { await service.poll(record.agentId); } catch { /* The next round retries from durable state. */ }
-        try { await service.trySleep(record.agentId); } catch { /* Keep the round going. */ }
+        if (monitorInflight.has(record.agentId) || nextPollAt.get(record.agentId) > Date.now() || record.nextAttemptAt > Date.now()
+            || (!record.task?.cancelRequested && (record.task?.dispatches ?? []).some(d => !d.accepted && d.state === 'retrying' && d.nextAttemptAt > Date.now()))) continue;
+        const work = service.poll(record.agentId).then(() => service.trySleep(record.agentId))
+          .catch(() => { /* The next round retries from durable state. */ })
+          .finally(() => {
+            monitorInflight.delete(record.agentId);
+            if (store.get(record.agentId)) nextPollAt.set(record.agentId, Date.now() + 1000);
+            else nextPollAt.delete(record.agentId);
+            onPollComplete();
+          });
+        monitorInflight.set(record.agentId, work);
       }
       return busy;
+    },
+    async drainPolls() {
+      draining = true;
+      await Promise.allSettled([...monitorInflight.values(), ...inflight.values()]);
     },
     async ensureIdleMonitor() {
       const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();

@@ -34,7 +34,7 @@ const values = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, in
 if (!values['--config'] || !/^monitor-[0-9a-f-]{36}$/.test(values['--lease'] ?? '')) throw new Error('Invalid shared monitor identity.');
 const config = await loadConfig(values['--config']);
 const hostDirectory = config.managedStateDirectory ?? path.join(path.dirname(config.hostBridgeFile), 'managed-host');
-const service = createScopedAgents(config), store = service.store, holder = values['--lease'];
+const service = createScopedAgents(config, { onPollComplete: () => signal() }), store = service.store, holder = values['--lease'];
 
 let wake, heartbeat, running = true, signalled = false, lastDelivery = 0;
 let idleSince, lastVersion = store.dataVersion(), rounds = 0;
@@ -124,10 +124,13 @@ try {
     }
     // A self-write can only arrive as a hint; it never shortens the round floor.
     const floor = Math.max(0, MIN_ROUND_MS - (Date.now() - roundStarted));
-    await sleepUntilSignalled(Math.max(floor, external ? 0 : IDLE_WAIT_MS));
+    const immediate = signalled || external;
+    signalled = false;
+    await sleepUntilSignalled(Math.max(floor, immediate ? 0 : IDLE_WAIT_MS));
   }
 } finally {
   await deliveries.drain();
+  await service.drainPolls();
   clearInterval(heartbeat);
   watchers.close();
   await closeReportService();

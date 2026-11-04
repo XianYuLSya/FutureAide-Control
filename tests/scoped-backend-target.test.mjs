@@ -230,7 +230,9 @@ test('claude-desktop is created, dispatched and listed only through its own adap
     assert.deepEqual(f.monitors, ['start'], 'and the single monitor is what provides it');
 
     const receipt = await f.service.send({ name: 'partner', message: 'read the plan' }, extra(A));
-    assert.equal(receipt.accepted, true, 'written is accepted, not completion');
+    assert.equal(receipt.queued, true, 'Desktop dispatch runs in the shared monitor');
+    assert.equal(receipt.accepted, false);
+    await f.service.poll(f.record('partner').agentId);
     const deliveries = events.filter(event => Array.isArray(event) && event[0] === 'claude:deliver');
     assert.equal(deliveries.length, 1);
     assert.match(deliveries[0][1], /^request-[a-f0-9]{32}$/, 'the durable request id crosses the boundary');
@@ -333,10 +335,12 @@ test('a historical currentModel is not trusted: the real control decides the fol
   try {
     await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A));
     await f.service.send({ name: 'partner', message: 'first' }, extra(A));
+    await f.service.poll(f.record('partner').agentId);
     selections.length = 0;
     // A busy supplement goes through observe(); the stale value equals the default,
     // so only the real control can reveal the mismatch.
     await f.service.send({ name: 'partner', message: 'continue while busy' }, extra(A));
+    await f.service.poll(f.record('partner').agentId);
     assert.equal(selections.length, 1, 'the default was re-selected from the real next-turn control');
     assert.deepEqual(selections[0].model, CLAUDE_MODEL.model);
   } finally { f.service.close(); }
@@ -359,8 +363,10 @@ test('an observed live selection is used as-is, without another control round-tr
   try {
     await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A));
     await f.service.send({ name: 'partner', message: 'first' }, extra(A));
+    await f.service.poll(f.record('partner').agentId);
     selections.length = 0;
     await f.service.send({ name: 'partner', message: 'continue while busy' }, extra(A));
+    await f.service.poll(f.record('partner').agentId);
     assert.deepEqual(selections, [], 'the session already runs the default; nothing is re-selected');
   } finally { f.service.close(); }
 });
@@ -484,7 +490,8 @@ test('an adapter keeps its own state row and one host lock without touching the 
     assert.deepEqual(f.store.backendState(first.agentId).binding, { sessionId: 'native-a1', pid: 4321 });
 
     const receipt = await f.service.send({ name: 'a1', message: 'read the plan' }, extra(A));
-    assert.equal(receipt.accepted, true);
+    assert.equal(receipt.queued, true);
+    await f.service.poll(first.agentId);
     const state = f.store.backendState(first.agentId);
     assert.equal(state.cursor, 1, 'the adapter read back its own cursor');
     assert.equal(Object.keys(state.requests).length, 1, 'native write attempts stay beside the roster');
@@ -493,6 +500,7 @@ test('an adapter keeps its own state row and one host lock without touching the 
     assert.equal(f.store.agentForNativeSession('native-a1').name, 'a1', 'the reply surface finds the caller');
 
     await f.service.delete({ name: 'a1' }, extra(A));
+    await f.service.poll(first.agentId);
     assert.equal(f.store.backendState(first.agentId), undefined);
     assert.equal(f.store.agentForNativeSession('native-a1'), undefined);
   } finally { f.service.close(); }

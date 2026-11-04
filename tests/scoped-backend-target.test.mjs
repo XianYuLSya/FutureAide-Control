@@ -127,7 +127,7 @@ async function stateRoot() {
   return mkdtemp(path.join(base, 'target-'));
 }
 
-async function fixture({ adapters = {}, store, adapterLoader, reportStatusProbe } = {}) {
+async function fixture({ adapters = {}, store, adapterLoader, reportStatusProbe, codexProbeRegistration } = {}) {
   const events = [];
   const reports = [];
   const monitors = [];
@@ -140,6 +140,7 @@ async function fixture({ adapters = {}, store, adapterLoader, reportStatusProbe 
     reportReadyTimeoutMs: 0,
     removeTree: async () => {},
     backendAdapters: adapters,
+    ...(codexProbeRegistration ? { codexProbeRegistration } : {}),
     // No real loopback server in unit tests: the read-only health probe is
     // injected and counted, so a test can prove when readiness was asked for.
     reportStatusProbe: reportStatusProbe ?? (async () => {
@@ -226,6 +227,40 @@ test('claude-desktop is created, dispatched and listed only through its own adap
     assert.deepEqual(dshCalls(f.events), [], 'the DSH bridge stayed untouched');
     assert.equal(typeof f.record('partner').binding, 'undefined');
   } finally { f.service.close(); }
+});
+
+test('codex-desktop readiness comes from the registration probe, never from a session', async () => {
+  // A minimal adapter that satisfies the contract, so only the registration evidence
+  // decides readiness.
+  const codexAdapter = () => ({ probe: async () => ({ identity: {}, methods: [], treeProtocol: 1, reportProtocol: 1 }),
+    create: async () => ({ sessionId: 'session-codex-child', modelRequestsStarted: 0 }),
+    beginTask: async () => ({}), observe: async () => ({}), history: async () => ({ messages: [] }),
+    answer: async () => ({}), deliver: async () => ({ accepted: true }), receipt: async () => undefined,
+    turn: async () => ({ state: 'ended' }), models: async () => ({ models: [] }), model: async () => ({}),
+    selectModel: async () => ({ accepted: true }), cancel: async () => ({ cancelRequested: true }),
+    destroy: async () => ({ destroyed: true }), cursor: async () => ({}) });
+  const probes = [];
+  const probeFor = answer => async request => { probes.push(request); return answer; };
+
+  const registered = await fixture({ adapters: { 'codex-desktop': codexAdapter },
+    codexProbeRegistration: probeFor({ ready: true, registered: true,
+      tools: ['ask_parent', 'report_parent'], sessionVerified: false }) });
+  try {
+    const status = await registered.service.status(extra(A));
+    assert.deepEqual(probes[0], { workspace, configPath: path.join(registered.stateDirectory, 'config.json'),
+      serverName: 'futureaide-dev' }, 'the probe is asked about this project and the DEV entry');
+    assert.equal(status.backends['codex-desktop'].ready, true);
+    assert.equal(status.backends['codex-desktop'].sessionVerified ?? false, false,
+      'a registration alone never claims a native session was verified');
+  } finally { registered.service.close(); }
+
+  const missing = await fixture({ adapters: { 'codex-desktop': codexAdapter },
+    codexProbeRegistration: probeFor({ ready: true, registered: false, tools: ['ask_parent'], sessionVerified: false }) });
+  try {
+    const status = await missing.service.status(extra(A));
+    assert.equal(status.backends['codex-desktop'].ready, false, 'both tools must be listed');
+    assert.equal(status.backends['codex-desktop'].reason.code, 'codex-tools-not-registered');
+  } finally { missing.service.close(); }
 });
 
 test('a create that cannot reach the tool service takes no name', async () => {

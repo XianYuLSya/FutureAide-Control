@@ -23,6 +23,8 @@ const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_repor
 const METHODS = DSH_HOST_METHODS;
 const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
+/** The project-level MCP server entry the Codex ask/report tools are registered under. */
+const CODEX_SERVER_NAME = 'futureaide-dev';
 const reportProtocolError = (host = 'DSH') => Object.assign(new Error(`Update the ${host} plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting ${host} is not required.`), { code: 'report-protocol-required' });
 const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host} bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting ${host} is not required.`), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
@@ -221,6 +223,7 @@ export function createScopedAgents(config, {
   reportStatusProbe = readReportStatus,
   codexReportReady = undefined,
   codexToolsStatus = undefined,
+  codexProbeRegistration = undefined,
   reportReadyTimeoutMs = 2000,
 } = {}) {
   const clients = new Map();
@@ -420,8 +423,24 @@ export function createScopedAgents(config, {
     return names.join('/');
   }
 
+  /**
+   * The one read-only registration probe (codex-host): a trusted entry in this
+   * project's effective config that points at the same DEV tree and roster, plus that
+   * entry's real MCP tools/list. It never starts a Codex session and never sends a
+   * model turn, so sessionVerified stays false until a real dispatch proves otherwise.
+   */
+  async function probeCodexRegistration(record) {
+    if (typeof codexProbeRegistration !== 'function') return undefined;
+    try {
+      const value = await codexProbeRegistration({ workspace: record?.workspace ?? config.workspace,
+        configPath: config.configFile, serverName: CODEX_SERVER_NAME });
+      return value ?? undefined;
+    } catch (error) { return { ready: false, registered: false, reason: safeError(error) }; }
+  }
   /** Read-only Codex tool registration, for status: it never starts a session. */
   async function readCodexToolsStatus(record) {
+    const probed = await probeCodexRegistration(record);
+    if (probed) return probed;
     if (typeof codexToolsStatus !== 'function') return { registered: false };
     try { return (await codexToolsStatus(record)) ?? { registered: false }; }
     catch (error) { return { registered: false, reason: safeError(error) }; }
@@ -436,7 +455,8 @@ export function createScopedAgents(config, {
   async function readCodexReportStatus(record) {
     const value = await readCodexToolsStatus(record);
     const registered = provenRegistration(value);
-    return { ...value, ready: registered, registered, evidence: value?.evidence ?? 'registration' };
+    return { ...value, ready: registered, registered, evidence: value?.evidence ?? 'registration',
+      sessionVerified: value?.sessionVerified === true };
   }
   /** Both tool names, proven by whichever evidence the adapter has. */
   function provenRegistration(value) {
@@ -453,7 +473,16 @@ export function createScopedAgents(config, {
     // Preflight is read-only registration verification only: the project's effective MCP
     // entry must be the DEV entry over this roster and list both tools. It must not
     // create or reuse a Codex session — the first dispatch is the real integration test,
-    // and a zero-model create stays zero-model.
+    // and a zero-model create stays zero-model. The host probe is the one source of that
+    // evidence; codexReportReady stays as a fallback for a host that supplies it instead.
+    const probed = await probeCodexRegistration(record);
+    if (probed) {
+      const registered = provenRegistration(probed);
+      return { ...probed, ready: registered && probed.ready !== false, registered,
+        evidence: probed.evidence ?? 'registration', sessionVerified: probed.sessionVerified === true,
+        ...(registered ? {} : { reason: probed.reason ?? { code: 'codex-tools-not-registered',
+          message: 'The Codex-side ask/report registration was not verified for this project.' } }) };
+    }
     if (typeof codexReportReady !== 'function') {
       return { ready: false, registered: false,
         reason: { code: 'codex-tools-not-registered', message: 'This build does not register the Codex-side ask/report tools yet.' } };
@@ -641,8 +670,10 @@ export function createScopedAgents(config, {
     if (current?.task?.taskId !== record.task?.taskId || current.task.cancelRequested) return;
     try {
       await followHostModel(record, dispatch, observed);
+      // The model this request runs on is given explicitly, so a backend never has to
+      // guess it from a catalog default that may have moved since the preflight.
       const sent = await (await backendFor(record)).deliver({ requestId: dispatch.requestId,
-        message: dispatch.message, kind: dispatch.kind });
+        message: dispatch.message, kind: dispatch.kind, model: dispatch.model });
       Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
         afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined } : {}) });
     } catch (error) {

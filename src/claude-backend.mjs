@@ -30,8 +30,9 @@ export async function createClaudeBackend(record, deps = {}) {
   // operation. Direct/long-lived adapter callers continue to read fresh state.
   let observation;
   let firstModelSelection;
+  let inputModelSnapshot;
   const invalidateObservation = () => { observation = undefined; };
-  const invalidateInput = () => { invalidateObservation(); firstModelSelection = undefined; };
+  const invalidateInput = () => { invalidateObservation(); firstModelSelection = undefined; inputModelSnapshot = undefined; };
   const save = value => {
     invalidateObservation();
     if (deps.writeNativeState?.(value) === false) throw failure('agent-not-found', 'This managed Claude agent was removed.');
@@ -157,12 +158,28 @@ export async function createClaudeBackend(record, deps = {}) {
     return firstModelSelection ??= lockedHost(() => host.readDefaultModel(hostOptions()));
   }
 
+  async function modelSnapshot(state) {
+    if (deps.reuseObservation !== true || typeof driver.modelSnapshot !== 'function'
+      || typeof host.readModelSnapshot !== 'function') return undefined;
+    inputModelSnapshot ??= lockedHost(async () => {
+      const value = await host.readModelSnapshot({ nativeSessionId: state.binding.sessionId,
+        workspace: load().workspace }, hostOptions());
+      if (value?.titleMatchesRecord !== true || value.current?.resolved !== true || value.default?.resolved !== true) {
+        throw failure('claude-model-snapshot-unresolved', 'Claude Desktop’s current and default selections could not be read.');
+      }
+      return value;
+    });
+    return inputModelSnapshot;
+  }
+
   async function currentModel(state) {
     if (!state.binding) return firstDefaultModel();
+    const snapshot = await modelSnapshot(state);
+    if (snapshot) return snapshot.current;
     if (typeof host.readCurrentModel !== 'function') {
       throw failure('model-observation-unsupported', 'The host adapter cannot read the session’s next model selection yet.');
     }
-    return lockedHost(() => host.readCurrentModel({ nativeSessionId: state.binding.sessionId }, hostOptions()));
+    return lockedHost(() => host.readCurrentModel({ nativeSessionId: state.binding.sessionId, source: 'ui' }, hostOptions()));
   }
 
   return {
@@ -194,7 +211,9 @@ export async function createClaudeBackend(record, deps = {}) {
         save(state);
       }
       return { treeProtocol: treeModule?.TREE_PROTOCOL ?? null, reportProtocol: 1,
-        throughSeq: state.projection.throughSeq, currentModel: await currentModel(state) };
+        throughSeq: state.projection.throughSeq,
+        currentModel: state.binding ? state.projection.currentModel : await currentModel(state),
+        modelSelectionObserved: !state.binding };
     },
     async observe() {
       const current = load();
@@ -337,8 +356,10 @@ export async function createClaudeBackend(record, deps = {}) {
       // A new session has no independent selection. beginTask/models/model in
       // the same first dispatch can share one live default read. Each later
       // input still reads the host default again.
-      const value = stateForTask().binding ? await lockedHost(() => host.readDefaultModel(hostOptions()))
-        : await firstDefaultModel();
+      const state = stateForTask();
+      const snapshot = state.binding ? await modelSnapshot(state) : undefined;
+      const value = snapshot?.default ?? (state.binding ? await lockedHost(() => host.readDefaultModel(hostOptions()))
+        : await firstDefaultModel());
       if (!value?.model || value.resolved === false || value.verified === false) {
         throw failure('claude-default-model-unresolved', 'Claude Desktop’s current default model could not be read.');
       }

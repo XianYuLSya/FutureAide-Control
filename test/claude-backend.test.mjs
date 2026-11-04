@@ -229,6 +229,29 @@ test('one operation reuses an observation and refreshes after native changes', a
   assert.equal(reads, before + 3, 'a native write always observes its own delivery anew');
 });
 
+test('a bound input reads current and default controls together without trusting stored history', async () => {
+  const f = await setup();
+  await f.adapter.deliver({ requestId: 'first', message: 'First' });
+  let snapshots = 0;
+  const selection = { provider: 'anthropic', model: 'claude-opus-5-5', reasoningEffort: 'max', resolved: true };
+  const adapter = await createClaudeBackend(f.record, { ...f.deps, reuseObservation: true,
+    driver: { modelSnapshot() {} }, host: { ...f.deps.host,
+      readCurrentModel: async () => { throw new Error('must use the current composer snapshot'); },
+      readModelSnapshot: async () => { snapshots++; return {
+        titleMatchesRecord: true, current: selection, default: selection,
+      }; },
+    } });
+  const begun = await adapter.beginTask();
+  assert.equal(begun.modelSelectionObserved, false, 'task negotiation makes no claim about next-turn selection');
+  assert.equal(snapshots, 0);
+  assert.equal((await adapter.models()).default.reasoningEffort, 'max');
+  assert.equal((await adapter.model()).reasoningEffort, 'max');
+  assert.equal(snapshots, 1);
+  await adapter.deliver({ requestId: 'next', message: 'Next input' });
+  await adapter.models();
+  assert.equal(snapshots, 2, 'each subsequent input takes a new live control snapshot');
+});
+
 // ------------------------------------------------------------------ cancel
 
 const runningChild = (name, taskId) => ({ sessionId: `claude-agent-${taskId}`, parentSessionId: 'logical',

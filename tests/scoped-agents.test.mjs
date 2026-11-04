@@ -5,7 +5,8 @@ import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createScopedAgents } from '../src/scoped-agents.mjs';
+import { createScopedAgents, finalReminderDue } from '../src/scoped-agents.mjs';
+import { FINAL_REPORT_REMINDER } from '../src/report-contract.mjs';
 import { monitorSpawn } from '../src/shared-monitor.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
@@ -158,7 +159,15 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
     session.reports ??= [];
     session.reports.push({ id: 'explicit-' + session.reports.length, taskId: r.task.taskId, message, final, createdAt: new Date().toISOString() });
   }
-  return { report, service, store, sessions, api, controlFactory, sends, notices, removed, workers, reads, cancellations, beginnings, historyRequests, stateDirectory, record, finish,
+  // A turn that ends without a final report now earns one reminder, so a test that
+  // wants the settled awaiting_report state lets that reminder turn end too.
+  async function settle(name = 'artist', reply = 'done') {
+    finish(name, reply);
+    await service.poll(record(name).agentId);
+    finish(name, reply);
+    await service.poll(record(name).agentId);
+  }
+  return { report, service, store, sessions, api, controlFactory, sends, notices, removed, workers, reads, cancellations, beginnings, historyRequests, stateDirectory, record, finish, settle,
     offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls,
     defaultModel: value => { defaultModel = value; }, selections, catalogCalls: () => catalogCalls, cursorCalls: () => cursorCalls };
 }
@@ -245,6 +254,9 @@ test('model failure is visible in list wait and inspect without callbacks or red
     assert.equal((await f.service.list(extra(A))).items[0].error, undefined);
     assert.deepEqual(f.store.historyFor(f.record().agentId)[0].dispatches[0].failure, failed.error);
     f.finish();
+    const reminded = await f.service.poll(r.agentId);
+    assert.equal(reminded.state, 'running', 'a turn that ends without a final is reminded once');
+    f.finish();
     const completed = await f.service.poll(r.agentId);
     assert.equal(completed.state, 'awaiting_report');
     assert.equal(completed.error, undefined);
@@ -327,7 +339,7 @@ test('settled awaiting-report monitor sleeps and a supplement wakes the same tas
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
-  f.finish(); await f.service.poll(f.record().agentId);
+  await f.settle();
   const before = f.record();
   assert.equal(before.state, 'awaiting_report');
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
@@ -345,7 +357,7 @@ test('a wake after the monitor retires is recovered by restarting one listener',
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
-  f.finish(); await f.service.poll(f.record().agentId);
+  await f.settle();
   const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
@@ -362,7 +374,7 @@ test('a sleeping name is never polled twice and keeps the same task across a mon
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
-  f.finish(); await f.service.poll(f.record().agentId);
+  await f.settle();
   const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
@@ -373,7 +385,8 @@ test('a sleeping name is never polled twice and keeps the same task across a mon
   assert.equal(f.workers.length, count + 1);
   assert.equal(f.record().sleep, undefined);
   assert.equal(f.record().task.taskId, before.task.taskId);
-  assert.equal(f.sends.length, 1, 'the original dispatch was never repeated');
+  assert.equal(f.sends.filter(send => send.message === 'initial').length, 1, 'the original dispatch was never repeated');
+  assert.equal(f.sends.length, 2, 'the task and its one reminder, nothing more');
   f.service.close();
 });
 
@@ -381,7 +394,7 @@ test('a stale sleep marker from an older client wakes the newer task in the same
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
-  f.finish(); await f.service.poll(f.record().agentId);
+  await f.settle();
   const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
@@ -400,7 +413,7 @@ test('a lost shared monitor keeps the task durable and sweeps in process instead
   const f = await fixture({ startSharedMonitor: async () => ready, monitorFailureGraceMs: 0 });
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
-  f.finish(); await f.service.poll(f.record().agentId);
+  await f.settle();
   const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
@@ -421,7 +434,7 @@ test('a failed wake spawn retains the sleeping baseline for another attempt', as
   const f = await fixture({ startSharedMonitor: async () => { if (fail) throw new Error('spawn failed'); return true; } });
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
-  f.finish(); await f.service.poll(f.record().agentId);
+  await f.settle();
   const before = f.record();
   f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
   assert.equal(await f.service.trySleep(before.agentId), true);
@@ -951,6 +964,9 @@ test('one-shot requires an explicit final report and settled descendant tree', a
     assert.equal(f.notices.length, 0);
     s.tree.settled = true;
     await f.service.poll(r.agentId); // Settled tree, but root summary still unverified.
+    assert.equal(f.record().state, 'running', 'the missing final is reminded, not settled');
+    f.finish('artist', 'still not a report');
+    await f.service.poll(r.agentId);
     assert.equal(f.record().state, 'awaiting_report');
     assert.equal(f.notices.length, 0);
     const summary = '汇总'.repeat(5000) + '完整收尾';
@@ -1394,6 +1410,9 @@ test('ordinary turns stay quiet; nonfinal reports preserve the task and exact bo
     const first = f.record(), taskId = first.task.taskId;
     f.finish('artist', 'ordinary assistant text');
     await f.service.poll(first.agentId);
+    assert.equal(f.record().state, 'running', 'the ending without a final is reminded once');
+    f.finish('artist', 'still ordinary text');
+    await f.service.poll(first.agentId);
     assert.equal(f.record().state, 'awaiting_report');
     assert.equal(f.notices.length, 0); assert.equal(f.removed.length, 0);
     f.report('Only this progress', false);
@@ -1404,7 +1423,7 @@ test('ordinary turns stay quiet; nonfinal reports preserve the task and exact bo
     assert.equal(f.notices.length, 1);
     await f.service.send({ name: 'artist', message: 'continue' }, extra(A));
     assert.equal(f.record().task.taskId, taskId);
-    assert.equal(f.sends.length, 2);
+    assert.equal(f.sends.length, 3, 'task, one reminder, then the continuation');
     f.report('Explicit final');
     f.finish('artist', 'Different ordinary ending');
     await f.service.poll(first.agentId);
@@ -1544,5 +1563,196 @@ test('status names the DSH internals a changed host no longer provides', async (
     assert.deepEqual(changed.backends.dsh.missingInternals, ['sessionController.inspect or sessionQuery.readSession']);
     assert.equal(changed.backends.dsh.reason.code, 'dsh-internals-changed');
     assert.match(changed.backends.dsh.reason.message, /sessionQuery\.readSession/);
+  } finally { f.service.close(); }
+});
+
+const dueTask = overrides => ({ taskId: 'task-a', finalReminder: 'armed', reports: [], ...overrides });
+
+test('a turn that ends without a final report is reminded exactly once', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'draw the diagram' }, extra(A));
+    f.finish('artist', 'all done, written in the reply only');
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.sends.length, 2, 'the task plus one reminder');
+    assert.equal(f.sends[1].message, FINAL_REPORT_REMINDER);
+    assert.equal(f.sends[1].mode, 'steer', 'a supplement is read on the next step');
+    assert.equal(f.record().state, 'running', 'the reminder turn decides the next state, not this one');
+    assert.equal(f.record().task.finalReminder, 'sent');
+    assert.deepEqual(f.notices, [], 'the controlling side is never notified');
+
+    // The reminder turn ends without a final report: the task settles, silently.
+    f.finish('artist', 'still only text');
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.record().state, 'awaiting_report');
+    assert.equal(f.sends.length, 2, 'a reminder is never sent twice');
+  } finally { f.service.close(); }
+});
+
+test('a task without the marker is never reminded, which keeps older tasks quiet', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'old task' }, extra(A));
+    const record = f.record();
+    delete record.task.finalReminder;
+    f.store.save(record);
+    f.finish('artist', 'text only');
+    await f.service.poll(record.agentId);
+    assert.equal(f.record().state, 'awaiting_report');
+    assert.equal(f.sends.length, 1, 'no reminder for a task created before the rule');
+  } finally { f.service.close(); }
+});
+
+test('a failed or cancelled turn is not reminded', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'break' }, extra(A));
+    const session = f.sessions.get(f.record().sessionId);
+    for (const [id, turn] of session.turns) session.turns.set(id, { ...turn, state: 'ended', endSeq: 9,
+      completionReason: { kind: 'error', error: { kind: 'provider', message: 'boom' } } });
+    session.running = false;
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.record().state, 'failed');
+    assert.equal(f.sends.length, 1, 'a failed turn gets no reminder');
+
+    await f.service.send({ name: 'artist', message: 'again' }, extra(A));
+    await f.service.cancel({ name: 'artist' }, extra(A));
+    f.finish('artist', 'cut short');
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.sends.length, 2, 'a cancelled turn gets no reminder');
+  } finally { f.service.close(); }
+});
+
+test('a turn that already submitted a final report is not reminded', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'draw' }, extra(A));
+    f.finish('artist', 'done');
+    f.report('delivered properly', true);
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.sends.length, 1, 'the explicit final is the report; no reminder');
+  } finally { f.service.close(); }
+});
+
+test('a queued supplement suppresses the reminder until it is read', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'draw' }, extra(A));
+    const record = f.record();
+    f.store.enqueueSupplement(record, 'supplement-1', 'one more colour');
+    f.finish('artist', 'text only');
+    await f.service.poll(record.agentId);
+    const queued = f.record();
+    assert.equal(queued.task.finalReminder, 'armed', 'the reminder waits for the queued input');
+    assert.equal(f.sends.filter(send => send.message === FINAL_REPORT_REMINDER).length, 0);
+  } finally { f.service.close(); }
+});
+
+test('the reminder is decision logic on its own, so every condition can be checked directly', () => {
+  const view = { reports: [] };
+  assert.equal(finalReminderDue({ task: dueTask(), view, target: 'dsh', supplements: [] }), true);
+  assert.equal(finalReminderDue({ terminal: 'failed', task: dueTask(), view, target: 'dsh' }), false);
+  assert.equal(finalReminderDue({ terminal: 'cancelled', task: dueTask(), view, target: 'dsh' }), false);
+  assert.equal(finalReminderDue({ task: dueTask({ finalReminder: 'sent' }), view, target: 'dsh' }), false);
+  assert.equal(finalReminderDue({ task: dueTask({ reports: [{ final: true }] }), view, target: 'dsh' }), false);
+  assert.equal(finalReminderDue({ task: dueTask(), view: { reports: [{ final: true }] }, target: 'dsh' }), false,
+    'a final that only reached the observation still counts');
+  assert.equal(finalReminderDue({ task: dueTask(), view, target: 'claude-desktop' }), false,
+    'desktop targets use their own durable queue');
+  assert.equal(finalReminderDue({ task: dueTask(), view, target: 'dsh', supplements: [{ task: 'task-a', status: 'queued' }] }), false);
+  assert.equal(finalReminderDue({ task: dueTask(), view, target: 'dsh', supplements: [{ task: 'task-a', status: 'accepted' }] }), true,
+    'a delivered supplement no longer waits');
+  assert.equal(finalReminderDue({ task: dueTask(), view, target: 'dsh', supplements: [{ task: 'other', status: 'queued' }] }), true,
+    'another task supplement is not this task input');
+});
+
+test('a reminder that cannot be sent is not retried and does not fail the task', async () => {
+  let attempts = 0;
+  const f = await fixture({ beforeSend: async () => {
+    attempts += 1;
+    if (attempts === 2) throw Object.assign(new Error('supplement rejected'), { code: 'send-rejected' });
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'draw' }, extra(A));
+    f.finish('artist', 'text only');
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.record().task.finalReminder, 'sent');
+    assert.equal(f.record().state, 'running');
+    const reminder = f.record().task.dispatches.find(dispatch => dispatch.reminder);
+    assert.equal(reminder.state, 'failed', 'the reminder keeps its own failure');
+    assert.equal(reminder.error.code, 'send-rejected');
+
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.record().state, 'awaiting_report', 'the finished turn still settles');
+    assert.equal(attempts, 2, 'the reminder is never retried');
+    await f.service.poll(f.record().agentId);
+    assert.equal(attempts, 2, 'and no loop appears on later polls');
+  } finally { f.service.close(); }
+});
+
+test('a reminder left failed on disk settles the task instead of failing it', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'draw' }, extra(A));
+    f.finish('artist', 'text only');
+    await f.service.poll(f.record().agentId);
+    // The process died between the failed reminder write and the poll that would have
+    // settled the turn: the record on disk already holds a failed reminder.
+    const record = f.record();
+    record.task.dispatches.find(dispatch => dispatch.reminder).state = 'failed';
+    record.state = 'running';
+    record.task.state = 'running';
+    f.store.save(record);
+    f.sessions.get(record.sessionId).running = false;
+
+    await f.service.poll(record.agentId);
+    assert.equal(f.record().state, 'awaiting_report', 'a failed reminder never fails the finished turn');
+  } finally { f.service.close(); }
+});
+
+test('a reminder whose outcome is unknown settles the task and lets it sleep', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'draw' }, extra(A));
+    f.finish('artist', 'text only');
+    await f.service.poll(f.record().agentId);
+    const record = f.record();
+    record.task.dispatches.find(dispatch => dispatch.reminder).state = 'unknown';
+    record.state = 'running';
+    record.task.state = 'running';
+    f.store.save(record);
+    f.sessions.get(record.sessionId).running = false;
+
+    await f.service.poll(record.agentId);
+    const settled = f.record();
+    assert.equal(settled.state, 'awaiting_report', 'an undecided reminder is not work the task still owes');
+    f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
+    assert.equal(await f.service.trySleep(settled.agentId), true, 'and the name may sleep again');
+  } finally { f.service.close(); }
+});
+
+test('a reminder that did arrive keeps the task running while the model works', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'draw' }, extra(A));
+    f.finish('artist', 'text only');
+    await f.service.poll(f.record().agentId);
+    const record = f.record();
+    record.task.dispatches.find(dispatch => dispatch.reminder).state = 'running';
+    f.store.save(record);
+    f.sessions.get(record.sessionId).running = true;
+
+    const working = await f.service.poll(record.agentId);
+    assert.equal(working.state, 'running', 'the reminder turn is work in progress, not a finished task');
+    assert.equal(f.record().task.state, 'running');
   } finally { f.service.close(); }
 });

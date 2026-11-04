@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { apply, createHostHandler, createManagedHost } from '../src/host-plugin.mjs';
+import { apply, createHostHandler, createManagedHost, CHILD_QUESTION_REFUSAL, ROOT_QUESTION_REFUSAL } from '../src/host-plugin.mjs';
 
 // Fixtures remain in the project's clean directory. No test deletes or moves files.
 async function fixture() {
@@ -64,8 +64,10 @@ async function fixture() {
     await mkdir(path.join(sessionRoot, 'project', id), { recursive: true });
     return { agent, async dispose() { disposed.push(id); live.delete(id); sessions.delete(id); } };
   }
+  const ownedBy = new Map();
   const ctx = { get: name => services[name], agents: { get: id => live.get(id), create: makeAgent,
-    resume: options => makeAgent(options, true) }, sessions: { get: id => sessions.get(id), flush: async () => {} } };
+    resume: options => makeAgent(options, true), isOwnedBy: (childId, parent) => ownedBy.get(childId) === parent },
+    sessions: { get: id => sessions.get(id), flush: async () => {} } };
   const store = { read: async key => records.has(key) ? structuredClone(records.get(key)) : undefined,
     write: async (key, value) => records.set(key, structuredClone(value)), remove: async key => records.delete(key) };
   let failRemoval = false;
@@ -76,6 +78,7 @@ async function fixture() {
   };
   return { root, workspace, ctx, services, store, removeDirectory, live, sessions, stored, records, project, checkpoints, indexed, observed, removed, disposed, cancelled, creations,
     failNextRemoval: () => { failRemoval = true; },
+    own: (childId, parent) => ownedBy.set(childId, parent),
     create: (context = ctx) => createManagedHost(context, { stateDirectory: path.join(root, 'managed'), store, removeDirectory,
       installDelegation: async agentCtx => { agentCtx.get('tools').register({name:'managed_subagent'}); } }) };
 }
@@ -562,4 +565,27 @@ test('a refusal with a control code and a failed write leave no note', async () 
     workspace: f.workspace, activate: true } });
   assert.equal(result.ok, false);
   assert.equal(result.error.code, 'host-operation-failed');
+});
+
+test('a managed agent cannot raise a UI question the dispatching chat never sees', async () => {
+  const f = await fixture(), input = identity(f.workspace), host = f.create();
+  await host.managedCreate(input);
+  const agent = f.live.get(input.sessionId);
+  assert.equal(agent.guards[0]({ agent, name: 'ask_user_question' }), ROOT_QUESTION_REFUSAL);
+  assert.equal(agent.guards[0]({ agent, name: 'request_user_input' }), ROOT_QUESTION_REFUSAL,
+    'the older spelling of the same prompt is refused too');
+  assert.equal(agent.guards[0]({ agent, name: 'write_file' }), undefined, 'other tools are untouched');
+  assert.equal(agent.guards[0]({ agent: { id: 'unrelated' }, name: 'write_file' }), undefined);
+
+  // A native descendant is guarded where its own tool calls are checked, because a
+  // descendant's scope is not guaranteed to chain to the root agent's guard.
+  const child = await f.ctx.agents.create({ sessionId: 'child-1', meta: { cwd: f.workspace }, setup: async () => {} });
+  f.own('child-1', agent);
+  const runtime = [...f.ctx[Symbol.for('futureaide-control.managed-runtimes')].values()][0];
+  await runtime.installManagedDescendant(child.agent);
+  assert.equal(child.agent.guards.length, 1);
+  assert.equal(child.agent.guards[0]({ agent: child.agent, name: 'ask_user_question' }), CHILD_QUESTION_REFUSAL);
+  assert.equal(child.agent.guards[0]({ agent: child.agent, name: 'read_file' }), undefined);
+  assert.equal(agent.guards[0]({ agent: child.agent, name: 'ask_user_question' }), CHILD_QUESTION_REFUSAL,
+    'if the root guard does see a descendant call, it names the parent route');
 });

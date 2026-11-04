@@ -4,7 +4,7 @@ import { mkdir, writeFile, appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { createCodexHost, createDesktopToolBridge, emptyProjection, readTranscript, readDefaultModel, markerLine } from '../src/codex-host.mjs';
+import { createCodexHost, createDesktopToolBridge, emptyProjection, readTranscript, readDefaultModel, readCodexMcpRegistration, markerLine } from '../src/codex-host.mjs';
 
 const directory = () => fileURLToPath(new URL(`../clean/validation/codex/${randomUUID()}/`, import.meta.url));
 test('native transcript cursor admits exact marker, keeps partial line and attributes FileChange', async () => {
@@ -50,6 +50,20 @@ test('first native creation uses verified anchor and exact saved workspace, neve
   assert.equal(calls[1].args.target.projectId, 'project');
   assert.equal(calls[1].id, 'anchor');
   await assert.rejects(host.destroy({ nativeSessionId: 'new' }), { code: 'codex-delete-owner-mismatch' });
+});
+
+test('registration matches exact build and roster with either config environment name and optional explicit server', async () => {
+  const dir = directory(), home = path.join(dir, 'home'), workspace = path.join(dir, 'workspace');
+  await mkdir(home, { recursive: true }); await mkdir(path.join(workspace, '.codex'), { recursive: true });
+  const q = value => JSON.stringify(value.replaceAll('\\', '/'));
+  const formal = path.join(dir, 'formal/mcp-server.mjs'), dev = path.join(dir, 'dev/mcp-server.mjs');
+  const formalConfig = path.join(dir, 'formal/config.json'), devConfig = path.join(dir, 'dev/config.json');
+  await writeFile(path.join(home, 'config.toml'), `[projects.${q(workspace)}]\ntrust_level = "trusted"\n[mcp_servers.renamed-production]\ncommand = ${q(process.execPath)}\nargs = [${q(formal)}]\n[mcp_servers.renamed-production.env]\nDSH_CONTROL_CONFIG = ${q(formalConfig)}\nFUTUREAIDE_CONTROL_CONFIG = ${q(devConfig)}\n`);
+  await writeFile(path.join(workspace, '.codex/config.toml'), `[mcp_servers.custom-dev]\ncommand = ${q(process.execPath)}\nargs = [${q(dev)}]\n[mcp_servers.custom-dev.env]\nFUTUREAIDE_CONTROL_CONFIG = ${q(devConfig)}\n`);
+  assert.equal((await readCodexMcpRegistration({ home, workspace, configPath: formalConfig, serverPath: formal })).serverName, 'renamed-production');
+  assert.equal((await readCodexMcpRegistration({ home, workspace, configPath: devConfig, serverPath: dev })).serverName, 'custom-dev');
+  await assert.rejects(readCodexMcpRegistration({ home, workspace, configPath: formalConfig, serverPath: dev }), { code: 'codex-registration-mismatch' });
+  await assert.rejects(readCodexMcpRegistration({ home, workspace, configPath: devConfig, serverPath: dev, serverName: 'renamed-production' }), { code: 'codex-registration-mismatch' });
 });
 
 test('native delete validates managed root, deletes descendants first and confirms native records are gone', async () => {

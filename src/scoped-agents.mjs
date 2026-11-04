@@ -23,8 +23,6 @@ const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_repor
 const METHODS = DSH_HOST_METHODS;
 const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
-/** The project-level MCP server entry the Codex ask/report tools are registered under. */
-const CODEX_SERVER_NAME = 'futureaide-dev';
 let codexProbePromise;
 /** codex-host's own registration probe, imported lazily so only the Codex path loads it. */
 function defaultCodexProbe() {
@@ -462,7 +460,7 @@ export function createScopedAgents(config, {
     }
     try {
       return (await probe({ workspace: record?.workspace ?? config.workspace,
-        configPath: config.configFile, serverName: CODEX_SERVER_NAME })) ?? undefined;
+        configPath: config.configFile })) ?? undefined;
     } catch (error) { return { ready: false, registered: false, sessionVerified: false, reason: safeError(error) }; }
   }
   /** Read-only Codex tool registration, for status: it never starts a session. */

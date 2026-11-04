@@ -144,22 +144,52 @@ for k,v in c.get('projects',{}).items():
  r=pathlib.Path(k).resolve()
  if cwd==r or r in cwd.parents: matches.append((len(r.parts),r,v.get('trust_level')))
 match=max(matches,key=lambda x:x[0]) if matches else None
-if not match or match[2]!='trusted': raise ValueError('Project is not trusted')
-root=next((d for d in [cwd,*cwd.parents] if any((d/m).exists() for m in c.get('project_root_markers',['.git']))),match[1])
-server=c.get('mcp_servers',{}).get(p['name'],{}); source=str(home/'config.toml'); dirs=[]
+root=next((d for d in [cwd,*cwd.parents] if any((d/m).exists() for m in c.get('project_root_markers',['.git']))),match[1] if match else cwd)
+servers=c.get('mcp_servers',{}); sources={name:str(home/'config.toml') for name in servers}; dirs=[]
 for d in [cwd,*cwd.parents]:
  dirs.append(d)
  if d==root: break
-for d in reversed(dirs):
- f=d/'.codex'/'config.toml'; entry=read(f).get('mcp_servers',{}).get(p['name'])
- if entry is not None: server={**server,**entry}; source=str(f)
-print(json.dumps({k:server.get(k) for k in ['command','args','cwd','enabled','enabled_tools','disabled_tools']}|{'source':source,'configPath':server.get('env',{}).get('FUTUREAIDE_CONTROL_CONFIG')}))
+if match and match[2]=='trusted':
+ for d in reversed(dirs):
+  f=d/'.codex'/'config.toml'
+  for name,entry in read(f).get('mcp_servers',{}).items():
+   old=servers.get(name,{})
+   servers[name]={**old,**entry,'env':{**old.get('env',{}),**entry.get('env',{})}}; sources[name]=str(f)
+def same(a,b):
+ return isinstance(a,str) and isinstance(b,str) and pathlib.Path(a).resolve()==pathlib.Path(b).resolve()
+found=[]
+for name,server in servers.items():
+ if p.get('name') and name!=p['name']: continue
+ env=server.get('env',{}); config=env.get('DSH_CONTROL_CONFIG') or env.get('FUTUREAIDE_CONTROL_CONFIG')
+ args=server.get('args',[])
+ if server.get('enabled') is False or not same(server.get('command'),p['command']) or len(args)!=1 or not same(args[0],p['serverPath']) or not same(config,p['configPath']): continue
+ found.append({k:server.get(k) for k in ['command','args','cwd','enabled','enabled_tools','disabled_tools']}|{'source':sources[name],'configPath':config,'serverName':name})
+print(json.dumps(found))
 `;
 const registrations = new Map();
 
+/** Match the current build AND roster, not a development-only registration name. */
+export async function readCodexMcpRegistration({ workspace, configPath, serverPath, serverName,
+  home = process.env.CODEX_HOME ?? path.join(homedir(), '.codex'), python } = {}) {
+  const bundled = path.join(homedir(), '.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe');
+  python ??= process.env.FUTUREAIDE_PYTHON ?? (process.platform === 'win32' && existsSync(bundled) ? bundled : process.platform === 'win32' ? 'py' : 'python3');
+  const matches = await new Promise((resolve, reject) => {
+    const child = execFile(python, [...(/^py(?:\.exe)?$/i.test(path.basename(python)) ? ['-3'] : []), '-X', 'utf8', '-c', REGISTRATION_SCRIPT],
+      { windowsHide: true, timeout: 10000, maxBuffer: 65536 }, (error, stdout) => {
+        if (error) return reject(fail('codex-registration-unresolved', 'Could not resolve the effective MCP registration.'));
+        try { resolve(JSON.parse(stdout)); } catch (error) { reject(error); }
+      });
+    child.stdin.end(JSON.stringify({ home, workspace, name: serverName, configPath, serverPath, command: process.execPath }));
+  });
+  if (matches.length !== 1) throw fail('codex-registration-mismatch', matches.length
+    ? 'Multiple MCP entries use this build and roster; specify the registered server name.'
+    : 'No enabled MCP entry uses this build and the same FutureAide state configuration.');
+  return matches[0];
+}
+
 /** Configuration plus a real tools/list handshake. This does not start a model
  * or claim a new native session has already loaded the registration. */
-export async function probeCodexReportRegistration({ workspace, configPath, serverName = 'futureaide-dev',
+export async function probeCodexReportRegistration({ workspace, configPath, serverName,
   home = process.env.CODEX_HOME ?? path.join(homedir(), '.codex'), python } = {}) {
   const serverPath = fileURLToPath(new URL('./mcp-server.mjs', import.meta.url));
   const files = [path.join(home, 'config.toml'), serverPath, configPath];
@@ -173,25 +203,11 @@ export async function probeCodexReportRegistration({ workspace, configPath, serv
   if (cached && cached.expires > Date.now()) return cached.promise;
   const entry = { expires: Infinity };
   entry.promise = (async () => {
-    const bundled = path.join(homedir(), '.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe');
-    python ??= process.env.FUTUREAIDE_PYTHON ?? (process.platform === 'win32' && existsSync(bundled) ? bundled : process.platform === 'win32' ? 'py' : 'python3');
-    const registration = await new Promise((resolve, reject) => {
-      const child = execFile(python, [...(/^py(?:\.exe)?$/i.test(path.basename(python)) ? ['-3'] : []), '-X', 'utf8', '-c', REGISTRATION_SCRIPT],
-        { windowsHide: true, timeout: 10000, maxBuffer: 65536 }, (error, stdout) => {
-          if (error) return reject(fail('codex-registration-unresolved', 'Could not resolve the trusted project MCP registration.'));
-          try { resolve(JSON.parse(stdout)); } catch (error) { reject(error); }
-        });
-      child.stdin.end(JSON.stringify({ home, workspace, name: serverName }));
-    });
-    if (registration.enabled === false || !samePath(registration.command, process.execPath)
-      || registration.args?.length !== 1 || !samePath(registration.args[0], serverPath)
-      || !samePath(registration.configPath, configPath)) {
-      throw fail('codex-registration-mismatch', 'The MCP registration must use this build and the same FutureAide state configuration.');
-    }
+    const registration = await readCodexMcpRegistration({ workspace, configPath, serverName, serverPath, home, python });
     const client = new Client({ name: 'futureaide-registration-check', version: '0.1.0' });
     try {
       await client.connect(new StdioClientTransport({ command: registration.command, args: registration.args,
-        cwd: registration.cwd ?? workspace, env: { ...process.env, FUTUREAIDE_CONTROL_CONFIG: configPath }, stderr: 'ignore' }));
+        cwd: registration.cwd ?? workspace, env: { ...process.env, DSH_CONTROL_CONFIG: configPath, FUTUREAIDE_CONTROL_CONFIG: configPath }, stderr: 'ignore' }));
       const catalog = await client.listTools();
       const tools = catalog.tools.filter(tool => (!registration.enabled_tools || registration.enabled_tools.includes(tool.name))
         && !registration.disabled_tools?.includes(tool.name));
@@ -201,7 +217,7 @@ export async function probeCodexReportRegistration({ workspace, configPath, serv
         throw fail('codex-report-tools-missing', 'The configured MCP server must expose the actual ask_parent and report_parent schemas.');
       }
       return { ready: true, registered: true, configured: true, sessionVerified: false,
-        tools: tools.map(tool => tool.name), source: registration.source, serverName };
+        tools: tools.map(tool => tool.name), source: registration.source, serverName: registration.serverName };
     } finally { await client.close(); }
   })().catch(error => {
     entry.expires = Date.now() + 5000;

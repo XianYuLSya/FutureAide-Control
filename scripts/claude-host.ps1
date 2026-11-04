@@ -717,6 +717,30 @@ try {
       $notes = @()
       $view0 = Get-PageSignature $window
       $previousTitle = ($view0.documentName -replace '\s+-\s+Claude Code$', '')
+      # The current control must be read from the page of the session the caller
+      # named, so the target is located and verified before anything is read. The
+      # title after the restore is not evidence about a value read earlier.
+      $titleWanted = [string]$payload.title
+      $identity = @{ wantedTitle = $titleWanted; initialDocumentName = $view0.documentName
+        navigatedToTarget = $false; matched = $false }
+      if ($titleWanted -and -not ($view0.documentName -and $view0.documentName.StartsWith($titleWanted))) {
+        $targetPattern = '^' + (Unescape-Pattern $titleWanted) + '($|\s)'
+        $entries = @(Find-Elements $web.Element $targetPattern 'Button' | Where-Object { $_.Current.Name -notmatch ('\s*' + [char]0x7684 + [char]0x66F4 + [char]0x591A + [char]0x9009 + [char]0x9879 + '$') })
+        if ($entries.Count -ge 1) {
+          Focus-Window $window.Element
+          $locate = Invoke-ElementByMouse $entries[0]
+          if ($locate.clicked) {
+            $wait = Wait-PageState $window { param($sig) $sig.documentName.StartsWith($titleWanted) } 2500
+            $identity.navigatedToTarget = $true
+            if ($wait.matched) { $view0 = $wait.signature }
+          }
+        }
+        $identity.matched = [bool]($view0.documentName -and $view0.documentName.StartsWith($titleWanted))
+        $previousTitle = ($view0.documentName -replace '\s+-\s+Claude Code$', '')
+      } else {
+        $identity.matched = [bool]($view0.documentName -and ($titleWanted -eq '' -or $view0.documentName.StartsWith($titleWanted)))
+      }
+      $currentDocumentName = $view0.documentName
       $readModelName = {
         $found = @(Find-Elements $web.Element $modelPattern 'Button')
         if ($found.Count -eq 0) { return $null }
@@ -783,6 +807,8 @@ try {
       Write-Result @{ ok = $true; value = @{
         documentName = $after.documentName; windowHwnd = $window.Hwnd; documents = $web.Documents
         previousDocumentName = $view0.documentName; stale = $web.Stale
+        currentDocumentName = $currentDocumentName; restoredDocumentName = $after.documentName
+        identity = $identity
         current = @{ raw = $currentRaw }; default = @{ raw = $defaultRaw }
         navigation = $navigation; notes = $notes } }
     }

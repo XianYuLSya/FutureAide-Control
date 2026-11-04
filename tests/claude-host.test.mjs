@@ -1768,3 +1768,38 @@ test('a bridge that omits the clicked flag is a contract violation, not a press'
     assert.equal(result.refused[0].error.code, 'bridge-contract-missing');
   } finally { await rm(host1.dir, { recursive: true, force: true }); }
 });
+
+
+test('the current model belongs to the page it was read from, not the restored one', async () => {
+  const host1 = await host({ sessions: [record()], transcriptLines: { [SESSION]: [assistantLine('claude-opus-5-5', 'max')] } });
+  const target = record().name;
+  const catalog = await loadModelCatalog({ asar: 'missing.asar' });
+  // The window starts on session A (sonnet) and the caller asks for B (opus).
+  const onTarget = uiDriver({
+    modelSnapshot: () => ({ currentDocumentName: `${target} - Claude Code`, documentName: `${target} - Claude Code`,
+      current: { raw: '模型：Opus 5.5 最高' }, default: { raw: '模型：Opus 5.5 中等' },
+      identity: { wantedTitle: target, matched: true, navigatedToTarget: true }, notes: [] }),
+  });
+  const stillOnA = uiDriver({
+    modelSnapshot: () => ({ currentDocumentName: 'Session A - Claude Code', documentName: `${target} - Claude Code`,
+      current: { raw: '模型：Sonnet 5.5 高' }, default: { raw: '模型：Opus 5.5 中等' },
+      identity: { wantedTitle: target, matched: false, navigatedToTarget: false }, notes: [] }),
+  });
+  try {
+    const correct = await readModelSnapshot({ nativeSessionId: SESSION }, { env: host1.env, driver: onTarget, isAlive: host1.isAlive, catalog });
+    assert.equal(correct.current.model, 'claude-opus-5-5', 'B was the page the value was read from');
+    assert.equal(correct.current.belongsToRecord, true);
+    assert.equal(correct.currentDocumentName, `${target} - Claude Code`);
+
+    // If the value was read on A, the restored title must not make it B's value.
+    const misread = await readModelSnapshot({ nativeSessionId: SESSION }, { env: host1.env, driver: stillOnA, isAlive: host1.isAlive, catalog });
+    assert.equal(misread.current.model, 'claude-sonnet-5-5');
+    assert.equal(misread.current.belongsToRecord, false, 'A value is not attributed to B');
+    assert.equal(misread.titleMatchesRecord, false);
+    assert.equal(misread.restoredDocumentName, `${target} - Claude Code`, 'the restore title is only that: a restore title');
+
+    const read = await readCurrentModel({ nativeSessionId: SESSION }, { env: host1.env, driver: stillOnA, isAlive: host1.isAlive, catalog });
+    assert.equal(read.singleCall, undefined, 'an unverifiable page falls back to the confirming path');
+    assert.notEqual(read.model, 'claude-sonnet-5-5', 'the other page model is never reported as this session');
+  } finally { await rm(host1.dir, { recursive: true, force: true }); }
+});

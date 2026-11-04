@@ -1976,7 +1976,10 @@ export async function readCurrentModel({ nativeSessionId, workspace = undefined,
       folderLabel: folderLabel ?? (record.workspace ? path.basename(record.workspace) : undefined), wantDefault: false })
       .catch(() => undefined);
     const control = describeControl(modelCatalog, snapshot?.current?.raw ?? null);
-    const titleMatches = Boolean(snapshot?.documentName && displayTitle(snapshot.documentName) === record.name);
+    // The value is only about this session when the page it was read from was this
+    // session's page; the restored title says nothing about an earlier read.
+    const readFrom = snapshot?.currentDocumentName ?? snapshot?.documentName ?? null;
+    const titleMatches = Boolean(readFrom && displayTitle(readFrom) === record.name);
     if (control.label && titleMatches) {
       const history = await readModelHistory({ env, record, driver });
       const historyDiffers = Boolean((history.transcript?.model && control.model && history.transcript.model !== control.model))
@@ -2098,14 +2101,25 @@ export async function readModelSnapshot({ nativeSessionId = undefined, workspace
     wantDefault,
   });
   const modelCatalog = catalog ?? await loadModelCatalog({ asar, driver: ui, env });
+  // The current value was read on whatever page was showing when it was read, so it
+  // is attributed to that page, never to the title the view was restored to after.
   const documentName = snapshot?.documentName ?? null;
-  const titleMatches = record?.name ? Boolean(documentName && displayTitle(documentName) === record.name) : undefined;
+  const currentDocumentName = snapshot?.currentDocumentName ?? documentName;
+  const currentBelongsToRecord = record?.name
+    ? Boolean(currentDocumentName && displayTitle(currentDocumentName) === record.name)
+    : undefined;
+  const titleMatches = currentBelongsToRecord;
   return {
     nativeSessionId: record?.nativeSessionId ?? null,
     documentName,
     titleMatchesRecord: titleMatches,
-    current: describeControl(modelCatalog, snapshot?.current?.raw),
+    current: { ...describeControl(modelCatalog, snapshot?.current?.raw), belongsToRecord: currentBelongsToRecord ?? null,
+      documentName: currentDocumentName ?? null },
     default: wantDefault ? describeControl(modelCatalog, snapshot?.default?.raw) : null,
+    currentDocumentName: currentDocumentName ?? null,
+    restoredDocumentName: documentName,
+    identity: snapshot?.identity ?? null,
+    currentBelongsToRecord: currentBelongsToRecord ?? null,
     navigation: snapshot?.navigation ?? null,
     notes: snapshot?.notes ?? [],
     selectionSource: modelCatalog.selectionSource ?? 'global_default',

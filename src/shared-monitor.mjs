@@ -66,18 +66,13 @@ export function createDirectoryWatchers(onEvent, { watchImpl = watch } = {}) {
  * event and spin the loop. Roster commits made by another connection are detected
  * instead through RosterStore.dataVersion(), which does not move for our own
  * commits.
- * Bindings come from the adapter's own state (binding.transcriptFile), so a new
- * child session directory joins the set as soon as it is recorded.
  */
-export function monitorDirectories(config, { env = process.env, bindings = [], exists = defaultExists } = {}) {
+export function monitorDirectories(config, { env = process.env, exists = defaultExists } = {}) {
   const directories = new Set();
   const host = config.managedStateDirectory ?? (config.hostBridgeFile ? path.join(path.dirname(config.hostBridgeFile), 'managed-host') : undefined);
   if (host) directories.add(host);
   const claudeRoot = env.CLAUDE_CONFIG_DIR || path.join(homedir(), '.claude');
   directories.add(path.join(claudeRoot, 'sessions'));
-  for (const file of bindings) {
-    if (typeof file === 'string' && file && path.isAbsolute(file)) directories.add(path.dirname(file));
-  }
   return [...directories].filter(directory => exists(directory)).map(directory => path.resolve(directory));
 }
 

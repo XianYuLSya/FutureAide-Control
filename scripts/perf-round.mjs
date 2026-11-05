@@ -120,8 +120,6 @@ async function round(index) {
   else { store.renewLease('idle-monitor', 'monitor-perf-bench', 60000); store.renewLease('idle-monitor:ready', 'monitor-perf-bench', 60000); }
   store.hasSleeping();
   store.listSleeping();
-  store.listClaudeBindings();
-  store.hasOpenTarget('claude-desktop');
   await scanSleeping(store, stateDir, () => {}, new Map(), sleepCache);
   // mode poll: the same name over and over, which is what "does an unchanged poll still
   // rewrite the body?" is really about — one big body is the whole measurement.

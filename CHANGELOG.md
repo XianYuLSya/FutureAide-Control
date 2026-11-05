@@ -1,5 +1,11 @@
 # 更新记录
 
+## 0.5.12 — 2026-11-05 · 移除 Claude Desktop 目标和窗口操作
+
+本版只做减法：插件不再操作用户的桌面。执行目标只剩 DSH 和 Codex Desktop，Claude 只当调用方。Codex 因此也调不起 Claude 会话了，Claude 这边只服务受管会话的 `ask_parent`、`report_parent` 一并删除，Codex 这边的保留。升级后需要重启监工，新进程才会停止列出这个目标。
+
+- 移除 Claude Desktop 执行目标和全部界面自动化：`target: "claude-desktop"` 不复存在，模拟鼠标、键盘、剪贴板并切换前台窗口的那套实现（`claude-host`、`claude-backend`、`claude-observer`、`claude-tree` 及其脚本与测试）一并移走。原因是它要操作用户真实的 Claude 窗口：会切走前台窗口，还可能点停用户正在用的会话。Claude 作为调用方派单给 DSH / Codex Desktop 的能力不变；名单里已存在的 `claude-desktop` 历史记录仍能正常列出，新建时明确拒绝（invalid-target），对它做需要后端的操作返回 backend-not-ready。
+
 ## 0.5.11 — 2026-11-04 · 派单结果和提问传得回来
 
 本版修两个让派单方收不到东西的问题，只对升级后新建的任务生效，已在等待中的历史任务不会被提醒。

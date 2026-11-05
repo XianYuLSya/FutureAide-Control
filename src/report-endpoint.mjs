@@ -1,7 +1,7 @@
-// Readiness link to the loopback tool service that managed Claude sessions call
-// back through. The service itself is src/claude-report-server.mjs (owned by the
-// report surface, tools ask_parent/report_parent only); this module only answers
-// "is OUR roster's service up, and what is its URL".
+// Readiness link to the loopback tool service a calling Claude Desktop session
+// reaches. The service itself is src/claude-report-server.mjs (the shared
+// name-addressed management tools); this module only answers "is OUR roster's
+// service up, and what is its URL".
 //
 // Hosting rule: the one shared monitor hosts it (same RosterStore, same process
 // lifetime), never a service per MCP connection. Identity is the roster itself —

@@ -183,7 +183,7 @@ test('a write that bypasses the store still invalidates the projections', () => 
   try {
     store.insert(record({ state: 'awaiting_report', sleep: { taskId: 'task-a', sessionId: 'session-a', signal: 'baseline' } }));
     assert.equal(store.listSleeping().length, 1, 'the projection is built and cached here');
-    // Another module writes the table directly; claude-report-binding does exactly this.
+    // Another module writes the table directly; an adapter's own state write does this.
     store.db.prepare("UPDATE agents SET body=json_remove(body,'$.sleep') WHERE id=?").run('agent-a');
     // A write the store does know about must not vouch for the one it does not.
     store.claimLease('probe-key', 'probe-holder', 1000);

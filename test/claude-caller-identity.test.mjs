@@ -1,7 +1,6 @@
 // Unit tests for the caller identity used by the report surface. Everything that
 // touches Windows (netstat, process start time, parent process) is injected, so
-// these tests check the decision rules, not this machine. The real lookups are
-// exercised by scripts/claude-report-probe.mjs.
+// these tests check the decision rules, not this machine.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { hostname } from 'node:os';

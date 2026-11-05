@@ -22,8 +22,8 @@ export class RosterStore {
         json_extract(body,'$.callbackBlocked'),json_extract(body,'$.sleep'),json_extract(body,'$.task.taskId'),
         json_extract(body,'$.task.reports'),json_extract(body,'$.task.cancelRequested'),
         json_extract(body,'$.task.cancelVerified'),json_extract(body,'$.task.cancelTreeSettled'),id,owner,name);
-      -- The listener asks "is any name open on this target?" every round; without an
-      -- index that reads every body. Two small values, maintained on write.
+      -- Finding a Codex child by its thread filters on target; without an index that
+      -- reads every body. One small value, maintained on write.
       CREATE INDEX IF NOT EXISTS agents_target ON agents(json_extract(body,'$.target'));
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
@@ -237,25 +237,6 @@ export class RosterStore {
   }
   deleteBackendState(agentId) { this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(agentId); this.dropProjections(); }
   /**
-   * Read-only reverse lookup for a reply surface that must identify its caller
-   * from the native session it was invoked in. Only live claude-desktop names
-   * qualify; a closed or other-target name is not the caller.
-   */
-  agentForNativeSession(nativeSessionId) {
-    if (typeof nativeSessionId !== 'string' || !nativeSessionId) return undefined;
-    const row = this.db.prepare(`SELECT a.id AS agentId, a.owner AS ownerId, a.name AS name,
-      json_extract(a.body,'$.target') AS target, json_extract(a.body,'$.state') AS state,
-      json_extract(a.body,'$.sessionId') AS logicalSessionId, b.body AS body
-      FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
-      WHERE json_extract(b.body,'$.binding.sessionId')=?
-        AND json_extract(a.body,'$.target')='claude-desktop'
-        AND coalesce(json_extract(a.body,'$.closed'),0)=0`).get(nativeSessionId);
-    if (!row) return undefined;
-    const binding = JSON.parse(row.body).binding ?? null;
-    return { agentId: row.agentId, ownerId: row.ownerId, name: row.name, target: row.target,
-      state: row.state, logicalSessionId: row.logicalSessionId, nativeSessionId, binding };
-  }
-  /**
    * The same reverse lookup for a Codex Desktop child: its own chat id is the
    * binding its backend records, and only a live codex-desktop name qualifies.
    */
@@ -438,31 +419,6 @@ export class RosterStore {
       ? ':memory:'
       : (process.platform === 'win32' ? this.location.toLowerCase() : this.location);
     return createHash('sha256').update(location).digest('hex');
-  }
-  /** Open claude-desktop bindings only, for the listener's watch set. */
-  listClaudeBindings() { return [...this.claudeBindings().values()]; }
-  claudeBindings() {
-    return this.projection('claude-bindings', () => new Map(this.db.prepare(`SELECT b.agent AS agent, b.body AS body
-      FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
-      WHERE json_extract(a.body,'$.target')='claude-desktop' AND coalesce(json_extract(a.body,'$.closed'),0)=0`)
-      .all().map(row => [row.agent, JSON.parse(row.body)?.binding ?? {}])));
-  }
-  /**
-   * Does this chat still own any open name on that target? A zero-model
-   * reservation counts: the session has been promised a place before its first
-   * turn, so the listener that serves it must not retire while it exists.
-   *
-   * Two index lookups on agents_target, not a scan of every body: this is asked once
-   * per round and must stay cheap enough to ask every second.
-   */
-  hasOpenTarget(target) {
-    const found = this.db.prepare(`SELECT 1 AS found FROM agents WHERE json_extract(body,'$.target')=?
-      AND coalesce(json_extract(body,'$.closed'),0)=0 LIMIT 1`).get(target);
-    if (found) return true;
-    // Names recorded before the field existed are this target by default.
-    if (target !== 'dsh') return false;
-    return this.db.prepare(`SELECT 1 AS found FROM agents WHERE json_extract(body,'$.target') IS NULL
-      AND coalesce(json_extract(body,'$.closed'),0)=0 LIMIT 1`).get() !== undefined;
   }
   /** Does this exact name still own its row? A skip must not hide a removal. */
   stillPresent(record) {

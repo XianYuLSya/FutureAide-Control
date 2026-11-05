@@ -1,6 +1,6 @@
 // The one boundary between the shared name-addressed state machine and whichever
 // target application executes the work. DSH delegates to the existing managed
-// bridge unchanged; Claude Desktop is supplied by its own adapter. A missing
+// bridge unchanged; Codex Desktop is supplied by its own adapter. A missing
 // adapter is reported as backend-not-ready and is never replaced by the DSH path.
 //
 // Contract (one instance per recorded name; every method async; failures throw an
@@ -52,10 +52,6 @@
 //   withHostLock(fn,{key}) Serialize host-wide work across names and processes
 //                         through the shared lease table, per target (+ optional
 //                         key); reuses store.locked, no second locking scheme.
-//   ensureClaudeReports() Make the loopback tool service ready and return
-//                         {url, ready}; only normal create/deliver calls may start
-//                         it, never a status probe or an adapter probe().
-//   readClaudeReportStatus() Readiness/registration only; never starts anything.
 //
 // Codex Desktop deps (a codex-desktop backend uses these instead):
 //   ensureCodexReports()  Preflight, called once before a name is created. Read-only:
@@ -86,8 +82,14 @@ import path from 'node:path';
 import { historyMessages, modelTurnError } from './control.mjs';
 import { dispatchBoundary } from './dispatch.mjs';
 
-export const TARGETS = Object.freeze(['dsh', 'claude-desktop', 'codex-desktop']);
+export const TARGETS = Object.freeze(['dsh', 'codex-desktop']);
 export const DEFAULT_TARGET = 'dsh';
+// A target an older build offered and this one no longer does. Roster records that
+// carry it are read-only history: nothing can be created on it, and no local work is
+// ever attempted for it. It stays outside TARGETS so creation rejects it outright,
+// while reads keep working — dropping the value entirely would make every read of
+// such a record throw and take list, status, wait and the monitor sweep down with it.
+export const REMOVED_TARGETS = Object.freeze(['claude-desktop']);
 // Older roster records carry no target and keep the DSH behavior they were
 // created with. Native identifiers stay internal: the contract only ever moves
 // the plugin's own sessionId across this boundary.
@@ -103,26 +105,27 @@ export const backendNotReady = (target, missing = []) => fail('backend-not-ready
   `The ${target} backend is not available in this build${missing.length ? `: it does not provide ${missing.join(', ')}` : ''}. No subagent was created and no task was sent to another backend.`);
 export const invalidTarget = value => fail('invalid-target',
   `target must be one of ${TARGETS.join(' / ')}; received ${JSON.stringify(value)}.`);
+export const removedTarget = target => fail('backend-not-ready',
+  `The ${target} target was removed from this build: it drove the user's own application window by simulating the mouse, keyboard and clipboard. This record is read-only and no local work is attempted for it; create a subagent on ${TARGETS.join(' / ')} instead.`);
 
 export function normalizeTarget(value) {
   if (value === undefined || value === null) return DEFAULT_TARGET;
   if (!TARGETS.includes(value)) throw invalidTarget(value);
   return value;
 }
-export function targetOf(record) { return normalizeTarget(record?.target); }
+export function targetOf(record) {
+  const value = record?.target;
+  if (REMOVED_TARGETS.includes(value)) return value;
+  return normalizeTarget(value);
+}
 
 // Display name of the application behind a target, used in user-facing text.
-// DSH keeps its historical wording; an unknown target falls back to its id.
-export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'claude-desktop': 'Claude Desktop', 'codex-desktop': 'Codex Desktop' });
+// DSH keeps its historical wording; a removed target falls back to its own id.
+export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'codex-desktop': 'Codex Desktop' });
 export function hostLabel(record) {
   const target = targetOf(record);
   return TARGET_LABELS[target] ?? target;
 }
-
-// Targets whose sessions call back through the plugin's loopback tool service.
-// Their adapter deps must make that service ready before a zero-model session is
-// created, otherwise the target's first turn has no tool to call.
-export const TARGET_REQUIRES_REPORT_SERVICE = Object.freeze({ 'claude-desktop': true });
 
 const reason = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 400) });
 
@@ -168,7 +171,6 @@ export function assertBackend(backend, target) {
 async function adapterFactory(target, adapters = {}) {
   if (typeof adapters?.[target] === 'function') return adapters[target];
   const entry = {
-    'claude-desktop': ['./claude-backend.mjs', 'createClaudeBackend'],
     'codex-desktop': ['./codex-backend.mjs', 'createCodexBackend'],
   }[target];
   if (!entry) return undefined;
@@ -192,7 +194,9 @@ async function adapterFactory(target, adapters = {}) {
  * factories already resolved by the caller.
  */
 export async function resolveBackend(record, { target, adapters = {}, dsh, load = () => record, deps = {}, adapterLoader = adapterFactory } = {}) {
-  const wanted = normalizeTarget(target ?? record?.target);
+  const requested = target ?? record?.target;
+  if (REMOVED_TARGETS.includes(requested)) throw removedTarget(requested);
+  const wanted = normalizeTarget(requested);
   if (wanted === DEFAULT_TARGET) {
     if (!dsh) throw backendNotReady(DEFAULT_TARGET);
     return assertBackend(createDshBackend({ ...dsh, load }), DEFAULT_TARGET);
@@ -224,7 +228,7 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
     async beginTask(input = {}) { return client.managedBeginTask({ ...args(), ...input }); },
     async observe() { return client.managedStatus(args()); },
     // Native events and the request-id boundary are DSH details; the shared layer
-    // only receives normalized messages, the same shape Claude Desktop returns.
+    // only receives normalized messages, never the host's own event format.
     async history({ targetSessionId, running = false, maxMessages = 20, requestId, afterSeq } = {}) {
       const raw = await client.managedHistory({ ...args(), targetSessionId });
       if (!Array.isArray(raw?.events)) throw Object.assign(new Error('The DSH bridge returned invalid session history.'), { code: 'invalid-response' });

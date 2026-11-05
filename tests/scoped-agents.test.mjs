@@ -574,7 +574,7 @@ test('run refuses a target or lifetime that differs from the existing name', asy
   const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await assert.rejects(f.service.run({ name: 'artist', message: 'x', target: 'claude-desktop' }, extra(A)),
+    await assert.rejects(f.service.run({ name: 'artist', message: 'x', target: 'codex-desktop' }, extra(A)),
       /already bound to DSH/, 'the refusal names the application this name belongs to');
     await assert.rejects(f.service.run({ name: 'artist', message: 'x', lifetime: 'once' }, extra(A)),
       /already a persistent subagent/);
@@ -1662,7 +1662,7 @@ test('the reminder is decision logic on its own, so every condition can be check
   assert.equal(finalReminderDue({ task: dueTask({ reports: [{ final: true }] }), view, target: 'dsh' }), false);
   assert.equal(finalReminderDue({ task: dueTask(), view: { reports: [{ final: true }] }, target: 'dsh' }), false,
     'a final that only reached the observation still counts');
-  assert.equal(finalReminderDue({ task: dueTask(), view, target: 'claude-desktop' }), false,
+  assert.equal(finalReminderDue({ task: dueTask(), view, target: 'codex-desktop' }), false,
     'desktop targets use their own durable queue');
   assert.equal(finalReminderDue({ task: dueTask(), view, target: 'dsh', supplements: [{ task: 'task-a', status: 'queued' }] }), false);
   assert.equal(finalReminderDue({ task: dueTask(), view, target: 'dsh', supplements: [{ task: 'task-a', status: 'accepted' }] }), true,

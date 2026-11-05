@@ -1,10 +1,10 @@
 // The report and question shape every managed target is asked to follow.
 //
 // One copy lives here and is embedded in the ask_parent / report_parent tool
-// descriptions of the three surfaces: the Codex side in mcp-server.mjs, the Claude
-// side in claude-report-server.mjs, and the DSH side in host-plugin.mjs. The DSH
-// plugin may only import node: builtins, so it keeps a literal copy of both strings;
-// tests/report-contract.test.mjs compares it with this module verbatim.
+// descriptions of the two surfaces: the Codex side in mcp-server.mjs and the DSH
+// side in host-plugin.mjs. The DSH plugin may only import node: builtins, so it
+// keeps a literal copy of both strings; tests/report-contract.test.mjs compares it
+// with this module verbatim.
 
 /** How a final report is written, for an agent whose lead spot-checks it. */
 export const FINAL_REPORT_CONTRACT = 'Write a final report for a controlling agent that will spot-check it, not re-read your work. '

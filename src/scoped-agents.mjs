@@ -8,14 +8,13 @@ import { resolveModel } from './agents.mjs';
 import { invokeCodexTool } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
-import { resolveNativeSession } from './claude-host.mjs';
+import { resolveNativeSession } from './claude-sessions.mjs';
 import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './report-endpoint.mjs';
 import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
-  TARGET_LABELS, TARGET_REQUIRES_REPORT_SERVICE, targetOf } from './agent-backend.mjs';
+  TARGET_LABELS, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 import { FINAL_REPORT_REMINDER } from './report-contract.mjs';
 
@@ -350,11 +349,9 @@ export function createScopedAgents(config, {
   removeTree = rm,
   backendAdapters = {},
   backendAdapterLoader = undefined,
-  reportStatusProbe = readReportStatus,
   codexReportReady = undefined,
   codexToolsStatus = undefined,
   codexProbeRegistration = undefined,
-  reportReadyTimeoutMs = 2000,
   captureFiles = captureWorkspace,
   onPollComplete = () => {},
   // Work queued in this process (a supplement, a cancel, a first dispatch) is a wake
@@ -453,25 +450,15 @@ export function createScopedAgents(config, {
   // Handles an adapter needs on the shared side: the target's own state in its own
   // row (never inside the record the shared layer will save again) and one host
   // lock per target application, reusing the existing lease table.
-  //
-  // ensureClaudeReports() makes the loopback tool service ready and returns
-  // {url, ready}: it starts THE shared monitor (the single host of that service —
-  // never a service per MCP connection) and waits for its health check with a
-  // short deadline. If the monitor cannot answer, ready is false with a reason; no
-  // other process grabs the port. readClaudeReportStatus() only reads
-  // readiness/registration, so a status probe can ask without starting anything.
-  const adapterDeps = (record, { startReports = true } = {}) => {
+  const adapterDeps = record => {
     const load = () => store.get(record.agentId) ?? record;
     const target = targetOf(record);
-    const readStatus = () => reportStatusProbe({ port: reportPort(config), expectedRoster: rosterIdentity(store) });
     return {
       load,
       requestDirectory: () => agentDirectory(load()),
       readNativeState: () => store.backendState(record.agentId),
       writeNativeState: value => store.saveBackendState(record.agentId, value),
       withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
-      ensureClaudeReports: () => (startReports ? ensureReportsReady() : readStatus()),
-      readClaudeReportStatus: readStatus,
       ensureCodexReports: () => beginCodexReports(record),
       readCodexReportState: () => readCodexReportState(load()),
       // The Codex probe reads its protocol readiness only; this must never start a
@@ -483,20 +470,6 @@ export function createScopedAgents(config, {
       hostOptions: { anchorResolver: () => anchorResolver(load()) },
     };
   };
-  async function ensureReportsReady() {
-    const port = reportPort(config);
-    await ensureMonitor();
-    const deadline = Date.now() + reportReadyTimeoutMs;
-    for (;;) {
-      const status = await reportStatusProbe({ port, expectedRoster: rosterIdentity(store) });
-      if (status.ready) return { ...status, via: 'monitor' };
-      if (Date.now() >= deadline) break;
-      await wait(50);
-    }
-    // The single monitor owns the service; this call never takes the port itself.
-    return { port, url: reportUrl(port), ready: false, via: 'none',
-      reason: { code: 'report-service-unavailable', message: 'The shared monitor that hosts the tool service did not answer in time.' } };
-  }
   // The chosen backend is rebuilt per operation from the live record, so a new
   // task id or state never hides behind a cached binding. Only the DSH client
   // (one authenticated connection per agent) is kept.
@@ -539,15 +512,6 @@ export function createScopedAgents(config, {
     }
     if (probe.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(label);
     if (probe.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(label);
-    // A zero-model session whose tool endpoint is not up would make the target's
-    // first turn call nothing. Refuse the name instead of creating it half-wired.
-    if (TARGET_REQUIRES_REPORT_SERVICE[target] === true) {
-      const endpoint = await deps.ensureClaudeReports();
-      if (endpoint?.ready !== true) {
-        throw Object.assign(new Error('The loopback tool service that managed sessions report through is not ready; no subagent was created.'),
-          { code: 'report-service-unavailable', ...(endpoint?.reason ? { detail: endpoint.reason } : {}) });
-      }
-    }
     // A Codex Desktop name is useless without its own ask/report tool surface, and
     // an online endpoint alone does not mean those tools are registered.
     if (target === 'codex-desktop') {
@@ -1723,25 +1687,22 @@ export function createScopedAgents(config, {
         && status.treeProtocolReady === true && status.reportProtocolReady === true;
       // Per-target readiness beside the unchanged DSH fields. Neither entry starts
       // a model turn or a session: the DSH probe is the same one above, and the
-      // claude-desktop entry imports its adapter and asks probe() only.
+      // Codex entry only reads its own registration evidence.
       const probe = { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
-        lifetime: 'once', target: 'claude-desktop', workspace: owner?.workspace ?? config.workspace,
+        lifetime: 'once', target: 'codex-desktop', workspace: owner?.workspace ?? config.workspace,
         state: 'probing', createdAt: now(), updatedAt: now(), history: [] };
       status.backends = {
         dsh: dshDiagnostics(host, status),
-        // This probe name is not in the roster, so a state write during diagnostics
-        // reports false instead of inventing a row.
-        'claude-desktop': await diagnoseTarget('claude-desktop', { adapters: backendAdapters,
-          ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
-          record: probe, deps: adapterDeps(probe, { startReports: false }) }),
       };
-      // A Codex Desktop entry is ready only when a real native Codex session reports
-      // the ask/report tools; an adapter that merely answers probe() is not enough,
-      // and a healthy loopback endpoint proves nothing about those tools.
+      // This probe name is not in the roster, so a state write during diagnostics
+      // reports false instead of inventing a row. A Codex Desktop entry is ready only
+      // when a real native Codex session reports the ask/report tools; an adapter that
+      // merely answers probe() is not enough, and a healthy loopback endpoint proves
+      // nothing about those tools.
       const codexProbe = { ...probe, target: 'codex-desktop' };
       const codexEntry = await diagnoseTarget('codex-desktop', { adapters: backendAdapters,
         ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
-        record: codexProbe, deps: adapterDeps(codexProbe, { startReports: false }) });
+        record: codexProbe, deps: adapterDeps(codexProbe) });
       status.backends['codex-desktop'] = codexEntry.ready ? codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)) : codexEntry;
       return status;
     },
@@ -1750,12 +1711,10 @@ export function createScopedAgents(config, {
       if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
       const backendTarget = normalizeTarget(target);
       const owner = await context(extra);
-      // A cross-application call: when the caller is itself a managed name — a
-      // Claude session by its native id, or a Codex child by its own chat — the new
-      // name is its child and follows that owner tree.
-      const caller = trustedCaller(extra);
-      const parent = caller ? store.agentForNativeSession(caller.nativeSessionId)
-        : store.agentForCodexThread(callingThread(extra));
+      // A cross-application call: when the caller is itself a managed Codex child, the
+      // new name is its child and follows that owner tree. A verified Claude caller has
+      // no Codex thread to look up — it owns its names flat, so it is never asked for one.
+      const parent = trustedCaller(extra) ? undefined : store.agentForCodexThread(callingThread(extra));
       const record = { agentId: uid('agent'), ownerId: owner.ownerId, sessionId: uid('session-codex'), name, lifetime,
         target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
         ...(parent ? { parentAgentId: parent.agentId } : {}) };

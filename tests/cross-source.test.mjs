@@ -126,7 +126,7 @@ test('a managed name created from another managed session follows the parent tre
     const childId = 'agent-' + 'e'.repeat(32);
     const base = { createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), history: [],
       lifetime: 'persistent', workspace, created: true, nativeDestroyed: true, state: 'idle' };
-    store.insert({ ...base, agentId: rootId, ownerId: ownerIdFor(THREAD), sessionId: 'session-root', name: 'root', target: 'claude-desktop' });
+    store.insert({ ...base, agentId: rootId, ownerId: ownerIdFor(THREAD), sessionId: 'session-root', name: 'root', target: 'codex-desktop' });
     // The child was created from inside the parent's Claude session, so it belongs to
     // that session's own owner and runs on a third application.
     store.insert({ ...base, agentId: childId, ownerId: ownerIdForSource('claude-desktop', 'native-s'),
@@ -161,18 +161,6 @@ test('a verified Claude owner keeps its host session and binding for cold resume
     assert.equal(saved.binding.socketPath, binding.socketPath, 'the transport binding survives a cold start');
     assert.equal(store.saveOwner({ ...saved }).binding.pid, 4242);
   } finally { store.close(); }
-});
-
-test('a name created by a managed parent records its parent and an unmanaged caller does not', async () => {
-  const { service, store } = await fixture();
-  try {
-    const parent = { agentId: 'agent-' + 'c'.repeat(32), ownerId: 'owner-parent', sessionId: 'session-parent',
-      name: 'parent', lifetime: 'persistent', target: 'claude-desktop', workspace, state: 'idle', created: true,
-      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), history: [] };
-    store.insert(parent);
-    store.saveBackendState(parent.agentId, { binding: { sessionId: 'native-parent', transcriptFile: 'D:\\claude\\p.jsonl' } });
-    assert.equal(store.agentForNativeSession('native-parent').agentId, parent.agentId);
-  } finally { service.close(); }
 });
 
 
@@ -218,7 +206,7 @@ function fakeBackend({ nodes = [], changes = [], historyText = id => 'history:' 
 }
 
 const taskRecord = (overrides) => ({ state: 'awaiting_report', created: true, nativeDestroyed: true,
-  lifetime: 'persistent', target: 'claude-desktop', workspace, createdAt: new Date().toISOString(),
+  lifetime: 'persistent', target: 'codex-desktop', workspace, createdAt: new Date().toISOString(),
   updatedAt: new Date().toISOString(), history: [], task: { taskId: 'task-' + overrides.name, message: 'work',
     state: 'running', startedAt: new Date().toISOString(), dispatches: [], answers: [], reports: [] }, ...overrides });
 
@@ -232,14 +220,14 @@ test('a same-named descendant never enters this chat’s namespace or list', asy
   const owner = ownerIdFor(THREAD);
   const alpha = 'agent-' + '1'.repeat(32);
   const beta = 'agent-' + '2'.repeat(32);
-  const f = await fixture({ adapters: { 'claude-desktop': fakeBackend() } });
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
   try {
     f.store.insert(taskRecord({ agentId: alpha, ownerId: owner, sessionId: 'session-alpha', name: 'alpha' }));
     f.store.insert(taskRecord({ agentId: beta, ownerId: owner, sessionId: 'session-beta', name: 'beta' }));
     // Both roots have a descendant called reviewer, each under its own session owner.
     for (const [parent, native] of [[alpha, 'native-alpha'], [beta, 'native-beta']]) {
       f.store.insert(taskRecord({ agentId: 'agent-' + parent.slice(6, 12) + 'f'.repeat(26), ownerId: ownerIdForSource('claude-desktop', native),
-        sessionId: 'session-' + native, name: 'reviewer', target: 'claude-desktop', parentAgentId: parent }));
+        sessionId: 'session-' + native, name: 'reviewer', target: 'codex-desktop', parentAgentId: parent }));
     }
     const listed = await f.service.list(extra(THREAD));
     assert.deepEqual(listed.items.map(item => item.name).sort(), ['alpha', 'beta'], 'descendants stay out of the list');
@@ -256,7 +244,7 @@ test('one composed view: a running descendant keeps the root from finishing', as
   const owner = ownerIdFor(THREAD);
   const rootId = 'agent-' + '3'.repeat(32);
   const childId = 'agent-' + '4'.repeat(32);
-  const f = await fixture({ adapters: { 'claude-desktop': fakeBackend() } });
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
   try {
     f.store.insert(taskRecord({ agentId: rootId, ownerId: owner, sessionId: 'session-root', name: 'root',
       state: 'awaiting_report', task: { taskId: 'task-root', message: 'work', state: 'running',
@@ -284,7 +272,7 @@ test('inspect and changes expose the mixed tree without internal ids', async () 
     changes: [{ path: 'src/root.ts', operation: 'edit' }], coverage: 'Observed' }];
   const childNodes = [{ sessionId: 'session-child', parentSessionId: null, name: 'child', status: 'idle', activity: 'idle',
     changes: [{ path: 'src/child.ts', operation: 'edit' }], coverage: 'Observed' }];
-  const f = await fixture({ adapters: { 'claude-desktop': record => {
+  const f = await fixture({ adapters: { 'codex-desktop': record => {
     const factory = fakeBackend(record.name === 'root' ? { nodes } : { nodes: childNodes });
     return factory(record);
   } } });
@@ -310,7 +298,7 @@ test('children are cleaned first; a child failure keeps the parent retryable', a
   const rootId = 'agent-' + '7'.repeat(32);
   const childId = 'agent-' + '8'.repeat(32);
   const backend = fakeBackend({ failDestroyTimes: 1, failWhen: record => record.name === 'child' });
-  const f = await fixture({ adapters: { 'claude-desktop': backend } });
+  const f = await fixture({ adapters: { 'codex-desktop': backend } });
   try {
     f.store.insert(taskRecord({ agentId: rootId, ownerId: owner, sessionId: 'session-root', name: 'root', nativeDestroyed: false }));
     f.store.insert(taskRecord({ agentId: childId, ownerId: ownerIdForSource('claude-desktop', 'native-kid3'),
@@ -333,7 +321,7 @@ test('children are cleaned first; a child failure keeps the parent retryable', a
 
 test('three managed levels settle after persistent child finals and pending notices finish', async () => {
   const backend = fakeBackend({ changes: [{ path: 'work.txt', operation: 'write' }] });
-  const f = await fixture({ adapters: { 'claude-desktop': backend } });
+  const f = await fixture({ adapters: { 'codex-desktop': backend } });
   try {
     await f.service.list(extra(THREAD));
     await f.service.list(extra(OTHER));
@@ -367,7 +355,7 @@ test('three managed levels settle after persistent child finals and pending noti
 
 test('a once child cleans itself and its files and native history survive in the parent task', async () => {
   const backend = fakeBackend({ changes: [{ path: 'child.txt', operation: 'write' }], historyText: () => 'completed child history' });
-  const f = await fixture({ adapters: { 'claude-desktop': backend } });
+  const f = await fixture({ adapters: { 'codex-desktop': backend } });
   try {
     await f.service.list(extra(THREAD)); await f.service.list(extra(OTHER));
     f.store.insert(taskRecord({ agentId: 'parent', ownerId: ownerIdFor(THREAD), sessionId: 'session-parent', name: 'parent',
@@ -417,7 +405,7 @@ test('a task keeps its workspace baseline beside the agent state and ends with u
     snapshot(root, { 'confirmed.txt': { code: ' M', stamp: '2000:9' }, 'shell-written.txt': { code: '??', stamp: '2000:7' } }));
   const base = fakeBackend({ changes: [{ path: confirmed, operation: 'write' }] });
   let finalSubmitted = false;
-  const f = await fixture({ captureFiles, adapters: { 'claude-desktop': record => ({ ...base(record),
+  const f = await fixture({ captureFiles, adapters: { 'codex-desktop': record => ({ ...base(record),
     observe: async () => ({ ...await base(record).observe(), reports: finalSubmitted
       ? [{ id: 'final-snapshot', taskId: record.task.taskId, message: 'files written', final: true, createdAt: new Date().toISOString() }]
       : [] }) }) } });
@@ -474,7 +462,7 @@ test('a running task computes workspace changes on demand and persists nothing',
   const captureFiles = snapshotSource(root, snapshot(root, {}),
     snapshot(root, { 'shell-written.txt': { code: '??', stamp: '2000:7' } }));
   const base = fakeBackend();
-  const f = await fixture({ captureFiles, adapters: { 'claude-desktop': record => base(record) } });
+  const f = await fixture({ captureFiles, adapters: { 'codex-desktop': record => base(record) } });
   try {
     await f.service.list(extra(THREAD));
     f.store.insert(taskRecord({ agentId: 'live', ownerId: ownerIdFor(THREAD), sessionId: 'session-live',
@@ -502,7 +490,7 @@ test('a failed or unusable snapshot never blocks delivery and states its reason'
   ];
   for (const scenario of scenarios) {
     const base = fakeBackend();
-    const f = await fixture({ captureFiles: scenario.capture, adapters: { 'claude-desktop': record => base(record) } });
+    const f = await fixture({ captureFiles: scenario.capture, adapters: { 'codex-desktop': record => base(record) } });
     try {
       await f.service.list(extra(THREAD));
       f.store.insert(taskRecord({ agentId: scenario.name, ownerId: ownerIdFor(THREAD), sessionId: `session-${scenario.name}`,
@@ -560,7 +548,7 @@ test('Codex poll consumes submissions atomically while ask remains answerable th
 test('cancelPending keeps the monitor advancing a late handback until the native tree settles', async () => {
   let cancels = 0;
   const base = fakeBackend();
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record), cancel: async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record), cancel: async () => {
     cancels++;
     return { cancelRequested: true, cancelPending: cancels < 3, remainingTasks: cancels < 3 ? ['late-handback'] : [], treeSettled: cancels >= 3 };
   } }) } });
@@ -590,7 +578,7 @@ test('Desktop first input and immediate supplement queue promptly and each dispa
   const sent = [];
   let instances = 0;
   const base = fakeBackend();
-  const f = await fixture({ adapters: { 'claude-desktop': record => {
+  const f = await fixture({ adapters: { 'codex-desktop': record => {
     instances++;
     return { ...base(record), deliver: async input => { sent.push(input); return { accepted: true }; } };
   } } });
@@ -617,7 +605,7 @@ test('one slow monitor name does not hold up another and shutdown drains the sin
   const fast = new Promise(resolve => { fastDone = resolve; });
   let slowCalls = 0, wakes = 0;
   const base = fakeBackend();
-  const f = await fixture({ onPollComplete: () => wakes++, adapters: { 'claude-desktop': record => ({ ...base(record),
+  const f = await fixture({ onPollComplete: () => wakes++, adapters: { 'codex-desktop': record => ({ ...base(record),
     deliver: async () => {
       if (record.name === 'a-slow') { slowCalls++; enterSlow(); await gate; }
       else fastDone();
@@ -647,7 +635,7 @@ test('a 123-name retained roster serves HTTP during a scan without loading idle 
   const { startHttpService } = await import('../src/claude-report-server.mjs');
   const base = fakeBackend();
   let observed = 0;
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     observe: async () => { observed++; return base(record).observe(); } }) } });
   const http = await startHttpService({ port: 0 });
   const gets = new Set(), get = f.store.get.bind(f.store);
@@ -677,7 +665,7 @@ test('a 123-name retained roster serves HTTP during a scan without loading idle 
 test('pre-delivery failures back off visibly, while ambiguous delivery is never sent again', async () => {
   let beginFailures = 1, modelFailures = 1, begins = 0, models = 0, sends = 0;
   const base = fakeBackend();
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     beginTask: async () => { begins++; if (beginFailures-- > 0) throw Object.assign(new Error('host busy before begin'), { code: 'agent-busy' }); return { treeProtocol: 1, reportProtocol: 1 }; },
     models: async () => { models++; if (modelFailures-- > 0) throw Object.assign(new Error('default read busy'), { code: 'agent-busy' }); return base(record).models(); },
     deliver: async () => { sends++; throw Object.assign(new Error('receipt not yet known'), { uncertain: true, code: 'delivery-unknown' }); },
@@ -708,7 +696,7 @@ test('pre-delivery failures back off visibly, while ambiguous delivery is never 
 test('supplement backoff does not delay a running task question and progress notice', async () => {
   const base = fakeBackend();
   let observations = 0, sends = 0, receipts = 0;
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     observe: async () => { observations++; return { ...await base(record).observe(),
       questions: [{ id: 'q-live', state: 'pending', message: 'Need a decision' }],
       reports: [{ id: 'progress-live', taskId: record.task.taskId, message: 'Work progressed', final: false }] }; },
@@ -738,7 +726,7 @@ test('supplement backoff does not delay a running task question and progress not
 test('parent observation never enters a busy child backend and stale child evidence cannot settle', async () => {
   const calls = [];
   const base = fakeBackend();
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     observe: async () => { calls.push(record.name); return base(record).observe(); },
   }) } });
   try {
@@ -764,7 +752,7 @@ test('parent observation never enters a busy child backend and stale child evide
 test('queued Desktop cleanup survives an old poll save and native failure is visible and retryable', async () => {
   let destroys = 0;
   const base = fakeBackend();
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record), destroy: async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record), destroy: async () => {
     destroys++; return { destroyed: destroys > 1, message: 'native deletion refused' };
   } }) } });
   try {
@@ -788,7 +776,7 @@ test('queued Desktop cleanup survives an old poll save and native failure is vis
 test('queued Desktop cancel exposes a host failure, backs off and resumes the same intent', async () => {
   let cancels = 0;
   const base = fakeBackend();
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record), cancel: async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record), cancel: async () => {
     cancels++;
     if (cancels === 1) throw Object.assign(new Error('cancel host unavailable'), { code: 'host-unavailable' });
     return { cancelRequested: true, cancelPending: false };
@@ -813,7 +801,7 @@ test('queued Desktop cancel exposes a host failure, backs off and resumes the sa
 test('a returned stop refusal remains visible through observation until native cancellation settles', async () => {
   let cancels = 0, settled = false;
   const base = fakeBackend();
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     observe: async () => { const view = await base(record).observe(); return { ...view, running: !settled,
       tree: { ...view.tree, running: !settled, settled } }; },
     cancel: async () => {
@@ -855,7 +843,7 @@ test('a returned stop refusal remains visible through observation until native c
 test('a recovered receipt clears stale dispatch errors and completed legacy errors stay out of list', async () => {
   const base = fakeBackend();
   let sends = 0;
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...base(record),
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     receipt: async () => ({ status: 'accepted', afterSeq: 1 }),
     deliver: async () => { sends++; throw new Error('recovery must not resend'); },
   }) } });

@@ -8,7 +8,6 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from '../src/report-contract.mjs';
 import * as dsh from '../src/host-plugin.mjs';
 import { makeScopedServer } from '../src/mcp-server.mjs';
-import { createClaudeReportServer } from '../src/claude-report-server.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -55,16 +54,3 @@ test('the Codex surface carries both contracts in its parent tools', async () =>
   } finally { await close(); }
 });
 
-test('the Claude surface carries both contracts in its parent tools', async () => {
-  const server = createClaudeReportServer({
-    resolveCaller: async () => ({ sessionId: 'native-1', workspace: root, pid: 1 }),
-    resolveOwned: async () => null,
-  });
-  const { client, close } = await connected(server);
-  try {
-    const tools = (await client.listTools()).tools;
-    assert.ok(tools.find(tool => tool.name === 'report_parent').description.includes(FINAL_REPORT_CONTRACT));
-    assert.ok(tools.find(tool => tool.name === 'ask_parent').description.includes(QUESTION_CONTRACT));
-    assert.doesNotMatch(JSON.stringify(tools), /Codex parent chat|Codex chat/);
-  } finally { await close(); }
-});

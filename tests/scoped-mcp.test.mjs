@@ -59,7 +59,7 @@ test('creation advertises one optional target and never repeats it on later call
     const { tools } = await client.listTools();
     const create = tools.find(tool => tool.name === 'futureaide_create_agent');
     assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['lifetime', 'name', 'target']);
-    assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'claude-desktop', 'codex-desktop'],
+    assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'codex-desktop'],
       'every supported application is reachable from the public schema, not just internally');
     assert.ok(!create.inputSchema.required?.includes('target'), 'the target stays optional');
     // run is the second entry point that may bind a new name to an application; it
@@ -71,9 +71,9 @@ test('creation advertises one optional target and never repeats it on later call
     await client.callTool({ name: 'futureaide_create_agent', arguments: { name: '搭档', lifetime: 'persistent' }, _meta: { threadId } });
     assert.deepEqual(calls[0].args, { name: '搭档', lifetime: 'persistent' }, 'an omitted target adds no argument');
     const selected = await client.callTool({ name: 'futureaide_create_agent',
-      arguments: { name: 'Opus搭档', lifetime: 'persistent', target: 'claude-desktop' }, _meta: { threadId } });
+      arguments: { name: 'Opus搭档', lifetime: 'persistent', target: 'codex-desktop' }, _meta: { threadId } });
     assert.notEqual(selected.isError, true);
-    assert.deepEqual(calls[1].args, { name: 'Opus搭档', lifetime: 'persistent', target: 'claude-desktop' });
+    assert.deepEqual(calls[1].args, { name: 'Opus搭档', lifetime: 'persistent', target: 'codex-desktop' });
     const refused = await client.callTool({ name: 'futureaide_create_agent',
       arguments: { name: 'other', lifetime: 'once', target: 'claude' }, _meta: { threadId } });
     assert.equal(refused.isError, true, 'the schema owns the enum');
@@ -158,17 +158,17 @@ test('list and wait answer compactly and return the full structure only for deta
 
 test('a compact view still reports a failed status as an error', async () => {
   let response = { ready: true, contextVerified: true, dshConnected: true,
-    backends: { dsh: { ready: true, connected: true }, 'claude-desktop': { ready: true, present: true, methods: ['probe', 'create'], treeProtocol: 1 } } };
+    backends: { dsh: { ready: true, connected: true }, 'codex-desktop': { ready: true, present: true, methods: ['probe', 'create'], treeProtocol: 1 } } };
   const { client, close } = await connected({ async resume() {}, async status() { return response; } });
   try {
     const shown = await client.callTool({ name: 'futureaide_status', arguments: {} });
     assert.notEqual(shown.isError, true);
     const status = JSON.parse(shown.content[0].text);
     assert.deepEqual(status.backends.dsh, { ready: true, connected: true });
-    assert.equal('methods' in status.backends['claude-desktop'], false, 'advertised method lists stay out of the text');
-    assert.equal(status.backends['claude-desktop'].treeProtocol, 1, 'readiness evidence is kept');
+    assert.equal('methods' in status.backends['codex-desktop'], false, 'advertised method lists stay out of the text');
+    assert.equal(status.backends['codex-desktop'].treeProtocol, 1, 'readiness evidence is kept');
     const full = JSON.parse((await client.callTool({ name: 'futureaide_status', arguments: { detail: true } })).content[0].text);
-    assert.deepEqual(full.backends['claude-desktop'].methods, ['probe', 'create'], 'detail keeps the advertised methods');
+    assert.deepEqual(full.backends['codex-desktop'].methods, ['probe', 'create'], 'detail keeps the advertised methods');
     response = { ...response, ready: false, backends: { ...response.backends, dsh: { ready: false, connected: false, reason: { code: 'managed-host-required' } } } };
     const refused = await client.callTool({ name: 'futureaide_status', arguments: {} });
     assert.equal(refused.isError, true, 'isError is decided on the full result, not the view');

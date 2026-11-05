@@ -111,19 +111,17 @@ test('two watched directories each deliver their own event', async () => {
   } finally { watchers.close(); }
 });
 
-test('the watch set covers the DSH host, the Claude registry and every binding', () => {
+test('the watch set covers the DSH host and the Claude registry', () => {
   const config = { stateDirectory: 'D:/state', hostBridgeFile: 'D:/state/host-bridge.json' };
-  const directories = monitorDirectories(config, { env: { CLAUDE_CONFIG_DIR: 'D:/claude' }, exists: () => true,
-    bindings: ['D:/claude/projects/p1/session-a.jsonl', 'D:/claude/projects/p2/session-b.jsonl'] });
-  assert.deepEqual(directories, ['D:/state/managed-host', 'D:/claude/sessions',
-    'D:/claude/projects/p1', 'D:/claude/projects/p2'].map(normalize));
+  const directories = monitorDirectories(config, { env: { CLAUDE_CONFIG_DIR: 'D:/claude' }, exists: () => true });
+  assert.deepEqual(directories, ['D:/state/managed-host', 'D:/claude/sessions'].map(normalize));
   // The roster directory is never watched: its -shm/-wal churn would echo our own
   // poll back at us. External commits are read from dataVersion() instead.
   assert.equal(directories.includes(normalize('D:/state')), false);
   // A directory that does not exist yet is skipped instead of breaking the watch.
   const filtered = monitorDirectories(config, { env: { CLAUDE_CONFIG_DIR: 'D:/claude' },
-    exists: directory => !directory.includes('projects'), bindings: ['D:/claude/projects/p1/session-a.jsonl'] });
-  assert.equal(filtered.some(directory => directory.includes('projects')), false);
+    exists: directory => !directory.includes('sessions') });
+  assert.equal(filtered.some(directory => directory.includes('sessions')), false);
   // The managed host directory can be configured explicitly.
   const explicit = monitorDirectories({ stateDirectory: 'D:/state', managedStateDirectory: 'D:/host' },
     { env: { CLAUDE_CONFIG_DIR: 'D:/claude' }, exists: () => true });

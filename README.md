@@ -2,29 +2,29 @@
 
 # FutureAide Control
 
-让 Codex 和 Claude Desktop 都能按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务；调用方也可以把 Claude Desktop 或 Codex Desktop 当作被调用目标（实验性）。插件自动识别当前聊天和项目；每个调用方有自己的名单。
+让 Codex 和 Claude Desktop 都能按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务；调用方也可以把 Codex Desktop 当作被调用目标（实验性）。插件自动识别当前聊天和项目；每个调用方有自己的名单。
 
-> **0.5.11（2026-11-04）**：派单结果和提问都能传回来了：助手没交最终报告时会被提醒一次，DSH 自带的提问工具会被拦下并转到 `ask_parent`。同时适配 DSH 0.2.2，单次读类工具调用从约 3.5 秒降到约 0.5 秒。主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 与 Claude Desktop 作为被调用目标（`target: 'codex-desktop'`、`'claude-desktop'`）仍是实验性的：功能在，后续继续完善，本版不按完成计。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
+> **0.5.12（2026-11-05）**：移除 `claude-desktop` 目标和全部窗口操作，插件不再模拟鼠标、键盘和剪贴板：执行目标只有 DSH 和 Codex Desktop，Claude 只当调用方。此前的改进都保留：派单结果和提问都能传回来了：助手没交最终报告时会被提醒一次，DSH 自带的提问工具会被拦下并转到 `ask_parent`。同时适配 DSH 0.2.2，单次读类工具调用从约 3.5 秒降到约 0.5 秒。主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 作为被调用目标（`target: 'codex-desktop'`）仍是实验性的：功能在，后续继续完善，本版不按完成计。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
 
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：助手用 `ask_parent` 提问，父级按名字回答；显式 `report_parent` 决定何时回包，正文只转发它提交的内容。
-- **多层分工**：助手可安排原生下属，受管 Claude 与 Codex 也可用同一套工具跨应用分工；顶层最终交付等待整棵树收尾。
+- **多层分工**：助手可安排原生下属，受管 Codex 也可用同一套工具跨应用分工；顶层最终交付等待整棵树收尾。
 - **随时监工**：列表显示各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
 - **管理生命周期**：一次性任务显式 final 报告送达且整树收尾后清除会话；长期代理保留上下文，按名字继续使用。
 
 无需填写项目路径、内部 ID 或创建传信 txt。每次新派单、补充与回答接续跟随所选应用的当前默认模型和推理档位；同一输入的后台恢复保留原模型与请求身份。版本变化见 [CHANGELOG](CHANGELOG.md)。
 
-## 调用 Claude Desktop，与调用 DSH 同一流程
+## 调用 Codex Desktop，与调用 DSH 同一流程
 
-当前机器已经接好正式入口。保持目标桌面应用运行，先用 `futureaide_status({})` 查看对应 `backends` 是否就绪，然后创建并派单：
+保持目标桌面应用运行，先用 `futureaide_status({})` 查看对应 `backends` 是否就绪，然后创建并派单：
 
 ```text
-futureaide_create_agent({name: "方案搭档", lifetime: "persistent", target: "claude-desktop"})
+futureaide_create_agent({name: "方案搭档", lifetime: "persistent", target: "codex-desktop"})
 futureaide_send_agent({name: "方案搭档", message: "阅读当前项目，检查方案并提出改进；需要确认就 ask_parent，完成后 report_parent(final:true)。"})
 futureaide_list_agents({})
 ```
 
-Claude 在自己的项目会话中工作；提问和显式报告回到创建它的聊天。父级用 `futureaide_answer_agent` 回答、`futureaide_agent_changes` 看文件、`futureaide_inspect_agent` 看上下文。Claude 需要 Codex 帮忙时，在自己的会话调用 `futureaide_create_agent({name, lifetime, target:"codex-desktop"})`，其余操作完全相同；省略 `target` 就调用 DSH。
+Codex 在自己的会话中工作；提问和显式报告回到创建它的聊天。父级用 `futureaide_answer_agent` 回答、`futureaide_agent_changes` 看文件、`futureaide_inspect_agent` 看上下文。省略 `target` 就调用 DSH。
 
 `once` 在成功 final 送达且整树收尾后自动删除会话，保留项目产物；`persistent` 留下同一上下文供下一项任务使用。按名字取消保留上下文，按名字删除清理它拥有的整棵会话树。桌面调用的 `queued:true` 表示已持久保存，后续由监控推进，调用方无需重复发送。
 
@@ -60,7 +60,7 @@ Claude 侧的桥接进程声明了 `tools.listChanged`：服务端的工具名�
 
 从 0.4 升级到 0.5 前，先让正在运行的任务完成。需要保留在途任务升级时，还须按原任务身份切换后台 `scoped-worker`；仅重新加载 MCP 不会替换已经启动的监工进程，也不要重新派发任务来代替迁移。
 
-宿主目标由 `target` 决定：`dsh`（默认）、`claude-desktop`、`codex-desktop`。DSH 路径未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；桌面目标使用已由宿主打开的应用会话，每个目标单独发现与校验，不读取账号凭据、不启动独立 CLI 顶替桌面。旧 FutureAide 应用的 shell、端口、启动日志与环境变量覆盖一律不使用。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
+宿主目标由 `target` 决定：`dsh`（默认）、`codex-desktop`。DSH 路径未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；桌面目标使用已由宿主打开的应用会话，每个目标单独发现与校验，不读取账号凭据、不启动独立 CLI 顶替桌面。旧 FutureAide 应用的 shell、端口、启动日志与环境变量覆盖一律不使用。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
 
 维护 CLI 默认使用此安装目录的 `.runtime/config.json`；`--config` 和配置环境变量可显式选择其他配置。桌面桥接若已绑定不同凭据或托管状态目录，安装会报告冲突并保留原绑定；只有确定要迁移时才使用 `desktop-host-install --rebind` 或 `connect-desktop.ps1 -Rebind`。
 
@@ -130,9 +130,9 @@ futureaide_inspect_agent({name: "设计团队长"})
 
 | 工具 | 用途 |
 |---|---|
-| `futureaide_status` | 检查当前调用方与项目，以及三种后端各自是否就绪 |
+| `futureaide_status` | 检查当前调用方与项目，以及两种后端各自是否就绪 |
 | `futureaide_run_agent` | 一步创建并派单；名字已存在就直接发给它；省略 `name` 时自动生成 |
-| `futureaide_create_agent` | 创建一次性或长期子代理；可选 `target`：`dsh`（默认）/`claude-desktop`/`codex-desktop` |
+| `futureaide_create_agent` | 创建一次性或长期子代理；可选 `target`：`dsh`（默认）/`codex-desktop` |
 | `futureaide_send_agent` | 发任务、运行中补充（DSH 下模型下一步就能读到）；等待回答时也可直接答复 |
 | `futureaide_answer_agent` | 回答当前待答问题 |
 | `futureaide_list_agents` | 查看本聊天名单；有下属的名字用 `team` 一行一人列出整棵树 |
@@ -142,7 +142,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 | `futureaide_cancel_agent` | 停止当前任务及所属后代，清除未执行输入，保留上下文 |
 | `futureaide_delete_agent` | 关闭代理及所属后代，清除会话数据，保留项目产物 |
 
-受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。DSH 助手的一轮结束却没有 final 报告时，插件会在同一任务里提醒它一次（主控侧不产生通知，任务保持 running）；失败或取消的轮次不提醒，提醒后仍没有 final 就正常停在 `awaiting_report`，同一任务不会重复提醒。Claude 与 Codex 目标的补充走各自持久队列，这次未加此提醒。两者的说明里带着同一份回报契约：`report_parent` 要求按 Result / Changes / Verified / Not verified / Decisions 分段、控制在 300 词内，团队长只汇总一份；`ask_parent` 要求写清要定的决定、选项与建议。Claude、Codex、DSH 三侧用的是同一段文本。
+受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。DSH 助手的一轮结束却没有 final 报告时，插件会在同一任务里提醒它一次（主控侧不产生通知，任务保持 running）；失败或取消的轮次不提醒，提醒后仍没有 final 就正常停在 `awaiting_report`，同一任务不会重复提醒。Codex 目标的补充走自己的持久队列，这次未加此提醒。两者的说明里带着同一份回报契约：`report_parent` 要求按 Result / Changes / Verified / Not verified / Decisions 分段、控制在 300 词内，团队长只汇总一份；`ask_parent` 要求写清要定的决定、选项与建议。Codex、DSH 两侧用的是同一段文本。
 
 上级看全队只用一次 `futureaide_list_agents`：有下属的名字返回 `team`，后代每人一行（相对根、可寻址的 `path`、状态、运行时活动、文件数，文件数封顶时显示 `12+`），最多 30 行，超出以 `{more:n}` 收尾；两个成员同名时第二个起用 `名字#2`、`名字#3`。宿主读不到树时条目带 `treeError` 且没有 `team`——那是未知，不是“没有下属”。需要某个成员的对话时用 `futureaide_inspect_agent({name, node})`：`node` 取 `team` 里的路径（如 `"团队长/前端"`、`"subagent#2"`）或成员名，路径优先；被省略成 `…` 的路径按前缀匹配；同名命中多个成员时以 `node-ambiguous` 拒绝并给出可用路径，其余节点只留名字和状态。整份答案仍超长时先把每个 `team` 换成 `teamSize` 计数并加一条提示，再超才退化成 preview。
 
@@ -150,7 +150,7 @@ futureaide_inspect_agent({name: "设计团队长"})
 
 桌面目标的首次派发、忙时补充、取消与删除同样是**持久排队意图**：受理后不重发；执行者或监听器中断后按原 `requestId` 恢复原请求，已发出的不重放。
 
-一个共享监控进程推进各名字的任务。任务树已静止且没有执行中或排队输入的等待代理显示 `monitor: sleeping`；发送或回答会唤醒它。监听器通常在宿主持久记录变化时唤醒，约每 30 秒补扫并处理待投递报告或问题。若所有插件连接及监听器均关闭，下次连接时恢复检查。Claude 子代理已结束而后台命令仍运行时，任务树继续显示运行中，取消也会停止该后台任务。
+一个共享监控进程推进各名字的任务。任务树已静止且没有执行中或排队输入的等待代理显示 `monitor: sleeping`；发送或回答会唤醒它。监听器通常在宿主持久记录变化时唤醒，约每 30 秒补扫并处理待投递报告或问题。若所有插件连接及监听器均关闭，下次连接时恢复检查。Codex 子代理已结束而后台命令仍运行时，任务树继续显示运行中，取消也会停止该后台任务。
 
 取消请求优先送到所属代理，即使普通监工操作正忙也不必等待其释放操作锁。返回 `accepted` 表示请求已被宿主接受；通过列表确认任务树停止，取消不会撤销已经发生的操作。若自动清理已经开始，取消返回未接受。
 
@@ -197,13 +197,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 ## 本版验证结论（2026-11-04）
 
 - **Claude → DSH 全链路已实机通过**：派单、问答、并行、多层树、上下文复用、取消、删除、会话重启后回报、忙时补充、shell 写入的 `changes`。
-- **互调目标未重新验证**：Codex 与 Claude 互调的目标（`target: 'codex-desktop'`、`'claude-desktop'`）在本版改动后尚未重新验证，仍按实验性处理。
+- **互调目标未重新验证**：Codex 互调的目标（`target: 'codex-desktop'`）在本版改动后尚未重新验证，仍按实验性处理。
 
 ## 已知未完成
 
-- Claude 会话的创建、选模、停止、删除仍靠界面自动化。
 - Codex 子会话目前走 `create_thread`，会被当作委派，权限降级并可能弹出审批。
-- Claude → Codex → DSH 混合树的删除尚未重测。
+- Codex → DSH 混合树的删除尚未重测。
 - 退出整个应用再打开后的恢复未验证。
 
 ## 维护与兼容

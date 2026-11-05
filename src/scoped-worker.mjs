@@ -1,7 +1,7 @@
 // The single shared listener for every named subagent of this installation.
 //
-// Event path: file events on the DSH managed host directory, the Claude session
-// registry and every managed session's transcript directory wake the loop. The
+// Event path: file events on the DSH managed host directory and on the Claude
+// session registry wake the loop. The
 // managed host names one file per name (sha256(owner + newline + agent).json), so such
 // an event is resolved through RosterStore.wakeIndex() and polls that one record;
 // anything it cannot name asks for a whole-roster sweep, at most once per second.
@@ -16,11 +16,9 @@
 // its own file event, with a whole-roster sweep at least every five seconds, so a
 // missed event costs at most five seconds and a named event costs the round floor.
 //
-// Exit: a real idle dwell (IDLE_EXIT_MS without work, without an external commit
-// and without a sleeping or managed Claude name) releases the leases and ends the
-// process. The loopback tool service lives in this process, so any open managed
-// Claude session keeps it alive; a DSH-only installation still goes to zero
-// background processes.
+// Exit: a real idle dwell (IDLE_EXIT_MS without work and without an external
+// commit) releases the leases and ends the process. A DSH-only installation goes
+// to zero background processes.
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
@@ -112,14 +110,10 @@ async function waitForWork(timeoutMs, floor) {
   }
 }
 
-/** Open managed Claude names — including an idle zero-model reservation — keep this
- *  process (and therefore its tool service) alive. */
-const hasManagedClaude = () => store.hasOpenTarget('claude-desktop');
-
 try {
-  // The loopback tool service is hosted here (config.reportPort, then
-  // FUTUREAIDE_REPORT_PORT, then the default) so an idle managed session always
-  // finds it; DSH work alone does not need it. A service answering for another
+  // The loopback management tool service is hosted here (config.reportPort, then
+  // FUTUREAIDE_REPORT_PORT, then the default) so a calling Claude Desktop session
+  // always finds it; DSH work alone does not need it. A service answering for another
   // roster is reported and never reused.
   const reports = await ensureReportService({ store, port: reportPort(config),
     management: scopedManagement({ service }), log: message => trace(`report: ${message}`) });
@@ -155,7 +149,7 @@ try {
     const fast = service.fastPollNames();
     const only = fast.length ? [...new Set([...taken.names, ...fast])] : taken.names;
     const sweepDue = taken.sweep || Date.now() - lastSweepAt >= SWEEP_MS;
-    attach(monitorDirectories(config, { bindings: store.listClaudeBindings().map(binding => binding.transcriptFile) }));
+    attach(monitorDirectories(config));
     // Sleeping agents keep their existing DSH host-state path unchanged.
     await scanSleeping(store, hostDirectory, (agentId, taskId) => {
       const current = store.lease(MONITOR_LEASE);
@@ -189,10 +183,10 @@ try {
     else idleSince ??= Date.now();
     rounds += 1;
     trace(`round=${rounds} busy=${busy} external=${external} sweep=${sweepDue ? 1 : 0} idleMs=${idleSince === undefined ? 0 : Date.now() - idleSince} watched=${watchers.size}`);
-    const quiet = !busy && !external && !store.hasSleeping() && !hasManagedClaude();
+    const quiet = !busy && !external && !store.hasSleeping();
     if (quiet && Date.now() - idleSince >= IDLE_EXIT_MS) {
       store.releaseLease(MONITOR_READY_LEASE, holder);
-      const stillQuiet = !store.hasSleeping() && !hasManagedClaude() && store.dataVersion() === lastVersion;
+      const stillQuiet = !store.hasSleeping() && store.dataVersion() === lastVersion;
       if (stillQuiet) break;
       if (!store.claimLease(MONITOR_READY_LEASE, holder, 60000)) break;
       idleSince = Date.now();

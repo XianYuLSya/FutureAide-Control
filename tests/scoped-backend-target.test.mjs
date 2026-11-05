@@ -5,13 +5,17 @@ import { mkdir, mkdtemp } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
-import { ownerIdFor } from '../src/calling-context.mjs';
+import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
 import { BACKEND_METHODS, normalizeTarget, targetOf, resolveBackend } from '../src/agent-backend.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const A = '11111111-1111-4111-8111-111111111111';
 const extra = threadId => ({ _meta: { threadId } });
-const CLAUDE_MODEL = { provider: 'anthropic', model: 'claude-opus-5-5' };
+const DESKTOP_MODEL = { provider: 'fixture', model: 'desktop-model' };
+// The one registration answer a Codex Desktop create needs: both ask/report tools
+// listed for this project. Read-only evidence, so no session is started for it.
+const REGISTERED = async () => ({ ready: true, registered: true, tools: ['ask_parent', 'report_parent'],
+  sessionVerified: false });
 
 test('default loader connects the real Codex adapter without an injected factory', async () => {
   const backend = await resolveBackend({ target: 'codex-desktop', workspace }, { deps: {
@@ -59,7 +63,7 @@ function calling(events) {
 }
 
 // The existing DSH managed bridge, reduced to the calls the shared state machine
-// makes. Its presence proves a claude-desktop subagent never borrows it.
+// makes. Its presence proves a desktop subagent never borrows it.
 function dshFixture(events) {
   const session = { sessionId: undefined, taskId: undefined, running: false, seq: 0 };
   const api = {
@@ -101,46 +105,46 @@ function dshFixture(events) {
   return { api, controlFactory, session };
 }
 
-// A stand-in for the Claude Desktop adapter the controlling agent is wiring: the
-// contract only, so target plumbing is verifiable before that adapter exists.
-function claudeAdapter(events, { omit = [] } = {}) {
+// A stand-in for a desktop adapter: the contract only, so target plumbing is
+// verifiable without the real application.
+function desktopAdapter(events, { omit = [] } = {}) {
   const backend = {
-    target: 'claude-desktop',
-    labels: { host: 'Claude Desktop', bridge: 'The Claude Desktop adapter' },
+    target: 'codex-desktop',
+    labels: { host: 'Codex Desktop', bridge: 'The Codex Desktop adapter' },
     async probe() {
-      events.push('claude:probe');
-      return { identity: { application: 'claude-desktop', dataRoot: '/fixture/claude' },
+      events.push('desktop:probe');
+      return { identity: { application: 'codex-desktop', dataRoot: '/fixture/desktop' },
         methods: ['create', 'observe', 'deliver'], treeProtocol: 1, reportProtocol: 1 };
     },
     async create() {
-      events.push('claude:create');
-      return { sessionId: backend.record.sessionId, modelRequestsStarted: 0, model: { ...CLAUDE_MODEL } };
+      events.push('desktop:create');
+      return { sessionId: backend.record.sessionId, modelRequestsStarted: 0, model: { ...DESKTOP_MODEL } };
     },
-    async beginTask() { events.push('claude:beginTask'); return { treeProtocol: 1, reportProtocol: 1, throughSeq: 0, currentModel: { ...CLAUDE_MODEL } }; },
+    async beginTask() { events.push('desktop:beginTask'); return { treeProtocol: 1, reportProtocol: 1, throughSeq: 0, currentModel: { ...DESKTOP_MODEL } }; },
     async observe() {
-      events.push('claude:observe');
+      events.push('desktop:observe');
       return { sessionId: backend.record.sessionId, taskId: backend.record.task?.taskId, running: false,
-        questions: [], reports: [], changes: [], throughSeq: 1, currentModel: { ...CLAUDE_MODEL },
+        questions: [], reports: [], changes: [], throughSeq: 1, currentModel: { ...DESKTOP_MODEL },
         tree: { settled: true, running: false, nodes: [] } };
     },
-    async history() { events.push('claude:history'); return { messages: [], hasMore: false }; },
-    async answer() { events.push('claude:answer'); return { consumedQuestionIds: [] }; },
+    async history() { events.push('desktop:history'); return { messages: [], hasMore: false }; },
+    async answer() { events.push('desktop:answer'); return { consumedQuestionIds: [] }; },
     async deliver(input) {
-      events.push(['claude:deliver', input.requestId]);
+      events.push(['desktop:deliver', input.requestId]);
       return { accepted: true, status: 'written', afterSeq: 1 };
     },
-    async receipt() { events.push('claude:receipt'); return undefined; },
-    async turn() { events.push('claude:turn'); return { state: 'running', afterSeq: 1 }; },
+    async receipt() { events.push('desktop:receipt'); return undefined; },
+    async turn() { events.push('desktop:turn'); return { state: 'running', afterSeq: 1 }; },
     async models() {
-      events.push('claude:models');
-      return { default: { ...CLAUDE_MODEL }, routableProviders: [CLAUDE_MODEL.provider],
-        groups: [{ id: CLAUDE_MODEL.provider, models: [{ id: CLAUDE_MODEL.model, reasoningEfforts: ['max'] }] }] };
+      events.push('desktop:models');
+      return { default: { ...DESKTOP_MODEL }, routableProviders: [DESKTOP_MODEL.provider],
+        groups: [{ id: DESKTOP_MODEL.provider, models: [{ id: DESKTOP_MODEL.model, reasoningEfforts: ['max'] }] }] };
     },
-    async model() { events.push('claude:model'); return { ...CLAUDE_MODEL }; },
-    async selectModel() { events.push('claude:selectModel'); return { accepted: true }; },
-    async cancel() { events.push('claude:cancel'); return { cancelRequested: true }; },
-    async destroy() { events.push('claude:destroy'); return { destroyed: true }; },
-    async cursor() { events.push('claude:cursor'); return { throughSeq: 0 }; },
+    async model() { events.push('desktop:model'); return { ...DESKTOP_MODEL }; },
+    async selectModel() { events.push('desktop:selectModel'); return { accepted: true }; },
+    async cancel() { events.push('desktop:cancel'); return { cancelRequested: true }; },
+    async destroy() { events.push('desktop:destroy'); return { destroyed: true }; },
+    async cursor() { events.push('desktop:cursor'); return { throughSeq: 0 }; },
   };
   for (const name of omit) delete backend[name];
   return backend;
@@ -152,31 +156,22 @@ async function stateRoot() {
   return mkdtemp(path.join(base, 'target-'));
 }
 
-async function fixture({ adapters = {}, store, adapterLoader, reportStatusProbe, codexProbeRegistration } = {}) {
+async function fixture({ adapters = {}, store, adapterLoader, codexProbeRegistration } = {}) {
   const events = [];
-  const reports = [];
-  const monitors = [];
   const stateDirectory = await stateRoot();
   const roster = store ?? new RosterStore(':memory:');
   const dsh = dshFixture(events);
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
     store: roster, clientFactory: () => dsh.api, controlFactory: dsh.controlFactory, callCodex: calling(events),
-    startSharedMonitor: () => { monitors.push('start'); return true; },
-    reportReadyTimeoutMs: 0,
+    startSharedMonitor: () => true,
     removeTree: async () => {},
     backendAdapters: adapters,
-    ...(codexProbeRegistration ? { codexProbeRegistration } : {}),
-    // No real loopback server in unit tests: the read-only health probe is
-    // injected and counted, so a test can prove when readiness was asked for.
-    reportStatusProbe: reportStatusProbe ?? (async () => {
-      reports.push('probe');
-      return { url: 'http://127.0.0.1:17654/mcp', port: 17654, ready: true, hosting: 'monitor' };
-    }),
+    codexProbeRegistration: codexProbeRegistration ?? REGISTERED,
     // These cases pin the refusal path, so the installed adapter file must not
     // decide the outcome; an injected loader says whether one exists here.
     ...(adapterLoader ? { backendAdapterLoader: adapterLoader } : {}),
   });
-  return { events, reports, monitors, service, store: roster, stateDirectory, dsh,
+  return { events, service, store: roster, stateDirectory, dsh,
     record: (name = 'artist', thread = A) => roster.named(ownerIdFor(thread), name) };
 }
 
@@ -212,47 +207,6 @@ test('a roster record written without a target keeps the DSH behavior', async ()
     const receipt = await f.service.send({ name: 'legacy', message: 'legacy task' }, extra(A));
     assert.equal(receipt.accepted, true);
     assert.deepEqual(f.events.filter(event => Array.isArray(event) && event[0] === 'send').map(event => event[1]).length, 1);
-    assert.ok(!f.events.some(event => typeof event === 'string' && event.startsWith('claude:')), 'a legacy name never reaches another backend');
-  } finally { f.service.close(); }
-});
-
-test('a claude-desktop subagent without an adapter is refused before the name exists', async () => {
-  const f = await fixture({ adapterLoader: async () => undefined });
-  try {
-    const error = await rejection(f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)));
-    assert.equal(error.code, 'backend-not-ready');
-    assert.match(error.message, /claude-desktop/);
-    assert.match(error.message, /no task was sent to another backend/i);
-    assert.equal(f.store.count(ownerIdFor(A)), 0, 'no name was taken');
-    assert.deepEqual(dshCalls(f.events), [], 'the DSH bridge was not used as a substitute');
-  } finally { f.service.close(); }
-});
-
-test('claude-desktop is created, dispatched and listed only through its own adapter', async () => {
-  const events = [];
-  const f = await fixture({ adapters: { 'claude-desktop': (record, deps) => { const backend = claudeAdapter(events); backend.record = record; backend.deps = deps; return backend; } } });
-  try {
-    const created = await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A));
-    assert.equal(created.created, true);
-    assert.equal(created.target, 'claude-desktop');
-    assert.equal(created.modelRequestsStarted, 0);
-    assert.ok(events.includes('claude:create'));
-    assert.equal(f.record('partner').target, 'claude-desktop');
-    assert.deepEqual(dshCalls(f.events), [], 'no DSH call runs for a claude-desktop name');
-    assert.deepEqual(f.reports, ['probe'], 'a zero-model create first waits for the monitor-owned tool service');
-    assert.deepEqual(f.monitors, ['start'], 'and the single monitor is what provides it');
-
-    const receipt = await f.service.send({ name: 'partner', message: 'read the plan' }, extra(A));
-    assert.equal(receipt.queued, true, 'Desktop dispatch runs in the shared monitor');
-    assert.equal(receipt.accepted, false);
-    await f.service.poll(f.record('partner').agentId);
-    const deliveries = events.filter(event => Array.isArray(event) && event[0] === 'claude:deliver');
-    assert.equal(deliveries.length, 1);
-    assert.match(deliveries[0][1], /^request-[a-f0-9]{32}$/, 'the durable request id crosses the boundary');
-    assert.equal(events.includes('claude:selectModel'), false, 'a matching target default needs no selection');
-    assert.deepEqual((await f.service.list(extra(A))).items.map(item => [item.name, item.target]), [['partner', 'claude-desktop']]);
-    assert.deepEqual(dshCalls(f.events), [], 'the DSH bridge stayed untouched');
-    assert.equal(typeof f.record('partner').binding, 'undefined');
   } finally { f.service.close(); }
 });
 
@@ -297,97 +251,39 @@ test('codex-desktop readiness comes from the registration probe, never from a se
   } finally { missing.service.close(); }
 });
 
-test('a create that cannot reach the tool service takes no name', async () => {
-  const f = await fixture({
-    adapters: { 'claude-desktop': record => { const backend = claudeAdapter([]); backend.record = record; return backend; } },
-    reportStatusProbe: async () => ({ port: 17654, url: 'http://127.0.0.1:17654/mcp', ready: false }),
-  });
+test('a codex-desktop name is created, dispatched and listed only through its own adapter', async () => {
+  const events = [];
+  const f = await fixture({ adapters: { 'codex-desktop': (record, deps) => { const backend = desktopAdapter(events); backend.record = record; backend.deps = deps; return backend; } } });
   try {
-    const error = await rejection(f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)));
-    assert.equal(error.code, 'report-service-unavailable');
-    assert.equal(error.detail.code, 'report-service-unavailable');
-    assert.equal(f.store.count(ownerIdFor(A)), 0, 'no half-wired name is left behind');
-    assert.deepEqual(dshCalls(f.events), [], 'nothing was created on another backend either');
+    const created = await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop' }, extra(A));
+    assert.equal(created.created, true);
+    assert.equal(created.target, 'codex-desktop');
+    assert.equal(created.modelRequestsStarted, 0);
+    assert.ok(events.includes('desktop:create'));
+    assert.equal(f.record('partner').target, 'codex-desktop');
+    assert.deepEqual(dshCalls(f.events), [], 'no DSH call runs for a codex-desktop name');
+
+    const receipt = await f.service.send({ name: 'partner', message: 'read the plan' }, extra(A));
+    assert.equal(receipt.queued, true, 'desktop dispatch runs in the shared monitor');
+    assert.equal(receipt.accepted, false);
+    await f.service.poll(f.record('partner').agentId);
+    const deliveries = events.filter(event => Array.isArray(event) && event[0] === 'desktop:deliver');
+    assert.equal(deliveries.length, 1);
+    assert.match(deliveries[0][1], /^request-[a-f0-9]{32}$/, 'the durable request id crosses the boundary');
+    assert.equal(events.includes('desktop:selectModel'), false, 'a matching target default needs no selection');
+    assert.deepEqual((await f.service.list(extra(A))).items.map(item => [item.name, item.target]), [['partner', 'codex-desktop']]);
+    assert.deepEqual(dshCalls(f.events), [], 'the DSH bridge stayed untouched');
   } finally { f.service.close(); }
 });
 
 test('an unfinished protocol leaves no name instead of a reconnecting one', async () => {
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...claudeAdapter([]), record,
-    async probe() { return { identity: { application: 'claude-desktop', dataRoot: '/fixture/claude' },
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...desktopAdapter([]), record,
+    async probe() { return { identity: { application: 'codex-desktop', dataRoot: '/fixture/desktop' },
       methods: [], treeProtocol: undefined, reportProtocol: 1 }; } }) } });
   try {
-    const error = await rejection(f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)));
+    const error = await rejection(f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop' }, extra(A)));
     assert.equal(error.code, 'tree-protocol-required');
     assert.equal(f.store.count(ownerIdFor(A)), 0, 'the name is not taken for a backend that cannot serve it');
-    assert.deepEqual(f.reports, [], 'the tool service is not started for a name that cannot exist');
-  } finally { f.service.close(); }
-});
-
-test('status reads tool-service readiness without starting it', async () => {
-  const f = await fixture({ adapters: { 'claude-desktop': record => { const backend = claudeAdapter([]); backend.record = record; return backend; } } });
-  try {
-    const status = await f.service.status(extra(A));
-    assert.equal(status.backends['claude-desktop'].ready, true);
-    assert.deepEqual(f.reports, [], 'a status probe never starts the loopback service');
-    assert.deepEqual(f.monitors, [], 'nor does it start the shared monitor');
-    assert.equal(f.store.count(ownerIdFor(A)), 0);
-  } finally { f.service.close(); }
-});
-
-test('a historical currentModel is not trusted: the real control decides the follow', async () => {
-  // The observation replays the assistant transcript (historical). The user picked
-  // a different model in the UI without sending a turn, so the historical value
-  // still looks like the default while the real control has moved.
-  const selections = [];
-  const factory = (record, deps) => {
-    const backend = claudeAdapter([]);
-    backend.record = record;
-    backend.deps = deps;
-    backend.observe = async () => ({ sessionId: record.sessionId, taskId: record.task?.taskId, running: true,
-      questions: [], reports: [], changes: [], throughSeq: 5, currentModel: { ...CLAUDE_MODEL },
-      modelSelectionObserved: false, tree: { settled: false, running: true, nodes: [] } });
-    backend.model = async () => ({ provider: 'anthropic', model: 'claude-opus-5-6' });
-    const select = backend.selectModel;
-    backend.selectModel = async input => { selections.push(input); return select(input); };
-    return backend;
-  };
-  const f = await fixture({ adapters: { 'claude-desktop': factory } });
-  try {
-    await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A));
-    await f.service.send({ name: 'partner', message: 'first' }, extra(A));
-    await f.service.poll(f.record('partner').agentId);
-    selections.length = 0;
-    // A busy supplement goes through observe(); the stale value equals the default,
-    // so only the real control can reveal the mismatch.
-    await f.service.send({ name: 'partner', message: 'continue while busy' }, extra(A));
-    await f.service.poll(f.record('partner').agentId);
-    assert.equal(selections.length, 1, 'the default was re-selected from the real next-turn control');
-    assert.deepEqual(selections[0].model, CLAUDE_MODEL.model);
-  } finally { f.service.close(); }
-});
-
-test('an observed live selection is used as-is, without another control round-trip', async () => {
-  const selections = [];
-  const factory = record => {
-    const backend = claudeAdapter([]);
-    backend.record = record;
-    backend.observe = async () => ({ sessionId: record.sessionId, taskId: record.task?.taskId, running: true,
-      questions: [], reports: [], changes: [], throughSeq: 5, currentModel: { ...CLAUDE_MODEL },
-      tree: { settled: false, running: true, nodes: [] } });
-    backend.model = async () => { throw new Error('the live observation already answers this'); };
-    const select = backend.selectModel;
-    backend.selectModel = async input => { selections.push(input); return select(input); };
-    return backend;
-  };
-  const f = await fixture({ adapters: { 'claude-desktop': factory } });
-  try {
-    await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A));
-    await f.service.send({ name: 'partner', message: 'first' }, extra(A));
-    await f.service.poll(f.record('partner').agentId);
-    selections.length = 0;
-    await f.service.send({ name: 'partner', message: 'continue while busy' }, extra(A));
-    await f.service.poll(f.record('partner').agentId);
-    assert.deepEqual(selections, [], 'the session already runs the default; nothing is re-selected');
   } finally { f.service.close(); }
 });
 
@@ -396,16 +292,27 @@ test('an unknown target is rejected before any backend is resolved', async () =>
   try {
     const error = await rejection(f.service.create({ name: 'artist', lifetime: 'once', target: 'claude' }, extra(A)));
     assert.equal(error.code, 'invalid-target');
-    assert.match(error.message, /dsh \/ claude-desktop/);
+    assert.match(error.message, /dsh \/ codex-desktop/);
     assert.equal(f.store.count(ownerIdFor(A)), 0);
     assert.equal(normalizeTarget(undefined), 'dsh');
   } finally { f.service.close(); }
 });
 
-test('an adapter that only covers part of the contract is refused with the missing names', async () => {
-  const f = await fixture({ adapters: { 'claude-desktop': (record, deps) => { const backend = claudeAdapter([], { omit: ['deliver', 'receipt', 'destroy'] }); backend.record = record; backend.deps = deps; return backend; } } });
+test('a target this build no longer offers is refused for creation', async () => {
+  const f = await fixture();
   try {
-    const error = await rejection(f.service.create({ name: 'partner', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)));
+    const error = await rejection(f.service.create({ name: 'artist', lifetime: 'once', target: 'claude-desktop' }, extra(A)));
+    assert.equal(error.code, 'invalid-target');
+    assert.match(error.message, /dsh \/ codex-desktop/);
+    assert.equal(f.store.count(ownerIdFor(A)), 0);
+    assert.deepEqual(dshCalls(f.events), [], 'nothing was created on another backend either');
+  } finally { f.service.close(); }
+});
+
+test('an adapter that only covers part of the contract is refused with the missing names', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': (record, deps) => { const backend = desktopAdapter([], { omit: ['deliver', 'receipt', 'destroy'] }); backend.record = record; backend.deps = deps; return backend; } } });
+  try {
+    const error = await rejection(f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop' }, extra(A)));
     assert.equal(error.code, 'backend-not-ready');
     for (const name of ['deliver', 'receipt', 'destroy']) assert.match(error.message, new RegExp(name));
     assert.equal(f.store.count(ownerIdFor(A)), 0);
@@ -413,7 +320,7 @@ test('an adapter that only covers part of the contract is refused with the missi
   } finally { f.service.close(); }
 });
 
-test('status keeps every DSH field and refuses to look ready without a claude adapter', async () => {
+test('status keeps every DSH field and reports both targets', async () => {
   const f = await fixture({ adapterLoader: async () => undefined });
   try {
     const status = await f.service.status(extra(A));
@@ -425,15 +332,16 @@ test('status keeps every DSH field and refuses to look ready without a claude ad
     assert.equal(status.reportProtocolReady, true);
     assert.equal(status.returnChannel, 'chat-verified');
     assert.equal(status.ready, true);
-    // The new per-target section tells the truth about the missing adapter.
+    // The per-target section reports both remaining targets and nothing else.
+    assert.deepEqual(Object.keys(status.backends).sort(), ['codex-desktop', 'dsh']);
     assert.equal(status.backends.dsh.ready, true);
     assert.equal(status.backends.dsh.connected, true);
     assert.equal(status.backends.dsh.treeProtocol, 1);
     assert.equal(status.backends.dsh.reportProtocol, 1);
     assert.deepEqual(status.backends.dsh.reason, undefined);
-    assert.equal(status.backends['claude-desktop'].ready, false);
-    assert.equal(status.backends['claude-desktop'].present, false);
-    assert.equal(status.backends['claude-desktop'].reason.code, 'backend-not-ready');
+    assert.equal(status.backends['codex-desktop'].ready, false, 'no adapter is installed, so the target is not ready');
+    assert.equal(status.backends['codex-desktop'].present, false);
+    assert.equal(status.backends['codex-desktop'].reason.code, 'backend-not-ready');
     // Diagnostics start no model turn and no session.
     assert.ok(!f.events.includes('managedCreate'));
     assert.ok(!f.events.includes('managedBeginTask'));
@@ -444,27 +352,26 @@ test('status keeps every DSH field and refuses to look ready without a claude ad
 
 test('status separates an unfinished adapter from a ready one without using it', async () => {
   const unfinished = [];
-  const f = await fixture({ adapters: { 'claude-desktop': record => ({ ...claudeAdapter(unfinished),
-    async probe() { unfinished.push('claude:probe'); return { identity: { application: 'claude-desktop', dataRoot: '/fixture/claude' },
+  const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...desktopAdapter(unfinished),
+    async probe() { unfinished.push('desktop:probe'); return { identity: { application: 'codex-desktop', dataRoot: '/fixture/desktop' },
       methods: [], treeProtocol: undefined, reportProtocol: 1 }; } }) } });
   try {
     const status = await f.service.status(extra(A));
-    assert.equal(status.backends['claude-desktop'].ready, false);
-    assert.equal(status.backends['claude-desktop'].present, true);
-    assert.equal(status.backends['claude-desktop'].reason.code, 'tree-protocol-required');
-    assert.equal(status.backends['claude-desktop'].treeProtocol, null);
+    assert.equal(status.backends['codex-desktop'].ready, false);
+    assert.equal(status.backends['codex-desktop'].present, true);
+    assert.equal(status.backends['codex-desktop'].reason.code, 'tree-protocol-required');
+    assert.equal(status.backends['codex-desktop'].treeProtocol, null);
     assert.equal(status.ready, true, 'the DSH path stays the default and unchanged');
-    assert.deepEqual(unfinished, ['claude:probe'], 'diagnostics only probed; no create, deliver or session');
+    assert.deepEqual(unfinished, ['desktop:probe'], 'diagnostics only probed; no create, deliver or session');
   } finally { f.service.close(); }
 
   const ready = [];
-  const g = await fixture({ adapters: { 'claude-desktop': record => { const backend = claudeAdapter(ready); backend.record = record; return backend; } } });
+  const g = await fixture({ adapters: { 'codex-desktop': record => { const backend = desktopAdapter(ready); backend.record = record; return backend; } } });
   try {
     const status = await g.service.status(extra(A));
-    assert.equal(status.backends['claude-desktop'].ready, true);
-    assert.equal(status.backends['claude-desktop'].treeProtocol, 1);
-    assert.equal(status.backends['claude-desktop'].reportProtocol, 1);
-    assert.deepEqual(ready, ['claude:probe'], 'a ready adapter is still not created, dispatched or answered');
+    assert.equal(status.backends['codex-desktop'].ready, true);
+    assert.equal(status.backends['codex-desktop'].registered, true, 'the entry is the registration evidence');
+    assert.deepEqual(ready, ['desktop:probe'], 'a ready adapter is still not created, dispatched or answered');
     assert.equal(g.store.count(ownerIdFor(A)), 0);
   } finally { g.service.close(); }
 });
@@ -472,7 +379,7 @@ test('status separates an unfinished adapter from a ready one without using it',
 test('an adapter keeps its own state row and one host lock without touching the record', async () => {
   let inside = 0, overlaps = 0;
   const factory = (record, deps) => {
-    const backend = claudeAdapter([]);
+    const backend = desktopAdapter([]);
     backend.record = record;
     backend.deps = deps;
     backend.create = async () => {
@@ -483,7 +390,7 @@ test('an adapter keeps its own state row and one host lock without touching the 
           binding: { sessionId: `native-${record.name}`, pid: 4321 }, cursor: 0, requests: {}, projection: {} });
         inside -= 1;
       });
-      return { sessionId: record.sessionId, modelRequestsStarted: 0, model: { ...CLAUDE_MODEL } };
+      return { sessionId: record.sessionId, modelRequestsStarted: 0, model: { ...DESKTOP_MODEL } };
     };
     backend.deliver = async input => {
       const state = deps.readNativeState() ?? {};
@@ -493,11 +400,11 @@ test('an adapter keeps its own state row and one host lock without touching the 
     };
     return backend;
   };
-  const f = await fixture({ adapters: { 'claude-desktop': factory } });
+  const f = await fixture({ adapters: { 'codex-desktop': factory } });
   try {
     await Promise.all([
-      f.service.create({ name: 'a1', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)),
-      f.service.create({ name: 'a2', lifetime: 'persistent', target: 'claude-desktop' }, extra(A)),
+      f.service.create({ name: 'a1', lifetime: 'persistent', target: 'codex-desktop' }, extra(A)),
+      f.service.create({ name: 'a2', lifetime: 'persistent', target: 'codex-desktop' }, extra(A)),
     ]);
     assert.equal(overlaps, 0, 'withHostLock serialized host work across both names');
     const first = f.record('a1');
@@ -517,12 +424,51 @@ test('an adapter keeps its own state row and one host lock without touching the 
     assert.equal(Object.keys(state.requests).length, 1, 'native write attempts stay beside the roster');
     assert.equal(state.requests[Object.keys(state.requests)[0]].stage, 'written');
     assert.equal(f.store.get(first.agentId).binding, undefined, 'the shared record carries no native field');
-    assert.equal(f.store.agentForNativeSession('native-a1').name, 'a1', 'the reply surface finds the caller');
 
     await f.service.delete({ name: 'a1' }, extra(A));
     await f.service.poll(first.agentId);
     assert.equal(f.store.backendState(first.agentId), undefined);
-    assert.equal(f.store.agentForNativeSession('native-a1'), undefined);
   } finally { f.service.close(); }
 });
+// A verified Claude caller has a TRUSTED_CALLER and no Codex thread metadata at all.
+const claudeExtra = (nativeSessionId = 'native-caller') =>
+  ({ [TRUSTED_CALLER]: { source: 'claude-desktop', nativeSessionId, workspace } });
 
+function seedClaudeOwner(store, nativeSessionId = 'native-caller') {
+  const ownerId = ownerIdForSource('claude-desktop', nativeSessionId);
+  store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId, workspace,
+    createdAt: new Date().toISOString() });
+  return ownerId;
+}
+
+test('a Claude caller with no Codex thread creates and runs names without a parent', async () => {
+  const f = await fixture();
+  try {
+    const ownerId = seedClaudeOwner(f.store);
+    const created = await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'dsh' }, claudeExtra());
+    assert.equal(created.created, true);
+    assert.equal(f.store.named(ownerId, 'partner').parentAgentId, undefined,
+      'a Claude caller has no managed Codex parent to hang a new name under');
+
+    const ran = await f.service.run({ name: 'artist', message: 'draw it' }, claudeExtra());
+    assert.equal(ran.created, true);
+    assert.equal(ran.name, 'artist');
+    assert.equal(f.store.named(ownerId, 'artist').parentAgentId, undefined);
+    assert.deepEqual((await f.service.list(claudeExtra())).items.map(item => item.name).sort(), ['artist', 'partner'],
+      'both names belong to the Claude caller and are addressable by name');
+  } finally { f.service.close(); }
+});
+test('a managed Codex child still records its parent when it creates a name', async () => {
+  const f = await fixture();
+  try {
+    const rootId = 'agent-' + 'b'.repeat(32);
+    f.store.insert({ agentId: rootId, ownerId: ownerIdFor(A), sessionId: 'session-root', name: 'root',
+      lifetime: 'persistent', target: 'codex-desktop', workspace, state: 'idle', created: true,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), history: [] });
+    f.store.saveBackendState(rootId, { binding: { threadId: A } });
+    const created = await f.service.create({ name: 'child', lifetime: 'once' }, extra(A));
+    assert.equal(created.created, true);
+    assert.equal(f.store.named(ownerIdFor(A), 'child').parentAgentId, rootId,
+      'a Codex child owns its new name under its own tree');
+  } finally { f.service.close(); }
+});

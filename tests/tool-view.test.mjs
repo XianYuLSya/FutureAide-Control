@@ -18,12 +18,12 @@ function heavyItem() {
     agentPath: ['助手-1a2b', ...path], depth, status: 'running', activity: 'writing',
     changes: files.slice(0, 3), coverage: { complete: false, limitation: 'x' } });
   return {
-    name: '助手-1a2b', lifetime: 'once', target: 'claude-desktop', state: 'running', activity: 'writing',
+    name: '助手-1a2b', lifetime: 'once', target: 'codex-desktop', state: 'running', activity: 'writing',
     task: { text: 'Rebuild the report pipeline so every tool answer stays inside the context budget of the calling model. '.repeat(3),
       state: 'running', startedAt: '2026-11-04T01:00:00.000Z',
       result: { state: 'completed', summary: REPORT, files, coverage: { workspace: {} } } },
     changes: { count: 12, unconfirmed: 9, files,
-      coverage: { scope: 'Claude Desktop task tree', nodes: [], workspace: { complete: false, limitation: 'x' } },
+      coverage: { scope: 'Codex Desktop task tree', nodes: [], workspace: { complete: false, limitation: 'x' } },
       observedAt: '2026-11-04T02:00:00.000Z', stale: false },
     questions: [{ message: 'Which report should land first?' }],
     tree: { settled: false, running: true, nodes: [node('助手-1a2b', 0, []), node('helper', 1, ['helper']),
@@ -37,7 +37,7 @@ function heavyItem() {
 test('a compact entry keeps the decision facts and nothing else', () => {
   const item = heavyItem();
   assert.deepEqual(compactAgent(item), {
-    name: '助手-1a2b', target: 'claude-desktop', state: 'running', lifetime: 'once', activity: 'writing',
+    name: '助手-1a2b', target: 'codex-desktop', state: 'running', lifetime: 'once', activity: 'writing',
     task: truncated(item.task.text, 80),
     questions: ['Which report should land first?'],
     report: { summary: truncated(REPORT, 200), final: true, delivery: 'delivered' },
@@ -109,9 +109,9 @@ test('a creation receipt keeps the outcome and the error, not the coverage text'
     modelRequestsStarted: 0, changes: { count: 12, coverage: { limitation: 'x' } }, tree: { nodes: [] }, updatedAt: 'now' }),
   { name: 'artist', lifetime: 'once', state: 'idle', created: true, modelRequestsStarted: 0 });
   const error = { code: 'managed-host-required', message: 'Install the current managed DSH bridge.' };
-  assert.deepEqual(compactCreate({ name: 'claude', lifetime: 'once', target: 'claude-desktop', state: 'reconnecting',
+  assert.deepEqual(compactCreate({ name: 'partner', lifetime: 'once', target: 'codex-desktop', state: 'reconnecting',
     created: false, error }),
-  { name: 'claude', target: 'claude-desktop', lifetime: 'once', state: 'reconnecting', created: false, error });
+  { name: 'partner', target: 'codex-desktop', lifetime: 'once', state: 'reconnecting', created: false, error });
 });
 
 test('a changes answer keeps one line per path and one coverage sentence', () => {
@@ -206,13 +206,13 @@ test('an inspection shows each message list once and clips only long text', () =
 test('status keeps every readiness field and drops only the method lists', () => {
   const status = { ready: true, contextVerified: true, workspace: 'D:\\project',
     backends: { dsh: { ready: true, connected: true },
-      'claude-desktop': { ready: true, present: true, methods: ['probe', 'create'], treeProtocol: 1, reportProtocol: 1 } } };
+      'codex-desktop': { ready: true, present: true, methods: ['probe', 'create'], treeProtocol: 1, reportProtocol: 1 } } };
   assert.deepEqual(compactStatus(status), { ...status,
     backends: { dsh: { ready: true, connected: true },
-      'claude-desktop': { ready: true, present: true, treeProtocol: 1, reportProtocol: 1 } } });
+      'codex-desktop': { ready: true, present: true, treeProtocol: 1, reportProtocol: 1 } } });
   assert.deepEqual(compactStatus({ ready: false, contextError: { code: 'calling-context' } }),
     { ready: false, contextError: { code: 'calling-context' } }, 'a status without backends is unchanged');
-  assert.deepEqual(status.backends['claude-desktop'].methods, ['probe', 'create'], 'the input is not mutated');
+  assert.deepEqual(status.backends['codex-desktop'].methods, ['probe', 'create'], 'the input is not mutated');
 });
 
 test('list and wait wrap the same compact entry and keep their own receipt fields', () => {

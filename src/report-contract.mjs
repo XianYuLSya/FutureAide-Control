@@ -16,7 +16,7 @@ export const FINAL_REPORT_CONTRACT = 'Write a final report for a controlling age
   + 'Decisions: only choices the controlling agent must make. '
   + 'Stay under about 300 words. Do not restate the task or narrate your process. '
   + 'Put long material in a file and name it. '
-  + 'A lead that ran a team sends one summary of the team\'s result, not each member\'s report.';
+  + 'If you delegated work, send one summary of the combined result.';
 
 /** How a question is written, so it can be answered without reading the work. */
 export const QUESTION_CONTRACT = 'State the decision you need, the options and your recommendation in a few lines, '

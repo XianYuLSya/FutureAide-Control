@@ -24,7 +24,7 @@ test('the final report contract names every part a lead wants to check', () => {
     assert.ok(FINAL_REPORT_CONTRACT.includes(part), `the contract must name ${part}`);
   }
   assert.match(FINAL_REPORT_CONTRACT, /spot-check it, not re-read your work/);
-  assert.match(FINAL_REPORT_CONTRACT, /A lead that ran a team sends one summary/,
+  assert.match(FINAL_REPORT_CONTRACT, /If you delegated work, send one summary/,
     'a team lead reports the team, not each member');
   assert.match(QUESTION_CONTRACT, /recommendation/);
   assert.ok(QUESTION_CONTRACT.length < 300, 'a question stays short enough to answer without the work');

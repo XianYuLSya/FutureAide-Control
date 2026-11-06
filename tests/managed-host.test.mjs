@@ -14,6 +14,7 @@ async function fixture() {
   const stored = new Map(), live = new Map(), sessions = new Map(), records = new Map();
   const checkpoints = new Map(), indexed = new Set(), observed = new Map();
   const removed = [], disposed = [], cancelled = [], creations = [];
+  const modelSelections = [], defaultSaves = [], imageAdmissions = [];
   const project = { id: 'project-1', path: workspace, sessionIds: [],
     async attachSession(id) { if (!this.sessionIds.includes(id)) this.sessionIds.push(id); },
     async detachSession(id) { this.sessionIds = this.sessionIds.filter(value => value !== id); } };
@@ -29,10 +30,16 @@ async function fixture() {
   const services = {
     subagents: { listDescendants: async () => [], waitForChildren: async () => false, interrupt: () => {}, drainDescendants: async () => {} },
     sessionPersistence: persistence, workspaceRegistry: registry, sessionQuery: query,
-    agentDefaultModel: { currentSelection: () => ({ provider: 'provider', model: 'model' }) },
+    agentDefaultModel: { currentSelection: () => ({ provider: 'provider', model: 'model' }),
+      saveSelection: async value => { defaultSaves.push(structuredClone(value)); } },
+    llm: { listProviders: () => [{ id: 'provider' }, { id: 'other' }],
+      listModels: async provider => provider === 'provider' ? [{ id: 'model' }, { id: 'second' }]
+        : provider === 'other' ? [{ id: 'alpha' }] : [],
+      resolveCallConfig: async value => value },
     sessionProjectionCache: { requireTable: () => ({ delete: async id => checkpoints.delete(id), get: id => checkpoints.get(id) }),
       flushSoft: async session => checkpoints.set(session.header.id, { oldContext: true }) },
-    sessionController: { agents: { composeAgent: async preset => ({ agentPreset: preset ?? 'default', setup: async () => {} }) },
+    sessionController: { agents: { composeAgent: async preset => ({ agentPreset: preset ?? 'default', setup: async () => {} }),
+        serializeImageAdmission: async (agent, operation) => { imageAdmissions.push(agent.id); return operation(); } },
       inspect: async id => ({ meta: stored.get(id), events: sessions.get(id)?.events ?? [] }) },
   };
   async function makeAgent(options, resume = false) {
@@ -57,6 +64,13 @@ async function fixture() {
         on: (event, listener) => { const rows = callbacks.get(event) ?? []; rows.push(listener); callbacks.set(event, rows); } },
       definitions, guards, callbacks,
     };
+    let modelState = options.agentOptions ? { ...options.agentOptions } : undefined;
+    agent.model = { current: () => modelState ? { ...modelState } : undefined,
+      select(selection) {
+        modelState = { ...selection };
+        modelSelections.push({ sessionId: id, selection: { ...selection } });
+        agent.session.events.push({ type: 'model/selection', data: { ...selection } });
+      } };
     await options.setup(agent.ctx, agent);
     live.set(id, agent); sessions.set(id, agent.session); stored.set(id, header);
     indexed.add(id); checkpoints.set(id, { context: 'private' });
@@ -77,6 +91,7 @@ async function fixture() {
     stored.delete(path.basename(target));
   };
   return { root, workspace, ctx, services, store, removeDirectory, live, sessions, stored, records, project, checkpoints, indexed, observed, removed, disposed, cancelled, creations,
+    modelSelections, defaultSaves, imageAdmissions,
     failNextRemoval: () => { failRemoval = true; },
     own: (childId, parent) => ownedBy.set(childId, parent),
     create: (context = ctx) => createManagedHost(context, { stateDirectory: path.join(root, 'managed'), store, removeDirectory,
@@ -95,6 +110,44 @@ test('managed status exposes the live selection instead of its creation snapshot
   assert.equal(started.model.provider, 'provider', 'creation snapshot remains distinct');
   selection = { provider: 'third-provider', model: 'third-model' };
   assert.deepEqual((await host.managedStatus({ ...input, taskId: 'task-model' })).currentModel, selection);
+});
+
+test('managed explicit model selection changes only the named session and never the app default', async () => {
+  const f = await fixture(), host = f.create();
+  const a = identity(f.workspace);
+  const b = { ...identity(f.workspace), agentId: 'agent-b', sessionId: 'session-managed-b' };
+  await host.managedCreate(a);
+  await host.managedCreate(b);
+  const selection = { provider: 'other', model: 'alpha', reasoningEffort: 'high' };
+  const result = await host.managedSelectModel({ ...a, selection });
+  assert.equal(result.accepted, true);
+  assert.deepEqual(result.selected, selection);
+  assert.equal(result.source, 'managed-session-selectModel');
+  assert.match(result.defaultModelBehavior, /unchanged/);
+  assert.deepEqual(f.modelSelections, [{ sessionId: a.sessionId, selection }], 'the real Agent model primitive was called');
+  assert.deepEqual(f.defaultSaves, [], 'the app-wide default is never saved');
+  assert.deepEqual(f.services.agentDefaultModel.currentSelection(), { provider: 'provider', model: 'model' });
+  assert.deepEqual(f.live.get(a.sessionId).model.current(), selection);
+  assert.deepEqual(f.live.get(b.sessionId).model.current(), { provider: 'provider', model: 'model' },
+    'another managed name keeps its own selection');
+  assert.deepEqual((await host.managedStatus(a)).currentModel, selection);
+  assert.deepEqual(f.imageAdmissions, [a.sessionId], 'selection runs through DSH image-admission serialization');
+
+  await assert.rejects(host.managedSelectModel({ ...a, selection: { provider: 'other', model: 'missing' } }),
+    error => error.controlCode === 'managed-model-unavailable');
+  await assert.rejects(host.managedSelectModel({ ...a, sessionId: 'session-other', selection }),
+    error => error.controlCode === 'managed-session-mismatch');
+  assert.equal(f.defaultSaves.length, 0);
+});
+
+test('managed explicit model selection refuses a host that did not record the requested route', async () => {
+  const f = await fixture(), host = f.create(), input = identity(f.workspace);
+  await host.managedCreate(input);
+  f.live.get(input.sessionId).model.select = () => {};
+  await assert.rejects(host.managedSelectModel({ ...input,
+    selection: { provider: 'other', model: 'alpha' } }),
+  error => error.controlCode === 'managed-model-selection-unconfirmed');
+  assert.equal(f.defaultSaves.length, 0, 'a failed read-back never writes the global default');
 });
 
 test('explicit reports persist across reload and final seals reporting', async () => {

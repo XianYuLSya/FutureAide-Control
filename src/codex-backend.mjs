@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { createCodexHost, emptyProjection, markerLine, CODEX_FILE_COVERAGE } from './codex-host.mjs';
-import { isCodexRpcUnavailable } from './codex-ipc.mjs';
+import { isCodexReadRetryable, isCodexRpcUnavailable } from './codex-ipc.mjs';
 
 const METHODS = ['probe', 'create', 'beginTask', 'observe', 'history', 'answer', 'deliver', 'receipt',
   'turn', 'models', 'model', 'selectModel', 'cancel', 'destroy', 'cursor'];
@@ -18,7 +18,6 @@ export async function createCodexBackend(record, deps = {}) {
     return value;
   };
   const locked = action => deps.withHostLock ? deps.withHostLock(action) : action();
-  const defaultModel = () => host.readDefaultModel({ workspace: load().workspace });
   async function applyPendingTitle(value) {
     if (!value.pendingTitle || !value.binding) return;
     if (value.pendingTitle.attempts >= MAX_TITLE_ATTEMPTS) {
@@ -118,8 +117,12 @@ export async function createCodexBackend(record, deps = {}) {
         value.answers = {};
         save(value);
       }
+      // An unbound name has no native session yet, so there is no live selection
+      // to read. In particular this keeps an explicit first selection independent
+      // from a config.toml default that omits model or effort.
+      const currentModel = value.binding ? await host.readCurrentModel(value.binding.sessionId) : undefined;
       return { treeProtocol: 1, reportProtocol: 1, throughSeq: projection(value).seq,
-        currentModel: value.binding ? await host.readCurrentModel(value.binding.sessionId) : await defaultModel() };
+        ...(currentModel ? { currentModel } : {}) };
     },
     async observe() {
       const { value, tree } = await refresh();
@@ -153,7 +156,7 @@ export async function createCodexBackend(record, deps = {}) {
       (value.answers ??= {})[answerId] = result; save(value);
       return result;
     },
-    async deliver({ requestId, message, model: dispatchModel }) {
+    async deliver({ requestId, message, model: dispatchModel, explicitModel = false }) {
       if (!requestId || typeof message !== 'string' || !message.trim()) throw fail('invalid-dispatch', 'A request id and message are required.');
       await reportsReady();
       let value = await recover(state());
@@ -161,30 +164,88 @@ export async function createCodexBackend(record, deps = {}) {
       const prior = value.requests[requestId];
       if (prior && prior.messageHash !== hash) throw fail('request-id-conflict', 'This request id already belongs to another message.');
       if (prior && prior.status !== 'retryable') return { accepted: prior.status === 'accepted', status: prior.status, afterSeq: prior.afterSeq };
-      // The coordinator freezes each input's default before dispatch. Recovery of
-      // that same input must retain its choice even if the user changes defaults.
-      const model = prior?.model ?? dispatchModel
-        ?? load().task?.dispatches?.find(item => item.requestId === requestId)?.model
-        ?? value.selectedModels?.[`${requestId}-model`] ?? await defaultModel();
+      // A selection and its resolved wire values are frozen together with the
+      // request. Recovery must not re-resolve a catalog id to a different slug;
+      // a name without a pin never falls back to a deploy-time default either.
+      // A 0.5.13 request may carry `model` even though it was never explicit:
+      // that historical display value is ignored and the turn inherits.
+      const explicit = prior ? prior.explicitModel === true : explicitModel === true;
+      const frozenSelection = explicit
+        ? (prior?.model
+          ?? (explicitModel === true ? dispatchModel : undefined)
+          ?? load().task?.dispatches?.find(item => item.requestId === requestId && item.explicitModel === true)?.model
+          ?? value.selectedModels?.[`${requestId}-model`])
+        : undefined;
+      // A retry may omit the flag and still reuses its frozen selection; adding a
+      // selection to a request that was first written without one is a conflict.
+      if (prior && prior.explicitModel !== true && explicitModel === true) {
+        throw fail('request-id-conflict', 'This request id was already recorded without a model selection.');
+      }
+      if (explicitModel === true && dispatchModel !== undefined && frozenSelection
+          && (dispatchModel.model !== frozenSelection.model
+            || (dispatchModel.reasoningEffort ?? undefined) !== (frozenSelection.reasoningEffort ?? undefined)
+            || (dispatchModel.provider ?? undefined) !== (frozenSelection.provider ?? undefined))) {
+        throw fail('request-id-conflict', 'This request id already belongs to another model selection.');
+      }
+      if (explicit && !frozenSelection?.model) {
+        throw fail('model-required', 'An explicit Codex model selection requires a model id; no turn was started.', { terminal: true });
+      }
+      if (!explicit && dispatchModel !== undefined) {
+        throw fail('invalid-dispatch',
+          'A model selection was supplied without explicitModel:true. Refusing to start a turn that would silently drop it.',
+          { terminal: true });
+      }
+      // Resolve only when this is the first attempt that carries a selection.
+      // The result is stored beside the request so every later receipt/retry
+      // reuses the same native slug and effort.
+      let delivery = prior?.delivery;
+      if (explicit && !delivery) {
+        try {
+          delivery = await host.resolveModelDelivery({ selection: frozenSelection, workspace: load().workspace });
+        } catch (error) {
+          // Catalog/config resolution is read-only: a transient transport failure
+          // here is safe to retry and must not become a failed dispatch. A real
+          // missing model or effort remains terminal.
+          if (['model-required', 'model-not-found', 'effort-not-supported',
+            'codex-model-catalog-empty'].includes(error?.code)) {
+            error.terminal = true;
+            throw error;
+          }
+          if (isCodexReadRetryable(error)) {
+            throw fail(error.code, error.message, {
+              retryableRead: true,
+              ...(error.rpcMessage ? { rpcMessage: error.rpcMessage } : {}),
+            });
+          }
+          throw error;
+        }
+        if (!delivery?.model) throw fail('codex-native-rpc-invalid-response',
+          'The selected model could not be mapped to a native Codex model slug.', { terminal: true });
+      }
       value.nonce ??= randomUUID();
       const marker = markerLine(requestId, value.nonce);
       const request = { requestId, marker, messageHash: hash, taskId: load().task?.taskId,
-        startedAt: new Date().toISOString(), afterSeq: projection(value).seq, status: 'retryable', attempted: false, model };
+        startedAt: new Date().toISOString(), afterSeq: projection(value).seq, status: 'retryable', attempted: false,
+        ...(explicit ? { model: { ...frozenSelection }, explicitModel: true,
+          delivery: { model: delivery.model, ...(delivery.effort ? { effort: delivery.effort } : {}) } }
+          : { explicitModel: false }) };
       value.requests[requestId] = request; save(value);
       await locked(async () => {
         request.attempted = true; request.status = 'unknown'; save(value);
         try {
           let turnId;
           if (!value.binding) {
-            // No model, reasoning effort or permission field is passed: the new
-            // Codex thread inherits every one of them from the user's defaults.
-            // The caller's task stays first; the marker moves to the last line so
-            // the user sees the original request at the top of the new chat.
+            // With no explicit selection no model, reasoning effort or permission
+            // field is passed: the new thread inherits every one of them from the
+            // user's defaults. The caller's task stays first; the marker moves to
+            // the last line so the user sees the original request at the top.
             const first = await host.createFirstTurn({ workspace: load().workspace, title: load().name,
               requestId, message: `${message}\n\nYou are FutureAide managed helper ${JSON.stringify(load().name)}. `
                 + 'If you need a parent decision, use ask_parent; deliver the final result with '
                 + 'report_parent(message, final=true). Ordinary replies do not report to your parent.\n\n'
-                + marker });
+                + marker,
+              ...(request.delivery ? { model: request.delivery.model,
+                effort: request.delivery.effort } : {}) });
             turnId = first?.turnId;
             if (first?.nativeSessionId) {
               value.binding = { sessionId: first.nativeSessionId, owned: true };
@@ -192,7 +253,9 @@ export async function createCodexBackend(record, deps = {}) {
               save(value);
             }
           } else {
-            const sent = await host.send({ nativeSessionId: value.binding.sessionId, message: `${message}\n\n${marker}`, requestId });
+            const sent = await host.send({ nativeSessionId: value.binding.sessionId, message: `${message}\n\n${marker}`, requestId,
+              ...(request.delivery ? { model: request.delivery.model,
+                effort: request.delivery.effort } : {}) });
             turnId = sent?.turnId;
           }
           // A returned native turn id is acceptance, not completion. Recording it
@@ -207,6 +270,13 @@ export async function createCodexBackend(record, deps = {}) {
             value.binding = { sessionId: error.nativeSessionId, owned: true };
             value.pendingTitle ??= { name: load().name, attempts: 0 };
             save(value);
+          }
+          // A terminal refusal happened before the native write (for example a
+          // model change requested on a running turn). It is not an unknown write
+          // and must not be retried.
+          if (error.terminal === true) {
+            request.status = 'failed'; save(value);
+            throw fail(error.code ?? 'codex-delivery-refused', error.message, { terminal: true });
           }
           // No debug port means the write never reached Codex, so this is a
           // retryable transport failure rather than an unknown write outcome.
@@ -245,23 +315,24 @@ export async function createCodexBackend(record, deps = {}) {
       return { ...native, correlation, turnId: request.turnId };
     },
     async models() {
-      const value = state();
-      // A bound thread's live selection is the honest catalog here: the shared
-      // layer compares it before each dispatch, and this target never overrides
-      // the user's choice. An unbound name shows the Codex default.
-      const selection = value.binding ? await host.readCurrentModel(value.binding.sessionId) : await defaultModel();
-      return { default: selection, routableProviders: [selection.provider], groups: [{ id: selection.provider,
-        models: [{ id: selection.model, reasoningEfforts: selection.reasoningEffort ? [selection.reasoningEffort] : [] }] }] };
+      // A sessionless name still needs a real catalog: status and explicit model
+      // resolution both read here before any native thread exists. The catalog
+      // carries the stable preset id plus supported/default reasoning efforts.
+      return host.models({ workspace: load().workspace });
     },
     async model() {
+      // model() reports the live thread selection. An unbound name has none yet;
+      // returning undefined keeps native inheritance honest and never invents a
+      // default from an unresolvable config.toml.
       const value = state();
-      return value.binding ? host.readCurrentModel(value.binding.sessionId) : defaultModel();
+      return value.binding ? host.readCurrentModel(value.binding.sessionId) : undefined;
     },
     async selectModel() {
-      // Codex Desktop inherits the user's own model picker and config. Pretending
-      // to change it here would silently disagree with the next real turn.
+      // Codex Desktop has no session-level model switch: an explicit selection is
+      // applied by the next turn/start. Pretending to change the picker here would
+      // disagree with the next real turn.
       throw fail('model-selection-unsupported',
-        'Codex Desktop subagents use the user\'s own model and reasoning selection; this plugin never overrides them.');
+        'Codex Desktop applies a model selection to an explicit turn. Wait for the current turn to end, then send the selection with the task.');
     },
     async cancel() {
       const { value, tree } = await refresh();

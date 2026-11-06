@@ -17,6 +17,7 @@ function hostServices() {
   return { tools, services: {
     sessionController: { agents: { composeAgent: async () => ({}) }, resolveAgent: async () => ({}), inspect: async () => ({}) },
     sessionQuery: { readSession: async () => ({}), _observations: { cache: { has: () => false, delete: () => {} } } },
+    llm: { listProviders: () => [], listModels: async () => [], resolveCallConfig: async value => value },
     sessionPersistence: { resolveCurrentLog: async () => undefined, stat: async () => undefined, config: { root: 'C:/sessions' } },
     workspaceRegistry: { resolveByPath: async () => undefined, create: async () => undefined, get: () => undefined, list: () => [] },
     subagents: { listDescendants: async () => [], waitForChildren: async () => false, drainDescendants: async () => {} },

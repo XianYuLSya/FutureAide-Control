@@ -26,17 +26,19 @@
 //                      at most maxMessages; the target's own event format never
 //                      leaves the adapter.
 //   answer(input)      {consumedQuestionIds, continuation?} — empty ids is an error.
-//   deliver(input)     {accepted, status, afterSeq?} — one idempotent request;
-//                      acceptance is not model completion.
+//   deliver(input)     {accepted, status, afterSeq?} — one idempotent request.
+//                      For an explicitly selected Codex name, model contains
+//                      the frozen selection and explicitModel is true.
 //   receipt(input)     {status, afterSeq?, result?} | undefined — undefined means
 //                      no write was ever attempted, never "no native marker found".
 //   turn(input)        {state: 'running'|'ended', correlation?, completionReason?, endSeq?}
-//   models() / model() Catalog of the target's default, and the target's real
+//   models() / model() Ordered catalog of the target's models, their efforts
+//                      and its default selection, and the target's real
 //                      current selection for this session. model() must report
 //                      what the target would actually use; it must not echo an
 //                      assumed default to avoid a missing capability.
-//   selectModel(input) {accepted} — a target that cannot select its model throws
-//                      (e.g. model-selection-unsupported); it never fakes success.
+//   selectModel(input) {accepted} — DSH applies sessionOnly selections to this
+//                      managed session. Codex applies its selection at turn start.
 //   cancel()           {cancelRequested}   destroy() {destroyed, message?}
 //   cursor()           {throughSeq} baseline used only when no observation exists.
 //   history(input)     (above) already normalized, at most maxMessages.
@@ -78,6 +80,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { historyMessages, modelTurnError } from './control.mjs';
 import { dispatchBoundary } from './dispatch.mjs';
+import { modelCatalogSummary } from './model-selection.mjs';
 
 export const TARGETS = Object.freeze(['dsh', 'codex-desktop']);
 export const DEFAULT_TARGET = 'dsh';
@@ -126,9 +129,16 @@ export function hostLabel(record) {
 
 const reason = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 400) });
 
+// Catalog reads are diagnostic: an unavailable catalog must not hide the
+// registration evidence or substitute a default from the other application.
+export async function readStatusModels(readCatalog) {
+  try { return modelCatalogSummary(await readCatalog()); }
+  catch (error) { return { models: [], defaultModel: null, modelError: reason(error) }; }
+}
+
 /**
  * Readiness of one target without starting a model or a session: import the
- * adapter, check the whole contract, then call probe() only. An adapter that is
+ * adapter, check the whole contract, then read its readiness and model catalog. An adapter that is
  * absent, incomplete, or reports unfinished protocols is ready:false with the
  * concrete reason; nothing here ever answers for another target.
  * @param {string} target TARGETS entry.
@@ -150,7 +160,7 @@ export async function diagnoseTarget(target, { adapters = {}, record = {}, reque
   try { probe = await backend.probe(); }
   catch (error) { return { ready: false, present: true, reason: reason(error) }; }
   const capabilities = { methods: probe?.methods ?? [], treeProtocol: probe?.treeProtocol ?? null,
-    reportProtocol: probe?.reportProtocol ?? null };
+    reportProtocol: probe?.reportProtocol ?? null, ...await readStatusModels(() => backend.models()) };
   if (capabilities.treeProtocol !== 1) return { ready: false, present: true, ...capabilities,
     reason: { code: 'tree-protocol-required', message: `The ${wanted} adapter has not completed its task-tree protocol. No subagent can be created on it yet.` } };
   if (capabilities.reportProtocol !== 1) return { ready: false, present: true, ...capabilities,
@@ -265,9 +275,10 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
       const session = await client.managedSession(args());
       return session?.projections?.values?.modelSelection?.next ?? null;
     },
-    async selectModel({ requestId, provider, model, reasoningEffort } = {}) {
+    async selectModel({ requestId, provider, model, reasoningEffort, sessionOnly } = {}) {
       return control().selectModel({ sessionId: args().sessionId, provider, model,
-        ...(reasoningEffort === undefined ? {} : { reasoningEffort }), requestId });
+        ...(reasoningEffort === undefined ? {} : { reasoningEffort }), requestId,
+        ...(sessionOnly === true ? { sessionOnly: true } : {}) });
     },
     async cancel() { return client.managedCancel(args()); },
     async destroy() { return client.managedDestroy(args()); },

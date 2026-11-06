@@ -14,7 +14,7 @@ export const FINAL_REPORT_CONTRACT = 'Write a final report for a controlling age
   + 'Decisions: only choices the controlling agent must make. '
   + 'Stay under about 300 words. Do not restate the task or narrate your process. '
   + 'Put long material in a file and name it. '
-  + 'A lead that ran a team sends one summary of the team\'s result, not each member\'s report.';
+  + 'If you delegated work, send one summary of the combined result.';
 
 export const QUESTION_CONTRACT = 'State the decision you need, the options and your recommendation in a few lines, '
   + 'so it can be answered without reading your work.';
@@ -76,7 +76,8 @@ export const name = 'futureaide-control-host';
 // Tools belong to each Agent's composition; the bridge also mounts at host scope.
 export const inject = ['connection', 'webServer', 'agents', 'sessions'];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
-export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedSelectModel',
+  'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
 
 // DSH's own question tool opens a prompt in the DSH window, which the chat that
 // dispatched the task never sees: the agent waits and the caller is never asked.
@@ -98,6 +99,10 @@ export const DSH_INTERNALS = Object.freeze([
   // 0.2.2 dropped sessionController.inspect in favour of the query service.
   { choices: [{ service: 'sessionController', member: 'inspect' }, { service: 'sessionQuery', member: 'readSession' }] },
   { service: 'sessionQuery', members: ['_observations.cache.delete', '_observations.cache.has'] },
+  // Session-local model selection validates the exact provider/model and effort
+  // through the same live registry the native session command uses. It is optional
+  // for compatibility because only the new explicit-selection method reads it.
+  { service: 'llm', members: ['listProviders', 'listModels', 'resolveCallConfig'], optional: true },
   { service: 'sessionPersistence', members: ['resolveCurrentLog', 'stat', 'config.root'] },
   { service: 'workspaceRegistry', members: ['resolveByPath', 'create', 'get', 'list'] },
   { service: 'subagents', members: ['listDescendants', 'waitForChildren', 'drainDescendants'] },
@@ -652,6 +657,55 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       await (writes.get(keyOf(record)) ?? Promise.resolve());
       return { ...snapshot(record, agent), reportProtocol: 1, tree: await treeSnapshot(record, agent) };
     }); },
+    // Explicit model selection is Session-local: DSH's own command would also save
+    // the app-wide default, so this path repeats only its validation and
+    // agent.model.select under the same image-admission serialization, and never
+    // calls agentDefaultModel.saveSelection.
+    managedSelectModel(input) { return serial(input, async () => {
+      managedId(input.sessionId);
+      if (input.taskId !== undefined) managedId(input.taskId);
+      if (typeof input.workspace !== 'string' || !path.isAbsolute(input.workspace)) reject('workspace-required');
+      const record = await load(input);
+      if (record.closing) reject('managed-agent-closing');
+      const selection = modelValue(input.selection);
+      const agent = await activate(record);
+      if (!agent) reject('managed-handle-unavailable');
+      const controller = service('sessionController');
+      const agents = controller?.agents;
+      if (typeof agents?.serializeImageAdmission !== 'function') reject('managed-model-selection-unavailable');
+      return agents.serializeImageAdmission(agent, async () => {
+        const llm = service('llm');
+        if (!llm || typeof llm.listProviders !== 'function' || typeof llm.listModels !== 'function'
+            || typeof llm.resolveCallConfig !== 'function') reject('managed-model-selection-unavailable');
+        const commands = controller?.commands;
+        if (typeof commands?.requireModel === 'function') {
+          try { await commands.requireModel.call(commands, selection); }
+          catch { reject('managed-model-unavailable'); }
+        } else {
+          if (!llm.listProviders().some(provider => provider?.id === selection.provider)) reject('managed-model-unavailable');
+          let models;
+          try { models = await llm.listModels(selection.provider); }
+          catch { reject('managed-model-unavailable'); }
+          if (!Array.isArray(models) || !models.some(model => model?.id === selection.model)) reject('managed-model-unavailable');
+        }
+        try { await llm.resolveCallConfig(selection); }
+        catch { reject('managed-model-unavailable'); }
+        if (typeof agent.model?.select !== 'function') reject('managed-model-selection-unavailable');
+        agent.model.select(selection);
+        // Read back the durable Session choice, not the request. The agent model
+        // reader and the projection/event view must agree on the requested route;
+        // a stale projection cannot mask a host that ignored or substituted it.
+        const recorded = typeof agent.model.current === 'function' ? agent.model.current() : undefined;
+        const observed = liveModelSelection(agent);
+        const current = sameSelectionValue(recorded, selection) ? recorded
+          : sameSelectionValue(observed, selection) ? observed : recorded ?? observed;
+        if (!sameSelectionValue(current, selection)) reject('managed-model-selection-unconfirmed');
+        return { accepted: true, sessionId: record.sessionId, selected: { ...current },
+          source: 'managed-session-selectModel',
+          defaultModelBehavior: 'Session-only: the app-wide default model is unchanged.',
+          modelRequestsStarted: 0 };
+      });
+    }); },
     managedHistory(input) { return serial(input, async () => {
       const record = await load(input);
       if (input.treeProtocol !== 1) reject('managed-tree-protocol-required');
@@ -846,6 +900,11 @@ function modelValue(value) {
         || !value.reasoningEffort.trim() || value.reasoningEffort.length > 100))) reject('invalid-model');
   return { provider: value.provider, model: value.model,
     ...(value.reasoningEffort === undefined ? {} : { reasoningEffort: value.reasoningEffort }) };
+}
+
+function sameSelectionValue(left, right) {
+  return left?.provider === right?.provider && left?.model === right?.model
+    && (left?.reasoningEffort ?? undefined) === (right?.reasoningEffort ?? undefined);
 }
 
 async function inWorkspace(candidate, workspace) {

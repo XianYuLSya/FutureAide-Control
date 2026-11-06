@@ -17,7 +17,7 @@ async function fixture({ modern = false, changeInstance = false } = {}) {
   const instance = { version: 1, application: 'dsh', pid: process.pid, instanceId: randomUUID(), dataRoot: workspace,
     baseUrl: 'http://127.0.0.1:45678', launchUrl: 'http://127.0.0.1:45678/?token=fixture' };
   await writeFile(instanceFile, JSON.stringify(instance));
-  const state = { calls: [], statusCalls: 0, failStatus: 0, losePromptReply: false, prompts: 0, events: [], seq: 4 };
+  const state = { calls: [], statusCalls: 0, failStatus: 0, losePromptReply: false, prompts: 0, events: [], seq: 4, managedSelections: [] };
   const stalled = signal => new Promise((resolve, reject) => {
     signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
   });
@@ -27,6 +27,13 @@ async function fixture({ modern = false, changeInstance = false } = {}) {
     state.calls.push(body);
     const reply = value => new Response(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value } }));
     const reject = code => new Response(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: false, error: { code } } }));
+    if (method === 'managedSelectModel') {
+      const args = body.payload.args;
+      state.managedSelections.push(args);
+      return reply({ accepted: true, sessionId: args.sessionId, selected: args.selection,
+        source: 'managed-session-selectModel', defaultModelBehavior: 'Session-only: the app-wide default model is unchanged.',
+        modelRequestsStarted: 0 });
+    }
     if (method === 'managedStatus') {
       state.statusCalls++;
       if (state.failStatus === state.statusCalls) return stalled(init.signal);
@@ -87,6 +94,24 @@ test('managed model selection, dispatch, wait and read never list all sessions',
   await f.control.read({ sessionId: 'session-a' });
   assert.equal(f.state.prompts, 1);
   assert.ok(f.state.calls.every(call => !['session/list', 'session.list'].includes(call.method)));
+});
+
+test('explicit managed selection uses the session-only host method while default-follow keeps the native path', async () => {
+  const selection = { provider: 'fixture', model: 'm', reasoningEffort: 'high' };
+  const explicit = await fixture();
+  await explicit.control.selectModel({ sessionId: 'session-a', ...selection, requestId: 'session-only-1', sessionOnly: true });
+  assert.equal(explicit.state.managedSelections.length, 1);
+  assert.deepEqual(explicit.state.managedSelections[0].selection, selection);
+  assert.ok(explicit.state.calls.some(call => call.method === 'managedSelectModel'));
+  assert.equal(explicit.state.calls.some(call => call.method === 'session/selectModel'), false,
+    'explicit session-only selection never calls the default-saving native command');
+
+  const follow = await fixture();
+  const follows = await follow.control.selectModel({ sessionId: 'session-a', provider: 'fixture', model: 'm', requestId: 'default-follow-1' });
+  assert.equal(follows.accepted, true);
+  assert.equal(follow.state.managedSelections.length, 0);
+  assert.ok(follow.state.calls.some(call => call.method === 'session/selectModel'),
+    'the unpinned/default-follow path is unchanged');
 });
 
 test('fresh modern managed wait and history detect the dialect without send or list', async () => {

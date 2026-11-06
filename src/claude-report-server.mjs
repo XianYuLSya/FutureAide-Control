@@ -38,7 +38,7 @@ export const DEFAULT_KEEP_ALIVE_MS = 600000;
 
 export const INSTRUCTIONS = `FutureAide Control management tools.
 
-These tools manage named subagents for the current project. The calling chat is identified from this connection itself: no session id, chat id, name or route is accepted as an argument, so never look for one. Each tool reports its own result; an ordinary reply and the end of a turn notify nobody.`;
+These tools manage named subagents in this project. Run, create and send accept model and effort. Check status for the target's IDs. The calling chat is identified from this connection itself. For caller identity, no session id, chat id, name or route is accepted as an argument, so never look for one. Explicit questions and reports reach the caller.`;
 
 /**
  * The trusted caller record the shared service reads from `calling-context`

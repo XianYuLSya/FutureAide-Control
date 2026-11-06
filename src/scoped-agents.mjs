@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
+import { actualModelName, resolveModelSelection, sameModelSelection } from './model-selection.mjs';
 import { callCodexOwner } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
@@ -13,7 +14,7 @@ import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, resolveBackend,
+import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, readStatusModels, resolveBackend,
   TARGET_LABELS, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 import { FINAL_REPORT_REMINDER } from './report-contract.mjs';
@@ -169,6 +170,14 @@ function publicResult(record, { fullResult = false } = {}) {
   const explicitReports = (task?.reports ?? []).filter(report => !report.failure);
   return {
     name: record.name, lifetime: record.lifetime, target: targetOf(record), state: record.state,
+    // The full ID the target actually uses, never the caller's substring. The
+    // explicit pin is a separate value and is only reported by a dispatch receipt;
+    // list/wait must not present an intended selection as an observed model. An
+    // unpinned Codex name starts null and becomes known from the live observation
+    // before record.model catches up.
+    actualModel: record.modelPin
+      ? actualModelName(record.model) ?? actualModelName(record.observation?.currentModel)
+      : actualModelName(record.observation?.currentModel) ?? actualModelName(record.model),
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
       ...(task.finishedAt ? { finishedAt: task.finishedAt } : {}),
       ...(task.result ? { result: { state: task.result.state,
@@ -920,34 +929,99 @@ export function createScopedAgents(config, {
     return composed;
   }
 
-  function sameModel(left, right) {
-    if (!left || !right) return false;
-    return left.provider === right.provider && left.model === right.model
-      && (left.reasoningEffort ?? undefined) === (right.reasoningEffort ?? undefined);
+  function hasModelRequest(input = {}) {
+    return input.model !== undefined || input.effort !== undefined;
+  }
+
+  function selectionRequest(input = {}) {
+    return {
+      ...(input.model === undefined ? {} : { model: input.model }),
+      ...(input.effort === undefined ? {} : { effort: input.effort }),
+    };
+  }
+
+  // A Codex turn cannot change model or effort while it is running: turn/steer
+  // only adds input to the live turn. This checks the shared state as well as the
+  // last observation, so an async queue cannot slip a rejected selection through.
+  function codexTurnRunning(record) {
+    if (targetOf(record) !== 'codex-desktop' || !record.task) return false;
+    if (['completed', 'cancelled', 'failed'].includes(record.task.state)) return false;
+    return record.state === 'running' || record.task.state === 'running'
+      || record.observation?.tree?.running === true;
+  }
+
+  function modelChangeRefused() {
+    return Object.assign(new Error('Codex Desktop cannot change model or effort while a turn is running. Wait for the current turn to end, then send the new selection.'),
+      { code: 'codex-model-change-while-running', terminal: true });
+  }
+
+  async function resolveRequestedPin(record, input) {
+    const request = selectionRequest(input);
+    if (request.model === undefined && !record.modelPin) {
+      // Fail before a catalog read: an effort alone may only refine an already
+      // explicit choice, never silently pin the host's current default.
+      return resolveModelSelection({ groups: [] }, request, { pinned: record.modelPin });
+    }
+    const backend = await backendFor(record);
+    return resolveModelSelection(await backend.models(), request, { pinned: record.modelPin });
+  }
+
+  /**
+   * Confirm one DSH selection before its dispatch. Only a live host observation proves
+   * what the session will use; a roster snapshot may have been migrated while asleep.
+   * An observation that reports modelSelectionObserved:false carries a historical
+   * value, stale exactly when the user changed the model in the UI without sending a
+   * turn — then the real next-turn control is read instead. `sessionOnly` is set for
+   * explicit pins and omitted for default-follow, which keeps the old DSH behavior.
+   */
+  async function confirmDshSelection(backend, target, dispatch, selection, observed, { sessionOnly = false } = {}) {
+    const current = observed && observed.modelSelectionObserved !== false
+      ? observed.currentModel
+      : await backend.model();
+    if (sameModelSelection(current, selection)) return;
+    const selected = await backend.selectModel({ ...selection, requestId: `${dispatch.requestId}-model`,
+      ...(sessionOnly ? { sessionOnly: true } : {}) });
+    if (selected.accepted !== true) {
+      throw Object.assign(new Error(`${backend.labels?.host ?? target} did not confirm the selected model.`),
+        { code: 'model-selection-unconfirmed', uncertain: selected.status === 'unknown' });
+    }
   }
 
   async function followHostModel(record, dispatch, observed) {
     if (dispatch.modelReady) return;
     const backend = await backendFor(record);
+    const target = targetOf(record);
+    const explicit = dispatch.explicitModel === true && dispatch.model !== undefined;
+    if (explicit) {
+      if (target === 'dsh') {
+        await confirmDshSelection(backend, target, dispatch, dispatch.model, observed, { sessionOnly: true });
+        record.model = { ...dispatch.model };
+      }
+      // Codex applies the model on its own turn/start. Calling its selectModel would
+      // either fake a selection or touch the user's defaults, so it is never used.
+      dispatch.modelReady = true;
+      store.save(record);
+      return;
+    }
+    if (target === 'codex-desktop') {
+      // Native inheritance: read the actual model for display, but never select or
+      // send one for a name that did not ask for an explicit selection.
+      const current = observed && observed.modelSelectionObserved !== false && observed.currentModel
+        ? observed.currentModel
+        : await backend.model();
+      dispatch.model = current ? { ...current } : undefined;
+      if (current) record.model = { ...current };
+      dispatch.modelReady = true;
+      store.save(record);
+      return;
+    }
+    // DSH default-follow keeps the old resolveModel and its catalog validation.
     if (!dispatch.model) {
       dispatch.model = resolveModel(await backend.models(), {});
       store.save(record);
     }
-    // Only a live host observation proves what the session will use. The roster
-    // model is a display snapshot and may have been migrated while asleep. An
-    // observation that reports modelSelectionObserved:false carries a historical
-    // value (read back from a transcript), which is stale exactly when the user
-    // changed the model in the UI without sending a turn — then the real
-    // next-turn control is read instead of trusting that value.
-    const current = observed && observed.modelSelectionObserved !== false
-      ? observed.currentModel
-      : await backend.model();
-    if (!sameModel(current, dispatch.model)) {
-      const selected = await backend.selectModel({ ...dispatch.model, requestId: `${dispatch.requestId}-model` });
-      if (selected.accepted !== true) throw Object.assign(new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the default model selection.`),
-        { code: 'model-selection-unconfirmed', uncertain: selected.status === 'unknown' });
-    }
-    record.model = dispatch.model;
+    await confirmDshSelection(backend, target, dispatch, dispatch.model, observed);
+    record.model = { ...dispatch.model };
     dispatch.modelReady = true;
     store.save(record);
   }
@@ -958,7 +1032,14 @@ export function createScopedAgents(config, {
       ? observed : await (await backendFor(record)).cursor();
     // `extra` is written with the dispatch, before the first save, so a reminder is
     // recognisable as one even if the process dies on the way to the native send.
-    const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now(), ...extra };
+    // The selection is frozen here: later pin changes must not rewrite an input that
+    // is already queued or being recovered. `freezeModel` on a queued supplement
+    // records that it had no pin when it was accepted, so a later pin cannot leak in.
+    const { model: frozenModel, freezeModel, ...dispatchExtra } = extra;
+    const selected = frozenModel !== undefined ? frozenModel
+      : freezeModel === true ? undefined : record.modelPin;
+    const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now(),
+      ...(selected ? { model: { ...selected }, explicitModel: true } : {}), ...dispatchExtra };
     task.dispatches.push(dispatch);
     record.state = 'running'; task.state = 'running';
     store.save(record); // The intent survives a caller or worker exiting during the write.
@@ -973,20 +1054,33 @@ export function createScopedAgents(config, {
     let delivering = false;
     try {
       await followHostModel(record, dispatch, observed);
-      // The model this request runs on is given explicitly, so a backend never has to
-      // guess it from a catalog default that may have moved since the preflight.
+      // The model this request runs on is frozen with the dispatch, so a backend never
+      // has to guess it from a catalog default that may have moved since the preflight.
+      // Codex receives the model object only when the caller explicitly selected one;
+      // every other turn keeps native inheritance and sends no model or effort.
       const backend = await backendFor(record);
       delivering = true;
+      const explicit = dispatch.explicitModel === true && dispatch.model !== undefined;
       const sent = await backend.deliver({ requestId: dispatch.requestId,
-        message: dispatch.message, kind: dispatch.kind, model: dispatch.model });
+        message: dispatch.message, kind: dispatch.kind,
+        ...(explicit ? { model: dispatch.model, explicitModel: true } : { explicitModel: false }) });
       Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
         afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined, nextAttemptAt: undefined } : {}) });
+      if (sent.accepted === true && explicit && targetOf(record) === 'codex-desktop') {
+        // The native turn now runs with the pinned model; record the real display value.
+        record.model = { ...dispatch.model };
+      }
       if (!sent.accepted && ['retryable', 'retrying'].includes(dispatch.state)) {
         dispatch.state = 'retrying'; deferRetry(dispatch);
       }
     } catch (error) {
-      const retryable = error.retryableRead === true || (targetOf(record) !== 'dsh' && (!delivering || error.code === 'agent-busy'));
-      const state = error.terminal === true ? 'failed'
+      // A model request that cannot be resolved is a caller-visible refusal, never a
+      // transient transport failure: retrying it would loop forever and hide the typo.
+      const modelError = ['model-required', 'model-required-for-effort', 'model-not-found',
+        'effort-not-supported', 'model-default-invalid', 'codex-model-change-while-running'].includes(error.code);
+      const retryable = !modelError && (error.retryableRead === true
+        || (targetOf(record) !== 'dsh' && (!delivering || error.code === 'agent-busy')));
+      const state = error.terminal === true || modelError ? 'failed'
         : targetOf(record) !== 'dsh' && !delivering ? 'retrying'
           : error.uncertain ? 'unknown' : retryable ? 'retrying' : 'failed';
       Object.assign(dispatch, { state, afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
@@ -1077,7 +1171,11 @@ export function createScopedAgents(config, {
     const reason = [record.error?.message, finalDispatch?.failure?.message,
       finalDispatch?.error?.message, finalDispatch?.failure?.code, finalDispatch?.error?.code,
       rootSummary(view)?.reply].find(value => typeof value === 'string' && value.trim()) ?? '模型执行失败';
-    return compactText(String(reason), 200);
+    // A generic message such as "model execution failed" says nothing on its own;
+    // the stable code (QUOTA, a rate limit) is what the parent can act on.
+    const code = [record.error?.code, finalDispatch?.failure?.code, finalDispatch?.error?.code]
+      .find(value => typeof value === 'string' && value.trim());
+    return compactText(code && !String(reason).includes(code) ? `${code}：${reason}` : String(reason), 200);
   }
 
   /**
@@ -1246,9 +1344,29 @@ export function createScopedAgents(config, {
     store.save(record);
     const created = await backend.create();
     if (created.sessionId !== record.sessionId || created.modelRequestsStarted !== 0) throw new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the requested empty subagent.`);
-    // The model is resolved from the live host default when the first input is
-    // sent; creation must not add a second catalog round-trip or pin a stale model.
-    record.model = created.model;
+    // An explicit pin is applied before the first input, without starting a turn.
+    // DSH records it on the session; `sessionOnly` keeps it out of the user's global
+    // default. Codex has no session-only select API: its adapter applies the pin on
+    // the first turn/start, so the resolved ID is the display value until then.
+    if (record.modelPin) {
+      if (targetOf(record) === 'dsh') {
+        if (!sameModelSelection(created.model, record.modelPin)) {
+          const selected = await backend.selectModel({ ...record.modelPin,
+            requestId: `${record.agentId}-model`, sessionOnly: true });
+          if (selected.accepted !== true) {
+            throw Object.assign(new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the selected model.`),
+              { code: 'model-selection-unconfirmed', uncertain: selected.status === 'unknown' });
+          }
+        }
+        record.model = { ...record.modelPin };
+      }
+      // Codex has no session-only select API: the resolved pin is reported by the
+      // creation receipt, but its actualModel stays unobserved until the first turn.
+    } else {
+      // No explicit choice: keep the host's own model display and resolve the live
+      // default only when the first input is sent.
+      record.model = created.model;
+    }
     record.created = true; record.state = 'idle'; record.error = undefined; store.save(record);
   }
 
@@ -1270,7 +1388,12 @@ export function createScopedAgents(config, {
     const baseline = startWorkspaceBaseline(record);
     try {
       const observed = await negotiateTree(record, true);
-      await sendDispatch(record, record.task.message, 'task', [], undefined, observed);
+      // A task freezes its selection at creation. The desktop first dispatch is
+      // delayed through the worker queue, so reading the live pin here would let a
+      // later change rewrite an input the caller had already accepted.
+      const frozen = Object.prototype.hasOwnProperty.call(record.task, 'modelSelection')
+        ? { model: record.task.modelSelection, freezeModel: true } : {};
+      await sendDispatch(record, record.task.message, 'task', [], undefined, observed, frozen);
     } finally { trackWorkspaceBaseline(record, baseline); }
   }
 
@@ -1564,20 +1687,28 @@ export function createScopedAgents(config, {
         store.setSupplement(item.requestId, 'blocked', current.task.cancelRequested ? 'task-cancelled' : 'task-closed'); continue;
       }
       if (priorAnswer) {
-        if (!priorAnswer.questionIds) await answerLocked(record, item.message, item.requestId);
+        if (!priorAnswer.questionIds) await answerLocked(record, item.message, item.requestId,
+          { modelSelection: item.selection ?? null });
         store.setSupplement(item.requestId, 'accepted');
         if (!priorAnswer.dispatched) return;
         continue;
       }
       const view = await observe(record);
       if ((view.reports ?? []).some(report => report.final)) { store.blockQueued(record.agentId, record.task.taskId, 'final-submitted'); store.setSupplement(item.requestId, 'blocked', 'final-submitted'); return; }
+      // A queued input keeps the selection frozen when it was accepted. Do not
+      // compare it with record.modelPin: that is the latest intended selection,
+      // not the model of the turn currently running, and a later pin change must
+      // not discard an earlier input. The Codex adapter checks the live thread's
+      // real model/effort and refuses an incompatible turn itself; send() rejects
+      // a new selection change while the turn is running at the entry.
       store.setSupplement(item.requestId, 'sending');
       if ((view.questions ?? []).some(question => question.state === 'pending')) {
-        await answerLocked(record, item.message, item.requestId);
+        await answerLocked(record, item.message, item.requestId, { modelSelection: item.selection ?? null });
         store.setSupplement(item.requestId, 'accepted');
         return;
       } else {
-        const dispatch = await sendDispatch(record, item.message, 'supplement', [], item.requestId, view);
+        const dispatch = await sendDispatch(record, item.message, 'supplement', [], item.requestId, view,
+          { model: item.selection, freezeModel: true });
         store.setSupplement(item.requestId, dispatch.accepted ? 'accepted' : dispatch.state === 'failed' ? 'blocked' : 'unknown', dispatch.accepted ? null : dispatch.error?.code ?? (dispatch.state === 'failed' ? 'send-failed' : 'acceptance-unknown'));
         if (!dispatch.accepted) return;
       }
@@ -1682,7 +1813,13 @@ export function createScopedAgents(config, {
       if (pendingAnswers.length && !task.cancelRequested) {
         const ids = pendingAnswers.flatMap(answer => answer.questionIds);
         for (const answer of pendingAnswers) answer.dispatched = true;
-        await sendDispatch(record, pendingAnswers.map(answer => answer.continuation).join('\n\n'), 'answer', ids, undefined, view);
+        // Multiple answers are joined into one continuation; the last accepted
+        // answer intent owns the selection frozen for that dispatch. An answer
+        // recorded before this field existed keeps the old live-pin fallback.
+        const last = pendingAnswers.at(-1);
+        const frozen = Object.prototype.hasOwnProperty.call(last, 'modelSelection')
+          ? { model: last.modelSelection, freezeModel: true } : {};
+        await sendDispatch(record, pendingAnswers.map(answer => answer.continuation).join('\n\n'), 'answer', ids, undefined, view, frozen);
         return publicResult(record);
       }
       if (!treeSettled(record, view)) {
@@ -1742,9 +1879,10 @@ export function createScopedAgents(config, {
         Object.assign(status, { contextVerified: true, workspace: owner.workspace, ...await returnChannel(owner),
           agents: typeof store.count === 'function' ? store.count(owner.ownerId) : store.list(owner.ownerId).length });
       } catch (error) { status.contextError = safeError(error); }
-      let host;
+      let client, host;
       try {
-        host = await clientFactory(config).hostStatus();
+        client = clientFactory(config);
+        host = await client.hostStatus();
         status.dshConnected = METHODS.every(method => host.methods?.includes(method));
         status.treeProtocolReady = host.treeProtocol === TREE_PROTOCOL;
         status.reportProtocolReady = host.reportProtocol === REPORT_PROTOCOL;
@@ -1753,30 +1891,25 @@ export function createScopedAgents(config, {
       } catch (error) { status.hostError = safeError(error); }
       status.ready = status.contextVerified && status.returnChannel === 'chat-verified' && status.dshConnected
         && status.treeProtocolReady === true && status.reportProtocolReady === true;
-      // Per-target readiness beside the unchanged DSH fields. Neither entry starts
-      // a model turn or a session: the DSH probe is the same one above, and the
-      // Codex entry only reads its own registration evidence.
-      const probe = { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
+      // Both catalogs can be read without reserving a name or starting a turn.
+      const codexProbe = { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
         lifetime: 'once', target: 'codex-desktop', workspace: owner?.workspace ?? config.workspace,
         state: 'probing', createdAt: now(), updatedAt: now(), history: [] };
+      const emptyCatalog = { models: [], defaultModel: null };
+      const [dshModels, codexEntry] = await Promise.all([
+        host ? readStatusModels(() => controlFactory(config, { client }).models()) : emptyCatalog,
+        diagnoseTarget('codex-desktop', { adapters: backendAdapters,
+          ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
+          record: codexProbe, deps: adapterDeps(codexProbe) }),
+      ]);
       status.backends = {
-        dsh: dshDiagnostics(host, status),
+        dsh: { ...dshDiagnostics(host, status), ...dshModels },
+        'codex-desktop': { ...emptyCatalog, ...codexEntry, ...(codexEntry.ready
+          ? { ...codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)), evidence: 'native-rpc' } : {}) },
       };
-      // This probe name is not in the roster, so a state write during diagnostics
-      // reports false instead of inventing a row. A Codex Desktop entry is ready only
-      // when a real native Codex session reports the ask/report tools; an adapter that
-      // merely answers probe() is not enough, and a healthy loopback endpoint proves
-      // nothing about those tools.
-      const codexProbe = { ...probe, target: 'codex-desktop' };
-      const codexEntry = await diagnoseTarget('codex-desktop', { adapters: backendAdapters,
-        ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
-        record: codexProbe, deps: adapterDeps(codexProbe) });
-      status.backends['codex-desktop'] = codexEntry.ready
-        ? { ...codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)), evidence: 'native-rpc' }
-        : codexEntry;
       return status;
     },
-    async create({ name, lifetime, target }, extra) {
+    async create({ name, lifetime, target, model, effort }, extra) {
       assertName(name);
       if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
       const backendTarget = normalizeTarget(target);
@@ -1789,27 +1922,76 @@ export function createScopedAgents(config, {
         target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
         ...(parent ? { parentAgentId: parent.agentId } : {}) };
       await ensureTargetBackend(record);
+      if (hasModelRequest({ model, effort })) {
+        // Resolve against the live target catalog before the name exists, so a typo
+        // creates nothing and a valid pin is part of the first durable record.
+        record.modelPin = await resolveRequestedPin(record, { model, effort });
+      }
       store.insert(record); // The database's (owner,name) constraint arbitrates parallel creation.
       return store.locked(record.agentId, async () => {
         if (!store.get(record.agentId)) throw new Error('This subagent was removed while it was being created.');
         try {
           await prepare(record);
-          return { ...publicResult(record), created: true, modelRequestsStarted: 0 };
+          return { ...publicResult(record), created: true, modelRequestsStarted: 0,
+            // A creation receipt reports the resolved pin even when the target has
+            // no session-level selection API yet; list/wait still report only an
+            // observed actual model.
+            actualModel: actualModelName(record.model) ?? actualModelName(record.modelPin) };
         } catch (error) {
           record.state = 'reconnecting'; record.error = safeError(error); store.save(record); await ensureWorker(record);
           return { ...publicResult(record), created: false };
         }
       });
     },
-    async send({ name, message }, extra) {
+    async send({ name, message, model, effort }, extra) {
       textMessage(message);
+      const request = { model, effort };
+      const wantsSelection = hasModelRequest(request);
+      const supplementStates = new Set(['running', 'awaiting_input', 'awaiting_report', 'reconnecting']);
       let enteredOperation = false;
-      const enqueue = async record => {
+      const queued = (record, pin) => ({
+        name: record.name, accepted: false, queued: true, state: record.state,
+        // The receipt reports the full ID resolved for this input, not a stale
+        // display value from before the pin changed.
+        actualModel: actualModelName(pin) ?? actualModelName(record.model),
+        ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
+      });
+      const persistPin = (record, pin) => {
+        if (!wantsSelection) return;
+        record.modelPin = { ...pin };
+        store.save(record);
+      };
+      const queue = async (record, pin, { usePinnedModel = false, savePin = false } = {}) => {
         const requestId = uid('request');
-        if (!store.enqueueSupplement(record, requestId, message)) throw Object.assign(new Error('The task changed, stopped or is no longer accepting supplements.'), { code: 'supplement-unavailable' });
+        const previous = record.modelPin;
+        if (savePin) record.modelPin = { ...pin };
+        let changed;
+        try {
+          // With no explicit selection the SQL copies the live pin in the same
+          // INSERT SELECT, so a poll's stale body cannot overwrite a newer value.
+          changed = store.enqueueSupplement(record, requestId, message, pin ? { ...pin } : undefined,
+            { ...(usePinnedModel ? { usePinnedModel: true } : {}), ...(savePin ? { saveRecord: true } : {}) });
+        } catch (error) {
+          if (savePin) record.modelPin = previous;
+          throw error;
+        }
+        if (!changed) {
+          if (savePin) record.modelPin = previous;
+          throw Object.assign(new Error('The task changed, stopped or is no longer accepting supplements.'), { code: 'supplement-unavailable' });
+        }
         await ensureWorker(store.get(record.agentId) ?? record, { wake: true });
-        return { name: record.name, accepted: false, queued: true, state: record.state,
-          ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
+        const current = store.get(record.agentId) ?? record;
+        // The INSERT SELECT may have captured a newer live pin than this caller
+        // read; report the selection actually frozen on the queued row.
+        const frozen = store.supplements(record.agentId).find(item => item.requestId === requestId)?.selection;
+        return queued(current, pin ?? frozen ?? current.modelPin);
+      };
+      // The no-wait path is only for a supplement that changes no selection: the
+      // INSERT SELECT itself freezes the current pin. An explicit model/effort must
+      // take the ordinary 10s lock so a poll cannot save an older body over modelPin.
+      const enqueueWithoutWait = async record => {
+        const fresh = store.get(record.agentId) ?? record;
+        return queue(fresh, undefined, { usePinnedModel: true });
       };
       // Named so the busy retry below runs exactly this body against a fresh record.
       const operation = async record => {
@@ -1826,30 +2008,63 @@ export function createScopedAgents(config, {
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
         if (targetOf(record) === 'dsh') await checkHost(record);
         const stoppedTask = record.task && ['cancelled', 'failed'].includes(record.state);
-        if (!stoppedTask && store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return enqueue(record);
         const pendingReports = (record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
         if (stoppedTask && (record.lifetime === 'once' || pendingReports)) throw new Error('This task stopped; delete the one-shot agent or wait for its submitted reports before reusing a persistent agent.');
         if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
+        const existingQueued = !stoppedTask && store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
+        // All rejections that must not touch the name are now past. Resolve a
+        // requested substring to its real ID first, so an unknown model still lists
+        // the catalog; only then decide whether a running Codex turn forbids a change.
+        const resolvePin = async () => {
+          if (!wantsSelection) return record.modelPin;
+          const pin = await resolveRequestedPin(record, request);
+          if (targetOf(record) === 'codex-desktop' && codexTurnRunning(record)
+              && (!record.modelPin || !sameModelSelection(pin, record.modelPin))) {
+            throw modelChangeRefused();
+          }
+          return pin;
+        };
+        if (existingQueued) {
+          const pin = await resolvePin();
+          // An explicit pin and its queued supplement commit in one transaction
+          // before the worker can wake; no-selection input copies the live pin.
+          return wantsSelection
+            ? queue(record, pin, { savePin: true })
+            : queue(record, undefined, { usePinnedModel: true });
+        }
         if (record.task && ACTIVE.has(record.state)) {
-          if (targetOf(record) !== 'dsh' || !record.task.dispatches.length) return enqueue(record);
+          if (targetOf(record) !== 'dsh' || !record.task.dispatches.length) {
+            const pin = await resolvePin();
+            return wantsSelection
+              ? queue(record, pin, { savePin: true })
+              : queue(record, undefined, { usePinnedModel: true });
+          }
+          // DSH can switch on its next step. Observe first, so a final report or a
+          // broken observation refuses the input before the pin is persisted.
           await negotiateTree(record);
           const view = await observe(record);
           if ((view.reports ?? []).some(report => report.final)) throw new Error('The agent has already submitted its final report.');
+          const pin = await resolvePin();
+          persistPin(record, pin);
           if ((view.questions ?? []).some(question => question.state === 'pending')) return answerLocked(record, message);
           await sendDispatch(record, message, 'supplement', [], undefined, view);
         } else {
+          const pin = await resolvePin();
+          persistPin(record, pin);
           if (record.task) store.appendHistory(record.agentId, { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
             coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) });
           // finalReminder marks this task as one that may be reminded once when a turn
           // ends without a final report. Tasks created before this rule carry no
           // marker, so a sleeping awaiting_report from an older version stays quiet.
+          // The selected model is frozen with the task: a desktop first dispatch is
+          // delayed through the worker queue and must not read a later pin change.
           record.task = { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [],
-            finalReminder: 'armed' };
+            modelSelection: pin ? { ...pin } : null, finalReminder: 'armed' };
           record.state = 'running'; record.observation = undefined; record.error = undefined;
           record.nextAttemptAt = undefined; record.retryAttempts = 0; store.save(record);
           if (targetOf(record) !== 'dsh') {
             await ensureWorker(record, { wake: true });
-            return { name: record.name, accepted: false, queued: true, state: record.state };
+            return queued(record, pin);
           }
           try { await beginTask(record); }
           catch (error) { record.state = 'reconnecting'; record.error = safeError(error); store.save(record); }
@@ -1859,6 +2074,7 @@ export function createScopedAgents(config, {
         const dispatch = record.task.dispatches.at(-1);
         const error = current.error ?? dispatch?.error;
         return { name: current.name, accepted: dispatch?.accepted === true, state: current.state,
+          actualModel: actualModelName(current.model) ?? actualModelName(current.modelPin),
           ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
           ...(error ? { error } : {}),
           ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
@@ -1867,11 +2083,27 @@ export function createScopedAgents(config, {
         if (enteredOperation || error.code !== 'agent-busy') throw error;
         const owner = await context(extra);
         const record = named(owner, name);
-        // A poll holds this lock for one round only, so waiting for it is cheap. Queuing
-        // here would hand a supplement to a task that has already ended, and report that
-        // as "the task changed, stopped" for a dispatch the next round would accept.
-        if (record.state === 'delivery_pending') return withName(extra, name, operation);
-        return enqueue(record);
+        if (wantsSelection) {
+          // Resolve first: a missing ID must report the catalog, not a busy state.
+          const pin = await resolveRequestedPin(record, request);
+          if (targetOf(record) === 'codex-desktop' && codexTurnRunning(record)) {
+            if (record.modelPin && sameModelSelection(pin, record.modelPin)) {
+              // The active turn already runs this exact pin; this is an ordinary
+              // supplement, not a selection change, so no lock or pin write is due.
+              return queue(record, pin);
+            }
+            throw modelChangeRefused();
+          }
+          // DSH, or a Codex name between turns: take the normal 10s lock so the
+          // pin is saved against the live body rather than a poll's stale snapshot.
+          return withName(extra, name, operation);
+        }
+        // A poll holds this lock for one round only. A no-selection supplement keeps
+        // the old no-wait durable queue; anything that starts a task should wait.
+        if (record.state === 'delivery_pending' || !supplementStates.has(record.state)) {
+          return withName(extra, name, operation);
+        }
+        return enqueueWithoutWait(record);
       }
     },
     /**
@@ -1879,13 +2111,14 @@ export function createScopedAgents(config, {
      * keeps its own application and lifetime, so a conflicting explicit value is
      * refused instead of quietly running the task on the wrong backend.
      */
-    async run({ name, message, lifetime, target } = {}, extra) {
+    async run({ name, message, lifetime, target, model, effort } = {}, extra) {
       textMessage(message);
       const owner = await context(extra);
       const wanted = normalizeTarget(target);
       const createdLifetime = lifetime ?? 'once';
       if (!['once', 'persistent'].includes(createdLifetime)) throw new Error('lifetime must be once or persistent.');
       const sent = result => ({ state: result.state, accepted: result.accepted === true,
+        actualModel: result.actualModel ?? null,
         ...(result.queued ? { queued: true } : {}), ...(result.retrying ? { retrying: true } : {}),
         ...(result.callbackError ? { callbackError: result.callbackError } : {}), ...(result.error ? { error: result.error } : {}) });
       const existing = name === undefined ? undefined : store.named(owner.ownerId, assertName(name));
@@ -1899,7 +2132,7 @@ export function createScopedAgents(config, {
         const boundTarget = targetOf(existing);
         if (target !== undefined && wanted !== boundTarget) throw Object.assign(new Error(`The name “${existing.name}” is already bound to ${hostLabel(existing)}; it cannot run on ${TARGET_LABELS[wanted]}. Omit target to continue this name, or use another name.`), { code: 'target-conflict' });
         if (lifetime !== undefined && lifetime !== existing.lifetime) throw Object.assign(new Error(`The name “${existing.name}” is already a ${existing.lifetime} subagent; omit lifetime, pass ${existing.lifetime}, or use another name.`), { code: 'lifetime-conflict' });
-        const result = await service.send({ name: existing.name, message }, extra);
+        const result = await service.send({ name: existing.name, message, model, effort }, extra);
         return { name: existing.name, lifetime: existing.lifetime, ...(boundTarget !== 'dsh' ? { target: boundTarget } : {}), ...sent(result), reused: true };
       }
       let chosen = name === undefined ? undefined : assertName(name);
@@ -1910,19 +2143,20 @@ export function createScopedAgents(config, {
         }
         if (chosen === undefined) throw new Error('Could not generate an unused subagent name; pass one explicitly.');
       }
-      const created = await service.create({ name: chosen, lifetime: createdLifetime, target: wanted }, extra);
+      const created = await service.create({ name: chosen, lifetime: createdLifetime, target: wanted, model, effort }, extra);
       // A failed creation keeps its own receipt: sending into a name that never
       // connected would report a delivery nobody is waiting for.
       if (created.created !== true || created.error) return created;
       try {
-        const result = await service.send({ name: chosen, message }, extra);
+        const result = await service.send({ name: chosen, message, model, effort }, extra);
         return { name: chosen, lifetime: createdLifetime, ...(wanted !== 'dsh' ? { target: wanted } : {}), ...sent(result), created: true };
       } catch (error) {
         // The name exists now, so a thrown send would hide the name the caller must
         // use to continue; report the created name with the failure instead.
         const current = store.named(owner.ownerId, chosen);
         return { name: chosen, lifetime: createdLifetime, ...(wanted !== 'dsh' ? { target: wanted } : {}),
-          created: true, state: current?.state ?? 'reconnecting', accepted: false, error: safeError(error) };
+          created: true, state: current?.state ?? 'reconnecting', accepted: false,
+          actualModel: actualModelName(current?.model) ?? actualModelName(current?.modelPin), error: safeError(error) };
       }
     },
     async answer({ name, message }, extra) {
@@ -2260,7 +2494,7 @@ export function createScopedAgents(config, {
     close() { store.close(); },
   };
 
-  async function answerLocked(record, message, queuedAnswerId) {
+  async function answerLocked(record, message, queuedAnswerId, { modelSelection } = {}) {
     if (!record.task || record.closed || record.task.cancelRequested) throw new Error('This subagent has no open task waiting for an answer.');
     await negotiateTree(record);
     await checkHost(record);
@@ -2269,13 +2503,21 @@ export function createScopedAgents(config, {
     if (!existing && !(view.questions ?? []).some(question => question.state === 'pending')) throw new Error('This subagent has no unanswered question.');
     record.task.answers ??= [];
     const answer = existing ?? { answerId: queuedAnswerId ?? uid('answer'), message, dispatched: false };
+    // The continuation is dispatched on a later poll. Freeze the selection on the
+    // answer intent now: a queued supplement carries its enqueue-time selection,
+    // while a direct answer freezes the name's current pin.
+    if (!Object.prototype.hasOwnProperty.call(answer, 'modelSelection')) {
+      const frozen = modelSelection !== undefined ? modelSelection : record.modelPin;
+      answer.modelSelection = frozen ? { ...frozen } : null;
+    }
     if (!existing) record.task.answers.push(answer);
     store.save(record);
     try { await resolveAnswer(record, answer); }
     catch (error) { record.error = safeError(error); store.save(record); await ensureWorker(record); throw error; }
     record.state = 'running'; record.task.state = 'running'; store.save(record);
     await ensureWorker(record, { wake: true });
-    return { name: record.name, answered: true, state: 'resuming' };
+    return { name: record.name, answered: true, state: 'resuming',
+      actualModel: actualModelName(answer.modelSelection) ?? actualModelName(record.model) };
   }
   return service;
 }

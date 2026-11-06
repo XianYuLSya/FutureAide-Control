@@ -135,6 +135,7 @@ export function compactAgent(item = {}) {
   const questions = questionMessages(item);
   return {
     name: item.name,
+    ...(item.actualModel === undefined ? {} : { actualModel: item.actualModel }),
     ...targetOfView(item.target),
     state: item.state,
     lifetime: item.lifetime,
@@ -159,6 +160,7 @@ export function compactAgent(item = {}) {
 export function compactCreate(result = {}) {
   return {
     name: result.name,
+    ...(result.actualModel === undefined ? {} : { actualModel: result.actualModel }),
     ...targetOfView(result.target),
     lifetime: result.lifetime,
     state: result.state,

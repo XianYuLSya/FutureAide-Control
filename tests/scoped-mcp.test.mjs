@@ -58,7 +58,14 @@ test('creation advertises one optional target and never repeats it on later call
   try {
     const { tools } = await client.listTools();
     const create = tools.find(tool => tool.name === 'futureaide_create_agent');
-    assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['lifetime', 'name', 'target']);
+    assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['effort', 'lifetime', 'model', 'name', 'target']);
+    for (const tool of tools) {
+      const supportsSelection = ['futureaide_run_agent', 'futureaide_create_agent', 'futureaide_send_agent'].includes(tool.name);
+      for (const field of ['model', 'effort']) {
+        assert.equal(field in tool.inputSchema.properties, supportsSelection, tool.name);
+        assert.ok(!tool.inputSchema.required?.includes(field), `${tool.name}: ${field} stays optional`);
+      }
+    }
     assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'codex-desktop'],
       'every supported application is reachable from the public schema, not just internally');
     assert.ok(!create.inputSchema.required?.includes('target'), 'the target stays optional');
@@ -112,7 +119,7 @@ async function connected(service) {
 // One entry shaped exactly like the service's publicResult plus list's own fields, so
 // the compact view is tested against the real structure rather than a small stub.
 const fullEntry = () => ({
-  name: '助手', lifetime: 'once', target: 'dsh', state: 'idle',
+  name: '助手', lifetime: 'once', target: 'dsh', state: 'idle', actualModel: 'example-astra',
   task: { text: 'x'.repeat(120), state: 'completed', startedAt: '2026-11-04T01:00:00.000Z',
     result: { state: 'completed', summary: 'y'.repeat(300), files: [], coverage: { workspace: { complete: false, reason: 'not-a-repository' } } } },
   activity: 'Waiting for a task',
@@ -138,7 +145,7 @@ test('list and wait answer compactly and return the full structure only for deta
     assert.notEqual(listed.isError, true);
     assert.equal(listed.content[0].text.includes('\n'), false, 'the compact view carries no indentation');
     const compact = JSON.parse(listed.content[0].text);
-    assert.deepEqual(compact.items[0], { name: '助手', state: 'idle', lifetime: 'once', task: 'x'.repeat(80) + '…',
+    assert.deepEqual(compact.items[0], { name: '助手', state: 'idle', lifetime: 'once', actualModel: 'example-astra', task: 'x'.repeat(80) + '…',
       report: { summary: 'z'.repeat(200) + '…', final: true, delivery: 'delivered' },
       files: { count: 1 }, team: [{ path: 'helper', state: 'running', activity: 'writing', files: 1 }] });
     assert.equal(compact.total, 1);
@@ -147,6 +154,7 @@ test('list and wait answer compactly and return the full structure only for deta
 
     const waited = JSON.parse((await client.callTool({ name: 'futureaide_wait_agents', arguments: { timeout_seconds: 0 } })).content[0].text);
     assert.equal(waited.items[0].task, 'x'.repeat(80) + '…');
+    assert.equal(waited.items[0].actualModel, 'example-astra');
     assert.deepEqual(waited.notListed, ['gone']);
     assert.equal(waited.note, 'Absence alone does not prove completion.');
     assert.deepEqual(waited.items[0].files, { count: 1 });

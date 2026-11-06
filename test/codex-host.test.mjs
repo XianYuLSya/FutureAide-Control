@@ -6,10 +6,118 @@ import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import {
   createCodexHost, emptyProjection, projectCodexTurns, readDefaultModel, readCodexMcpRegistration, markerLine,
+  sharedCodexCatalog, codexDeliverySelection,
 } from '../src/codex-host.mjs';
 import { liveThread, livePage, liveTurn } from './live-thread-fixture.mjs';
 
 const directory = () => fileURLToPath(new URL(`../clean/validation/codex/${randomUUID()}/`, import.meta.url));
+
+const nativeModel = (overrides = {}) => ({
+  id: 'preset-a', model: 'wire-a', displayName: 'Preset A', description: 'A model',
+  hidden: false, isDefault: false, defaultReasoningEffort: 'high',
+  supportedReasoningEfforts: [
+    { reasoningEffort: 'low', description: 'Fast' },
+    { reasoningEffort: 'high', description: 'Deep' },
+  ],
+  ...overrides,
+});
+
+test('models() reads every model/list page in order and exposes the shared catalog shape', async () => {
+  const calls = [];
+  const host = createCodexHost({ nativeRequest: async (method, params) => {
+    calls.push([method, params]);
+    if (method === 'model/list') {
+      return params.cursor
+        ? { data: [nativeModel({ id: 'preset-c', model: 'wire-c', displayName: 'C' })], nextCursor: null }
+        : { data: [nativeModel(), nativeModel({ id: 'preset-b', model: 'wire-b', displayName: 'B',
+          defaultReasoningEffort: 'medium', supportedReasoningEfforts: [
+            { reasoningEffort: 'medium', description: 'Medium' }, { reasoningEffort: 'xhigh', description: 'XHigh' }] })],
+        nextCursor: 'page-2' };
+    }
+    if (method === 'config/read') return { model: 'wire-b', provider: 'openai', reasoningEffort: 'xhigh' };
+    throw new Error('unexpected ' + method);
+  } });
+  const catalog = await host.models({ workspace: 'D:/work/p' });
+  assert.deepEqual(catalog.groups[0].models.map(model => model.id), ['preset-a', 'preset-b', 'preset-c']);
+  assert.deepEqual(catalog.groups[0].models[0].reasoning.efforts,
+    [{ id: 'low', name: 'Fast' }, { id: 'high', name: 'Deep' }]);
+  assert.equal(catalog.groups[0].models[0].reasoning.defaultEffort, 'high');
+  assert.deepEqual(catalog.default, { provider: 'openai', model: 'preset-b', reasoningEffort: 'xhigh' });
+  assert.deepEqual(catalog.routableProviders, ['openai']);
+  assert.deepEqual(calls.filter(call => call[0] === 'model/list').map(call => call[1]),
+    [{ limit: 100 }, { limit: 100, cursor: 'page-2' }]);
+});
+
+test('an implicit config default does not block the catalog; the catalog default is the fallback', async () => {
+  const host = createCodexHost({ nativeRequest: async method => {
+    if (method === 'model/list') return { data: [
+      nativeModel({ id: 'preset-a', model: 'wire-a' }),
+      nativeModel({ id: 'preset-b', model: 'wire-b', isDefault: true, defaultReasoningEffort: 'medium' }),
+    ], nextCursor: null };
+    if (method === 'config/read') throw Object.assign(new Error('model and effort are implicit'),
+      { code: 'codex-default-model-unresolved' });
+    throw new Error('unexpected ' + method);
+  } });
+  const catalog = await host.models({ workspace: 'D:/work/p' });
+  assert.deepEqual(catalog.default, { provider: 'openai', model: 'preset-b', reasoningEffort: 'medium' });
+});
+
+test('a custom configured default stays the real id, and no evidence keeps the default null', () => {
+  const configured = sharedCodexCatalog([nativeModel({ id: 'preset-a', model: 'wire-a' })],
+    { provider: 'openai', configured: { model: 'my-custom-model', reasoningEffort: 'max' } });
+  assert.deepEqual(configured.default,
+    { provider: 'openai', model: 'my-custom-model', reasoningEffort: 'max' },
+  'an unlisted config model is still the actual deployment default');
+  assert.equal(configured.defaultInCatalog, false);
+  assert.equal(configured.defaultSource, 'effective-config');
+  const unknown = sharedCodexCatalog([nativeModel({ id: 'preset-a', model: 'wire-a', isDefault: false })],
+    { provider: 'openai' });
+  assert.equal(unknown.default, null, 'the first catalog entry is never invented as the default');
+  assert.equal(unknown.defaultSource, null);
+});
+
+test('resolveModelDelivery maps a catalog id to the native model slug, never the other way around', async () => {
+  const catalog = sharedCodexCatalog([
+    nativeModel({ id: 'preset-a', model: 'wire-a' }),
+    nativeModel({ id: 'preset-b', model: 'wire-b', defaultReasoningEffort: 'low',
+      supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Fast' }] }),
+  ], { provider: 'openai' });
+  assert.deepEqual(codexDeliverySelection(catalog,
+    { provider: 'openai', model: 'preset-a', reasoningEffort: 'high' }),
+  { modelId: 'preset-a', model: 'wire-a', effort: 'high' }, 'the wire value is Model.model, not Model.id');
+  assert.deepEqual(codexDeliverySelection(catalog, { provider: 'openai', model: 'preset-b' }),
+    { modelId: 'preset-b', model: 'wire-b', effort: 'low' });
+  assert.throws(() => codexDeliverySelection(catalog, { provider: 'openai', model: 'missing' }),
+    { code: 'model-not-found', terminal: true });
+  assert.throws(() => codexDeliverySelection(catalog, { provider: 'openai', model: 'preset-b', reasoningEffort: 'high' }),
+    { code: 'effort-not-supported', terminal: true });
+  assert.throws(() => codexDeliverySelection(catalog, {}), { code: 'model-required' });
+  const aliased = sharedCodexCatalog([
+    nativeModel({ id: 'preset-a', model: 'shared-alias' }),
+    nativeModel({ id: 'shared-alias', model: 'wire-shared', defaultReasoningEffort: 'low' }),
+  ], { provider: 'openai' });
+  assert.equal(codexDeliverySelection(aliased, { provider: 'openai', model: 'shared-alias' }).model,
+    'wire-shared', 'an exact catalog id wins over another entry\'s wire alias');
+  const retired = sharedCodexCatalog([nativeModel({ id: 'preset-a', model: 'shared-alias' })]);
+  assert.throws(() => codexDeliverySelection(retired, { provider: 'openai', model: 'shared-alias' }),
+    { code: 'model-not-found', availableModels: ['preset-a'] });
+});
+
+test('an explicit first turn sends model and effort on turn/start only', async () => {
+  const calls = [];
+  const host = createCodexHost({ nativeRequest: async (method, params) => {
+    calls.push([method, params]);
+    if (method === 'thread/start') return { thread: liveThread({ id: 'thread-1', cwd: 'D:/work/p' }) };
+    if (method === 'turn/start') return { turn: liveTurn({ id: 'turn-1', status: 'inProgress', completedAt: null, durationMs: null }) };
+    throw new Error('unexpected ' + method);
+  } });
+  await host.createFirstTurn({ workspace: 'D:/work/p', message: 'work', title: 'helper',
+    model: 'wire-a', effort: 'high' });
+  assert.deepEqual(calls.map(call => call[0]), ['thread/start', 'turn/start']);
+  assert.equal('model' in calls[0][1], false, 'thread/start keeps the native default');
+  assert.equal(calls[1][1].model, 'wire-a');
+  assert.equal(calls[1][1].effort, 'high');
+});
 
 test('status uses one real read RPC and keeps each default-model read live', async () => {
   const home = directory(); await mkdir(home, { recursive: true });
@@ -200,15 +308,36 @@ test('a post-delete thread/read rejection saying not loaded counts as deleted', 
 });
 
 test('an empty rollout while observing is running, never a transient error', async () => {
+  const message = String.raw`rollout at C:\Users\test\.codex\sessions\2026\11\06\rollout-2026-11-06T23-10-00-xxx.jsonl is empty`;
   const host = createCodexHost({ nativeRequest: async method => {
     if (method === 'thread/read') throw Object.assign(new Error(
-      'failed to read session metadata for thread: rollout is empty'), { code: 'codex-native-rpc-rejected' });
+      `failed to read session metadata for thread: ${message}`), { code: 'codex-native-rpc-rejected', rpcMessage: message });
     throw new Error('unexpected ' + method);
   } });
   const observed = await host.observe({ nativeSessionId: 'thread-1', workspace: 'D:/work/p' });
   assert.equal(observed.tree.running, true);
   assert.equal(observed.tree.settled, false);
   assert.equal(observed.tree.nodes[0].status, 'running');
+});
+
+test('readCurrentModel treats an empty rollout as unknown, but propagates real read failures', async () => {
+  const message = String.raw`rollout at C:\Users\test\.codex\sessions\2026\11\06\rollout-2026-11-06T23-10-00-xxx.jsonl is empty`;
+  let mode = 'empty';
+  const host = createCodexHost({ nativeRequest: async method => {
+    if (method !== 'thread/read') throw new Error('unexpected ' + method);
+    if (mode === 'empty') throw Object.assign(new Error(message),
+      { code: 'codex-native-rpc-rejected', rpcMessage: message });
+    if (mode === 'missing') throw Object.assign(new Error('thread not found'),
+      { code: 'codex-native-rpc-rejected', rpcMessage: 'thread not found' });
+    throw Object.assign(new Error('permission denied: thread/read'),
+      { code: 'codex-native-rpc-rejected', rpcMessage: 'permission denied: thread/read' });
+  } });
+  assert.equal(await host.readCurrentModel('thread-1'), undefined, 'an empty rollout is not a model');
+  mode = 'missing';
+  await assert.rejects(host.readCurrentModel('thread-1'), { code: 'codex-thread-not-found', terminal: true });
+  mode = 'denied';
+  await assert.rejects(host.readCurrentModel('thread-1'),
+    error => error.code === 'codex-native-rpc-rejected' && /permission denied/.test(error.message));
 });
 
 test('interrupt reaches a running native child even when the root turn already ended', async () => {

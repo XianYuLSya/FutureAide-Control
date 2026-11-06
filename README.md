@@ -189,3 +189,7 @@ futureaide_send_agent({name: "审稿", message: "接着检查刚才提到的第�
 - 派单只接受文字，图片不是正式输入。
 - 取消 Codex 助手时，它已经启动的 shell 命令不会被结束。
 - 其他 MCP 客户端，以及只有 DSH web 或 tui profile 的环境，需要自己适配。
+
+## 许可证
+
+[MIT](LICENSE)。第三方代码的许可见 [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES.md)。

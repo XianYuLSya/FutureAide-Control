@@ -66,7 +66,7 @@ test('creation advertises one optional target and never repeats it on later call
         assert.ok(!tool.inputSchema.required?.includes(field), `${tool.name}: ${field} stays optional`);
       }
     }
-    assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'codex-desktop'],
+    assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'codex-desktop', 'claude-cli'],
       'every supported application is reachable from the public schema, not just internally');
     assert.ok(!create.inputSchema.required?.includes('target'), 'the target stays optional');
     // run is the second entry point that may bind a new name to an application; it

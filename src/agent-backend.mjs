@@ -1,6 +1,6 @@
 // The one boundary between the shared name-addressed state machine and whichever
 // target application executes the work. DSH delegates to the existing managed
-// bridge unchanged; Codex Desktop is supplied by its own adapter. A missing
+// bridge. Codex Desktop and headless Claude each supply their own adapter. A missing
 // adapter is reported as backend-not-ready and is never replaced by the DSH path.
 //
 // Contract (one instance per recorded name; every method async; failures throw an
@@ -31,7 +31,7 @@
 //                      the frozen selection and explicitModel is true.
 //   receipt(input)     {status, afterSeq?, result?} | undefined — undefined means
 //                      no write was ever attempted, never "no native marker found".
-//   turn(input)        {state: 'running'|'ended', correlation?, completionReason?, endSeq?}
+//   turn(input)        {state: 'running'|'ended', correlation?, completionReason?, endSeq?, failure?}
 //   models() / model() Ordered catalog of the target's models, their efforts
 //                      and its default selection, and the target's real
 //                      current selection for this session. model() must report
@@ -39,7 +39,7 @@
 //                      assumed default to avoid a missing capability.
 //   selectModel(input) {accepted} — DSH applies sessionOnly selections to this
 //                      managed session. Codex applies its selection at turn start.
-//   cancel()           {cancelRequested}   destroy() {destroyed, message?}
+//   cancel()           {cancelRequested}   destroy() {destroyed, message?, nativeSessionRetained?}
 //   cursor()           {throughSeq} baseline used only when no observation exists.
 //   history(input)     (above) already normalized, at most maxMessages.
 //
@@ -55,7 +55,10 @@
 //                         through the shared lease table, per target (+ optional
 //                         key); reuses store.locked, no second locking scheme.
 //
-// Codex Desktop deps (a codex-desktop backend uses these instead):
+// Headless Claude gets claudeReportConfig(requestId) for its turn-scoped stdio MCP
+// and readParentSubmissions() for the same durable questions and reports as Codex.
+//
+// Codex Desktop deps:
 //   ensureCodexReports()  Preflight, called once before a name is created. Read-only:
 //                         it verifies this project's effective MCP registration points
 //                         at the DEV entry over this same roster and that the entry's
@@ -82,7 +85,7 @@ import { historyMessages, modelTurnError } from './control.mjs';
 import { dispatchBoundary } from './dispatch.mjs';
 import { modelCatalogSummary } from './model-selection.mjs';
 
-export const TARGETS = Object.freeze(['dsh', 'codex-desktop']);
+export const TARGETS = Object.freeze(['dsh', 'codex-desktop', 'claude-cli']);
 export const DEFAULT_TARGET = 'dsh';
 // A target an older build offered and this one no longer does. Roster records that
 // carry it are read-only history: nothing can be created on it, and no local work is
@@ -121,7 +124,7 @@ export function targetOf(record) {
 
 // Display name of the application behind a target, used in user-facing text.
 // DSH keeps its historical wording; a removed target falls back to its own id.
-export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'codex-desktop': 'Codex Desktop' });
+export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'codex-desktop': 'Codex Desktop', 'claude-cli': 'Claude CLI' });
 export function hostLabel(record) {
   const target = targetOf(record);
   return TARGET_LABELS[target] ?? target;
@@ -158,7 +161,12 @@ export async function diagnoseTarget(target, { adapters = {}, record = {}, reque
   if (missing.length) return { ready: false, present: true, reason: reason(backendNotReady(wanted, missing)) };
   let probe;
   try { probe = await backend.probe(); }
-  catch (error) { return { ready: false, present: true, reason: reason(error) }; }
+  catch (error) {
+    // Claude's CLI catalog is available before login. Preserve both the IDs
+    // and the actual reason a turn cannot start.
+    return { ready: false, present: true, reason: reason(error),
+      ...(wanted === 'claude-cli' ? await readStatusModels(() => backend.models()) : {}) };
+  }
   const capabilities = { methods: probe?.methods ?? [], treeProtocol: probe?.treeProtocol ?? null,
     reportProtocol: probe?.reportProtocol ?? null, ...await readStatusModels(() => backend.models()) };
   if (capabilities.treeProtocol !== 1) return { ready: false, present: true, ...capabilities,
@@ -179,6 +187,7 @@ async function adapterFactory(target, adapters = {}) {
   if (typeof adapters?.[target] === 'function') return adapters[target];
   const entry = {
     'codex-desktop': ['./codex-backend.mjs', 'createCodexBackend'],
+    'claude-cli': ['./claude-cli-backend.mjs', 'createClaudeCliBackend'],
   }[target];
   if (!entry) return undefined;
   const moduleUrl = new URL(entry[0], import.meta.url);

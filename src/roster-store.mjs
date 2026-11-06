@@ -380,7 +380,8 @@ export class RosterStore {
       EXISTS (SELECT 1 FROM supplements AS queued WHERE queued.agent=agents.id
         AND queued.task=json_extract(agents.body,'$.task.taskId')
         AND queued.status IN ('queued','sending','unknown')) AS hasSupplement
-      FROM agents INDEXED BY agents_lifecycle WHERE json_type(json_extract(body,'$.sleep'))='object' ORDER BY name`).all().map(row => ({
+      FROM agents INDEXED BY agents_lifecycle WHERE json_type(json_extract(body,'$.sleep'))='object'
+        AND id NOT IN (SELECT id FROM agents WHERE json_extract(body,'$.target')='claude-desktop') ORDER BY name`).all().map(row => ({
       agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
       task: row.taskId == null ? undefined : { taskId: row.taskId,
         ...(row.cancelRequested ? { cancelRequested: true } : {}),
@@ -431,7 +432,8 @@ export class RosterStore {
         json_extract(body,'$.state') AS state, json_extract(body,'$.closed') AS closed, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
         json_extract(body,'$.sleep') AS sleep, json_extract(body,'$.task.taskId') AS taskId,
         json_extract(body,'$.task.reports') AS reports
-        FROM agents INDEXED BY agents_lifecycle ORDER BY name`).all().map(row => {
+        FROM agents INDEXED BY agents_lifecycle
+        WHERE id NOT IN (SELECT id FROM agents WHERE json_extract(body,'$.target')='claude-desktop') ORDER BY name`).all().map(row => {
         const reports = (JSON.parse(row.reports ?? '[]') ?? [])
           .map(report => ({ delivery: { state: report.delivery?.state ?? '' } }));
         return {
@@ -584,6 +586,34 @@ export class RosterStore {
   }
   pendingSubmissions(agentId, taskId) {
     return this.submissions(agentId, taskId, true);
+  }
+  /** Bind a callback to the current task before the shared monitor delivers it. */
+  submitParentMessage(agentId, { kind, message, final = false }, cliDispatch) {
+    if (typeof message !== 'string' || !message.trim() || message.length > 100000) {
+      throw Object.assign(new Error('A nonblank message of at most 100000 characters is required.'), { code: 'invalid-message' });
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const record = agentId && this.get(agentId);
+      const task = record?.task;
+      if (!task || record.closed || (cliDispatch && (record.target !== 'claude-cli'
+          || task.taskId !== cliDispatch.taskId || task.cancelRequested
+          || ['idle', 'failed', 'cancelled'].includes(record.state)
+          || task.dispatches.at(-1)?.requestId !== cliDispatch.requestId))) {
+        throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
+      }
+      if (task.reports?.some(report => report.final) || this.submissions(agentId, task.taskId).some(report => report.final)) {
+        throw Object.assign(new Error('This task already submitted its final report.'), { code: 'final-already-submitted' });
+      }
+      const id = 'submission-' + randomUUID().replaceAll('-', '');
+      this.enqueueSubmission({ id, ownerId: record.ownerId, agentId, taskId: task.taskId, kind, message, final });
+      if (record.sleep) this.wake(agentId, task.taskId);
+      this.db.exec('COMMIT');
+      return { accepted: true, name: record.name, taskId: task.taskId, submissionId: id, kind };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
   submissions(agentId, taskId, pendingOnly = false) {
     return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created FROM submissions

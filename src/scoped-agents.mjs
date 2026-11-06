@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
@@ -14,7 +15,7 @@ import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, readStatusModels, resolveBackend,
+import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, readStatusModels, REMOVED_TARGETS, removedTarget, resolveBackend,
   TARGET_LABELS, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 import { FINAL_REPORT_REMINDER } from './report-contract.mjs';
@@ -37,6 +38,11 @@ function defaultCodexProbe() {
 const reportProtocolError = (host = 'DSH') => Object.assign(new Error(`Update the ${host} plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting ${host} is not required.`), { code: 'report-protocol-required' });
 const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host} bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting ${host} is not required.`), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
+const readOnlyTarget = record => REMOVED_TARGETS.includes(record?.target);
+function requireWritableTarget(record) {
+  if (readOnlyTarget(record)) throw removedTarget(record.target);
+  return record;
+}
 
 function assertName(name) {
   if (typeof name !== 'string' || !name.trim() || name !== name.trim() || name.length > 80 || /[\x00-\x1f]/.test(name)) {
@@ -51,7 +57,7 @@ function textMessage(message) {
 function stableHost(identity, target) {
   // Codex home changes wholesale when FAswitch switches profiles, and the thread
   // read is the real ownership test. Compare only the application there.
-  if (target === 'codex-desktop') return { application: identity.application ?? null };
+  if (target === 'codex-desktop' || target === 'claude-cli') return { application: identity.application ?? null };
   return { application: identity.application ?? null, dataRoot: path.resolve(identity.dataRoot ?? '') };
 }
 // The compact view keeps the one label that stops a snapshot guess reading as a confirmed write.
@@ -175,7 +181,7 @@ function publicResult(record, { fullResult = false } = {}) {
     // list/wait must not present an intended selection as an observed model. An
     // unpinned Codex name starts null and becomes known from the live observation
     // before record.model catches up.
-    actualModel: record.modelPin
+    actualModel: record.modelPin && targetOf(record) !== 'claude-cli'
       ? actualModelName(record.model) ?? actualModelName(record.observation?.currentModel)
       : actualModelName(record.observation?.currentModel) ?? actualModelName(record.model),
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
@@ -481,7 +487,13 @@ export function createScopedAgents(config, {
       writeNativeState: value => store.saveBackendState(record.agentId, value),
       withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
       ensureCodexReports: () => beginCodexReports(record),
-      readCodexReportState: () => readCodexReportState(load()),
+      readCodexReportState: () => readParentSubmissions(load()),
+      ...(target === 'claude-cli' ? {
+        readParentSubmissions: () => readParentSubmissions(load()),
+        claudeReportConfig: requestId => ({ mcpServers: { futureaide: { type: 'stdio', command: process.execPath,
+          args: [fileURLToPath(new URL('./mcp-server.mjs', import.meta.url)), '--claude-cli-reports',
+            store.location, record.agentId, load().task.taskId, requestId] } } }),
+      } : {}),
       // The Codex probe reads its protocol readiness only; this must never start a
       // session, so it is the same read-only evidence status uses.
       readCodexReportStatus: () => readCodexReportStatus(record),
@@ -576,11 +588,11 @@ export function createScopedAgents(config, {
   }
 
   /**
-   * Codex-side explicit ask/report arrive through the shared submission queue. The
+   * Codex and Claude CLI explicit callbacks arrive through the shared submission queue. The
    * adapter surfaces them as its own questions/reports; the one state machine owns
    * delivery, so no second task or notice machine exists.
    */
-  function readCodexReportState(record) {
+  function readParentSubmissions(record) {
     if (!record?.task) return { questions: [], reports: [] };
     const pending = store.submissions(record.agentId, record.task.taskId);
     // Both lists carry the task they belong to: the Codex backend filters by taskId, so
@@ -780,6 +792,7 @@ export function createScopedAgents(config, {
   // by the monitor's existing DSH host-state wake path instead.
 
   function needsPoll(record) {
+    if (readOnlyTarget(record)) return false;
     if (record?.state === 'cleaning') return true;
     if (!record || record.closed || record.sleep) return false;
     if (ACTIVE.has(record.state)) return true;
@@ -807,7 +820,7 @@ export function createScopedAgents(config, {
   function announceWork(agentId) { try { if (agentId) onWorkQueued(agentId); } catch { /* a hint is never worth failing a call for */ } }
 
   async function ensureWorker(record, { wake = false } = {}) {
-    if (!record) return false;
+    if (!record || readOnlyTarget(record)) return false;
     if (wake && record.sleep) {
       if (!await ensureMonitor()) {
         // Nothing can watch this installation right now. Keep the sleeping
@@ -1003,7 +1016,7 @@ export function createScopedAgents(config, {
       store.save(record);
       return;
     }
-    if (target === 'codex-desktop') {
+    if (target !== 'dsh') {
       // Native inheritance: read the actual model for display, but never select or
       // send one for a name that did not ask for an explicit selection.
       const current = observed && observed.modelSelectionObserved !== false && observed.currentModel
@@ -1413,6 +1426,7 @@ export function createScopedAgents(config, {
    * cleanup_failed is retried too — closed is not the same as cleaned.
    */
   async function clearRecord(record, { autoClaimed = false } = {}) {
+    requireWritableTarget(record);
     record.state = 'cleaning'; record.closed = true;
     if (!autoClaimed) store.save(record);
     try {
@@ -1433,6 +1447,7 @@ export function createScopedAgents(config, {
         const backend = await checkHost(record);
         const result = await backend.destroy();
         if (result.destroyed !== true) throw new Error(result.message ?? `${backend.labels?.host ?? targetOf(record)} has not confirmed complete session cleanup.`);
+        if (result.nativeSessionRetained !== undefined) record.nativeSessionRetained = result.nativeSessionRetained;
         record.nativeDestroyed = true; store.save(record);
       }
       const directory = agentDirectory(record);
@@ -1450,7 +1465,8 @@ export function createScopedAgents(config, {
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       store.remove(record);
       forgetBackend(record);
-      return { name: record.name, deleted: true, sessionDataRemoved: true };
+      return { name: record.name, deleted: true, sessionDataRemoved: !record.nativeSessionRetained,
+        ...(record.nativeSessionRetained !== undefined ? { nativeSessionRetained: record.nativeSessionRetained } : {}) };
     } catch (error) {
       const current = store.get(record.agentId);
       // An uncertain destroy is a write whose outcome is unknown, not a failed cleanup:
@@ -1671,7 +1687,7 @@ export function createScopedAgents(config, {
             afterSeq: prior.afterSeq, timeoutSeconds: 0, maxMessages: 100 });
           if (observed.state === 'ended' && observed.correlation === 'request-id') Object.assign(prior,
             { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
-              failure: modelTurnError(observed.completionReason) });
+              failure: observed.failure ?? modelTurnError(observed.completionReason) });
         }
         store.save(record);
         if (prior.accepted) { store.setSupplement(item.requestId, 'accepted'); continue; }
@@ -1695,6 +1711,9 @@ export function createScopedAgents(config, {
       }
       const view = await observe(record);
       if ((view.reports ?? []).some(report => report.final)) { store.blockQueued(record.agentId, record.task.taskId, 'final-submitted'); store.setSupplement(item.requestId, 'blocked', 'final-submitted'); return; }
+      // A headless CLI turn owns the session until it exits. Leave the input
+      // in the shared queue so the next process can resume that same session.
+      if (targetOf(record) === 'claude-cli' && view.running) return;
       // A queued input keeps the selection frozen when it was accepted. Do not
       // compare it with record.modelPin: that is the latest intended selection,
       // not the model of the turn currently running, and a later pin change must
@@ -1716,6 +1735,7 @@ export function createScopedAgents(config, {
   }
 
   async function pollLocked(record) {
+    if (readOnlyTarget(record)) return publicResult(record);
     if (record.nextAttemptAt > Date.now()) return publicResult(record);
     if (firstDispatchDeferred(record)) return publicResult(record);
     if (record.state === 'cleaning') return clearRecord(record);
@@ -1790,7 +1810,7 @@ export function createScopedAgents(config, {
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
           Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
-            endSeq: result.endSeq, failure: modelTurnError(result.completionReason) });
+            endSeq: result.endSeq, failure: result.failure ?? modelTurnError(result.completionReason) });
         }
       }
       // A reminder is best-effort: its own dispatch never decides how the task ended,
@@ -1891,21 +1911,23 @@ export function createScopedAgents(config, {
       } catch (error) { status.hostError = safeError(error); }
       status.ready = status.contextVerified && status.returnChannel === 'chat-verified' && status.dshConnected
         && status.treeProtocolReady === true && status.reportProtocolReady === true;
-      // Both catalogs can be read without reserving a name or starting a turn.
+      // Catalog probes do not reserve a name or start a model turn.
       const codexProbe = { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
         lifetime: 'once', target: 'codex-desktop', workspace: owner?.workspace ?? config.workspace,
         state: 'probing', createdAt: now(), updatedAt: now(), history: [] };
       const emptyCatalog = { models: [], defaultModel: null };
-      const [dshModels, codexEntry] = await Promise.all([
+      const probeAdapter = record => diagnoseTarget(record.target, { adapters: backendAdapters,
+        ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}), record, deps: adapterDeps(record) });
+      const [dshModels, codexEntry, claudeEntry] = await Promise.all([
         host ? readStatusModels(() => controlFactory(config, { client }).models()) : emptyCatalog,
-        diagnoseTarget('codex-desktop', { adapters: backendAdapters,
-          ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
-          record: codexProbe, deps: adapterDeps(codexProbe) }),
+        probeAdapter(codexProbe),
+        probeAdapter({ ...codexProbe, target: 'claude-cli' }),
       ]);
       status.backends = {
         dsh: { ...dshDiagnostics(host, status), ...dshModels },
         'codex-desktop': { ...emptyCatalog, ...codexEntry, ...(codexEntry.ready
           ? { ...codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)), evidence: 'native-rpc' } : {}) },
+        'claude-cli': { ...emptyCatalog, ...claudeEntry },
       };
       return status;
     },
@@ -1996,6 +2018,7 @@ export function createScopedAgents(config, {
       // Named so the busy retry below runs exactly this body against a fresh record.
       const operation = async record => {
         enteredOperation = true;
+        requireWritableTarget(record);
         const closing = ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'];
         if (record.closed || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
         if (record.state === 'delivery_pending') {
@@ -2082,7 +2105,7 @@ export function createScopedAgents(config, {
       try { return await withName(extra, name, operation, { waitMs: 0 }); } catch (error) {
         if (enteredOperation || error.code !== 'agent-busy') throw error;
         const owner = await context(extra);
-        const record = named(owner, name);
+        const record = requireWritableTarget(named(owner, name));
         if (wantsSelection) {
           // Resolve first: a missing ID must report the catalog, not a busy state.
           const pin = await resolveRequestedPin(record, request);
@@ -2161,7 +2184,7 @@ export function createScopedAgents(config, {
     },
     async answer({ name, message }, extra) {
       textMessage(message);
-      return withName(extra, name, record => answerLocked(record, message));
+      return withName(extra, name, record => answerLocked(requireWritableTarget(record), message));
     },
     async list(extra) {
       const owner = await context(extra);
@@ -2259,12 +2282,12 @@ export function createScopedAgents(config, {
     },
     async cancel({ name }, extra) {
       const owner = await context(extra);
-      const record = named(owner, name);
+      const record = requireWritableTarget(named(owner, name));
       if (!record.task || record.closed) return { name, accepted: false, state: record.state };
       if (!store.requestCancel(record)) return { name, accepted: false, state: store.get(record.agentId)?.state ?? 'removed' };
       if (targetOf(record) !== 'dsh') {
         for (const child of store.descendantsOf([record.agentId])) {
-          if (!child.closed && child.task && store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
+          if (!readOnlyTarget(child) && !child.closed && child.task && store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
         }
         await ensureWorker(store.get(record.agentId), { wake: true });
         return { name, accepted: false, queued: true, state: 'cancelling' };
@@ -2275,7 +2298,7 @@ export function createScopedAgents(config, {
         // Descendants on any application stop with their parent; each keeps its own
         // record and report, so nothing is dropped from the tree.
         for (const child of store.descendantsOf([record.agentId])) {
-          if (child.closed || !child.task) continue;
+          if (readOnlyTarget(child) || child.closed || !child.task) continue;
           if (targetOf(child) !== 'dsh') {
             if (store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
             continue;
@@ -2297,7 +2320,7 @@ export function createScopedAgents(config, {
     },
     async delete({ name }, extra) {
       const owner = await context(extra);
-      const record = named(owner, name);
+      const record = requireWritableTarget(named(owner, name));
       if (targetOf(record) === 'dsh') {
         const result = await withName(extra, name, current => clearRecord(current));
         if (result.queued) await ensureWorker(store.get(record.agentId), { wake: true });
@@ -2305,7 +2328,8 @@ export function createScopedAgents(config, {
       }
       const queued = store.requestCleanup(record);
       if (queued) await ensureWorker(store.get(record.agentId), { wake: true });
-      return { name, deleted: false, queued, state: queued ? 'cleaning' : 'removed' };
+      return { name, deleted: false, queued, state: queued ? 'cleaning' : 'removed',
+        ...(targetOf(record) === 'claude-cli' ? { nativeHistoryPolicy: 'retain' } : {}) };
     },
     /**
      * Explicit ask/report from a managed Codex Desktop child, called from that
@@ -2318,19 +2342,9 @@ export function createScopedAgents(config, {
       if (!['ask', 'report'].includes(kind)) throw new Error('kind must be ask or report.');
       const threadId = callingThread(extra);
       const bound = store.agentForCodexThread(threadId);
-      const record = bound ? store.get(bound.agentId) : undefined;
-      if (!record || record.closed || !record.task) {
-        throw Object.assign(new Error('This chat is not bound to a managed subagent with a current task.'),
-          { code: 'submission-not-owned' });
-      }
-      if (record.task.reports?.some(report => report.final)) {
-        throw Object.assign(new Error('This task already submitted its final report.'), { code: 'final-already-submitted' });
-      }
-      const id = uid('submission');
-      store.enqueueSubmission({ id, ownerId: record.ownerId, agentId: record.agentId,
-        taskId: record.task.taskId, kind, message, final: final === true });
-      await ensureWorker(record, { wake: true });
-      return { accepted: true, name: record.name, taskId: record.task.taskId, submissionId: id, kind };
+      const receipt = store.submitParentMessage(bound?.agentId, { kind, message, final });
+      await ensureWorker(store.get(bound.agentId), { wake: true });
+      return receipt;
     },
     async wait({ names, timeoutSeconds = 0 } = {}, extra) {
       if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 45) throw new Error('Wait between 0 and 45 seconds.');
@@ -2479,14 +2493,14 @@ export function createScopedAgents(config, {
     fastPollNames() { return [...fastPoll]; },
     async wake(agentId, taskId) {
       const record = store.get(agentId);
-      if (!record || record.sleep?.taskId !== taskId || record.sleep.sessionId !== record.sessionId) return false;
+      if (!record || readOnlyTarget(record) || record.sleep?.taskId !== taskId || record.sleep.sessionId !== record.sessionId) return false;
       await ensureWorker(record, { wake: true });
       return true;
     },
     async trySleep(agentId) {
       return store.locked(agentId, async () => {
         const record = store.get(agentId);
-        if (!record || !canSleep(record, store.supplements(agentId), treeSettled)) return false;
+        if (!record || readOnlyTarget(record) || !canSleep(record, store.supplements(agentId), treeSettled)) return false;
         if (!await startSharedMonitor(config, store)) return false;
         return store.sleep(record, idleSignal({ ...record.observation, taskId: record.task.taskId }));
       });

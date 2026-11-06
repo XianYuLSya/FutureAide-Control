@@ -1,0 +1,52 @@
+// Schema-valid Thread fixture copied from a real Codex Desktop thread/start and
+// thread/read response. Tests override only the fields they assert on.
+export const liveThread = (overrides = {}) => ({
+  id: 'thread-1',
+  environments: [{ environmentId: 'local', cwd: 'D:/work/p', runtimeWorkspaceRoots: ['D:/work/p'] }],
+  extra: null,
+  sessionId: 'thread-1',
+  forkedFromId: null,
+  parentThreadId: null,
+  preview: '',
+  ephemeral: false,
+  section: null,
+  sectionEnteredAt: null,
+  projectId: null,
+  historyMode: 'paginated',
+  modelProvider: 'openai',
+  model: 'gpt-6-astra',
+  reasoningEffort: 'max',
+  createdAt: 1793932679,
+  updatedAt: 1793932679,
+  recencyAt: 1793932679,
+  status: { type: 'idle' },
+  path: null,
+  cwd: 'D:/work/p',
+  cliVersion: '0.166.0-alpha.6',
+  originator: 'Codex Desktop',
+  source: 'vscode',
+  canAcceptDirectInput: true,
+  threadSource: 'user',
+  agentNickname: null,
+  agentRole: null,
+  gitInfo: null,
+  name: null,
+  daybreakEnabled: null,
+  turns: [],
+  ...overrides,
+});
+
+export const livePage = (data = []) => ({ data, nextCursor: null, backwardsCursor: null });
+
+export const liveTurn = (overrides = {}) => ({
+  id: 'turn-1',
+  rootTurnId: 'turn-1',
+  items: [],
+  itemsView: 'full',
+  status: 'completed',
+  error: null,
+  startedAt: 1793932679,
+  completedAt: 1793932811,
+  durationMs: 131608,
+  ...overrides,
+});

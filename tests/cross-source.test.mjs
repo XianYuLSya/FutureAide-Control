@@ -973,7 +973,37 @@ function pendingReport(f, claude, name, delivery) {
   return ownerId;
 }
 
+function failedTask(f, claude, name, { cancel = false } = {}) {
+  const ownerId = ownerIdForSource('claude-desktop', claude.sessionId);
+  f.store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId: claude.sessionId, workspace, binding: claude.stale });
+  const task = { taskId: `task-${name}`, message: 'work', state: 'running', treeProtocol: 1, reportProtocol: 1,
+    startedAt: new Date().toISOString(), answers: [], reports: [],
+    dispatches: [{ requestId: `request-${name}`, state: 'failed', accepted: true }],
+    ...(cancel ? { cancelRequested: true } : {}) };
+  f.store.insert(taskRecord({ agentId: name, ownerId, sessionId: `session-${name}`, name,
+    target: 'codex-desktop', state: 'running', task }));
+}
+
 const again = (f, name) => { const record = f.store.get(name); record.task.reports[0].delivery.nextAttemptAt = 0; f.store.save(record); return f.service.poll(name); };
+
+test('a failed task notifies its Claude parent once, and a cancelled task sends nothing', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    failedTask(f, claude, 'failed');
+    await f.service.poll('failed');
+    assert.equal(claude.received.length, 1);
+    assert.match(JSON.stringify(claude.received[0]), /失败/);
+    assert.match(JSON.stringify(claude.received[0]), /failed/);
+    await f.service.poll('failed');
+    assert.equal(claude.received.length, 1, 'one failure notice per task');
+
+    failedTask(f, claude, 'cancelled', { cancel: true });
+    await f.service.poll('cancelled');
+    assert.equal(claude.received.length, 1, 'a parent-cancelled task sends no failure notice');
+  } finally { await claude.close(); f.service.close(); }
+});
 
 test('a report reaches a Claude session that restarted, once, and the new binding is kept', async () => {
   const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });

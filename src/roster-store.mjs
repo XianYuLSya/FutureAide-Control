@@ -286,18 +286,7 @@ export class RosterStore {
     }
     return found;
   }
-  /**
-   * Verified Codex chats this roster knows, newest first. Only these may anchor a
-   * Codex bridge: a Claude session id is never a Codex caller identity. Owners saved
-   * before the source field existed count too, because a thread id is the marker.
-   */
-  codexOwners() {
-    const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
-    return this.db.prepare('SELECT body FROM owners').all()
-      .map(row => JSON.parse(row.body))
-      .filter(owner => typeof owner.threadId === 'string' && UUID.test(owner.threadId))
-      .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
-  }
+  /** All managed records, optionally scoped to one owner. */
   list(owner) {
     const rows = owner === undefined
       ? this.db.prepare('SELECT body FROM agents ORDER BY name').all()

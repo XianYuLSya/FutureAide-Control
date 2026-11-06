@@ -2,9 +2,9 @@
 
 # FutureAide Control
 
-让 Codex 和 Claude Desktop 都能按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务；调用方也可以把 Codex Desktop 当作被调用目标（实验性）。插件自动识别当前聊天和项目；每个调用方有自己的名单。
+让 Codex 和 Claude Desktop 都能按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务；调用方也可以把 Codex Desktop 当作被调用目标（需要 Codex 带本地调试端口启动）。插件自动识别当前聊天和项目；每个调用方有自己的名单。
 
-> **0.5.12（2026-11-05）**：移除 `claude-desktop` 目标和全部窗口操作，插件不再模拟鼠标、键盘和剪贴板：执行目标只有 DSH 和 Codex Desktop，Claude 只当调用方。此前的改进都保留：派单结果和提问都能传回来了：助手没交最终报告时会被提醒一次，DSH 自带的提问工具会被拦下并转到 `ask_parent`。同时适配 DSH 0.2.2，单次读类工具调用从约 3.5 秒降到约 0.5 秒。主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 作为被调用目标（`target: 'codex-desktop'`）仍是实验性的：功能在，后续继续完善，本版不按完成计。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
+> **0.5.13（2026-11-05）**：`target: 'codex-desktop'` 改走 Codex 自己的接口：不再借用已有对话，会话继承用户默认的权限和模型，不动窗口；Claude 调 Codex、Codex 再调 DSH 的多层分工已实机跑通，任务失败时会通知上级一次。此前的改进都保留：移除 `claude-desktop` 目标和全部窗口操作，插件不再模拟鼠标、键盘和剪贴板：执行目标只有 DSH 和 Codex Desktop，Claude 只当调用方。此前的改进都保留：派单结果和提问都能传回来了：助手没交最终报告时会被提醒一次，DSH 自带的提问工具会被拦下并转到 `ask_parent`。同时适配 DSH 0.2.2，单次读类工具调用从约 3.5 秒降到约 0.5 秒。主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 作为被调用目标（`target: 'codex-desktop'`）需要 Codex 带本地调试端口启动。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
 
 - **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
 - **直接交流**：助手用 `ask_parent` 提问，父级按名字回答；显式 `report_parent` 决定何时回包，正文只转发它提交的内容。
@@ -25,6 +25,8 @@ futureaide_list_agents({})
 ```
 
 Codex 在自己的会话中工作；提问和显式报告回到创建它的聊天。父级用 `futureaide_answer_agent` 回答、`futureaide_agent_changes` 看文件、`futureaide_inspect_agent` 看上下文。省略 `target` 就调用 DSH。
+
+Codex Desktop 目标要求 Codex 由 **FAswitch** 打开：调试端口是启动器加的，Codex 自身不开。插件经主渲染进程的本地调试端口发 `thread/start`、`turn/start`，与界面新建对话走同一个入口；后续发送、补充、打断、删除和观察也走这条 app-server RPC，不读 `state_5.sqlite`、`thread_history_1.sqlite` 或 rollout 文件，也不再用 app-tools 的 `create_thread` 借锚点。首条消息不带模型、推理强度或权限字段，全部继承用户在 Codex 里的默认选择。标题不在首轮返回时硬设：等会话有内容后再补 `thread/name/set`，失败最多重试 5 次且不影响任务。没有调试端口时 `futureaide_status` 的 `codex-desktop` 项会报 `codex-native-rpc-unavailable`，并提示从 FAswitch 打开 Codex；此时普通 Codex 对话调用 DSH 仍走 app-tools，不受影响。已知限制：取消会停下模型这一轮，但 Codex 已经启动的 shell 命令不会被杀（实测 `turn/interrupt` 之后 `Start-Sleep` 还在跑）。
 
 `once` 在成功 final 送达且整树收尾后自动删除会话，保留项目产物；`persistent` 留下同一上下文供下一项任务使用。按名字取消保留上下文，按名字删除清理它拥有的整棵会话树。桌面调用的 `queued:true` 表示已持久保存，后续由监控推进，调用方无需重复发送。
 
@@ -60,7 +62,7 @@ Claude 侧的桥接进程声明了 `tools.listChanged`：服务端的工具名�
 
 从 0.4 升级到 0.5 前，先让正在运行的任务完成。需要保留在途任务升级时，还须按原任务身份切换后台 `scoped-worker`；仅重新加载 MCP 不会替换已经启动的监工进程，也不要重新派发任务来代替迁移。
 
-宿主目标由 `target` 决定：`dsh`（默认）、`codex-desktop`。DSH 路径未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`；桌面目标使用已由宿主打开的应用会话，每个目标单独发现与校验，不读取账号凭据、不启动独立 CLI 顶替桌面。旧 FutureAide 应用的 shell、端口、启动日志与环境变量覆盖一律不使用。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
+宿主目标由 `target` 决定：`dsh`（默认）、`codex-desktop`。DSH 路径未指定实例时只读取 DSH 的注册记录，默认数据目录为 `DSH_HOME` 或 `~/.dsh`。Codex Desktop 目标使用经 FAswitch 启动的应用主渲染进程：插件只经本地调试端口调用 Codex 自己的 app-server RPC，不读取账号凭据，不启动独立 CLI 或第二个 app-server，也不读 Codex 的数据库、thread history 或 rollout 文件；没有调试端口时 `status` 明确报不可用并提示从 FAswitch 打开，不以 app-tools 创建会话顶替。旧 FutureAide 应用的 shell、端口、启动日志与环境变量覆盖一律不使用。手工维护配置中的 `target` 只能为 `dsh`，已有 `auto` / `futureaide` 配置会明确报错；安装器会生成固定 DSH 配置。`futureaide_*` 工具名和已有 DSH 状态字段保持兼容。
 
 维护 CLI 默认使用此安装目录的 `.runtime/config.json`；`--config` 和配置环境变量可显式选择其他配置。桌面桥接若已绑定不同凭据或托管状态目录，安装会报告冲突并保留原绑定；只有确定要迁移时才使用 `desktop-host-install --rebind` 或 `connect-desktop.ps1 -Rebind`。
 
@@ -160,11 +162,11 @@ DSH 助手可以继续调用其原生子代理，形成多层任务树；Codex �
 
 普通 Codex 聊天支持后台回包；当前桌面对原生 multi-agent v2 子代理调用者拒绝后台回包。遇到该明确拒绝时，插件显示 `native-callback-unavailable`、保留未送达报告和原收件人，并停止重复投递。
 
-**一次性**完成一项任务，过程中可以多次提问、回答和显式报告。非 final 报告不会结束任务。成功的 final 报告确认送达且整树收尾后，插件关闭实例、删除该会话数据及私有记录，再移出名单。取消或失败只更新可见状态，不自动发送通知或清理；已提交的报告仍继续交付，代理可由用户按名字删除。清理失败仍显示在列表。已回到 Codex 的结果与项目产物保留。
+**一次性**完成一项任务，过程中可以多次提问、回答和显式报告。非 final 报告不会结束任务。成功的 final 报告确认送达且整树收尾后，插件关闭实例、删除该会话数据及私有记录，再移出名单。取消只更新可见状态，不自动发送通知或清理；失败在确定终态时给直接上级发一次执行失败通知（不重试模型任务）；已提交的报告仍继续交付，代理可由用户按名字删除。清理失败仍显示在列表。已回到 Codex 的结果与项目产物保留。
 
 **长期**显式 final 报告完成交付后回到空闲，留在名单中，下一项任务使用原上下文。没有 final 时显示 `awaiting_report`，同名发送继续原任务；final 已提交但尚未交付时不接受追加消息；派下一单时会先读回确认，回报已经进入对话就直接开始。只有按名字删除时才清除会话数据；停止当前任务不等于删除代理。取消或失败后，没有待投报告的长期代理可在同一会话开始新任务；一次性代理需显式删除。用户主动删除会同时丢弃尚未交付的报告。
 
-模型请求失败时，列表和查看结果中的 `error.source: "model"` 给出稳定错误代码、可用的 HTTP 状态和简短提示。例如 `no_healthy_account` 表示所用模型网关当前没有健康账号。模型失败原因保存在原任务中，不触发自动回包；新任务或后续成功会清除当前展示中的旧失败。升级前已失败的代理可通过一次正常查看补齐原因。
+模型请求失败时，列表和查看结果中的 `error.source: "model"` 给出稳定错误代码、可用的 HTTP 状态和简短提示。例如 `no_healthy_account` 表示所用模型网关当前没有健康账号。任务进入确定的失败终态时，插件复用报告投递给直接上级发一次执行失败通知（写明助手名、失败和简短原因），失败重试仍在进行时不发，上级自己取消的停止也不发；模型任务本身不会自动重试。失败原因保存在原任务中，新任务或后续成功会清除当前展示中的旧失败。升级前已失败的代理可通过一次正常查看补齐原因。
 
 `wait_agents` 遇到已自动退出的名字会返回 `notListed`，完成情况以已收到的结果为准。多代理组织由 Codex 负责，受管 DSH 助手使用各自的任务会话。
 
@@ -201,7 +203,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 ## 已知未完成
 
-- Codex 子会话目前走 `create_thread`，会被当作委派，权限降级并可能弹出审批。
+- Codex 目标的原生 RPC 通道（创建、发送、补充、打断、删除、观察、调用方验证与回报送达）已按 app-server v2 schema 实现并通过全量测试，尚未在真实 Codex 上做本版验收；`thread/list` 的父线程过滤、冷线程 `thread/resume`、标题和侧栏可见性以实机为准。
 - Codex → DSH 混合树的删除尚未重测。
 - 退出整个应用再打开后的恢复未验证。
 

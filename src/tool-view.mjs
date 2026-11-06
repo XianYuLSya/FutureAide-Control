@@ -33,7 +33,9 @@ const reportField = item => {
   // An earlier report can still be undelivered while the latest one is through; the
   // count is the only field that says a report is stuck.
   return { report: { summary: truncate(latest.summary, REPORT_LIMIT),
-    final: latest.final === true, delivery: latest.delivery, ...(pending > 0 ? { pending } : {}) } };
+    final: latest.final === true, delivery: latest.delivery,
+    ...(latest.error ? { error: latest.error } : {}),
+    ...(pending > 0 ? { pending } : {}) } };
 };
 
 // The count is the honest headline, and it already includes the unconfirmed paths:

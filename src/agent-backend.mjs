@@ -70,12 +70,9 @@
 //                         reports:[{id,taskId,message,final,createdAt}]}; read-only.
 //                         Consumption belongs to the shared state machine, which owns
 //                         the one queue; a backend never marks a submission consumed.
-//   anchorResolver()      Bridge anchor for the child: a Codex chat this roster already
-//                         verified, preferring the same workspace. The object
-//                         {threadId, ownerId, workspace} is the contract (hosts extract
-//                         threadId; toString() yields it too). A Claude session id is
-//                         never an anchor, and there is no per-create new session.
-//   hostOptions.anchorResolver  The same resolver, offered where a host expects it.
+//   nativeRequest()       Codex Desktop only: the one native RPC transport used for
+//                         create, send, observe, interrupt and delete. No anchor and
+//                         no create_thread path exists.
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';

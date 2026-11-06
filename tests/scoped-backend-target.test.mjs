@@ -7,6 +7,7 @@ import { createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
 import { BACKEND_METHODS, normalizeTarget, targetOf, resolveBackend } from '../src/agent-backend.mjs';
+import { liveThread, livePage } from '../test/live-thread-fixture.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const A = '11111111-1111-4111-8111-111111111111';
@@ -85,10 +86,12 @@ function dshFixture(events) {
     },
     async managedStatus(input) {
       events.push('managedStatus');
-      return { sessionId: input.sessionId, taskId: session.taskId, running: session.running, questions: [], reports: [],
+      return { sessionId: input.sessionId, taskId: session.taskId, running: session.running,
+        questions: session.questions ?? [], reports: session.reports ?? [],
         changes: [], throughSeq: session.seq, currentModel: { provider: 'fixture', model: 'dsh-model' },
-        tree: { settled: !session.running, running: session.running, nodes: [] } };
+        tree: { settled: !session.running, running: session.running, nodes: session.nodes ?? [] } };
     },
+    async managedCancel(input) { events.push('managedCancel'); return { cancelRequested: true }; },
     async managedSession() { events.push('managedSession'); return { projections: { values: { modelSelection: { next: { provider: 'fixture', model: 'dsh-model' } } } } }; },
     async historyCursor() { events.push('historyCursor'); return { throughSeq: session.seq }; },
   };
@@ -100,7 +103,7 @@ function dshFixture(events) {
     },
     async selectModel() { events.push('selectModel'); return { accepted: true }; },
     async send(input) { events.push(['send', input.requestId]); session.running = true; session.seq += 1; return { accepted: true, afterSeq: session.seq }; },
-    async wait() { return { state: 'running', afterSeq: session.seq }; },
+    async wait() { return session.turnResult ?? { state: 'running', afterSeq: session.seq }; },
   });
   return { api, controlFactory, session };
 }
@@ -156,13 +159,19 @@ async function stateRoot() {
   return mkdtemp(path.join(base, 'target-'));
 }
 
-async function fixture({ adapters = {}, store, adapterLoader, codexProbeRegistration } = {}) {
+async function fixture({ adapters = {}, store, adapterLoader, codexProbeRegistration,
+  callCodex, nativeRequest, codexInvoke } = {}) {
   const events = [];
   const stateDirectory = await stateRoot();
   const roster = store ?? new RosterStore(':memory:');
   const dsh = dshFixture(events);
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
-    store: roster, clientFactory: () => dsh.api, controlFactory: dsh.controlFactory, callCodex: calling(events),
+    store: roster, clientFactory: () => dsh.api, controlFactory: dsh.controlFactory,
+    // A fixture that wants the real Codex-owner path omits this injection and
+    // supplies only the transport seams below.
+    ...(callCodex === false ? {} : { callCodex: callCodex ?? calling(events) }),
+    ...(nativeRequest ? { nativeRequest } : {}),
+    ...(codexInvoke ? { codexInvoke } : {}),
     startSharedMonitor: () => true,
     removeTree: async () => {},
     backendAdapters: adapters,
@@ -276,6 +285,26 @@ test('a codex-desktop name is created, dispatched and listed only through its ow
   } finally { f.service.close(); }
 });
 
+test('a Codex record ignores its legacy dataRoot and keeps working', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': record => {
+    const backend = desktopAdapter([]);
+    backend.record = record;
+    backend.probe = async () => ({ identity: { application: 'codex-desktop', home: 'C:/Users/x/.codex' },
+      methods: ['create', 'observe', 'deliver'], treeProtocol: 1, reportProtocol: 1 });
+    return backend;
+  } } });
+  try {
+    await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop' }, extra(A));
+    const record = f.record('partner');
+    record.host = { application: 'codex-desktop', dataRoot: 'D:/Work/tools/codexX' };
+    f.store.save(record);
+    await f.service.send({ name: 'partner', message: 'continue' }, extra(A));
+    await f.service.poll(record.agentId);
+    assert.equal(f.record('partner').host.dataRoot, 'D:/Work/tools/codexX', 'the legacy row is not migrated');
+    assert.equal(f.record('partner').error, undefined, 'the monitor cwd is irrelevant to Codex ownership');
+  } finally { f.service.close(); }
+});
+
 test('an unfinished protocol leaves no name instead of a reconnecting one', async () => {
   const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...desktopAdapter([]), record,
     async probe() { return { identity: { application: 'codex-desktop', dataRoot: '/fixture/desktop' },
@@ -371,6 +400,7 @@ test('status separates an unfinished adapter from a ready one without using it',
     const status = await g.service.status(extra(A));
     assert.equal(status.backends['codex-desktop'].ready, true);
     assert.equal(status.backends['codex-desktop'].registered, true, 'the entry is the registration evidence');
+    assert.equal(status.backends['codex-desktop'].evidence, 'native-rpc', 'readiness came from the real thread/list RPC');
     assert.deepEqual(ready, ['desktop:probe'], 'a ready adapter is still not created, dispatched or answered');
     assert.equal(g.store.count(ownerIdFor(A)), 0);
   } finally { g.service.close(); }
@@ -458,6 +488,274 @@ test('a Claude caller with no Codex thread creates and runs names without a pare
       'both names belong to the Claude caller and are addressable by name');
   } finally { f.service.close(); }
 });
+test('a DSH child question reaches a Codex owner over the native RPC', async () => {
+  const calls = [];
+  const nativeRequest = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/read') return { thread: liveThread({ id: A, cwd: workspace, model: 'fixture' }) };
+    if (method === 'thread/turns/list') return livePage();
+    if (method === 'turn/start' || method === 'turn/steer') return { turn: { id: `turn-${calls.length}`, items: [], status: 'inProgress' } };
+    if (method === 'thread/list') return livePage();
+    throw new Error('unexpected ' + method);
+  };
+  const f = await fixture({ callCodex: false, nativeRequest });
+  try {
+    await f.service.create({ name: 'helper', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    await f.service.send({ name: 'helper', message: 'work' }, extra(A));
+    const record = f.record('helper');
+    const taskId = record.task.taskId;
+    f.dsh.session.running = false;
+    f.dsh.session.questions = [{ id: 'q1', taskId, state: 'pending', message: 'need input' }];
+    await f.service.poll(record.agentId);
+    const sent = calls.filter(call => call.method === 'turn/start');
+    assert.equal(sent.length, 1);
+    assert.match(JSON.stringify(sent[0].params), /need input/);
+  } finally { f.service.close(); }
+});
+
+test('a DSH child final report reaches a Codex owner over the native RPC', async () => {
+  const calls = [];
+  const nativeRequest = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/read') return { thread: liveThread({ id: A, cwd: workspace, model: 'fixture' }) };
+    if (method === 'thread/turns/list') return livePage();
+    if (method === 'turn/start' || method === 'turn/steer') return { turn: { id: `turn-${calls.length}`, items: [], status: 'inProgress' } };
+    if (method === 'thread/list') return livePage();
+    throw new Error('unexpected ' + method);
+  };
+  const f = await fixture({ callCodex: false, nativeRequest });
+  try {
+    await f.service.create({ name: 'helper', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    await f.service.send({ name: 'helper', message: 'work' }, extra(A));
+    const record = f.record('helper');
+    const taskId = record.task.taskId;
+    f.dsh.session.running = false;
+    f.dsh.session.nodes = [{ sessionId: record.sessionId, parentSessionId: null, status: 'idle', changes: [] }];
+    f.dsh.session.reports = [{ id: 'r1', taskId, message: 'all done', final: true, createdAt: new Date().toISOString() }];
+    await f.service.poll(record.agentId);
+    const sent = calls.filter(call => call.method === 'turn/start');
+    assert.equal(sent.length, 1);
+    assert.match(JSON.stringify(sent[0].params), /all done/);
+    assert.equal(f.record('helper').state, 'idle');
+  } finally { f.service.close(); }
+});
+
+test('without a debug port the DSH report falls back to the app-tools read and send', async () => {
+  const appTools = [];
+  const codexInvoke = async (threadId, toolName, args) => {
+    appTools.push({ threadId, toolName, args });
+    if (toolName === 'read_thread') return { content: [{ type: 'text', text: JSON.stringify({
+      thread: { id: A, kind: 'codex', hostId: 'local', cwd: workspace } }) }], isError: false };
+    return { content: [{ type: 'text', text: 'accepted' }], isError: false };
+  };
+  const nativeRequest = async () => { throw Object.assign(new Error('no debug port'), { code: 'codex-native-rpc-unavailable' }); };
+  const f = await fixture({ callCodex: false, nativeRequest, codexInvoke });
+  try {
+    await f.service.create({ name: 'helper', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    await f.service.send({ name: 'helper', message: 'work' }, extra(A));
+    const record = f.record('helper');
+    const taskId = record.task.taskId;
+    f.dsh.session.running = false;
+    f.dsh.session.nodes = [{ sessionId: record.sessionId, parentSessionId: null, status: 'idle', changes: [] }];
+    f.dsh.session.reports = [{ id: 'r2', taskId, message: 'fallback done', final: true, createdAt: new Date().toISOString() }];
+    await f.service.poll(record.agentId);
+    assert.deepEqual(appTools.map(item => item.toolName), ['read_thread', 'read_thread', 'send_message_to_thread']);
+    assert.match(appTools.find(item => item.toolName === 'send_message_to_thread').args.prompt, /fallback done/);
+  } finally { f.service.close(); }
+});
+test('a final notice to a missing Codex profile becomes a visible terminal failure', async () => {
+  let fail = false, reads = 0;
+  const nativeRequest = async method => {
+    if (method !== 'thread/read') return livePage();
+    reads++;
+    if (fail) throw Object.assign(new Error('thread not found'), { code: 'codex-thread-not-found', terminal: true });
+    return { thread: liveThread({ id: A, cwd: workspace, model: 'fixture' }) };
+  };
+  const f = await fixture({ callCodex: false, nativeRequest });
+  try {
+    await f.service.create({ name: 'helper', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    await f.service.send({ name: 'helper', message: 'work' }, extra(A));
+    const record = f.record('helper');
+    const taskId = record.task.taskId;
+    f.dsh.session.running = false;
+    f.dsh.session.nodes = [{ sessionId: record.sessionId, parentSessionId: null, status: 'idle', changes: [] }];
+    f.dsh.session.reports = [{ id: 'r3', taskId, message: 'kept report', final: true, createdAt: new Date().toISOString() }];
+    fail = true;
+    await f.service.poll(record.agentId);
+    const after = f.record('helper');
+    assert.equal(after.state, 'failed');
+    assert.equal(after.task.reports.at(-1).delivery.state, 'blocked');
+    assert.equal(after.task.reports.at(-1).delivery.error.code, 'codex-thread-not-found');
+    assert.match(after.task.reports.at(-1).delivery.error.message, /当前 Codex 档案里看不到这个对话/);
+    const listed = (await f.service.list(extra(A))).items.find(item => item.name === 'helper');
+    assert.equal(listed.reports.latest.error.code, 'codex-thread-not-found');
+    const readsAfter = reads;
+    await f.service.poll(record.agentId);
+    assert.equal(reads, readsAfter, 'a blocked profile notice is not retried');
+  } finally { f.service.close(); }
+});
+
+test('a transient Codex owner outage keeps the final notice pending and retries it', async () => {
+  let fail = false;
+  const nativeRequest = async (method, params) => {
+    if (method === 'thread/read') {
+      if (fail) throw Object.assign(new Error('no debug port'), { code: 'codex-native-rpc-unavailable' });
+      return { thread: { id: A, cwd: workspace, status: { type: 'idle' }, model: 'fixture' } };
+    }
+    if (method === 'thread/turns/list') return { data: [] };
+    if (method === 'turn/start' || method === 'turn/steer') return { turn: { id: 'turn-rpc', items: [], status: 'inProgress' } };
+    if (method === 'thread/list') return { data: [] };
+    throw new Error('unexpected ' + method);
+  };
+  const codexInvoke = async () => { throw new Error('app-tools also unavailable'); };
+  const f = await fixture({ callCodex: false, nativeRequest, codexInvoke });
+  try {
+    await f.service.create({ name: 'helper', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    await f.service.send({ name: 'helper', message: 'work' }, extra(A));
+    const record = f.record('helper');
+    const taskId = record.task.taskId;
+    f.dsh.session.running = false;
+    f.dsh.session.nodes = [{ sessionId: record.sessionId, parentSessionId: null, status: 'idle', changes: [] }];
+    f.dsh.session.reports = [{ id: 'r4', taskId, message: 'retry me', final: true, createdAt: new Date().toISOString() }];
+    fail = true;
+    await f.service.poll(record.agentId);
+    assert.equal(f.record('helper').state, 'delivery_pending');
+    assert.equal(f.record('helper').task.reports.at(-1).delivery.state, 'pending');
+    fail = false;
+    const retry = f.record('helper');
+    retry.task.reports.at(-1).delivery.nextAttemptAt = 0;
+    f.store.save(retry);
+    await f.service.poll(record.agentId);
+    assert.equal(f.record('helper').task.reports.at(-1).delivery.state, 'delivered');
+    assert.equal(f.record('helper').state, 'idle');
+  } finally { f.service.close(); }
+});
+
+test('a failed DSH task notifies its Codex parent once and a cancelled task does not', async () => {
+  const calls = [];
+  const nativeRequest = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/read') return { thread: liveThread({ id: A, cwd: workspace, model: 'fixture' }) };
+    if (method === 'thread/turns/list') return livePage();
+    if (method === 'turn/start' || method === 'turn/steer') return { turn: { id: `turn-${calls.length}`, items: [], status: 'inProgress' } };
+    if (method === 'thread/list') return livePage();
+    throw new Error('unexpected ' + method);
+  };
+  const f = await fixture({ callCodex: false, nativeRequest });
+  try {
+    await f.service.create({ name: 'helper', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    await f.service.send({ name: 'helper', message: 'work' }, extra(A));
+    const record = f.record('helper');
+    // A running/retrying task is not a terminal failure yet: no notice.
+    await f.service.poll(record.agentId);
+    assert.equal(calls.filter(call => call.method === 'turn/start'
+      && JSON.stringify(call.params).includes('执行失败')).length, 0);
+    f.dsh.session.running = false;
+    f.dsh.session.nodes = [{ sessionId: record.sessionId, parentSessionId: null, status: 'idle', changes: [] }];
+    f.dsh.session.turnResult = { state: 'ended', completionReason: { kind: 'error', error: { message: 'gateway 503' } },
+      endSeq: f.dsh.session.seq, correlation: 'request-id' };
+    await f.service.poll(record.agentId);
+    const failed = f.record('helper');
+    assert.equal(failed.state, 'failed');
+    const notices = calls.filter(call => call.method === 'turn/start'
+      && JSON.stringify(call.params).includes('执行失败'));
+    assert.equal(notices.length, 1);
+    assert.match(JSON.stringify(notices[0].params), /helper/);
+    await f.service.poll(record.agentId);
+    assert.equal(calls.filter(call => call.method === 'turn/start'
+      && JSON.stringify(call.params).includes('执行失败')).length, 1, 'one failure notice per task');
+
+    // A task the parent itself cancelled is stopped, not failed, and sends no notice.
+    const second = await fixture({ callCodex: false, nativeRequest });
+    await second.service.create({ name: 'cancelled', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    await second.service.send({ name: 'cancelled', message: 'work' }, extra(A));
+    const cancelled = second.record('cancelled');
+    second.dsh.session.running = false;
+    second.dsh.session.nodes = [{ sessionId: cancelled.sessionId, parentSessionId: null, status: 'idle', changes: [] }];
+    const current = second.store.get(cancelled.agentId);
+    current.task.cancelRequested = true;
+    second.store.save(current);
+    await second.service.poll(cancelled.agentId);
+    assert.equal(second.record('cancelled').task.reports.find(report => report.failure), undefined);
+    assert.equal(calls.filter(call => call.method === 'turn/start'
+      && JSON.stringify(call.params).includes('执行失败')).length, 1);
+    second.service.close();
+  } finally { f.service.close(); }
+});
+
+test('a failed notification is retried by the real candidate scan after its first send is unavailable', async () => {
+  const calls = [];
+  let fail = false;
+  const nativeRequest = async (method, params) => {
+    calls.push({ method, params });
+    if (fail) throw Object.assign(new Error('no debug port'), { code: 'codex-native-rpc-unavailable' });
+    if (method === 'thread/read') return { thread: liveThread({ id: A, cwd: workspace, model: 'fixture' }) };
+    if (method === 'thread/turns/list') return livePage();
+    if (method === 'turn/start' || method === 'turn/steer') return { turn: { id: `turn-${calls.length}`, items: [], status: 'inProgress' } };
+    if (method === 'thread/list') return livePage();
+    throw new Error('unexpected ' + method);
+  };
+  const f = await fixture({ callCodex: false, nativeRequest });
+  try {
+    await f.service.create({ name: 'helper', lifetime: 'persistent', target: 'dsh' }, extra(A));
+    await f.service.send({ name: 'helper', message: 'work' }, extra(A));
+    const record = f.record('helper');
+    f.dsh.session.running = false;
+    f.dsh.session.nodes = [{ sessionId: record.sessionId, parentSessionId: null, status: 'idle', changes: [] }];
+    f.dsh.session.turnResult = { state: 'ended', completionReason: { kind: 'error', error: { message: 'gateway 503' } },
+      endSeq: f.dsh.session.seq, correlation: 'request-id' };
+    fail = true;
+    await f.service.poll(record.agentId);
+    const failed = f.record('helper');
+    const failure = failed.task.reports.find(report => report.failure);
+    assert.equal(failed.state, 'failed');
+    assert.equal(failure.delivery.state, 'pending');
+    failure.delivery.nextAttemptAt = 0;
+    f.store.save(failed);
+    const candidate = f.store.listWorkerCandidates().find(item => item.agentId === failed.agentId);
+    assert.equal(candidate.pendingReports, 1, JSON.stringify(candidate));
+    fail = false;
+    await f.service.monitorScan({ force: true });
+    await f.service.drainPolls();
+    const retried = f.record('helper');
+    assert.equal(retried.task.reports.find(report => report.failure).delivery.state, 'delivered');
+    assert.equal(calls.filter(call => call.method === 'turn/start'
+      && JSON.stringify(call.params).includes('执行失败')).length, 1);
+  } finally { f.service.close(); }
+});
+
+test('a terminal backend error notifies the Codex parent once', async () => {
+  const calls = [];
+  const nativeRequest = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/read') return { thread: liveThread({ id: A, cwd: workspace, model: 'fixture' }) };
+    if (method === 'thread/turns/list') return livePage();
+    if (method === 'turn/start' || method === 'turn/steer') return { turn: { id: `turn-${calls.length}`, items: [], status: 'inProgress' } };
+    if (method === 'thread/list') return livePage();
+    throw new Error('unexpected ' + method);
+  };
+  const f = await fixture({ callCodex: false, nativeRequest,
+    adapters: { 'codex-desktop': record => {
+      const backend = desktopAdapter([]);
+      backend.record = record;
+      backend.observe = async () => { throw Object.assign(new Error('thread not found'), { code: 'codex-thread-not-found', terminal: true }); };
+      return backend;
+    } } });
+  try {
+    await f.service.create({ name: 'helper', lifetime: 'persistent', target: 'codex-desktop' }, extra(A));
+    await f.service.send({ name: 'helper', message: 'work' }, extra(A));
+    await f.service.poll(f.record('helper').agentId);
+    const record = f.record('helper');
+    assert.equal(record.state, 'failed');
+    const notices = calls.filter(call => call.method === 'turn/start'
+      && JSON.stringify(call.params).includes('执行失败'));
+    assert.equal(notices.length, 1);
+    await f.service.poll(record.agentId);
+    assert.equal(calls.filter(call => call.method === 'turn/start'
+      && JSON.stringify(call.params).includes('执行失败')).length, 1);
+  } finally { f.service.close(); }
+});
+
 test('a managed Codex child still records its parent when it creates a name', async () => {
   const f = await fixture();
   try {

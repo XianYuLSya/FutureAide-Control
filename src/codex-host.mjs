@@ -9,7 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
   requestCodexNative, readCodexThreadNative, ensureCodexThreadNative, listCodexTurnsNative,
-  sendCodexTextNative,
+  listCodexModelsNative, sendCodexTextNative,
 } from './codex-ipc.mjs';
 
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
@@ -109,6 +109,111 @@ function currentModelFromThread(thread) {
   if (!thread?.model) return undefined;
   return { provider: thread.modelProvider ?? 'openai', model: thread.model,
     ...(thread.reasoningEffort ? { reasoningEffort: thread.reasoningEffort } : {}) };
+}
+
+const modelText = value => typeof value === 'string' ? value.trim() : '';
+
+/**
+ * Convert the app-server ModelListResponse into the catalog the shared name
+ * state machine consumes. The native `id` is the stable preset identity used by
+ * callers; `model` is the slug a turn/start actually accepts. They are equal in
+ * the current build, but the wire field is deliberately kept apart so a catalog
+ * that later distinguishes them cannot silently deliver the wrong value.
+ */
+export function sharedCodexCatalog(models, { provider = 'openai', configured } = {}) {
+  if (!Array.isArray(models) || !models.length) {
+    throw fail('codex-model-catalog-empty', 'Codex returned no selectable models; no model can be offered or resolved.');
+  }
+  const entries = models.map(model => {
+    const id = modelText(model?.id);
+    const wireModel = modelText(model?.model);
+    if (!id || !wireModel) {
+      throw fail('codex-native-rpc-invalid-response',
+        'A Codex model entry is missing its catalog id or native model slug.');
+    }
+    const efforts = Array.isArray(model.supportedReasoningEfforts)
+      ? model.supportedReasoningEfforts
+        .filter(option => modelText(option?.reasoningEffort))
+        .map(option => ({ id: modelText(option.reasoningEffort),
+          ...(typeof option.description === 'string' ? { name: option.description } : {}) }))
+      : [];
+    const defaultEffort = modelText(model.defaultReasoningEffort) || undefined;
+    return {
+      id,
+      model: wireModel,
+      name: typeof model.displayName === 'string' && model.displayName ? model.displayName : id,
+      ...(typeof model.description === 'string' && model.description ? { description: model.description } : {}),
+      // `reasoning` is the shape model-selection.mjs reads; the flat fields keep
+      // status and older readers able to show the same advertised values.
+      reasoning: { efforts, ...(defaultEffort ? { defaultEffort } : {}) },
+      reasoningEfforts: efforts.map(effort => effort.id),
+      ...(defaultEffort ? { defaultEffort } : {}),
+      isDefault: model.isDefault === true,
+    };
+  });
+  const configuredModel = modelText(configured?.model);
+  const configuredEffort = modelText(configured?.reasoningEffort) || undefined;
+  const configuredEntry = configuredModel
+    ? (entries.find(entry => entry.id === configuredModel)
+      ?? entries.find(entry => entry.model === configuredModel))
+    : undefined;
+  // The effective config names the model a new thread actually inherits, even
+  // when that model is custom or hidden from the picker. Keep the real value;
+  // the catalog entry is reported separately rather than substituted for it.
+  // The model-list `isDefault` entry is used only when config gave no model, and
+  // with no evidence at all the default stays null instead of claiming entries[0].
+  let defaultSelection;
+  let defaultEntry;
+  if (configuredModel) {
+    defaultEntry = configuredEntry;
+    const effort = configuredEffort ?? configuredEntry?.reasoning.defaultEffort;
+    defaultSelection = { provider, model: configuredEntry?.id ?? configuredModel, ...(effort ? { reasoningEffort: effort } : {}) };
+  } else {
+    defaultEntry = entries.find(entry => entry.isDefault);
+    defaultSelection = defaultEntry
+      ? { provider, model: defaultEntry.id,
+        ...(defaultEntry.reasoning.defaultEffort ? { reasoningEffort: defaultEntry.reasoning.defaultEffort } : {}) }
+      : undefined;
+  }
+  return {
+    ...(defaultSelection
+      ? { default: defaultSelection,
+        defaultSource: configuredModel ? 'effective-config' : 'model-list-default',
+        defaultInCatalog: Boolean(defaultEntry) }
+      : { default: null, defaultSource: null, defaultInCatalog: false }),
+    routableProviders: [provider],
+    groups: [{ id: provider, models: entries }],
+  };
+}
+
+/** Map a shared selection (catalog id) to the values turn/start accepts. */
+export function codexDeliverySelection(catalog, selection) {
+  const wanted = modelText(selection?.model);
+  if (!wanted) {
+    throw fail('model-required', 'An explicit model selection requires a model id; no turn was started.');
+  }
+  const provider = modelText(selection?.provider);
+  const groups = (catalog?.groups ?? []).filter(group => !provider || group.id === provider);
+  const candidates = groups.flatMap(group => group.models ?? []);
+  // A saved selection is a catalog ID. If that preset disappears, a different
+  // preset with the old ID as its wire slug must not take over its dispatch.
+  const entry = candidates.find(model => model.id === wanted);
+  if (!entry) {
+    const available = (catalog?.groups ?? []).flatMap(group => group.models ?? []).map(model => model.id);
+    throw fail('model-not-found', available.length
+      ? `The selected Codex model "${wanted}" is not in the current catalog. Available model IDs: ${available.join(', ')}.`
+      : `The selected Codex model "${wanted}" is not available; the native catalog lists no models.`,
+    { availableModels: available, terminal: true });
+  }
+  const requestedEffort = modelText(selection?.reasoningEffort) || undefined;
+  const efforts = entry.reasoning?.efforts ?? [];
+  if (requestedEffort && !efforts.some(effort => effort.id === requestedEffort)) {
+    throw fail('effort-not-supported',
+      `Model "${entry.id}" does not support reasoning effort "${requestedEffort}". Supported efforts: ${efforts.map(effort => effort.id).join(', ') || 'none'}.`,
+      { availableEfforts: efforts.map(effort => effort.id), terminal: true });
+  }
+  const effort = requestedEffort ?? entry.reasoning?.defaultEffort;
+  return { modelId: entry.id, model: entry.model, ...(effort ? { effort } : {}) };
 }
 
 // Python's standard TOML parser handles quoted profile keys and TOML escaping.
@@ -271,6 +376,23 @@ export function createCodexHost(options = {}) {
   const nativeRequest = options.nativeRequest ?? requestCodexNative;
   const probes = options.nativeRequest ? new Map() : capabilityProbes;
   const observeCache = new Map();
+  const readEffectiveConfig = options.readEffectiveConfig
+    ?? (({ workspace }) => nativeRequest('config/read', { includeLayers: false, cwd: workspace }));
+  const readCatalog = async workspace => {
+    // The catalog is read independently of the effective default. A name with an
+    // explicit selection must still work when config.toml leaves model/effort
+    // implicit; only the default/status path uses the configured value.
+    const [page, configured] = await Promise.all([
+      listCodexModelsNative({ request: nativeRequest, includeHidden: options.includeHidden,
+        limit: options.modelPageSize ?? 100 }),
+      (async () => {
+        try { return await readEffectiveConfig({ workspace }); }
+        catch { return undefined; }
+      })(),
+    ]);
+    const provider = modelText(configured?.provider) || modelText(options.provider) || 'openai';
+    return sharedCodexCatalog(page.data, { provider, configured });
+  };
   const childrenOf = async parentThreadId => {
     const data = [];
     let cursor;
@@ -313,26 +435,42 @@ export function createCodexHost(options = {}) {
       }
       return { identity: { application: 'codex-desktop', home }, missing: [] };
     },
-    readDefaultModel: input => readDefaultModel({ home, ...input, readEffectiveConfig: options.readEffectiveConfig
-      ?? (({ workspace }) => nativeRequest('config/read', { includeLayers: false, cwd: workspace })),
+    readDefaultModel: input => readDefaultModel({ home, ...input, readEffectiveConfig,
       python: options.python, profile: options.profile }),
+    models: ({ workspace = options.workspace ?? process.cwd() } = {}) => readCatalog(workspace),
+    async resolveModelDelivery({ selection, workspace = options.workspace ?? process.cwd() } = {}) {
+      return codexDeliverySelection(await readCatalog(workspace), selection);
+    },
     async readCurrentModel(id) {
-      const thread = await ensureCodexThreadNative(id, { request: nativeRequest });
+      let thread;
+      try {
+        thread = await ensureCodexThreadNative(id, { request: nativeRequest });
+      } catch (error) {
+        // An empty rollout is a read gap before the first turn, not a failed
+        // binding. Status/beginTask must not turn it into reconnecting.
+        if (error.code === 'codex-empty-rollout') return undefined;
+        throw error;
+      }
       const model = currentModelFromThread(thread);
-      if (!model?.model) throw fail('codex-model-unavailable', 'Codex Desktop has no live model selection for this thread.');
+      // A readable thread with no model metadata is also unknown, not the
+      // deployment default. Never invent a selection here.
+      if (!model?.model) return undefined;
       return { ...model, verified: true, resolved: true };
     },
     async createFirstTurn(input) {
       // thread/start is the same entry the UI uses. Omitting model, effort,
       // approval, reviewer, sandbox, permissions and config leaves every one of
-      // them to the user's Codex defaults.
+      // them to the user's Codex defaults. An explicit selection is applied to
+      // the first turn itself, never to the user's global defaults.
       const started = await nativeRequest('thread/start', { cwd: path.resolve(input.workspace), threadSource: 'user' });
       const threadId = started?.thread?.id;
       if (typeof threadId !== 'string') throw fail('codex-native-rpc-invalid-response', 'Codex did not return a new thread id.');
       let turn;
       try {
         turn = await nativeRequest('turn/start', { threadId, clientUserMessageId: randomUUID(),
-          input: [{ type: 'text', text: input.message, text_elements: [] }] });
+          input: [{ type: 'text', text: input.message, text_elements: [] }],
+          ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.effort === undefined ? {} : { effort: input.effort }) });
         if (typeof turn?.turn?.id !== 'string') throw fail('codex-native-rpc-invalid-response', 'Codex accepted the thread but returned no turn.');
       } catch (error) {
         // The thread exists even when the first turn was not confirmed. Keep the
@@ -349,8 +487,9 @@ export function createCodexHost(options = {}) {
       await nativeRequest('thread/name/set', { threadId: nativeSessionId, name });
       return { renamed: true };
     },
-    async send({ nativeSessionId, message }) {
-      const result = await sendCodexTextNative(nativeSessionId, message, { request: nativeRequest });
+    async send({ nativeSessionId, message, model, effort }) {
+      const result = await sendCodexTextNative(nativeSessionId, message,
+        { request: nativeRequest, ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) });
       return { sent: true, turnId: result?.turn?.id ?? result?.turnId };
     },
     async observe({ nativeSessionId, workspace, projections = {}, requests = {} }) {

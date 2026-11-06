@@ -9,14 +9,17 @@ const fail = (code, message, extra = {}) => Object.assign(new Error(message), { 
 // The methods the managed Codex path needs. config/read is kept separate below
 // because its result is reduced to model fields before it leaves the renderer.
 const NATIVE_METHODS = new Set([
-  'config/read',
+  'config/read', 'model/list',
   'thread/start', 'thread/name/set', 'thread/read', 'thread/turns/list', 'thread/list',
   'thread/resume', 'thread/delete',
   'turn/start', 'turn/steer', 'turn/interrupt',
 ]);
 
 const THREAD_MISSING = /(?:thread|conversation)[^.]*(?:not found|does not exist|unknown)|no (?:such )?thread|invalid thread/i;
-const EMPTY_ROLLOUT = /rollout (?:is )?empty|no rollout/i;
+// Native Codex reports "rollout is empty", "rollout empty", and the path-bearing
+// form "rollout at C:\...\xxx.jsonl is empty"; all mean the thread exists but
+// its first turn has not been written yet.
+const EMPTY_ROLLOUT = /rollout (?:at .*? )?(?:is )?empty|no rollout/i;
 
 export function codexThreadNotFound(threadId) {
   return fail('codex-thread-not-found',
@@ -38,6 +41,13 @@ export function isCodexRolloutEmpty(error) {
 /** A request that never reached the desktop: safe to fall back to app-tools. */
 export function isCodexRpcUnavailable(error) {
   return ['codex-native-rpc-unavailable', 'codex-native-rpc-timeout'].includes(error?.code);
+}
+
+/** A read-only native call that failed before any write was attempted. These
+ * transport outcomes are safe to retry; application rejections are not. */
+export function isCodexReadRetryable(error) {
+  return isCodexRpcUnavailable(error)
+    || ['codex-native-rpc-response-timeout', 'codex-native-rpc-closed'].includes(error?.code);
 }
 
 // The running Desktop already opens this local debug endpoint. Never restart it
@@ -217,21 +227,67 @@ export async function listCodexTurnsNative(threadId, { limit = 40, request = req
   } catch (error) {
     // A thread created by thread/start has no rollout until its first turn is
     // written; that is an empty page, not a missing thread.
-    if (EMPTY_ROLLOUT.test(String(error?.rpcMessage ?? error?.message ?? ''))) return { data: [], nextCursor: null };
+    if (isCodexRolloutEmpty(error)) return { data: [], nextCursor: null };
     if (isCodexThreadMissing(error)) throw codexThreadNotFound(threadId);
     throw error;
   }
 }
 
-/** Send text to an idle thread with turn/start, or steer the active turn. */
-export async function sendCodexTextNative(threadId, text, { request = requestCodexNative } = {}) {
-  await ensureCodexThreadNative(threadId, { request });
+/**
+ * Read the native model catalog in the order the app-server returns it. Every
+ * page is part of one logical list; a repeated cursor is a protocol failure, not
+ * a signal to stop early, so the caller never receives a truncated catalog.
+ */
+export async function listCodexModelsNative({ request = requestCodexNative, includeHidden, limit = 100 } = {}) {
+  const data = [], cursors = new Set();
+  let cursor;
+  do {
+    const result = await request('model/list', {
+      limit,
+      ...(includeHidden === undefined ? {} : { includeHidden: includeHidden === true }),
+      ...(cursor ? { cursor } : {}),
+    });
+    if (!Array.isArray(result?.data)) throw fail('codex-native-rpc-invalid-response', 'Codex returned no model page.');
+    data.push(...result.data);
+    cursor = typeof result?.nextCursor === 'string' && result.nextCursor ? result.nextCursor : undefined;
+    if (cursor && cursors.has(cursor)) throw fail('codex-native-rpc-invalid-response', 'Codex repeated a model-list pagination cursor.');
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+  return { data, nextCursor: null };
+}
+
+/** Send text to an idle thread with turn/start, or add input to the active turn.
+ * `model` and `effort` are the already-resolved native values: they are only
+ * legal on a new turn. A steer has no such fields, so a running turn can only
+ * receive the same selection it already runs with; anything else is refused
+ * before a write instead of being silently dropped. */
+export async function sendCodexTextNative(threadId, text, { request = requestCodexNative, model, effort } = {}) {
+  let thread;
+  try {
+    thread = await ensureCodexThreadNative(threadId, { request });
+  } catch (error) {
+    // A bound thread with an unwritten first rollout has no metadata to read,
+    // but its turn page is still the authoritative "empty" page. Continue to
+    // turn/start instead of turning a pre-write read gap into an unknown write.
+    if (error.code !== 'codex-empty-rollout') throw error;
+  }
   const page = await listCodexTurnsNative(threadId, { limit: 10, request });
   const active = (page.data ?? []).find(turn => turn?.status === 'inProgress' && typeof turn.id === 'string');
   const input = [{ type: 'text', text, text_elements: [] }];
   if (active) {
+    // Without thread metadata the active turn's selection cannot be proven
+    // unchanged, so only an option-free steer is safe.
+    const sameModel = model === undefined || thread?.model === model;
+    const sameEffort = effort === undefined || (thread?.reasoningEffort ?? undefined) === effort;
+    if (!sameModel || !sameEffort) {
+      throw fail('codex-model-change-while-running',
+        'Codex Desktop cannot change model or effort while a turn is running. This input was not sent; wait for the current turn to end, then send the new selection.',
+        { terminal: true, threadId, turnId: active.id });
+    }
     const result = await request('turn/steer', { threadId, expectedTurnId: active.id, clientUserMessageId: randomUUID(), input });
     return { ...(result ?? {}), turnId: result?.turnId ?? active.id };
   }
-  return request('turn/start', { threadId, clientUserMessageId: randomUUID(), input });
+  return request('turn/start', { threadId, clientUserMessageId: randomUUID(), input,
+    ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }) });
 }

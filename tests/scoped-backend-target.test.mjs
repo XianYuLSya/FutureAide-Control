@@ -121,7 +121,9 @@ function desktopAdapter(events, { omit = [] } = {}) {
     },
     async create() {
       events.push('desktop:create');
-      return { sessionId: backend.record.sessionId, modelRequestsStarted: 0, model: { ...DESKTOP_MODEL } };
+      // The real unbound Codex backend reads no config at creation; its model stays
+      // unknown until a live observation reports one.
+      return { sessionId: backend.record.sessionId, modelRequestsStarted: 0 };
     },
     async beginTask() { events.push('desktop:beginTask'); return { treeProtocol: 1, reportProtocol: 1, throughSeq: 0, currentModel: { ...DESKTOP_MODEL } }; },
     async observe() {
@@ -285,6 +287,144 @@ test('a codex-desktop name is created, dispatched and listed only through its ow
   } finally { f.service.close(); }
 });
 
+test('an unpinned Codex name reports actualModel from the live observation, never a guess', async () => {
+  const events = [];
+  const f = await fixture({ adapters: { 'codex-desktop': record => {
+    const backend = desktopAdapter(events); backend.record = record; return backend;
+  } } });
+  try {
+    const created = await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop' }, extra(A));
+    assert.equal(created.actualModel, null, 'creation has no observed model yet');
+    const receipt = await f.service.send({ name: 'partner', message: 'work' }, extra(A));
+    assert.equal(receipt.queued, true);
+    assert.equal(receipt.actualModel, null);
+    await f.service.poll(f.record('partner').agentId);
+    const observed = f.record('partner');
+    assert.ok(observed.observation?.currentModel, 'the poll recorded the real observation');
+    // Model display can lag behind observation on an unpinned desktop name; list
+    // must read the observation rather than presenting null.
+    observed.model = undefined; f.store.save(observed);
+    assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'desktop-model');
+    assert.equal((await f.service.wait({ names: ['partner'] }, extra(A))).items[0].actualModel, 'desktop-model');
+  } finally { f.service.close(); }
+});
+
+test('Codex receives an explicit model on deliver and never selects one; a running turn refuses a pin change', async () => {
+  const deliveries = [];
+  const events = [];
+  const catalog = { default: { ...DESKTOP_MODEL }, routableProviders: [DESKTOP_MODEL.provider],
+    groups: [{ id: DESKTOP_MODEL.provider, models: [
+      { id: DESKTOP_MODEL.model, reasoning: { efforts: [{ id: 'max' }], defaultEffort: 'max' } },
+      { id: 'desktop-pro', reasoning: { efforts: [{ id: 'high' }], defaultEffort: 'high' } },
+    ] }] };
+  const f = await fixture({ adapters: { 'codex-desktop': record => {
+    const backend = desktopAdapter(events); backend.record = record;
+    backend.models = async () => { events.push('desktop:models'); return catalog; };
+    backend.deliver = async input => {
+      deliveries.push(input); events.push(['desktop:deliver', input.requestId]);
+      return { accepted: true, status: 'written', afterSeq: 1 };
+    };
+    return backend;
+  } } });
+  try {
+    const created = await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop', model: 'PRO' }, extra(A));
+    assert.equal(created.actualModel, 'desktop-pro', 'the receipt reports the resolved pin');
+    assert.equal(f.record('partner').model, undefined, 'no session-only model write exists for Codex');
+    assert.equal((await f.service.list(extra(A))).items[0].actualModel, null,
+      'list waits for a real observation instead of presenting the pin as actual');
+    assert.deepEqual(f.record('partner').modelPin,
+      { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' });
+    await f.service.send({ name: 'partner', message: 'work' }, extra(A));
+    await f.service.poll(f.record('partner').agentId);
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0].explicitModel, true);
+    assert.deepEqual(deliveries[0].model,
+      { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' });
+    assert.equal(events.includes('desktop:selectModel'), false,
+      'the shared layer never calls Codex selectModel');
+
+    const error = await rejection(f.service.send({ name: 'partner', message: 'change', model: 'desktop-model' }, extra(A)));
+    assert.equal(error.code, 'codex-model-change-while-running');
+    assert.deepEqual(f.record('partner').modelPin,
+      { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' },
+      'the refused selection is not persisted');
+    assert.equal(f.store.supplements(f.record('partner').agentId).length, 0);
+    assert.equal(f.record('partner').task.dispatches.length, 1, 'the refused change created no dispatch');
+    const unknown = await rejection(f.service.send({ name: 'partner', message: 'typo', model: 'not-in-catalog' }, extra(A)));
+    assert.equal(unknown.code, 'model-not-found', 'a missing ID is reported before the running check');
+    assert.match(unknown.message, /desktop-pro/);
+    const same = await f.service.send({ name: 'partner', message: 'same pin', model: 'PRO', effort: 'high' }, extra(A));
+    assert.equal(same.queued, true, 'the exact active pin is an ordinary supplement');
+    assert.equal(same.actualModel, 'desktop-pro');
+    assert.equal(f.store.supplements(f.record('partner').agentId).length, 1);
+    assert.deepEqual(f.record('partner').modelPin,
+      { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' });
+
+    await f.service.create({ name: 'unpinned', lifetime: 'persistent', target: 'codex-desktop' }, extra(A));
+    await f.service.send({ name: 'unpinned', message: 'inherit' }, extra(A));
+    await f.service.poll(f.record('unpinned').agentId);
+    assert.equal(deliveries.length, 2);
+    assert.equal(deliveries[1].explicitModel, false);
+    assert.equal('model' in deliveries[1], false, 'native inheritance sends no model field');
+  } finally { f.service.close(); }
+});
+
+test('an earlier queued selection is delivered even after a later pin change; the live turn decides compatibility', async () => {
+  const catalog = { default: { provider: 'fixture', model: 'a-model' }, routableProviders: ['fixture'],
+    groups: [{ id: 'fixture', models: [
+      { id: 'a-model', reasoning: { efforts: [{ id: 'low' }], defaultEffort: 'low' } },
+      { id: 'b-model', reasoning: { efforts: [{ id: 'high' }], defaultEffort: 'high' } },
+    ] }] };
+  const deliveries = [];
+  const f = await fixture({ adapters: { 'codex-desktop': record => {
+    const backend = desktopAdapter([]); backend.record = record;
+    backend.models = async () => catalog;
+    backend.deliver = async input => {
+      deliveries.push(input);
+      if (input.explicitModel && input.model?.model !== 'a-model') {
+        throw Object.assign(new Error('the running turn still uses a-model'), {
+          code: 'codex-model-change-while-running', terminal: true,
+        });
+      }
+      return { accepted: true, status: 'written', afterSeq: 1 };
+    };
+    return backend;
+  } } });
+  try {
+    await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop', model: 'A' }, extra(A));
+    await f.service.send({ name: 'partner', message: 'first' }, extra(A));
+    await f.service.poll(f.record('partner').agentId);
+    const queuedA = f.record('partner');
+    // Simulate the between-turns window in which inputs are accepted while the
+    // running turn still uses a-model.
+    queuedA.state = queuedA.task.state = 'awaiting_report';
+    queuedA.observation = { ...(queuedA.observation ?? {}),
+      tree: { ...(queuedA.observation?.tree ?? {}), running: false } };
+    f.store.save(queuedA);
+
+    const first = await f.service.send({ name: 'partner', message: 'old input', model: 'A' }, extra(A));
+    const second = await f.service.send({ name: 'partner', message: 'new input', model: 'B' }, extra(A));
+    assert.equal(first.actualModel, 'a-model');
+    assert.equal(second.actualModel, 'b-model');
+    assert.deepEqual(f.record('partner').modelPin,
+      { provider: 'fixture', model: 'b-model', reasoningEffort: 'high' });
+
+    const running = f.record('partner');
+    running.state = running.task.state = 'running';
+    running.observation = { ...(running.observation ?? {}),
+      tree: { ...(running.observation?.tree ?? {}), running: true, settled: false } };
+    f.store.save(running);
+    await f.service.poll(running.agentId);
+
+    assert.equal(deliveries[1].model.model, 'a-model', 'the earlier input is not discarded by the later pin');
+    assert.equal(deliveries[1].explicitModel, true);
+    const summary = f.store.supplementSummary(running.agentId, running.task.taskId);
+    assert.equal(summary.accepted, 1);
+    assert.equal(summary.blocked, 1, 'the incompatible later input is left visibly blocked');
+    assert.equal(summary.latest.reason, 'codex-model-change-while-running');
+  } finally { f.service.close(); }
+});
+
 test('a Codex record ignores its legacy dataRoot and keeps working', async () => {
   const f = await fixture({ adapters: { 'codex-desktop': record => {
     const backend = desktopAdapter([]);
@@ -367,9 +507,13 @@ test('status keeps every DSH field and reports both targets', async () => {
     assert.equal(status.backends.dsh.connected, true);
     assert.equal(status.backends.dsh.treeProtocol, 1);
     assert.equal(status.backends.dsh.reportProtocol, 1);
+    assert.deepEqual(status.backends.dsh.models, ['dsh-model']);
+    assert.equal(status.backends.dsh.defaultModel, 'dsh-model');
     assert.deepEqual(status.backends.dsh.reason, undefined);
     assert.equal(status.backends['codex-desktop'].ready, false, 'no adapter is installed, so the target is not ready');
     assert.equal(status.backends['codex-desktop'].present, false);
+    assert.deepEqual(status.backends['codex-desktop'].models, []);
+    assert.equal(status.backends['codex-desktop'].defaultModel, null);
     assert.equal(status.backends['codex-desktop'].reason.code, 'backend-not-ready');
     // Diagnostics start no model turn and no session.
     assert.ok(!f.events.includes('managedCreate'));
@@ -391,7 +535,8 @@ test('status separates an unfinished adapter from a ready one without using it',
     assert.equal(status.backends['codex-desktop'].reason.code, 'tree-protocol-required');
     assert.equal(status.backends['codex-desktop'].treeProtocol, null);
     assert.equal(status.ready, true, 'the DSH path stays the default and unchanged');
-    assert.deepEqual(unfinished, ['desktop:probe'], 'diagnostics only probed; no create, deliver or session');
+    assert.deepEqual(status.backends['codex-desktop'].models, ['desktop-model']);
+    assert.deepEqual(unfinished, ['desktop:probe', 'desktop:models'], 'a reachable catalog is visible even before the adapter is ready');
   } finally { f.service.close(); }
 
   const ready = [];
@@ -401,7 +546,9 @@ test('status separates an unfinished adapter from a ready one without using it',
     assert.equal(status.backends['codex-desktop'].ready, true);
     assert.equal(status.backends['codex-desktop'].registered, true, 'the entry is the registration evidence');
     assert.equal(status.backends['codex-desktop'].evidence, 'native-rpc', 'readiness came from the real thread/list RPC');
-    assert.deepEqual(ready, ['desktop:probe'], 'a ready adapter is still not created, dispatched or answered');
+    assert.deepEqual(status.backends['codex-desktop'].models, ['desktop-model']);
+    assert.equal(status.backends['codex-desktop'].defaultModel, 'desktop-model');
+    assert.deepEqual(ready, ['desktop:probe', 'desktop:models'], 'diagnostics only read the native probe and catalog');
     assert.equal(g.store.count(ownerIdFor(A)), 0);
   } finally { g.service.close(); }
 });

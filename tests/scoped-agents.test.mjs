@@ -27,6 +27,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
   const sends = [], notices = [], removed = [], workers = [], reads = [], cancellations = [], beginnings = [], historyRequests = [];
   let offline = false, notificationMode = 'ok', statusCalls = 0, catalogCalls = 0, cursorCalls = 0;
   let defaultModel = { provider: 'fixture', model: 'test' };
+  let catalogOverride;
   const selections = [];
   const api = {
     async connectionIdentity() { if (offline) throw new Error('DSH offline'); return { application: 'dsh', dataRoot: path.join(stateDirectory, 'native') }; },
@@ -98,7 +99,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
     async models() {
       catalogCalls++;
       if (beforeModels) await beforeModels();
-      return { default: { ...defaultModel }, routableProviders: [defaultModel.provider],
+      return catalogOverride ?? { default: { ...defaultModel }, routableProviders: [defaultModel.provider],
         groups: [{ id: defaultModel.provider, models: [{ id: defaultModel.model, reasoningEfforts: ['off', 'high', 'max'] }] }] };
     },
     async selectModel(input) {
@@ -169,7 +170,8 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
   }
   return { report, service, store, sessions, api, controlFactory, sends, notices, removed, workers, reads, cancellations, beginnings, historyRequests, stateDirectory, record, finish, settle,
     offline: value => { offline = value; }, notification: value => { notificationMode = value; }, statusCalls: () => statusCalls,
-    defaultModel: value => { defaultModel = value; }, selections, catalogCalls: () => catalogCalls, cursorCalls: () => cursorCalls };
+    defaultModel: value => { defaultModel = value; }, catalog: value => { catalogOverride = value; },
+    selections, catalogCalls: () => catalogCalls, cursorCalls: () => cursorCalls };
 }
 
 test('default model follows live host for new tasks, supplements and answers without stale roster selection', async () => {
@@ -247,6 +249,7 @@ test('model failure is visible in list wait and inspect, notifies once and clear
     assert.doesNotMatch(JSON.stringify(f.record()), /private upstream/);
     assert.equal(f.notices.length, 1, 'a confirmed model failure notifies the parent once');
     assert.match(f.notices[0].prompt, /执行失败/);
+    assert.match(f.notices[0].prompt, /no_healthy_account/, 'the notice names the failure, not only that it failed');
     assert.match(f.notices[0].prompt, /artist/);
     assert.equal(f.sends.length, 1);
     assert.equal(f.removed.length, 0);
@@ -1182,7 +1185,7 @@ test('busy supplements persist independently and are dispatched in order to the 
   const record = f.record(); let release;
   const held = f.store.locked(record.agentId, () => new Promise(resolve => { release = resolve; }));
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(await f.service.send({ name: 'artist', message: 'first' }, extra(A)), { name: 'artist', accepted: false, queued: true, state: 'running' });
+  assert.deepEqual(await f.service.send({ name: 'artist', message: 'first' }, extra(A)), { name: 'artist', accepted: false, queued: true, state: 'running', actualModel: 'test' });
   const flagged = f.record(); flagged.callbackBlocked = true; f.store.save(flagged);
   const second = await f.service.send({ name: 'artist', message: 'second' }, extra(A));
   assert.equal(second.queued, true);
@@ -1370,7 +1373,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   try {
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   assert.deepEqual(await f.service.send({ name: 'artist', message: 'private initial task' }, extra(A)),
-    { name: 'artist', accepted: true, state: 'running' });
+    { name: 'artist', accepted: true, state: 'running', actualModel: 'test' });
   const record = f.record();
   record.callbackBlocked = true;
   record.task.reports = [{ id: 'old-report', message: 'private report', final: false, delivery: { state: 'blocked' } }];
@@ -1383,7 +1386,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   ];
   f.store.save(record);
   const result = await f.service.send({ name: 'artist', message: 'private supplement' }, extra(A));
-  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'callbackError', 'name', 'state']);
+  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'name', 'state']);
   assert.equal(result.accepted, true);
   assert.equal(result.callbackError.code, 'native-callback-unavailable');
   assert.doesNotMatch(JSON.stringify(result), /private|deep child|coverage/);
@@ -1402,7 +1405,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   assert.equal(unknown.error.code, 'send-unknown');
   failure = undefined;
   f.sessions.get(f.record().sessionId).questions = [{ id: 'q', message: 'question', state: 'pending' }];
-  assert.deepEqual(await f.service.send({ name: 'artist', message: 'answer' }, extra(A)), { name: 'artist', answered: true, state: 'resuming' });
+  assert.deepEqual(await f.service.send({ name: 'artist', message: 'answer' }, extra(A)), { name: 'artist', answered: true, state: 'resuming', actualModel: 'test' });
   } finally { f.service.close(); }
 });
 
@@ -1740,6 +1743,154 @@ test('a reminder whose outcome is unknown settles the task and lets it sleep', a
     assert.equal(settled.state, 'awaiting_report', 'an undecided reminder is not work the task still owes');
     f.store.claimLease('idle-monitor', 'monitor', 60000); f.store.claimLease('idle-monitor:ready', 'monitor', 60000);
     assert.equal(await f.service.trySleep(settled.agentId), true, 'and the name may sleep again');
+  } finally { f.service.close(); }
+});
+
+const MULTI_MODEL_CATALOG = {
+  default: { provider: 'fixture', model: 'base' },
+  routableProviders: ['fixture'],
+  groups: [{ id: 'fixture', models: [
+    { id: 'base', reasoning: { efforts: [{ id: 'off' }, { id: 'high' }], defaultEffort: 'off' } },
+    { id: 'alpha-pro', reasoning: { efforts: [{ id: 'low' }, { id: 'max' }], defaultEffort: 'low' } },
+    { id: 'beta-mini', reasoning: { efforts: [{ id: 'medium' }], defaultEffort: 'medium' } },
+  ] }],
+};
+
+test('create resolves a model substring and keeps it across sends, effort changes and list', async () => {
+  const f = await fixture();
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    const created = await f.service.create({ name: 'artist', lifetime: 'persistent', model: 'ALPHA' }, extra(A));
+    assert.equal(created.created, true);
+    assert.equal(created.actualModel, 'alpha-pro');
+    assert.equal(f.sends.length, 0, 'creation starts no model turn');
+    assert.deepEqual(f.record().modelPin,
+      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
+    assert.deepEqual(f.selections.map(item => [item.model, item.reasoningEffort, item.sessionOnly]),
+      [['alpha-pro', 'low', true]], 'an explicit DSH pin is session-only');
+    assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'alpha-pro');
+
+    const first = await f.service.send({ name: 'artist', message: 'go' }, extra(A));
+    assert.equal(first.actualModel, 'alpha-pro');
+    assert.equal(f.selections.length, 1, 'the same live selection is not selected again');
+    assert.deepEqual(f.record().task.modelSelection,
+      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
+
+    const second = await f.service.send({ name: 'artist', message: 'more', effort: 'max' }, extra(A));
+    assert.equal(second.actualModel, 'alpha-pro');
+    assert.deepEqual(f.record().modelPin,
+      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'max' });
+    const lastSelection = f.selections.at(-1);
+    assert.equal(lastSelection.provider, 'fixture');
+    assert.equal(lastSelection.model, 'alpha-pro');
+    assert.equal(lastSelection.reasoningEffort, 'max');
+    assert.equal(lastSelection.sessionOnly, true);
+    assert.equal(lastSelection.requestId.endsWith('-model'), true);
+    assert.equal(f.record().task.dispatches.at(-1).model.reasoningEffort, 'max');
+  } finally { f.service.close(); }
+});
+
+test('effort alone without a pin is refused without touching the name or sending', async () => {
+  const f = await fixture();
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await assert.rejects(f.service.send({ name: 'artist', message: 'work', effort: 'high' }, extra(A)),
+      error => error.code === 'model-required-for-effort' && /host default/.test(error.message));
+    assert.equal(f.record().modelPin, undefined);
+    assert.equal(f.sends.length, 0);
+  } finally { f.service.close(); }
+});
+
+test('an unknown model lists the catalog IDs and creates no durable pin or dispatch', async () => {
+  const f = await fixture();
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await assert.rejects(f.service.send({ name: 'artist', message: 'work', model: 'missing' }, extra(A)),
+      error => error.code === 'model-not-found' && /alpha-pro/.test(error.message) && /beta-mini/.test(error.message));
+    assert.equal(f.record().modelPin, undefined);
+    assert.equal(f.sends.length, 0);
+  } finally { f.service.close(); }
+});
+
+test('a busy lock freezes the current pin for queued input and a later pin change takes the normal lock', async () => {
+  const f = await fixture();
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    await f.service.create({ name: 'artist', lifetime: 'persistent', model: 'ALPHA' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+    const record = f.record(); let release;
+    const held = f.store.locked(record.agentId, () => new Promise(resolve => { release = resolve; }));
+    await new Promise(resolve => setImmediate(resolve));
+
+    // No model/effort: the old no-wait path stores the current pin in the same
+    // INSERT SELECT. An explicit selection must not use this path.
+    const old = await f.service.send({ name: 'artist', message: 'queued-old' }, extra(A));
+    assert.equal(old.queued, true);
+    assert.equal(old.actualModel, 'alpha-pro');
+    release(); await held;
+
+    const newer = await f.service.send({ name: 'artist', message: 'queued-new', model: 'BETA' }, extra(A));
+    assert.equal(newer.queued, true);
+    assert.equal(newer.actualModel, 'beta-mini', 'the queued receipt reports this input’s resolved full ID');
+    assert.deepEqual(f.record().modelPin,
+      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
+    assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'alpha-pro',
+      'list keeps the observed model separate from the queued new pin');
+    assert.equal(f.store.supplements(record.agentId).length, 2);
+
+    await f.service.poll(record.agentId);
+    const supplements = f.record().task.dispatches.filter(dispatch => dispatch.kind === 'supplement');
+    assert.deepEqual(supplements.map(dispatch => [dispatch.message, dispatch.model.model]),
+      [['queued-old', 'alpha-pro'], ['queued-new', 'beta-mini']],
+      'each queued input keeps the selection frozen when it was accepted');
+    assert.deepEqual(f.sends.slice(1).map(send => send.message), ['queued-old', 'queued-new']);
+  } finally { f.service.close(); }
+});
+
+test('a pending question freezes the answer selection before its continuation dispatch', async () => {
+  const f = await fixture();
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    await f.service.create({ name: 'artist', lifetime: 'persistent', model: 'ALPHA' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
+    const record = f.record();
+    f.sessions.get(record.sessionId).questions = [{ id: 'question-model', state: 'pending', message: 'Continue?' }];
+    await f.service.poll(record.agentId);
+    assert.equal(f.record().state, 'awaiting_input');
+
+    const answered = await f.service.send({ name: 'artist', message: 'yes', model: 'BETA' }, extra(A));
+    assert.equal(answered.answered, true);
+    assert.equal(answered.actualModel, 'beta-mini');
+    const answer = f.record().task.answers[0];
+    assert.deepEqual(answer.modelSelection,
+      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
+    // The continuation waits for the live turn to end; a later pin change must not
+    // rewrite the answer intent already accepted.
+    f.finish();
+    const later = f.record();
+    later.modelPin = { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'max' };
+    f.store.save(later);
+    await f.service.poll(record.agentId);
+    const dispatch = f.record().task.dispatches.find(item => item.kind === 'answer');
+    assert.deepEqual(dispatch.model,
+      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
+  } finally { f.service.close(); }
+});
+
+test('a reminder keeps the name’s explicit selection', async () => {
+  const f = await fixture();
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    await f.service.create({ name: 'artist', lifetime: 'persistent', model: 'ALPHA' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    f.finish();
+    await f.service.poll(f.record().agentId);
+    const reminder = f.record().task.dispatches.find(item => item.reminder === true);
+    assert.ok(reminder);
+    assert.deepEqual(reminder.model,
+      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
   } finally { f.service.close(); }
 });
 

@@ -26,7 +26,7 @@ export class RosterStore {
       -- reads every body. One small value, maintained on write.
       CREATE INDEX IF NOT EXISTS agents_target ON agents(json_extract(body,'$.target'));
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL, selection TEXT);
       CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS submissions (id TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL,
         task TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, final INTEGER NOT NULL,
@@ -43,7 +43,33 @@ export class RosterStore {
     this.bodies = new Map();
     this.projections = new Map();
     this.settled = 0;
+    this.migrateSupplementSelection();
     this.migrateHistory();
+  }
+
+  /**
+   * Older rosters have no frozen model selection on queued supplements. Add the
+   * column in place; existing rows keep NULL, which means "follow the target's
+   * default when this input is finally dispatched".
+   */
+  migrateSupplementSelection() {
+    const columns = () => this.db.prepare('PRAGMA table_info(supplements)').all().map(row => row.name);
+    // New rosters already have the column; keep that path free of a write lock.
+    if (columns().includes('selection')) return;
+    // Claude's worker and a Codex stdio server can open the same roster at once.
+    // Both may see the old table; serialize the recheck and ALTER, and recheck
+    // inside the lock so the loser does not hit "duplicate column name".
+    this.db.exec('PRAGMA busy_timeout=30000');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!columns().includes('selection')) this.db.exec('ALTER TABLE supplements ADD COLUMN selection TEXT');
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    } finally {
+      this.db.exec('PRAGMA busy_timeout=5000');
+    }
   }
 
   /**
@@ -196,19 +222,59 @@ export class RosterStore {
     return changed;
   }
   named(owner, name) { const row = this.db.prepare('SELECT body FROM agents WHERE owner=? AND name=?').get(owner, name); return row ? JSON.parse(row.body) : undefined; }
-  enqueueSupplement(record, requestId, message) {
-    const changed = this.db.prepare(`INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created)
-      SELECT ?,id.owner,id.id,json_extract(id.body,'$.sessionId'),json_extract(id.body,'$.task.taskId'),?,'queued',?
+  /**
+   * Queue one supplement together with the model selection it was accepted with.
+   * `selection` is frozen on the row; `usePinnedModel` copies the live pin from the
+   * agent row in the same INSERT SELECT, so a supplement accepted without a new
+   * model always freezes exactly what the name had at that moment. `saveRecord`
+   * commits this record (for example a new explicit pin) in the same transaction:
+   * a caller holding the name lock gets an all-or-nothing queue write, and the
+   * worker is only woken after both the supplement and the pin are durable.
+   */
+  enqueueSupplement(record, requestId, message, selection = undefined, { usePinnedModel = false, saveRecord = false } = {}) {
+    const body = selection === undefined ? null : JSON.stringify(selection);
+    const insert = () => this.db.prepare(`INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created,selection)
+      SELECT ?,id.owner,id.id,json_extract(id.body,'$.sessionId'),json_extract(id.body,'$.task.taskId'),?,'queued',?,
+        CASE WHEN ?=1 THEN json_extract(id.body,'$.modelPin') ELSE ? END
       FROM agents AS id WHERE id.id=? AND id.owner=? AND id.name=? AND json_extract(id.body,'$.sessionId')=?
       AND json_extract(id.body,'$.task.taskId')=? AND coalesce(json_extract(id.body,'$.closed'),0)=0
       AND coalesce(json_extract(id.body,'$.task.cancelRequested'),0)=0
       AND json_extract(id.body,'$.state') IN ('running','awaiting_input','awaiting_report','reconnecting')
       AND NOT EXISTS (SELECT 1 FROM json_each(id.body,'$.task.reports') WHERE json_extract(value,'$.final')=1)`)
-      .run(requestId, message, new Date().toISOString(), record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
-    this.dropProjections();
-    return changed;
+      .run(requestId, message, new Date().toISOString(), usePinnedModel ? 1 : 0, body,
+        record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
+    if (!saveRecord) {
+      const changed = insert();
+      this.dropProjections();
+      return changed;
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.save(record);
+      const changed = insert();
+      if (!changed) {
+        this.db.exec('ROLLBACK');
+        this.bodies.delete(record.agentId);
+        this.dropProjections();
+        return false;
+      }
+      this.db.exec('COMMIT');
+      this.dropProjections();
+      return true;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      this.bodies.delete(record.agentId);
+      this.dropProjections();
+      throw error;
+    }
   }
-  supplements(agentId) { return this.db.prepare("SELECT * FROM supplements WHERE agent=? AND status IN ('queued','sending','unknown','blocked') ORDER BY rowid").all(agentId); }
+  supplements(agentId) {
+    return this.db.prepare("SELECT * FROM supplements WHERE agent=? AND status IN ('queued','sending','unknown','blocked') ORDER BY rowid")
+      .all(agentId).map(row => ({
+        ...row,
+        selection: row.selection ? JSON.parse(row.selection) : undefined,
+      }));
+  }
   setSupplement(requestId, status, reason = null) { this.db.prepare('UPDATE supplements SET status=?,reason=? WHERE requestId=?').run(status, reason, requestId); this.dropProjections(); }
   blockQueued(agentId, taskId, reason) { this.db.prepare("UPDATE supplements SET status='blocked',reason=? WHERE agent=? AND task=? AND status='queued'").run(reason, agentId, taskId); this.dropProjections(); }
   supplementSummary(agentId, taskId) {

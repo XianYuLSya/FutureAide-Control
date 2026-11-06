@@ -435,11 +435,21 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
       return writeOnce('attach-session', sessionId, requestId, { workspace: config.workspace },
         id => api.attachSessionToWorkspace(id, config.workspace));
     },
-    async selectModel({ sessionId, provider, model, reasoningEffort, requestId }) {
+    async selectModel({ sessionId, provider, model, reasoningEffort, requestId, sessionOnly }) {
       if (typeof provider !== 'string' || !provider.trim() || typeof model !== 'string' || !model.trim()) throw new Error('Provide both provider and model.');
       const selection = { provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) };
-      return writeOnce('select-model', sessionId, requestId, selection, id => managed
-        ? api.managedSelectModel(managed, selection) : api.selectModel(id, selection));
+      return writeOnce('select-model', sessionId, requestId, selection, id => {
+        if (sessionOnly === true) {
+          // The native session/selectModel also saves the app-wide default. A managed
+          // explicit pin must use the host's session-only method; if that method is
+          // unavailable, refuse instead of falling back to the global write.
+          if (!managed) {
+            throw Object.assign(new Error('Session-only model selection requires the managed DSH bridge. The app-wide default was not changed; no fallback selection was attempted.'), { code: 'managed-select-model-unsupported' });
+          }
+          return api.managedSelectModel(managed, selection, { sessionOnly: true });
+        }
+        return managed ? api.managedSelectModel(managed, selection) : api.selectModel(id, selection);
+      });
     },
     async capabilities({ sessionId, toolName, activate = true } = {}) {
       const row = await checkSession(sessionId);

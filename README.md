@@ -4,19 +4,27 @@
 
 让 Codex 和 Claude Desktop 都能按名字调用 DSH 子代理，在当前项目中完成画图、写代码和文档等任务；调用方也可以把 Codex Desktop 当作被调用目标（需要 Codex 带本地调试端口启动）。插件自动识别当前聊天和项目；每个调用方有自己的名单。
 
-> **0.5.13（2026-11-05）**：`target: 'codex-desktop'` 改走 Codex 自己的接口：不再借用已有对话，会话继承用户默认的权限和模型，不动窗口；Claude 调 Codex、Codex 再调 DSH 的多层分工已实机跑通，任务失败时会通知上级一次。此前的改进都保留：移除 `claude-desktop` 目标和全部窗口操作，插件不再模拟鼠标、键盘和剪贴板：执行目标只有 DSH 和 Codex Desktop，Claude 只当调用方。此前的改进都保留：派单结果和提问都能传回来了：助手没交最终报告时会被提醒一次，DSH 自带的提问工具会被拦下并转到 `ask_parent`。同时适配 DSH 0.2.2，单次读类工具调用从约 3.5 秒降到约 0.5 秒。主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 作为被调用目标（`target: 'codex-desktop'`）需要 Codex 带本地调试端口启动。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
+> **0.5.14（2026-11-06）**：调用时可以选模型和思考强度：`run`、`create`、`send` 传 `model`、`effort`，模型名写一段就行，选定后跟着名字走，`status` 列出可选模型。此前的改进都保留：`target: 'codex-desktop'` 改走 Codex 自己的接口：不再借用已有对话，会话继承用户默认的权限和模型，不动窗口；Claude 调 Codex、Codex 再调 DSH 的多层分工已实机跑通，任务失败时会通知上级一次。此前的改进都保留：移除 `claude-desktop` 目标和全部窗口操作，插件不再模拟鼠标、键盘和剪贴板：执行目标只有 DSH 和 Codex Desktop，Claude 只当调用方。此前的改进都保留：派单结果和提问都能传回来了：助手没交最终报告时会被提醒一次，DSH 自带的提问工具会被拦下并转到 `ask_parent`。同时适配 DSH 0.2.2，单次读类工具调用从约 3.5 秒降到约 0.5 秒。主控用起来更省心：`futureaide_run_agent` 一次调用开工，工具默认只回决策需要的信息，`list` 一次看全整棵团队树，子代理的回报格式统一，监工的 CPU 和推送延迟都明显下降。Claude 调用 DSH 已实机验证。Codex Desktop 作为被调用目标（`target: 'codex-desktop'`）需要 Codex 带本地调试端口启动。创建时选择 `target`，省略时仍使用 DSH，其后只按名字操作。
 
-- **简单派活**：创建时只选名字和一次性/长期，直接发送任务文字。
+- **派单时选模型**。在 `run`、`create` 或 `send` 传入 `model` 和可选的 `effort`，同一个名字的后续输入会沿用选择。
 - **直接交流**：助手用 `ask_parent` 提问，父级按名字回答；显式 `report_parent` 决定何时回包，正文只转发它提交的内容。
 - **多层分工**：助手可安排原生下属，受管 Codex 也可用同一套工具跨应用分工；顶层最终交付等待整棵树收尾。
 - **随时监工**：列表显示各层任务、活动、待答问题和文件归属，需要时再查差异或上下文。
 - **管理生命周期**：一次性任务显式 final 报告送达且整树收尾后清除会话；长期代理保留上下文，按名字继续使用。
 
-无需填写项目路径、内部 ID 或创建传信 txt。每次新派单、补充与回答接续跟随所选应用的当前默认模型和推理档位；同一输入的后台恢复保留原模型与请求身份。版本变化见 [CHANGELOG](CHANGELOG.md)。
+无需填写项目路径、内部 ID 或创建传信 txt。从未指定模型的名字跟随目标应用的当前默认设置。版本变化见 [CHANGELOG](CHANGELOG.md)。
 
 ## 调用 Codex Desktop，与调用 DSH 同一流程
 
-保持目标桌面应用运行，先用 `futureaide_status({})` 查看对应 `backends` 是否就绪，然后创建并派单：
+保持目标桌面应用运行。`futureaide_status({})` 中，各后端的 `models` 依目录顺序列出可选 ID，`defaultModel` 给出默认 ID。假设目录里有包含 `astra` 的模型，且支持 `high`，可以这样调用。
+
+```text
+futureaide_run_agent({name: "审阅搭档", target: "codex-desktop", model: "astra", effort: "high", message: "检查当前修改并报告发现。"})
+```
+
+`model` 忽略大小写，先找完全相同的 ID，再选包含该片段的第一项。回执、`list` 和 `wait` 的 `actualModel` 显示解析出的完整 ID。找不到模型时，错误会列出可选 ID。`effort` 必须是所选模型支持的档位，每次显式指定 `model` 时省略它会采用该模型默认档位。后续任务、补充、回答和提醒沿用这个名字的选择。DSH 通过本版宿主桥把显式选择应用到该会话，其他名字仍可跟随应用默认模型。若工具提示更新宿主桥，使用本版安装流程同步 DSH 端后再派单。已选模型的名字也可以单传 `effort` 调整档位。
+
+也可以先创建，稍后再派单。
 
 ```text
 futureaide_create_agent({name: "方案搭档", lifetime: "persistent", target: "codex-desktop"})
@@ -26,7 +34,7 @@ futureaide_list_agents({})
 
 Codex 在自己的会话中工作；提问和显式报告回到创建它的聊天。父级用 `futureaide_answer_agent` 回答、`futureaide_agent_changes` 看文件、`futureaide_inspect_agent` 看上下文。省略 `target` 就调用 DSH。
 
-Codex Desktop 目标要求 Codex 由 **FAswitch** 打开：调试端口是启动器加的，Codex 自身不开。插件经主渲染进程的本地调试端口发 `thread/start`、`turn/start`，与界面新建对话走同一个入口；后续发送、补充、打断、删除和观察也走这条 app-server RPC，不读 `state_5.sqlite`、`thread_history_1.sqlite` 或 rollout 文件，也不再用 app-tools 的 `create_thread` 借锚点。首条消息不带模型、推理强度或权限字段，全部继承用户在 Codex 里的默认选择。标题不在首轮返回时硬设：等会话有内容后再补 `thread/name/set`，失败最多重试 5 次且不影响任务。没有调试端口时 `futureaide_status` 的 `codex-desktop` 项会报 `codex-native-rpc-unavailable`，并提示从 FAswitch 打开 Codex；此时普通 Codex 对话调用 DSH 仍走 app-tools，不受影响。已知限制：取消会停下模型这一轮，但 Codex 已经启动的 shell 命令不会被杀（实测 `turn/interrupt` 之后 `Start-Sleep` 还在跑）。
+Codex Desktop 目标要求 Codex 由 **FAswitch** 打开：调试端口是启动器加的，Codex 自身不开。插件经主渲染进程的本地调试端口发 `thread/start`、`turn/start`，与界面新建对话走同一个入口；后续发送、补充、打断、删除和观察也走这条 app-server RPC，不读 `state_5.sqlite`、`thread_history_1.sqlite` 或 rollout 文件，也不再用 app-tools 的 `create_thread` 借锚点。已选模型的名字在 `turn/start` 传入完整模型和推理档位。其余名字由 Codex 决定模型和档位。Codex 的 `turn/steer` 只补充当前轮次，运行中换模型或档位会报错，请等该轮结束后再发送。权限沿用 Codex 设置。标题不在首轮返回时硬设：等会话有内容后再补 `thread/name/set`，失败最多重试 5 次且不影响任务。没有调试端口时 `futureaide_status` 的 `codex-desktop` 项会报 `codex-native-rpc-unavailable`，并提示从 FAswitch 打开 Codex；此时普通 Codex 对话调用 DSH 仍走 app-tools，不受影响。已知限制：取消会停下模型这一轮，但 Codex 已经启动的 shell 命令不会被杀（实测 `turn/interrupt` 之后 `Start-Sleep` 还在跑）。
 
 `once` 在成功 final 送达且整树收尾后自动删除会话，保留项目产物；`persistent` 留下同一上下文供下一项任务使用。按名字取消保留上下文，按名字删除清理它拥有的整棵会话树。桌面调用的 `queued:true` 表示已持久保存，后续由监控推进，调用方无需重复发送。
 
@@ -74,7 +82,7 @@ Claude 侧的桥接进程声明了 `tools.listChanged`：服务端的工具名�
 futureaide_run_agent({name: "画图助手", lifetime: "once", message: "阅读当前项目，生成中文架构图，保存为 docs/architecture.svg。"})
 ```
 
-`run` 一次完成创建与派单，可以省略 `name` 让插件生成；名字已存在时直接把任务发给它。创建本身不会启动模型轮次，收到任务后才开始工作。切换供应商时，只需修改 DSH 默认模型；插件名单里的新旧代理在下一次输入派出时跟随该设置，无需逐条改配置或提供模型参数。正在执行的模型请求继续完成，失败任务不会自动重放，休眠代理不会为切换而全部唤醒；同一输入的后台恢复保留最初已确定的模型和请求身份。DSH 原生下属的新建与复用仍遵循其自身的模型继承和显式选择规则。
+`run` 一次完成创建与派单，可以省略 `name` 让插件生成；名字已存在时直接把任务发给它。创建本身不会启动模型轮次，收到任务后才开始工作。从未指定模型的名字在下一次输入派出时读取 DSH 默认模型。正在执行的模型请求继续完成，失败任务不会自动重放，休眠代理不会为切换而全部唤醒；同一输入的后台恢复保留最初已确定的模型和请求身份。DSH 原生下属的新建与复用仍遵循其自身的模型继承和显式选择规则。
 
 如果 DSH 询问图中需要包含哪些模块，问题会主动回到当前聊天，Codex 按名字回答即可：
 
@@ -115,15 +123,15 @@ futureaide_send_agent({name: "架构图助手", message: "沿用刚才的架构�
 futureaide_delete_agent({name: "架构图助手"})
 ```
 
-## 让 DSH 团队长继续分配下属
+## 让 DSH 助手继续分工
 
-Codex 只创建和联系团队长，由它通过 DSH 原生委派工具组织下属，下属也可以继续向下分工。例如：
+Codex 可以把任务发给一个 DSH 助手，由它用 DSH 原生工具继续分工。
 
 ```text
-futureaide_create_agent({name: "设计团队长", lifetime: "persistent"})
-futureaide_send_agent({name: "设计团队长", message: "组织下属分别分析架构和模块职责，明确文件分工；需要时继续分配下级，最后汇总结果。"})
+futureaide_create_agent({name: "设计助手", lifetime: "persistent"})
+futureaide_send_agent({name: "设计助手", message: "组织下属分别分析架构和模块职责，明确文件分工；需要时继续分配下级，最后汇总结果。"})
 futureaide_list_agents({})
-futureaide_inspect_agent({name: "设计团队长"})
+futureaide_inspect_agent({name: "设计助手"})
 ```
 
 下属通过原生消息联系直接父级，需要 Codex 决定的问题由顶层提出；Codex 继续按顶层名字回答。插件不设固定层数上限，模型与工具权限仍由 DSH 管理。
@@ -132,10 +140,10 @@ futureaide_inspect_agent({name: "设计团队长"})
 
 | 工具 | 用途 |
 |---|---|
-| `futureaide_status` | 检查当前调用方与项目，以及两种后端各自是否就绪 |
-| `futureaide_run_agent` | 一步创建并派单；名字已存在就直接发给它；省略 `name` 时自动生成 |
-| `futureaide_create_agent` | 创建一次性或长期子代理；可选 `target`：`dsh`（默认）/`codex-desktop` |
-| `futureaide_send_agent` | 发任务、运行中补充（DSH 下模型下一步就能读到）；等待回答时也可直接答复 |
+| `futureaide_status` | 查看当前调用方、项目和各后端的就绪状态、可用模型 ID 与默认模型 |
+| `futureaide_run_agent` | 一步创建并派单，可选 `model` 和 `effort`。已有名字直接接收任务，省略 `name` 时自动生成 |
+| `futureaide_create_agent` | 为一次性或长期子代理预留名字，可选 `target`、`model` 和 `effort` |
+| `futureaide_send_agent` | 按名字派单、补充或回答，也可用 `model` 或 `effort` 更新选择 |
 | `futureaide_answer_agent` | 回答当前待答问题 |
 | `futureaide_list_agents` | 查看本聊天名单；有下属的名字用 `team` 一行一人列出整棵树 |
 | `futureaide_wait_agents` | 按需等一个或多个名字，单次最多 45 秒 |
@@ -144,9 +152,9 @@ futureaide_inspect_agent({name: "设计团队长"})
 | `futureaide_cancel_agent` | 停止当前任务及所属后代，清除未执行输入，保留上下文 |
 | `futureaide_delete_agent` | 关闭代理及所属后代，清除会话数据，保留项目产物 |
 
-受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。DSH 助手的一轮结束却没有 final 报告时，插件会在同一任务里提醒它一次（主控侧不产生通知，任务保持 running）；失败或取消的轮次不提醒，提醒后仍没有 final 就正常停在 `awaiting_report`，同一任务不会重复提醒。Codex 目标的补充走自己的持久队列，这次未加此提醒。两者的说明里带着同一份回报契约：`report_parent` 要求按 Result / Changes / Verified / Not verified / Decisions 分段、控制在 300 词内，团队长只汇总一份；`ask_parent` 要求写清要定的决定、选项与建议。Codex、DSH 两侧用的是同一段文本。
+受管子代理侧另有两个工具：`ask_parent` 提问、`report_parent` 显式报告，由插件在目标会话内提供；普通输出、轮次结束与树空闲都不产生回包。DSH 助手的一轮结束却没有 final 报告时，插件会在同一任务里提醒它一次（主控侧不产生通知，任务保持 running）；失败或取消的轮次不提醒，提醒后仍没有 final 就正常停在 `awaiting_report`，同一任务不会重复提醒。Codex 目标的补充走自己的持久队列，这次未加此提醒。两者的说明里带着同一份回报契约：`report_parent` 要求按 Result / Changes / Verified / Not verified / Decisions 分段、控制在 300 词内，负责汇总的助手提交一份报告；`ask_parent` 要求写清要定的决定、选项与建议。Codex、DSH 两侧用的是同一段文本。
 
-上级看全队只用一次 `futureaide_list_agents`：有下属的名字返回 `team`，后代每人一行（相对根、可寻址的 `path`、状态、运行时活动、文件数，文件数封顶时显示 `12+`），最多 30 行，超出以 `{more:n}` 收尾；两个成员同名时第二个起用 `名字#2`、`名字#3`。宿主读不到树时条目带 `treeError` 且没有 `team`——那是未知，不是“没有下属”。需要某个成员的对话时用 `futureaide_inspect_agent({name, node})`：`node` 取 `team` 里的路径（如 `"团队长/前端"`、`"subagent#2"`）或成员名，路径优先；被省略成 `…` 的路径按前缀匹配；同名命中多个成员时以 `node-ambiguous` 拒绝并给出可用路径，其余节点只留名字和状态。整份答案仍超长时先把每个 `team` 换成 `teamSize` 计数并加一条提示，再超才退化成 preview。
+上级看全队只用一次 `futureaide_list_agents`：有下属的名字返回 `team`，后代每人一行（相对根、可寻址的 `path`、状态、运行时活动、文件数，文件数封顶时显示 `12+`），最多 30 行，超出以 `{more:n}` 收尾；两个成员同名时第二个起用 `名字#2`、`名字#3`。宿主读不到树时条目带 `treeError` 且没有 `team`——那是未知，不是“没有下属”。需要某个成员的对话时用 `futureaide_inspect_agent({name, node})`：`node` 取 `team` 里的路径（如 `"设计助手/前端"`、`"subagent#2"`）或成员名，路径优先；被省略成 `…` 的路径按前缀匹配；同名命中多个成员时以 `node-ambiguous` 拒绝并给出可用路径，其余节点只留名字和状态。整份答案仍超长时先把每个 `team` 换成 `teamSize` 计数并加一条提示，再超才退化成 preview。
 
 发送任务或补充消息返回精简受理回执；需要任务树、文件变更或历史时，按需使用列表、变更或查看工具。`queued: true` 表示已在本地保存（普通监工忙时进入持久队列），不得重发；`retrying: true` 表示原请求正等待后台恢复，调用方无需重发；`unknown` 表示原生写入结果不明，重试前先核对原回执和原收件人，绝不盲目重复；`accepted: true` 只表示目标宿主已受理，不代表任务完成或要求已落实。列表展示队列状态。
 

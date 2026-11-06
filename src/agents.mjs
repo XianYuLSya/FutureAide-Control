@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, realpath, rename, rm, rmdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, rm, rmdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { isCodexThreadId } from './codex-target.mjs';
 import { createControl, endedState, errorResult } from './control.mjs';
+import { replaceStateFile } from './replace-state-file.mjs';
 
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const request = value => {
@@ -67,7 +68,7 @@ export function createAgents(config, { controlFactory = createControl } = {}) {
     const filename = path.join(directory(record.agentId), 'agent.json');
     const temp = filename + '.' + randomUUID() + '.tmp';
     await writeFile(temp, JSON.stringify(record, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-    await rename(temp, filename);
+    await replaceStateFile(temp, filename);
   };
   const summary = record => ({ agentId: record.agentId, taskName: record.taskName, workspace: record.workspace,
     ...(record.taskDirectory === undefined ? {} : { taskDirectory: record.taskDirectory }),

@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.5.14 — 2026-11-06 · 调用时选模型和思考强度
+
+本版让调用方按名字选模型。没选过的名字行为不变，继续跟随目标应用的默认值。失败通知现在带上错误代码，比如 `QUOTA`。
+
+- Claude 和 Codex 调用方都可在 `futureaide_run_agent`、`futureaide_create_agent`、`futureaide_send_agent` 中指定 `model` 和 `effort`。模型可按完整 ID 或片段匹配，解析结果随名字保存，后续派单、回答和提醒沿用。状态显示各后端的可选模型和默认模型，回执、名单和等待结果显示完整模型 ID。
+- Codex 通过 `model/list` 读取可用模型和档位，显式选择在 `turn/start` 生效。未选模型的名字继续继承 Codex 默认值。正在运行的轮次要求等到结束后再更换模型或档位。
+- 识别 Codex 首轮返回的带文件路径的空 rollout 错误，首次观察时按空记录处理。
+- Windows 上并发读取短暂占用状态或回执文件时，重试原子替换，避免已接单的任务因写盘中断。
+
 ## 0.5.13 — 2026-11-05 · Codex 目标改走原生 RPC
 
 本版把 `target: "codex-desktop"` 从 app-tools 的 `create_thread` 锚点方案换成 Codex 自己的 app-server RPC，会话和界面新建的对话一样，保住用户的模型、推理强度和审批/沙箱默认值。已在真实 Codex 26.1029.7803.0 上跑通 Claude 调 Codex、Codex 再调 DSH 的全链路；没有调试端口时退回 app-tools 的路径、Codex 重启后续用长期名字还未实测。

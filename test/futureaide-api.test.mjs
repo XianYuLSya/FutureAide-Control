@@ -271,6 +271,63 @@ test('model selection uses the native validated path and declares its native def
   assert.deepEqual(f.state.calls[1].body.payload.args.request, { sessionId: 'session-parent', ...selection });
 });
 
+test('managed session-only model selection uses the host method and never the native default-saving command', async t => {
+  const home = await tempHome(t);
+  const bridge = join(home, 'bridge.json');
+  await writeFile(bridge, JSON.stringify({ version: 1, token: 'b'.repeat(64) }));
+  const managed = { ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a',
+    workspace: ordinary.cwd, treeProtocol: 1, reportProtocol: 1 };
+  const selection = { provider: 'fixture', model: 'fixture-model', reasoningEffort: 'high' };
+  const f = await fixture(t, { hostBridgeFile: bridge, rpc(body, res) {
+    assert.equal(body.method, 'managedSelectModel');
+    assert.equal(body.payload.args.token, 'b'.repeat(64));
+    assert.deepEqual(body.payload.args, { ...managed, token: 'b'.repeat(64), selection });
+    reply(res, body, { ok: true, value: { accepted: true, sessionId: managed.sessionId, selected: selection,
+      source: 'managed-session-selectModel', defaultModelBehavior: 'Session-only: the app-wide default model is unchanged.',
+      modelRequestsStarted: 0 } });
+  } });
+  const result = await f.client.managedSelectModel(managed, selection, { sessionOnly: true });
+  assert.equal(result.accepted, true);
+  assert.deepEqual(result.selected, selection);
+  assert.equal(result.source, 'managed-session-selectModel');
+  assert.match(result.defaultModelBehavior, /unchanged/);
+  assert.deepEqual(f.state.calls.map(call => [call.path, call.body.method]),
+    [['/futureaide-control/managedSelectModel', 'managedSelectModel']],
+    'the native session/selectModel command is never called');
+});
+
+test('managed session-only selection refuses an old bridge without falling back to the global default write', async t => {
+  const home = await tempHome(t);
+  const bridge = join(home, 'bridge.json');
+  await writeFile(bridge, JSON.stringify({ version: 1, token: 'c'.repeat(64) }));
+  const managed = { ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a',
+    workspace: ordinary.cwd, treeProtocol: 1, reportProtocol: 1 };
+  const f = await fixture(t, { hostBridgeFile: bridge, rpc(body, res) {
+    assert.equal(body.method, 'managedSelectModel');
+    reply(res, body, { ok: false, error: { code: 'unknown-method', message: 'unknown-method' } });
+  } });
+  await assert.rejects(f.client.managedSelectModel(managed, { provider: 'fixture', model: 'fixture-model' },
+    { sessionOnly: true }), failure('managed-select-model-unsupported'));
+  assert.deepEqual(f.state.calls.map(call => call.body.method), ['managedSelectModel'],
+    'an unsupported host is never retried through native session/selectModel');
+});
+
+test('managed session-only selection refuses a substituted host selection', async t => {
+  const home = await tempHome(t);
+  const bridge = join(home, 'bridge.json');
+  await writeFile(bridge, JSON.stringify({ version: 1, token: 'd'.repeat(64) }));
+  const managed = { ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a',
+    workspace: ordinary.cwd, treeProtocol: 1, reportProtocol: 1 };
+  const f = await fixture(t, { hostBridgeFile: bridge, rpc(body, res) {
+    assert.equal(body.method, 'managedSelectModel');
+    reply(res, body, { ok: true, value: { accepted: true, sessionId: managed.sessionId,
+      selected: { provider: 'fixture', model: 'other-model' }, source: 'managed-session-selectModel' } });
+  } });
+  await assert.rejects(f.client.managedSelectModel(managed, { provider: 'fixture', model: 'fixture-model' },
+    { sessionOnly: true }), failure('invalid-response', true));
+  assert.deepEqual(f.state.calls.map(call => call.body.method), ['managedSelectModel']);
+});
+
 test('uses the list cursor for a cold-safe page and preserves the real reply', async t => {
   const f = await fixture(t);
   const page = await f.client.readSession('session-parent', { maxMessages: 7 });
@@ -545,11 +602,18 @@ test('does not send a write if the discovery record changes after target preflig
   assert.equal(next.state.exchanges, 0);
 });
 
-test('supports an explicitly supplied launch URL through the process environment', async t => {
+test('only an explicit launch URL connects to the supplied DSH host', async t => {
   const f = await fixture(t);
+  const dataHome = await tempHome(t);
   process.env.FUTUREAIDE_LAUNCH_URL = f.launchUrl;
   try {
-    assert.equal((await new FutureAideClient().status()).connected, true);
+    const ignored = await new FutureAideClient({ dataHome }).status();
+    assert.equal(ignored.error.code, 'instance-not-found');
+    assert.equal(f.state.exchanges, 0);
+    const explicit = await new FutureAideClient({ dataHome, launchUrl: f.launchUrl }).status();
+    assert.equal(explicit.connected, true);
+    assert.equal(explicit.baseUrl, f.baseUrl);
+    assert.equal(f.state.exchanges, 1);
   } finally {
     delete process.env.FUTUREAIDE_LAUNCH_URL;
   }

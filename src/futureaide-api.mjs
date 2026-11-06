@@ -666,11 +666,36 @@ export class FutureAideClient {
     if (this.#dialect === undefined) await this.modelCatalog();
     return this.#sendPrompt(row.sessionId, text, { mode, requestId }, expectedInstance);
   }
-  async managedSelectModel(input, selection) {
-    const row = await this.managedSession(input);
-    const expectedInstance = this.#instance;
-    if (this.#dialect === undefined) await this.modelCatalog();
-    return this.#selectModel(row.sessionId, selection, expectedInstance);
+  async managedSelectModel(input, selection, { sessionOnly = false } = {}) {
+    if (sessionOnly !== true) {
+      const row = await this.managedSession(input);
+      const expectedInstance = this.#instance;
+      if (this.#dialect === undefined) await this.modelCatalog();
+      return this.#selectModel(row.sessionId, selection, expectedInstance);
+    }
+    validId(input?.sessionId);
+    if (typeof input?.workspace !== 'string' || !isAbsolute(input.workspace)) {
+      fail('invalid-input', 'A managed workspace is required.');
+    }
+    let value;
+    try {
+      value = await this.#managedCall('managedSelectModel', { ...input, selection }, true);
+    } catch (error) {
+      // Older host bridges do not expose the managed method. Never retry through
+      // the native session/selectModel, which would also save the app-wide default.
+      if (error instanceof FutureAideError && ['unknown-method', 'remote-not-found', 'not-found'].includes(error.code)) {
+        fail('managed-select-model-unsupported',
+          'This DSH host bridge does not support session-only model selection. Update and reinstall the FutureAide Control host bridge in DSH, then retry. The app-wide default was not changed.');
+      }
+      throw error;
+    }
+    if (value?.accepted !== true || value.sessionId !== input.sessionId
+        || value.selected?.provider !== selection.provider || value.selected?.model !== selection.model
+        || (value.selected?.reasoningEffort ?? undefined) !== (selection.reasoningEffort ?? undefined)) {
+      fail('invalid-response', 'DSH did not confirm the requested session-only model selection.', { uncertain: true });
+    }
+    return { ...value, sessionId: input.sessionId, source: 'managed-session-selectModel',
+      defaultModelBehavior: 'Session-only: the app-wide default model is unchanged.', modelRequestsStarted: 0 };
   }
   async managedHistory(input) {
     validId(input?.targetSessionId, 'targetSessionId');

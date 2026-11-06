@@ -667,7 +667,7 @@ test('pre-delivery failures back off visibly, while ambiguous delivery is never 
   const base = fakeBackend();
   const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     beginTask: async () => { begins++; if (beginFailures-- > 0) throw Object.assign(new Error('host busy before begin'), { code: 'agent-busy' }); return { treeProtocol: 1, reportProtocol: 1 }; },
-    models: async () => { models++; if (modelFailures-- > 0) throw Object.assign(new Error('default read busy'), { code: 'agent-busy' }); return base(record).models(); },
+    model: async () => { models++; if (modelFailures-- > 0) throw Object.assign(new Error('current model read busy'), { code: 'agent-busy' }); return base(record).model(); },
     deliver: async () => { sends++; throw Object.assign(new Error('receipt not yet known'), { uncertain: true, code: 'delivery-unknown' }); },
     turn: async () => ({ state: 'running' }),
   }) } });

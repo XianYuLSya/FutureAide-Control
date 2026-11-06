@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, realpath, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { replaceStateFile } from './replace-state-file.mjs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createAgents } from './agents.mjs';
@@ -649,7 +650,7 @@ export function createPeers(config, { agentsFactory = createAgents, codexCall, s
     const filename = exchangeFile(record.exchangeId);
     const temporary = `${filename}.${randomUUID()}.tmp`;
     await writeFile(temporary, JSON.stringify(record, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
-    await rename(temporary, filename);
+    await replaceStateFile(temporary, filename);
   }
 
   async function loadWatch(exchangeId) {

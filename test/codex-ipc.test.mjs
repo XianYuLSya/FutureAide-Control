@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createCodexNativeRpc, nativeRpcExpression, sendCodexTextNative, ensureCodexThreadNative,
-  readCodexThreadNative, listCodexTurnsNative, isCodexRpcUnavailable, isCodexThreadMissing,
-  codexThreadNotFound,
+  readCodexThreadNative, listCodexTurnsNative, listCodexModelsNative, isCodexRpcUnavailable,
+  isCodexThreadMissing, isCodexRolloutEmpty, codexThreadNotFound,
 } from '../src/codex-ipc.mjs';
 import { liveThread, livePage, liveTurn } from './live-thread-fixture.mjs';
 
@@ -39,8 +39,8 @@ test('config/read still returns only the four model fields', async () => {
 
 test('the managed thread and turn methods are allowed and return the raw app-server result', async () => {
   const thread = { id: 'thread-1', cwd: 'D:/work', status: { type: 'idle' }, turns: [] };
-  for (const method of ['thread/start', 'thread/read', 'thread/turns/list', 'thread/list',
-    'thread/resume', 'thread/name/set', 'thread/delete', 'turn/start', 'turn/steer', 'turn/interrupt']) {
+  for (const method of ['model/list', 'thread/start', 'thread/read', 'thread/turns/list',
+    'thread/list', 'thread/resume', 'thread/name/set', 'thread/delete', 'turn/start', 'turn/steer', 'turn/interrupt']) {
     const { value, requests } = await run(method, { threadId: 'thread-1' }, () => ({ result: { thread } }));
     assert.deepEqual(value, { thread }, method);
     assert.equal(requests[0].request.method, method);
@@ -114,6 +114,58 @@ test('an idle thread gets turn/start with no model, effort or permission fields'
   assert.match(params.clientUserMessageId, /^[a-f0-9-]{36}$/);
 });
 
+test('an explicit selection reaches turn/start as model and effort only', async () => {
+  const fake = scriptedRequest(method => {
+    if (method === 'thread/read') return { thread: liveThread({ id: 'thread-1', cwd: 'D:/work/p', updatedAt: 1 }) };
+    if (method === 'thread/turns/list') return livePage();
+    if (method === 'turn/start') return { turn: liveTurn({ id: 'turn-1', status: 'inProgress', completedAt: null, durationMs: null }) };
+    throw new Error('unexpected ' + method);
+  });
+  await sendCodexTextNative('thread-1', 'hello', { request: fake.request, model: 'native-model-a', effort: 'high' });
+  const params = fake.calls.at(-1).params;
+  assert.equal(params.model, 'native-model-a');
+  assert.equal(params.effort, 'high');
+  for (const forbidden of ['sandboxPolicy', 'permissions', 'approvalPolicy', 'approvalsReviewer']) {
+    assert.equal(forbidden in params, false);
+  }
+});
+
+test('an active turn can be steered with the same selection, but carries no option fields', async () => {
+  const fake = scriptedRequest(method => {
+    if (method === 'thread/read') return { thread: liveThread({ id: 'thread-1', cwd: 'D:/work/p',
+      status: { type: 'active' }, model: 'native-model-a', reasoningEffort: 'high', updatedAt: 1 }) };
+    if (method === 'thread/turns/list') return livePage([liveTurn({ id: 'turn-active', status: 'inProgress', completedAt: null, durationMs: null })]);
+    if (method === 'turn/steer') return { turnId: 'turn-active' };
+    throw new Error('unexpected ' + method);
+  });
+  const result = await sendCodexTextNative('thread-1', 'supplement',
+    { request: fake.request, model: 'native-model-a', effort: 'high' });
+  assert.equal(result.turnId, 'turn-active');
+  const params = fake.calls.at(-1).params;
+  assert.equal(fake.calls.at(-1).method, 'turn/steer');
+  assert.equal(params.expectedTurnId, 'turn-active');
+  assert.deepEqual(params.input, [{ type: 'text', text: 'supplement', text_elements: [] }]);
+  for (const forbidden of ['model', 'effort', 'serviceTier', 'permissions']) {
+    assert.equal(forbidden in params, false, `${forbidden} must never be sent on turn/steer`);
+  }
+});
+
+test('changing model while the turn is active is refused before turn/steer', async () => {
+  const fake = scriptedRequest(method => {
+    if (method === 'thread/read') return { thread: liveThread({ id: 'thread-1', cwd: 'D:/work/p',
+      status: { type: 'active' }, model: 'native-model-a', reasoningEffort: 'high', updatedAt: 1 }) };
+    if (method === 'thread/turns/list') return livePage([liveTurn({ id: 'turn-active', status: 'inProgress', completedAt: null, durationMs: null })]);
+    throw new Error('unexpected ' + method);
+  });
+  await assert.rejects(sendCodexTextNative('thread-1', 'change model',
+    { request: fake.request, model: 'native-model-b', effort: 'high' }),
+  { code: 'codex-model-change-while-running', terminal: true });
+  assert.equal(fake.calls.some(call => call.method === 'turn/steer'), false, 'no input is written when the selection cannot change');
+  await assert.rejects(sendCodexTextNative('thread-1', 'change effort',
+    { request: fake.request, model: 'native-model-a', effort: 'low' }),
+  { code: 'codex-model-change-while-running', terminal: true });
+});
+
 test('a running thread is steered with the active turn id', async () => {
   const fake = scriptedRequest(method => {
     if (method === 'thread/read') return { thread: liveThread({ id: 'thread-1', cwd: 'D:/work/p', status: { type: 'active' }, updatedAt: 1 }) };
@@ -149,11 +201,43 @@ test('a missing thread becomes a terminal codex-thread-not-found error', async (
   assert.match(codexThreadNotFound('gone').message, /current profile/);
 });
 
-test('an empty rollout is an empty turn page, not a missing thread', async () => {
+test('the exact path-bearing empty-rollout message is an empty turn page', async () => {
+  // This is the native wording seen from this machine, not a shortened fixture:
+  // the path sits between "rollout" and "is empty".
+  const message = String.raw`rollout at C:\Users\test\.codex\sessions\2026\11\06\rollout-2026-11-06T23-10-00-xxx.jsonl is empty`;
+  for (const wording of ['rollout is empty', 'rollout empty', message]) {
+    assert.equal(isCodexRolloutEmpty({ rpcMessage: wording }), true, wording);
+  }
   const page = await listCodexTurnsNative('thread-1', { request: async () => {
-    throw Object.assign(new Error('rollout is empty'), { rpcMessage: 'rollout is empty' });
+    throw Object.assign(new Error(message), { code: 'codex-native-rpc-rejected', rpcMessage: message });
   } });
   assert.deepEqual(page, { data: [], nextCursor: null });
+});
+
+test('the first turn reads the empty rollout page and still starts turn/start', async () => {
+  const message = String.raw`rollout at C:\Users\test\.codex\sessions\2026\11\06\rollout-2026-11-06T23-10-00-xxx.jsonl is empty`;
+  const fake = scriptedRequest(method => {
+    if (method === 'thread/read') return { thread: liveThread({ id: 'thread-1', cwd: 'D:/work/p', updatedAt: 1 }) };
+    if (method === 'thread/turns/list') throw Object.assign(new Error(message),
+      { code: 'codex-native-rpc-rejected', rpcMessage: message });
+    if (method === 'turn/start') return { turn: liveTurn({ id: 'turn-1', status: 'inProgress', completedAt: null, durationMs: null }) };
+    throw new Error('unexpected ' + method);
+  });
+  const result = await sendCodexTextNative('thread-1', 'first message', { request: fake.request });
+  assert.equal(result.turn.id, 'turn-1');
+  assert.deepEqual(fake.calls.map(call => call.method), ['thread/read', 'thread/turns/list', 'turn/start']);
+  assert.deepEqual(fake.calls.at(-1).params.input, [{ type: 'text', text: 'first message', text_elements: [] }]);
+});
+
+test('model/list is read in order across every page', async () => {
+  const calls = [];
+  const page = await listCodexModelsNative({ request: async (method, params) => {
+    calls.push([method, params]);
+    if (!params.cursor) return { data: [{ id: 'a' }, { id: 'b' }], nextCursor: 'next-1' };
+    return { data: [{ id: 'c' }], nextCursor: null };
+  } });
+  assert.deepEqual(page.data.map(model => model.id), ['a', 'b', 'c']);
+  assert.deepEqual(calls, [['model/list', { limit: 100 }], ['model/list', { limit: 100, cursor: 'next-1' }]]);
 });
 
 test('only pre-send transport failures count as unavailable for a fallback', () => {
@@ -161,4 +245,65 @@ test('only pre-send transport failures count as unavailable for a fallback', () 
   assert.equal(isCodexRpcUnavailable({ code: 'codex-native-rpc-timeout' }), true);
   assert.equal(isCodexRpcUnavailable({ code: 'codex-native-rpc-closed' }), false);
   assert.equal(isCodexRpcUnavailable({ code: 'codex-native-rpc-rejected' }), false);
+});
+
+test('a path-bearing empty rollout on thread/read still starts the first turn', async () => {
+  const message = String.raw`rollout at C:\Users\test\.codex\sessions\2026\11\06\rollout-2026-11-06T23-10-00-xxx.jsonl is empty`;
+  const fake = scriptedRequest(method => {
+    if (method === 'thread/read') throw Object.assign(new Error(`failed to read session metadata for thread: ${message}`),
+      { code: 'codex-native-rpc-rejected', rpcMessage: message });
+    if (method === 'thread/turns/list') return livePage();
+    if (method === 'turn/start') return { turn: liveTurn({ id: 'turn-1', status: 'inProgress', completedAt: null, durationMs: null }) };
+    throw new Error('unexpected ' + method);
+  });
+  const result = await sendCodexTextNative('thread-1', 'first', { request: fake.request,
+    model: 'wire-a', effort: 'high' });
+  assert.equal(result.turn.id, 'turn-1');
+  assert.deepEqual(fake.calls.map(call => call.method), ['thread/read', 'thread/turns/list', 'turn/start']);
+  assert.equal(fake.calls.at(-1).params.model, 'wire-a');
+  assert.equal(fake.calls.at(-1).params.effort, 'high');
+
+  const plain = scriptedRequest(method => {
+    if (method === 'thread/read') throw Object.assign(new Error(`failed to read session metadata for thread: ${message}`),
+      { code: 'codex-native-rpc-rejected', rpcMessage: message });
+    if (method === 'thread/turns/list') return livePage();
+    if (method === 'turn/start') return { turn: liveTurn({ id: 'turn-2', status: 'inProgress', completedAt: null, durationMs: null }) };
+    throw new Error('unexpected ' + method);
+  });
+  await sendCodexTextNative('thread-1', 'plain', { request: plain.request });
+  assert.equal('model' in plain.calls.at(-1).params, false);
+  assert.equal('effort' in plain.calls.at(-1).params, false);
+});
+
+test('thread/read errors other than an empty rollout are not swallowed', async () => {
+  const missing = scriptedRequest(method => {
+    if (method === 'thread/read') throw Object.assign(new Error('thread not found'),
+      { code: 'codex-native-rpc-rejected', rpcMessage: 'thread not found' });
+    throw new Error('unexpected ' + method);
+  });
+  await assert.rejects(sendCodexTextNative('gone', 'x', { request: missing.request }),
+    { code: 'codex-thread-not-found', terminal: true });
+  assert.equal(missing.calls.some(call => call.method === 'turn/start'), false);
+
+  const denied = scriptedRequest(method => {
+    if (method === 'thread/read') throw Object.assign(new Error('permission denied: thread/read'),
+      { code: 'codex-native-rpc-rejected', rpcMessage: 'permission denied: thread/read' });
+    throw new Error('unexpected ' + method);
+  });
+  await assert.rejects(sendCodexTextNative('thread-1', 'x', { request: denied.request }),
+    error => error.code === 'codex-native-rpc-rejected' && /permission denied/.test(error.message));
+  assert.equal(denied.calls.some(call => call.method === 'turn/start'), false);
+});
+
+test('empty thread metadata cannot bypass the active-turn selection guard', async () => {
+  const message = String.raw`rollout at C:\Users\test\.codex\sessions\2026\11\06\rollout-2026-11-06T23-10-00-xxx.jsonl is empty`;
+  const fake = scriptedRequest(method => {
+    if (method === 'thread/read') throw Object.assign(new Error(message),
+      { code: 'codex-native-rpc-rejected', rpcMessage: message });
+    if (method === 'thread/turns/list') return livePage([liveTurn({ id: 'turn-active', status: 'inProgress', completedAt: null, durationMs: null })]);
+    throw new Error('unexpected ' + method);
+  });
+  await assert.rejects(sendCodexTextNative('thread-1', 'change', { request: fake.request,
+    model: 'wire-b', effort: 'high' }), { code: 'codex-model-change-while-running', terminal: true });
+  assert.equal(fake.calls.some(call => call.method === 'turn/steer'), false);
 });

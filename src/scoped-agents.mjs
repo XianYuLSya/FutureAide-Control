@@ -5,7 +5,7 @@ import path from 'node:path';
 import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
-import { invokeCodexTool } from './codex-notify.mjs';
+import { callCodexOwner } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-sessions.mjs';
@@ -47,7 +47,10 @@ function textMessage(message) {
   if (typeof message !== 'string' || !message.trim() || message.length > 100000) throw new Error('A message of 1–100000 characters is required.');
   return message;
 }
-function stableHost(identity) {
+function stableHost(identity, target) {
+  // Codex home changes wholesale when FAswitch switches profiles, and the thread
+  // read is the real ownership test. Compare only the application there.
+  if (target === 'codex-desktop') return { application: identity.application ?? null };
   return { application: identity.application ?? null, dataRoot: path.resolve(identity.dataRoot ?? '') };
 }
 // The compact view keeps the one label that stops a snapshot guess reading as a confirmed write.
@@ -163,6 +166,7 @@ function publicResult(record, { fullResult = false } = {}) {
     ?? (!['completed', 'cancelled'].includes(lastDispatch?.state) ? lastDispatch?.error : undefined);
   const view = record.observation ?? {};
   const changes = attributedChanges(record, view);
+  const explicitReports = (task?.reports ?? []).filter(report => !report.failure);
   return {
     name: record.name, lifetime: record.lifetime, target: targetOf(record), state: record.state,
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
@@ -179,9 +183,10 @@ function publicResult(record, { fullResult = false } = {}) {
       observedAt: view.capturedAt ?? null, stale: Boolean(view.stale) },
     questions: (view.questions ?? []).filter(question => question.state === 'pending').map(question => ({ message: question.message })),
     tree: publicTree(record, view),
-    reports: { total: task?.reports?.length ?? 0, pending: (task?.reports ?? []).filter(report => report.delivery.state !== 'delivered').length,
-      ...(task?.reports?.length ? { latest: { summary: compactText(task.reports.at(-1).message, 240), final: task.reports.at(-1).final, delivery: task.reports.at(-1).delivery.state } } : {}) },
-    delivery: task?.reports?.find(report => report.delivery.state !== 'delivered')?.delivery.state ?? task?.reports?.at(-1)?.delivery.state ?? null, updatedAt: record.updatedAt,
+    reports: { total: explicitReports.length, pending: explicitReports.filter(report => report.delivery.state !== 'delivered').length,
+      ...(explicitReports.length ? { latest: { summary: compactText(explicitReports.at(-1).message, 240), final: explicitReports.at(-1).final, delivery: explicitReports.at(-1).delivery.state,
+        ...(explicitReports.at(-1).delivery.error ? { error: explicitReports.at(-1).delivery.error } : {}) } } : {}) },
+    delivery: explicitReports.find(report => report.delivery.state !== 'delivered')?.delivery.state ?? explicitReports.at(-1)?.delivery.state ?? null, updatedAt: record.updatedAt,
     ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
     ...(error ? { error } : {}),
   };
@@ -339,7 +344,9 @@ export function owesFastPoll(record, at = Date.now()) {
 /** Name-addressed operations; owner and native identifiers never come from tool arguments. */
 export function createScopedAgents(config, {
   store = new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
-  callCodex = invokeCodexTool,
+  callCodex = undefined,
+  nativeRequest = undefined,
+  codexInvoke = undefined,
   clientFactory = settings => new FutureAideClient({ dataHome: settings.dataRoot, dshDataHome: settings.dshDataRoot,
     target: settings.target, instanceFile: settings.instanceFile, preferredInstanceFile: settings.preferredInstanceFile,
     baseUrl: settings.baseUrl, timeoutMs: settings.timeoutMs, hostBridgeFile: settings.hostBridgeFile }),
@@ -362,6 +369,11 @@ export function createScopedAgents(config, {
   const clients = new Map();
   const operationBackends = new WeakMap();
   const inflight = new Map(), monitorInflight = new Map();
+  // One shared Codex-owner entry for reads and sends: native RPC first, app-tools
+  // only when the debug port is unavailable. Tests may inject the transport seams,
+  // but never replace this routing with a callCodex override.
+  const codexOwnerCall = callCodex ?? ((threadId, toolName, args) => callCodexOwner(threadId, toolName, args,
+    { ...(nativeRequest ? { nativeRequest } : {}), ...(codexInvoke ? { invoke: codexInvoke } : {}) }));
   // A snapshot write started by a dispatch is not awaited by it, so its promise is kept
   // per task: reading the baseline and shutting down both wait for it here.
   const baselineWrites = new Map();
@@ -464,10 +476,6 @@ export function createScopedAgents(config, {
       // The Codex probe reads its protocol readiness only; this must never start a
       // session, so it is the same read-only evidence status uses.
       readCodexReportStatus: () => readCodexReportStatus(record),
-      // A Codex child's bridge is anchored on a verified Codex chat, never on a Claude
-      // session id, and the same resolver is offered both ways for its host options.
-      anchorResolver: () => anchorResolver(load()),
-      hostOptions: { anchorResolver: () => anchorResolver(load()) },
     };
   };
   // The chosen backend is rebuilt per operation from the live record, so a new
@@ -532,7 +540,7 @@ export function createScopedAgents(config, {
     const caller = trustedCaller(extra);
     const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
     return store.saveOwner(await resolveCallingContext(extra,
-      { knownOwner: store.owner(ownerId), callCodex, verifyClaude, bindOwner: bindClaude }));
+      { knownOwner: store.owner(ownerId), callCodex: codexOwnerCall, nativeRequest, verifyClaude, bindOwner: bindClaude }));
   }
   /**
    * Records this owner can see: its own, plus every managed descendant that a
@@ -556,24 +564,6 @@ export function createScopedAgents(config, {
     const session = await resolveNativeSession(caller.nativeSessionId,
       { ...(caller.workspace ? { workspace: caller.workspace } : {}) });
     return { pid: session?.pid, workspace: session?.cwd ?? session?.workspace ?? caller.workspace };
-  }
-
-  /**
-   * Bridge anchor for a Codex Desktop child: a Codex chat this plugin already
-   * verified and saved in this roster, preferring the same project. A Claude session
-   * id is never an anchor, because only a verified chat can carry a Codex bridge.
-   * The object is the contract; toString() yields the thread id so a host that still
-   * expects a plain string keeps working while it moves to the object.
-   */
-  function anchorResolver(record) {
-    const owners = store.codexOwners();
-    if (!owners.length) {
-      throw Object.assign(new Error('No verified Codex chat is available to anchor this Codex Desktop session.'),
-        { code: 'codex-anchor-unavailable' });
-    }
-    const anchor = owners.find(owner => owner.workspace === record?.workspace) ?? owners[0];
-    return { threadId: anchor.threadId, ownerId: anchor.ownerId, workspace: anchor.workspace,
-      toString() { return anchor.threadId; } };
   }
 
   /**
@@ -733,19 +723,25 @@ export function createScopedAgents(config, {
   async function checkHost(record, { creation = false, taskTree = false } = {}) {
     const backend = await backendFor(record);
     const probe = await backend.probe();
-    const stable = stableHost(probe.identity);
+    const target = targetOf(record);
+    const stable = stableHost(probe.identity, target);
     const labels = backend.labels ?? {};
-    if (record.host && JSON.stringify(record.host) !== JSON.stringify(stable)) {
-      throw Object.assign(new Error(`The original ${labels.host ?? targetOf(record)} data store is not connected. The task was not sent to another host.`), { code: 'host-ownership-mismatch' });
+    const recorded = target === 'codex-desktop'
+      ? (record.host?.application ? { application: record.host.application } : undefined)
+      : record.host;
+    if (recorded && JSON.stringify(recorded) !== JSON.stringify(stable)) {
+      throw Object.assign(new Error(`The original ${labels.host ?? target} data store is not connected. The task was not sent to another host.`), { code: 'host-ownership-mismatch' });
     }
     if (creation || taskTree) {
       const required = backend.requiredMethods ?? probe.methods ?? [];
       if (!required.every(method => probe.methods?.includes(method))) {
-        throw Object.assign(new Error(`${labels.bridge ?? `The ${targetOf(record)} backend`} needs this plugin version installed before subagents can be created.`), { code: 'managed-host-required' });
+        throw Object.assign(new Error(`${labels.bridge ?? `The ${target} backend`} needs this plugin version installed before subagents can be created.`), { code: 'managed-host-required' });
       }
       if (probe.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(labels.host ?? hostLabel(record));
       if (probe.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(labels.host ?? hostLabel(record));
     }
+    // Do not rewrite an existing Codex host row: its historical dataRoot is
+    // irrelevant and is deliberately ignored rather than migrated.
     record.host ??= stable;
     return backend;
   }
@@ -990,8 +986,9 @@ export function createScopedAgents(config, {
       }
     } catch (error) {
       const retryable = error.retryableRead === true || (targetOf(record) !== 'dsh' && (!delivering || error.code === 'agent-busy'));
-      const state = targetOf(record) !== 'dsh' && !delivering ? 'retrying'
-        : error.uncertain ? 'unknown' : retryable ? 'retrying' : 'failed';
+      const state = error.terminal === true ? 'failed'
+        : targetOf(record) !== 'dsh' && !delivering ? 'retrying'
+          : error.uncertain ? 'unknown' : retryable ? 'retrying' : 'failed';
       Object.assign(dispatch, { state, afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
       if (dispatch.state === 'retrying' && targetOf(record) !== 'dsh') deferRetry(dispatch);
     }
@@ -1056,14 +1053,50 @@ export function createScopedAgents(config, {
     store.save(record);
   }
 
+  const CODEX_PROFILE_MISSING = '当前 Codex 档案里看不到这个对话；报告正文已保留。请在 FAswitch 切回创建它的档案，或删除这个名称后重新派单；不会继续重试。';
+  const terminalCodexOwnerError = error => error?.terminal === true || error?.code === 'codex-thread-not-found';
+  function blockCodexNotice(record, notice, error) {
+    notice.state = 'blocked';
+    notice.error = { code: 'codex-thread-not-found', message: CODEX_PROFILE_MISSING };
+    record.error = { code: 'codex-thread-not-found', message: CODEX_PROFILE_MISSING, detail: safeError(error) };
+  }
+
   async function verifyOwner(owner) {
-    const thread = threadFromResult(await callCodex(owner.threadId, 'read_thread', {
+    const thread = threadFromResult(await codexOwnerCall(owner.threadId, 'read_thread', {
       threadId: owner.threadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 100,
     }));
-    if (thread?.id?.toLowerCase() !== owner.threadId || thread.kind !== 'codex' || thread.hostId !== 'local'
+    // Native RPC thread records do not carry app-tools' kind/hostId fields. The
+    // stable ownership check is the exact chat id plus its local absolute cwd.
+    if (thread?.id?.toLowerCase() !== owner.threadId
         || typeof thread.cwd !== 'string' || await realpath(thread.cwd) !== owner.workspace) {
       throw new Error('The original Codex chat project could not be re-verified.');
     }
+  }
+
+  function failureReason(record, view, finalDispatch) {
+    const reason = [record.error?.message, finalDispatch?.failure?.message,
+      finalDispatch?.error?.message, finalDispatch?.failure?.code, finalDispatch?.error?.code,
+      rootSummary(view)?.reply].find(value => typeof value === 'string' && value.trim()) ?? '模型执行失败';
+    return compactText(String(reason), 200);
+  }
+
+  /**
+   * One terminal failure notice per task. It rides the same owner delivery path
+   * (and the same notice id/dedup) as reports, so a transient Codex/Claude outage
+   * retries naturally and a delivered notice is never sent twice.
+   */
+  async function notifyFailure(record, terminal, view, finalDispatch) {
+    const task = record.task;
+    if (!task || terminal !== 'failed' || task.cancelRequested) return;
+    const text = `${hostLabel(record)}「${record.name}」执行失败：${failureReason(record, view, finalDispatch)}`;
+    task.reports ??= [];
+    let failure = task.reports.find(report => report.failure === true);
+    if (!failure) {
+      failure = { id: `failure-${task.taskId}`, taskId: task.taskId, message: text, final: false,
+        failure: true, delivery: { id: `failure-notice-${task.taskId}`, state: 'pending' } };
+      task.reports.push(failure);
+    }
+    await deliver(record, failure.delivery, failure.message);
   }
 
   async function deliver(record, notice, text) {
@@ -1092,14 +1125,17 @@ export function createScopedAgents(config, {
             ? { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined }
             : { state: 'unknown' });
         } else {
-          const history = await callCodex(owner.threadId, 'read_thread', {
+          const history = await codexOwnerCall(owner.threadId, 'read_thread', {
             threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
           });
           if (!history?.isError && JSON.stringify(history).includes(marker)) {
             Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
           } else notice.state = 'unknown';
         }
-      } catch { notice.state = 'unknown'; }
+      } catch (error) {
+        if (terminalCodexOwnerError(error)) blockCodexNotice(record, notice, error);
+        else notice.state = 'unknown';
+      }
       store.save(record);
       return;
     }
@@ -1107,7 +1143,12 @@ export function createScopedAgents(config, {
     // delivery: the read-back branch above remains its only recovery path.
     if (record.callbackBlocked) { notice.state = 'blocked'; store.save(record); return; }
     try { await (claude ? claudeNoticeBinding(owner) : verifyOwner(owner)); }
-    catch (error) { Object.assign(notice, { state: 'pending', error: safeError(error) }); store.save(record); return; }
+    catch (error) {
+      if (!claude && terminalCodexOwnerError(error)) blockCodexNotice(record, notice, error);
+      else Object.assign(notice, { state: 'pending', error: safeError(error) });
+      store.save(record);
+      return;
+    }
     // A previous attempt may have reached the desktop. Never send a second copy blindly.
     Object.assign(notice, { state: 'sending', attemptedAt: now() });
     store.save(record);
@@ -1142,7 +1183,7 @@ export function createScopedAgents(config, {
         if (sent?.status === 'failed') Object.assign(notice, { state: 'pending', error: { message: 'The Claude inbox rejected this notice before acceptance.' } });
         else Object.assign(notice, { state: 'unknown', error: undefined });
       } else {
-        const result = await callCodex(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
+        const result = await codexOwnerCall(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
         const unavailable = result?.isError && JSON.stringify(result).includes('direct app-server input is not allowed for multi-agent v2 sub-agents');
         if (unavailable) record.callbackBlocked = true;
         Object.assign(notice, unavailable ? { state: 'blocked', error: { code: 'native-callback-unavailable' } } : result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
@@ -1150,8 +1191,10 @@ export function createScopedAgents(config, {
       }
     } catch (error) {
       // sendClaude throws only before its write, and a session that cannot be found was
-      // never written to, so a Claude notice that lands here can be sent again.
-      Object.assign(notice, { state: claude ? 'pending' : 'unknown', error: safeError(error) });
+      // never written to, so a Claude notice that lands here can be sent again. A
+      // Codex owner that disappeared with the profile is a terminal notice instead.
+      if (!claude && terminalCodexOwnerError(error)) blockCodexNotice(record, notice, error);
+      else Object.assign(notice, { state: claude ? 'pending' : 'unknown', error: safeError(error) });
     }
     store.save(record);
   }
@@ -1327,6 +1370,11 @@ export function createScopedAgents(config, {
   // Only persisted report_parent calls may wake the parent chat.
   async function deliverReports(record) {
     for (const report of record.task.reports ?? []) {
+      if (report.failure) {
+        await deliver(record, report.delivery, report.message);
+        if (report.delivery.state !== 'delivered') return false;
+        continue;
+      }
       if (report.final && !report.treeSettledConfirmed) continue;
       await deliver(record, report.delivery, `${hostLabel(record)}「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`);
       if (report.delivery.state !== 'delivered') return false;
@@ -1426,8 +1474,15 @@ export function createScopedAgents(config, {
         store.save(record);
       }
       if (delivered) return finishDeliveredReport(record);
-      record.state = record.callbackBlocked && ['failed', 'cancelled'].includes(task.result.state)
-        && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled)) ? task.result.state : 'delivery_pending';
+      const terminalDelivery = final.delivery.state === 'blocked'
+        && final.delivery.error?.code === 'codex-thread-not-found';
+      if (terminalDelivery) {
+        record.state = task.state = 'failed';
+        record.error = final.delivery.error;
+      } else {
+        record.state = record.callbackBlocked && ['failed', 'cancelled'].includes(task.result.state)
+          && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled)) ? task.result.state : 'delivery_pending';
+      }
     }
     store.save(record);
     return publicResult(record);
@@ -1653,11 +1708,24 @@ export function createScopedAgents(config, {
         return publicResult(record);
       }
       record.state = task.state = terminal ?? 'awaiting_report';
+      if (terminal === 'failed' && !task.cancelRequested) await notifyFailure(record, terminal, view, finalDispatch);
       return await finishReports(record, view);
     } catch (error) {
-      record.state = record.task?.result ? 'delivery_pending' : 'reconnecting';
-      record.error = safeError(error); record.observation = { ...record.observation, stale: true };
-      if (targetOf(record) !== 'dsh') deferRetry(record);
+      // A missing thread after a profile switch is a terminal state, not a
+      // transient transport failure: keep the exact error and stop polling it.
+      const terminal = error.terminal === true;
+      record.state = terminal ? 'failed' : record.task?.result ? 'delivery_pending' : 'reconnecting';
+      record.error = safeError(error);
+      if (terminal && record.task) {
+        record.task.state = 'failed';
+        if (!record.task.cancelRequested) {
+          try { await notifyFailure(record, 'failed', record.observation ?? {}, undefined); }
+          catch { /* the pending failure report is retried by the next scan */ }
+        }
+      }
+      record.observation = { ...record.observation, stale: true };
+      if (terminal) record.nextAttemptAt = undefined;
+      else if (targetOf(record) !== 'dsh') deferRetry(record);
       forgetBackend(record);
       store.save(record);
       return publicResult(record);
@@ -1703,7 +1771,9 @@ export function createScopedAgents(config, {
       const codexEntry = await diagnoseTarget('codex-desktop', { adapters: backendAdapters,
         ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
         record: codexProbe, deps: adapterDeps(codexProbe) });
-      status.backends['codex-desktop'] = codexEntry.ready ? codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)) : codexEntry;
+      status.backends['codex-desktop'] = codexEntry.ready
+        ? { ...codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)), evidence: 'native-rpc' }
+        : codexEntry;
       return status;
     },
     async create({ name, lifetime, target }, extra) {

@@ -81,6 +81,35 @@ test('callCodexTool keeps its accepted contract while using the bridge invocatio
   assert.deepEqual(calls[0].slice(0, 3), [threadId, 'send_message_to_thread', { threadId, prompt: 'not sent' }]);
 });
 
+test('a report send prefers the native RPC and falls back only when the port is unavailable', async () => {
+  const methods = [];
+  const nativeRequest = async (method, params) => {
+    methods.push(method);
+    if (method === 'thread/read') return { thread: { id: threadId, cwd: 'D:/work', status: { type: 'idle' } } };
+    if (method === 'thread/turns/list') return { data: [] };
+    if (method === 'turn/start') return { turn: { id: 'turn-1', items: [], status: 'inProgress' } };
+    throw new Error('unexpected ' + method);
+  };
+  const result = await callCodexTool(threadId, 'send_message_to_thread', { threadId, prompt: 'report' }, { nativeRequest });
+  assert.equal(result.via, 'native-rpc');
+  assert.deepEqual(methods, ['thread/read', 'thread/turns/list', 'turn/start']);
+
+  let invoked = 0;
+  const fallback = await callCodexTool(threadId, 'send_message_to_thread', { threadId, prompt: 'report' }, {
+    nativeRequest: async () => { throw Object.assign(new Error('no debug port'), { code: 'codex-native-rpc-unavailable' }); },
+    invoke: async () => { invoked++; return { content: [{ type: 'text', text: 'accepted' }], isError: false }; },
+  });
+  assert.equal(fallback.accepted, true);
+  assert.equal(invoked, 1);
+
+  invoked = 0;
+  await assert.rejects(callCodexTool(threadId, 'send_message_to_thread', { threadId, prompt: 'report' }, {
+    nativeRequest: async () => { throw Object.assign(new Error('turn rejected'), { code: 'codex-native-rpc-rejected' }); },
+    invoke: async () => { invoked++; return { content: [{ type: 'text', text: 'accepted' }], isError: false }; },
+  }), /turn rejected/);
+  assert.equal(invoked, 0, 'a write that was attempted is never retried over app-tools');
+});
+
 test('a real isError result stays visible to invoke and is never accepted', { skip: !windows }, async t => {
   const bridge = await fakeBridge(t);
   const raw = await invokeCodexTool(threadId, 'send_message_to_thread', { mode: 'error' }, { bridge });

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { invokeCodexTool } from './codex-notify.mjs';
+import { callCodexOwner } from './codex-notify.mjs';
 
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 
@@ -90,9 +90,13 @@ async function resolveClaudeOwner(caller, { knownOwner, verifyClaude, bindOwner 
 /**
  * The host supplies identity; only the native desktop supplies the initial cwd.
  * A verified Claude caller takes precedence over the Codex metadata path, and the
- * two owners are namespaced apart.
+ * two owners are namespaced apart. A Codex caller is read over the native RPC
+ * first; a desktop without a debug port falls back to its app-tools bridge, which
+ * is the normal path for an ordinary Codex chat.
  */
-export async function resolveCallingContext(extra, { knownOwner, callCodex = invokeCodexTool, verifyClaude, bindOwner } = {}) {
+export async function resolveCallingContext(extra, {
+  knownOwner, callCodex = callCodexOwner, nativeRequest, codexInvoke, verifyClaude, bindOwner,
+} = {}) {
   const caller = trustedCaller(extra);
   if (caller) {
     if (typeof verifyClaude !== 'function') {
@@ -107,11 +111,12 @@ export async function resolveCallingContext(extra, { knownOwner, callCodex = inv
     if (knownOwner.ownerId !== ownerId || knownOwner.threadId !== threadId) throw new Error('Saved chat ownership does not match the caller.');
     return knownOwner;
   }
+  // The shared owner entry reads over native RPC first and falls back to app-tools
+  // only when no debug port exists. A confirmed missing thread is terminal.
   const thread = threadFromResult(await callCodex(threadId, 'read_thread', {
     threadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 100,
-  }));
-  if (thread?.id?.toLowerCase() !== threadId || thread.kind !== 'codex' || thread.hostId !== 'local'
-      || typeof thread.cwd !== 'string' || !path.isAbsolute(thread.cwd)) {
+  }, { nativeRequest, ...(codexInvoke ? { invoke: codexInvoke } : {}) }));
+  if (thread?.id?.toLowerCase() !== threadId || typeof thread.cwd !== 'string' || !path.isAbsolute(thread.cwd)) {
     throw Object.assign(new Error('The calling Codex chat and its local project could not be verified.'), { code: 'calling-context-unavailable' });
   }
   return { ownerId, source: 'codex-desktop', threadId, workspace: await realpath(thread.cwd), createdAt: new Date().toISOString() };

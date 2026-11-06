@@ -1,8 +1,11 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { createCodexHost, emptyProjection, markerLine, CODEX_FILE_COVERAGE } from './codex-host.mjs';
+import { isCodexRpcUnavailable } from './codex-ipc.mjs';
 
 const METHODS = ['probe', 'create', 'beginTask', 'observe', 'history', 'answer', 'deliver', 'receipt',
   'turn', 'models', 'model', 'selectModel', 'cancel', 'destroy', 'cursor'];
+const MAX_TITLE_ATTEMPTS = 5;
+const FIRST_DISPATCH_GRACE_MS = 2 * 60 * 1000;
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
 
 export async function createCodexBackend(record, deps = {}) {
@@ -16,6 +19,25 @@ export async function createCodexBackend(record, deps = {}) {
   };
   const locked = action => deps.withHostLock ? deps.withHostLock(action) : action();
   const defaultModel = () => host.readDefaultModel({ workspace: load().workspace });
+  async function applyPendingTitle(value) {
+    if (!value.pendingTitle || !value.binding) return;
+    if (value.pendingTitle.attempts >= MAX_TITLE_ATTEMPTS) {
+      delete value.pendingTitle; save(value); return;
+    }
+    const projection = value.projections[value.binding.sessionId];
+    if (!projection?.messages?.length || typeof host.setTitle !== 'function') return;
+    value.pendingTitle.attempts += 1;
+    save(value);
+    try {
+      await host.setTitle({ nativeSessionId: value.binding.sessionId, name: value.pendingTitle.name });
+      delete value.pendingTitle;
+    } catch {
+      // An empty rollout is expected on the first attempts. Keep the task state
+      // untouched; the next refresh retries, up to the bounded attempt count.
+      if (value.pendingTitle.attempts >= MAX_TITLE_ATTEMPTS) delete value.pendingTitle;
+    }
+    save(value);
+  }
   async function reportsReady() {
     const result = await deps.ensureCodexReports?.(load());
     if (result?.ready !== true || !deps.readCodexReportState) {
@@ -29,7 +51,15 @@ export async function createCodexBackend(record, deps = {}) {
     const native = await host.findCreatedSession({ workspace: load().workspace, marker: first.marker, startedAt: first.startedAt });
     if (native?.nativeSessionId) {
       value.binding = { sessionId: native.nativeSessionId, owned: true };
+      value.pendingTitle ??= { name: load().name, attempts: 0 };
       save(value);
+    } else if (Number.isFinite(Date.parse(first.startedAt))
+        && Date.now() - Date.parse(first.startedAt) >= FIRST_DISPATCH_GRACE_MS) {
+      // The first write was never observed. After the grace period, stop looking
+      // and turn the ambiguous dispatch into a visible terminal failure.
+      throw fail('codex-first-dispatch-unconfirmed',
+        'The first Codex dispatch was not found in any thread after 2 minutes. It was not delivered; reassign the task if needed.',
+        { terminal: true });
     }
     return value;
   }
@@ -44,6 +74,7 @@ export async function createCodexBackend(record, deps = {}) {
     for (const [id, delivery] of Object.entries(value.projections[value.binding.sessionId]?.deliveries ?? {})) {
       if (value.requests[id]) Object.assign(value.requests[id], { status: 'accepted', turnId: delivery.turnId, deliverySeq: delivery.seq });
     }
+    await applyPendingTitle(value);
     save(value);
     return { value, ...observed };
   }
@@ -69,7 +100,8 @@ export async function createCodexBackend(record, deps = {}) {
       ]);
       if (result.missing?.length) throw fail('codex-backend-not-ready', `Missing native Codex capabilities: ${result.missing.join(', ')}.`);
       return { identity: result.identity, methods: METHODS, treeProtocol: 1,
-        reportProtocol: reportStatus?.ready === true && deps.readCodexReportState ? 1 : null };
+        reportProtocol: reportStatus?.ready === true && deps.readCodexReportState ? 1 : null,
+        evidence: 'native-rpc' };
     },
     async create() {
       await reportsReady();
@@ -86,7 +118,8 @@ export async function createCodexBackend(record, deps = {}) {
         value.answers = {};
         save(value);
       }
-      return { treeProtocol: 1, reportProtocol: 1, throughSeq: projection(value).seq, currentModel: await defaultModel() };
+      return { treeProtocol: 1, reportProtocol: 1, throughSeq: projection(value).seq,
+        currentModel: value.binding ? await host.readCurrentModel(value.binding.sessionId) : await defaultModel() };
     },
     async observe() {
       const { value, tree } = await refresh();
@@ -141,32 +174,68 @@ export async function createCodexBackend(record, deps = {}) {
       await locked(async () => {
         request.attempted = true; request.status = 'unknown'; save(value);
         try {
+          let turnId;
           if (!value.binding) {
-            const first = await host.createFirstTurn({ workspace: load().workspace, title: load().name, model,
-              requestId, message: `${marker}\nYou are FutureAide managed helper ${JSON.stringify(load().name)}.\n`
-                + 'Use ask_parent for questions and report_parent(message, final=true) for verified final delivery. '
-                + 'Ordinary messages do not report to your parent.\n\n' + message });
+            // No model, reasoning effort or permission field is passed: the new
+            // Codex thread inherits every one of them from the user's defaults.
+            // The caller's task stays first; the marker moves to the last line so
+            // the user sees the original request at the top of the new chat.
+            const first = await host.createFirstTurn({ workspace: load().workspace, title: load().name,
+              requestId, message: `${message}\n\nYou are FutureAide managed helper ${JSON.stringify(load().name)}. `
+                + 'If you need a parent decision, use ask_parent; deliver the final result with '
+                + 'report_parent(message, final=true). Ordinary replies do not report to your parent.\n\n'
+                + marker });
+            turnId = first?.turnId;
             if (first?.nativeSessionId) {
               value.binding = { sessionId: first.nativeSessionId, owned: true };
+              value.pendingTitle ??= { name: load().name, attempts: 0 };
               save(value);
             }
-          } else await host.send({ nativeSessionId: value.binding.sessionId, model, message: `${marker}\n${message}`, requestId });
+          } else {
+            const sent = await host.send({ nativeSessionId: value.binding.sessionId, message: `${message}\n\n${marker}`, requestId });
+            turnId = sent?.turnId;
+          }
+          // A returned native turn id is acceptance, not completion. Recording it
+          // avoids reporting a confirmed turn as unknown while the transcript page
+          // is still catching up.
+          if (turnId) {
+            Object.assign(request, { status: 'accepted', turnId });
+            save(value);
+          }
         } catch (error) {
-          if (['codex-caller-context-required', 'codex-project-unresolved'].includes(error.code)) {
+          if (error.nativeSessionId) {
+            value.binding = { sessionId: error.nativeSessionId, owned: true };
+            value.pendingTitle ??= { name: load().name, attempts: 0 };
+            save(value);
+          }
+          // No debug port means the write never reached Codex, so this is a
+          // retryable transport failure rather than an unknown write outcome.
+          if (isCodexRpcUnavailable(error)) {
             request.attempted = false; request.status = 'retryable'; save(value);
             throw fail(error.code, error.message, { retryableRead: true });
           }
-          throw fail(error.code ?? 'codex-delivery-unconfirmed', error.message, { uncertain: true });
+          throw fail(error.code ?? 'codex-delivery-unconfirmed', error.message,
+            { uncertain: true, ...(error.terminal ? { terminal: true } : {}) });
         }
       });
       try { ({ value } = await refresh()); }
-      catch (error) { throw fail(error.code ?? 'codex-observation-pending', error.message, { uncertain: true }); }
+      catch (error) {
+        // The native turn id already proved acceptance. A later read failure is
+        // an observation gap, not a reason to downgrade that accepted write.
+        if (request.status === 'accepted') return { accepted: true, status: 'accepted', afterSeq: request.afterSeq };
+        throw fail(error.code ?? 'codex-observation-pending', error.message, { uncertain: true });
+      }
       const receipt = receiptFrom(value, requestId);
       return { accepted: receipt.status === 'accepted', status: receipt.status, afterSeq: receipt.afterSeq };
     },
     async receipt({ requestId }) {
-      if (!state().requests[requestId]) return undefined;
-      return receiptFrom((await refresh()).value, requestId);
+      const value = state();
+      if (!value.requests[requestId]) return undefined;
+      try { return receiptFrom((await refresh()).value, requestId); }
+      catch (error) {
+        if (value.requests[requestId].status === 'accepted') return receiptFrom(value, requestId);
+        throw error;
+      }
     },
     async turn({ requestId }) {
       const { value, tree } = await refresh(), p = projection(value), request = value.requests[requestId];
@@ -176,7 +245,11 @@ export async function createCodexBackend(record, deps = {}) {
       return { ...native, correlation, turnId: request.turnId };
     },
     async models() {
-      const selection = await defaultModel();
+      const value = state();
+      // A bound thread's live selection is the honest catalog here: the shared
+      // layer compares it before each dispatch, and this target never overrides
+      // the user's choice. An unbound name shows the Codex default.
+      const selection = value.binding ? await host.readCurrentModel(value.binding.sessionId) : await defaultModel();
       return { default: selection, routableProviders: [selection.provider], groups: [{ id: selection.provider,
         models: [{ id: selection.model, reasoningEfforts: selection.reasoningEffort ? [selection.reasoningEffort] : [] }] }] };
     },
@@ -184,13 +257,11 @@ export async function createCodexBackend(record, deps = {}) {
       const value = state();
       return value.binding ? host.readCurrentModel(value.binding.sessionId) : defaultModel();
     },
-    async selectModel(input) {
-      if (!input.model || !input.provider || !input.reasoningEffort || !input.requestId) throw fail('invalid-model-selection', 'A dispatch model and selection request id are required.');
-      const value = state();
-      (value.selectedModels ??= {})[input.requestId] = { provider: input.provider, model: input.model, reasoningEffort: input.reasoningEffort };
-      save(value);
-      // Selection belongs to the next native send's explicit model/thinking args.
-      return { accepted: true, appliesOnDelivery: true };
+    async selectModel() {
+      // Codex Desktop inherits the user's own model picker and config. Pretending
+      // to change it here would silently disagree with the next real turn.
+      throw fail('model-selection-unsupported',
+        'Codex Desktop subagents use the user\'s own model and reasoning selection; this plugin never overrides them.');
     },
     async cancel() {
       const { value, tree } = await refresh();
@@ -200,8 +271,21 @@ export async function createCodexBackend(record, deps = {}) {
       return { cancelRequested: result.interrupted === true };
     },
     async destroy() {
-      const { value, tree } = await refresh();
-      if (!value.binding) return { destroyed: tree.settled };
+      let value, tree;
+      try { ({ value, tree } = await refresh()); }
+      catch (error) {
+        // The first dispatch was never found in any thread, so there is no native
+        // session to clean. A retried delete of that name must finish.
+        if (error.code === 'codex-first-dispatch-unconfirmed') return { destroyed: true };
+        // A previous delete may have removed the thread before its verification
+        // read; both app-server shapes mean there is nothing left to delete.
+        if (error.code === 'codex-thread-not-found'
+            || /thread not loaded|thread not found|does not exist/i.test(String(error?.rpcMessage ?? error?.message ?? ''))) {
+          return { destroyed: true };
+        }
+        throw error;
+      }
+      if (!value.binding) return { destroyed: true };
       if (!tree.settled) return { destroyed: false, message: 'The managed Codex tree has not settled.' };
       return locked(() => host.destroy({ nativeSessionId: value.binding.sessionId, ownedNodeIds: ownedIds(value), workspace: load().workspace }));
     },

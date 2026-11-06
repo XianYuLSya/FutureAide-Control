@@ -1,5 +1,19 @@
 # 更新记录
 
+## 0.5.13 — 2026-11-05 · Codex 目标改走原生 RPC
+
+本版把 `target: "codex-desktop"` 从 app-tools 的 `create_thread` 锚点方案换成 Codex 自己的 app-server RPC，会话和界面新建的对话一样，保住用户的模型、推理强度和审批/沙箱默认值。已在真实 Codex 26.1029.7803.0 上跑通 Claude 调 Codex、Codex 再调 DSH 的全链路；没有调试端口时退回 app-tools 的路径、Codex 重启后续用长期名字还未实测。
+
+- 建会话：经主渲染进程的本地调试端口发 `thread/start`、首条 `turn/start`；首条消息把派单方的任务原文放最前，后面跟简短的 `ask_parent` / `report_parent(final=true)` 提醒，dispatch marker 放最后一行，不传模型、推理强度或权限字段。后续空闲发送用 `turn/start`，运行中补充用 `turn/steer`，打断用 `turn/interrupt`，删除用 `thread/delete`，冷线程先 `thread/resume`。标题不在首轮返回时硬设：绑定时记下待设标题，等投影有消息后再 `thread/name/set`，失败最多重试 5 次且不影响任务。
+- 失败通知：任务进入确定的失败终态时，复用 report 的投递与去重给直接上级发一次通知，写明助手名、“执行失败”和简短原因；Claude 与 Codex 上级同一路径。通知作为任务内的报告条目进入既有候选扫描，首投遇到瞬时不可用会在后续扫描重试；terminal 错误也同样发一次，失败重试仍在进行时不发，上级自己 cancel 造成的停止不发。
+- 稳定性：所有名字共用的原生 RPC 连接只在传输故障时重建，应用层拒绝不再关掉 socket 掐断别的名字；首派 unknown 超过 2 分钟且所有线程都找不到 marker 时转失败终态，由上级决定是否重派；`findCreatedSession` 只读、绝不 resume 用户线程；`status` 的 Codex 证据改为 `native-rpc`。
+- 收尾：删除后的核对把 `thread/read` 的“thread not loaded”视为已删除；没有 binding 的名字直接算清理完成；首次 rollout 未写入时观察按运行中处理，不闪 reconnecting；后续消息的 marker 也放最后。README 与 SKILL 记录取消不会杀掉 Codex 已启动的 shell 命令。Codex 宿主身份只比较 `application`，旧记录的 `dataRoot` 不再参与比较；清理时 `thread not loaded` 和 `codex-thread-not-found` 都按已删除处理。
+- 观察：改用 `thread/read`、`thread/turns/list`、`thread/list` 组装状态、消息和文件改动；原生子线程按 `thread/list.parentThreadId` 入树，不再读 `state_5.sqlite`、`thread_history_1.sqlite` 或 rollout 文件。`thread/list` 的 `sourceKinds` 显式包含 subAgent 各类型。线程 `updatedAt`/状态未变时复用上轮结果，不重复拉 turns 和子线程；冷线程 resume 使用 `excludeTurns`，turn 页只取最新 20 条。
+- 调用方验证与回报送达：Codex owner 的读取、问答/报告通知统一走一个入口，优先原生 RPC；桌面没有调试端口（`codex-native-rpc-unavailable`）时退回 app-tools，普通 Codex 对话调 DSH 的基础场景不变。写入失败不自动重试，结果不明仍走 `unknown` 语义；线程在当前档案不存在时通知转 `blocked` 终态、保留报告正文并在 list 给出原因，瞬时不可用继续等待重试。
+- 状态与错误：`status` 的 Codex 就绪来自一次真实的 `thread/list` 读类 RPC；没有调试端口时给出 `codex-native-rpc-unavailable`，文字提示从 FAswitch 打开 Codex。当前档案里看不到受管线程时返回 `codex-thread-not-found` 并终止该任务的重试，不再无限轮询。
+- 删除：删掉锚点解析、`create_thread` 路径、`state_5` / rollout 读取函数和 `thread_source` / `agent_created_thread` 删除保护。删除保护改为核对名单绑定与线程 `cwd`，并沿 `thread/list.parentThreadId` 核对整棵受管树。
+- 测试：新增按 app-server v2 schema 形状构造的假 RPC 测试，覆盖创建参数、无模型/权限字段、运行中 steer、冷线程 resume、父线程过滤、删除顺序、缺失线程终端语义、调用方验证与回报送达的 RPC 优先/回退。
+
 ## 0.5.12 — 2026-11-05 · 移除 Claude Desktop 目标和窗口操作
 
 本版只做减法：插件不再操作用户的桌面。执行目标只剩 DSH 和 Codex Desktop，Claude 只当调用方。Codex 因此也调不起 Claude 会话了，Claude 这边只服务受管会话的 `ask_parent`、`report_parent` 一并删除，Codex 这边的保留。升级后需要重启监工，新进程才会停止列出这个目标。

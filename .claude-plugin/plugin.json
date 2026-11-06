@@ -1,6 +1,6 @@
 {
   "name": "futureaide-control",
-  "version": "0.5.12",
+  "version": "0.5.13",
   "description": "Named DSH subagents for Claude: assign work, answer questions, follow reports and manage sessions by name in any project.",
   "author": {
     "name": "FutureAide"

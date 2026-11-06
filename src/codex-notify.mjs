@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { requireWorkspace } from './config.mjs';
+import { requestCodexNative, sendCodexTextNative, isCodexRpcUnavailable } from './codex-ipc.mjs';
 
 const run = promisify(execFile);
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
@@ -328,7 +329,7 @@ export async function invokeCodexTool(threadId, toolName, args, options = {}) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
-    env: { ...process.env, CODEX_APP_TOOLS_PIPE_PATH: pipePath },
+    env: { ...process.env, CODEX_APP_TOOLS_PIPE_PATH: pipePath, CODEX_APP_TOOLS_CALLER_HOST_ID: 'local' },
     stderr: 'pipe',
   });
   const client = new Client({ name: 'futureaide-control-callback', version: '0.1.0' });
@@ -350,12 +351,50 @@ export async function invokeCodexTool(threadId, toolName, args, options = {}) {
   }
 }
 
-// Existing notification callers rely on the small acceptance contract, not on raw MCP data. The
-// optional `invoke` seam keeps that contract testable while the default reuses invokeCodexTool.
-export async function callCodexTool(threadId, toolName, args, options = {}) {
+/**
+ * One shared entry for a Codex owner chat that this plugin did not create. Reads
+ * and writes use the native RPC when the desktop has a debug port; a desktop
+ * without one falls back to the window-loaded app-tools bridge. A confirmed
+ * missing thread is terminal and never falls back.
+ */
+export async function callCodexOwner(threadId, toolName, args, options = {}) {
   const settings = options && typeof options === 'object' ? options : {};
+  const rpcEnabled = settings.nativeRequest !== undefined || (settings.invoke === undefined && settings.bridge === undefined);
+  const nativeRequest = settings.nativeRequest ?? requestCodexNative;
+  if (rpcEnabled && toolName === 'read_thread') {
+    try {
+      const result = await nativeRequest('thread/read', { threadId,
+        includeTurns: Boolean(args?.includeOutputs || args?.includeTurns) });
+      if (result?.thread) return { ...result, via: 'native-rpc' };
+      throw Object.assign(new Error('Codex returned no thread metadata.'), { code: 'codex-native-rpc-invalid-response' });
+    } catch (error) {
+      if (error.code === 'codex-thread-not-found') throw error;
+      if (!isCodexRpcUnavailable(error) && !/not found|no rollout|unknown thread/i.test(String(error?.message ?? ''))) throw error;
+      // Only an unavailable transport falls through to app-tools.
+    }
+  }
+  if (rpcEnabled && toolName === 'send_message_to_thread' && typeof args?.prompt === 'string') {
+    try {
+      await sendCodexTextNative(threadId, args.prompt, { request: nativeRequest });
+      return { accepted: true, threadId, via: 'native-rpc' };
+    } catch (error) {
+      if (!isCodexRpcUnavailable(error)) throw error;
+      // No debug port: the ordinary app-tools bridge is the supported fallback.
+    }
+  }
   const invoke = settings.invoke ?? invokeCodexTool;
-  const result = await invoke(threadId, toolName, args, settings);
+  return invoke(threadId, toolName, args, settings);
+}
+
+// Existing notification callers rely on the small acceptance contract, not on raw MCP data. The
+// optional `invoke` seam keeps that contract testable while the default sends over native RPC
+// and falls back to the desktop's app-tools bridge when no debug port exists. A failed write is
+// never retried, so a non-transport failure propagates instead of being attempted twice.
+export async function callCodexTool(threadId, toolName, args, options = {}) {
+  const result = await callCodexOwner(threadId, toolName, args, options);
+  if (toolName === 'send_message_to_thread' && result?.via === 'native-rpc') {
+    return { accepted: true, threadId, via: 'native-rpc' };
+  }
   assertAcceptedToolResult(result);
   return { accepted: true, threadId };
 }

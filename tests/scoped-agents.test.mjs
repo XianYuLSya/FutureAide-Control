@@ -226,7 +226,7 @@ test('default model read failure retries the original saved dispatch before send
   } finally { f.service.close(); }
 });
 
-test('model failure is visible in list wait and inspect without callbacks or redispatch and clears on the next task', async () => {
+test('model failure is visible in list wait and inspect, notifies once and clears on the next task', async () => {
   const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
@@ -245,7 +245,9 @@ test('model failure is visible in list wait and inspect without callbacks or red
     assert.deepEqual((await f.service.inspect({ name: 'artist' }, extra(A))).error, failed.error);
     assert.equal(f.record().error, undefined, 'successful observation does not replace model failure with a connection error');
     assert.doesNotMatch(JSON.stringify(f.record()), /private upstream/);
-    assert.equal(f.notices.length, 0);
+    assert.equal(f.notices.length, 1, 'a confirmed model failure notifies the parent once');
+    assert.match(f.notices[0].prompt, /执行失败/);
+    assert.match(f.notices[0].prompt, /artist/);
     assert.equal(f.sends.length, 1);
     assert.equal(f.removed.length, 0);
 
@@ -1114,7 +1116,7 @@ test('a new caller adopts the exact old in-flight task without resending its pro
 });
 
 
-test('a native final summary never becomes a report or completion notice', async () => {
+test('a native final summary never becomes a report, but a failed turn notifies', async () => {
   const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
@@ -1126,7 +1128,9 @@ test('a native final summary never becomes a report or completion notice', async
     await f.service.poll(r.agentId);
     assert.equal(f.record().state, 'failed');
     assert.equal(f.record().task.result, undefined);
-    assert.equal(f.notices.length, 0);
+    assert.equal(f.record().task.reports.filter(report => !report.failure).length, 0, 'native text never becomes an explicit report');
+    assert.equal(f.notices.length, 1, 'the failure still reaches the parent');
+    assert.match(f.notices[0].prompt, /执行失败/);
   } finally { f.service.close(); }
 });
 

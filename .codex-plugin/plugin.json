@@ -1,7 +1,7 @@
 {
   "name": "futureaide-control",
   "version": "0.5.15",
-  "description": "Named DSH teams for Codex with multi-level delegation, agent-controlled reports, direct questions, file attribution, and managed lifetimes.",
+  "description": "Named subagents for Codex and Claude Desktop: assign work to DSH, Codex Desktop or the Claude CLI by name, with direct questions, explicit reports, file attribution and managed lifetimes.",
   "author": {
     "name": "FutureAide"
   },

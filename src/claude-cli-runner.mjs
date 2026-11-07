@@ -778,6 +778,7 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
   if (!state) {
     if (!turn) throw fail('claude-turn-not-found', `No Claude turn is recorded in ${directory}.`);
     const alive = Number.isSafeInteger(turn.workerPid) && isAlive(turn.workerPid);
+    if (!alive && await readJson(path.join(directory, CLAUDE_TURN_FILES.state))) return readClaudeTurn(directory, { isAlive });
     return {
       directory, state: alive ? 'running' : 'failed', requestId: turn.requestId ?? null,
       sessionId: turn.sessionId ?? null, cliSessionId: null, model: null, messages: [], sessionStarted: false,
@@ -792,6 +793,13 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
   const owned = [...new Set([workerPid, claudePid].filter(pid => pid !== null))];
   const live = new Map(owned.map(pid => [pid, isAlive(pid)]));
   const alivePids = owned.filter(pid => live.get(pid));
+  // The worker writes its final state and then exits, so a state read just before that
+  // write can meet pids that are already gone. Only a read taken after they died may call
+  // the turn lost; otherwise a finished turn would be reported failed.
+  if (!alivePids.length && !TERMINAL_STATES.includes(state.state)) {
+    const latest = await readJson(path.join(directory, CLAUDE_TURN_FILES.state));
+    if (TERMINAL_STATES.includes(latest?.state)) return readClaudeTurn(directory, { isAlive });
+  }
   let reported = state.state === undefined ? 'running' : state.state;
   let error = state.error ?? undefined;
   let orphaned;

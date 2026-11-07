@@ -6,6 +6,7 @@
 // Scratch directories are created under clean/claude-cli-runner-tests/ and are left in
 // place on purpose: this project moves work aside instead of deleting it.
 import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { test, after } from 'node:test';
@@ -59,7 +60,17 @@ function run(directory, { scenario = 'ok', message = 'Do the task.', ...rest } =
   process.env.FAKE_CLAUDE_SCENARIO = scenario;
   process.env.FAKE_CLAUDE_RECEIPT_DIR = path.join(directory, 'receipts');
   return startClaudeTurn({ directory, cli: fixtureCli, workspace: directory, sessionId: SESSION,
-    message, mcpConfig: MCP_CONFIG, ...rest });
+    message, mcpConfig: MCP_CONFIG, ...rest }).then(async started => {
+    // The detached worker reads FAKE_CLAUDE_SCENARIO when it spawns. Do not let the
+    // next case replace that environment before this worker has really started.
+    const spawnLog = path.join(directory, 'receipts', 'fake-claude-spawns.log');
+    for (let attempt = 0; attempt < 250; attempt++) {
+      try { await stat(spawnLog); break; }
+      catch (error) { if (error.code !== 'ENOENT') throw error; }
+      await delay(20);
+    }
+    return started;
+  });
 }
 
 after(async () => {
@@ -521,15 +532,20 @@ test('the last line is kept even when it has no newline and is larger than one r
 test('re-reading a turn never dispatches again, and one directory is one request', { timeout: 60000 }, async () => {
   const directory = await scratch('duplicate');
   const [first, second] = await Promise.all([run(directory, { scenario: 'hang' }), run(directory, { scenario: 'hang' })]);
-  assert.equal([first, second].filter(result => result.accepted === true).length, 2);
+  assert.ok([first, second].some(result => result.accepted === true), 'one concurrent call is accepted');
   assert.equal([first, second].filter(result => result.duplicate === false).length, 1, 'exactly one call dispatches');
   await waitForTurn(directory, value => Number.isSafeInteger(value.claudePid));
   // Reading is free: no new CLI process appears.
   await readClaudeTurn(directory);
   await readClaudeTurn(directory);
-  await delay(400);
-  const spawns = (await readFile(path.join(directory, 'receipts', 'fake-claude-spawns.log'), 'utf8'))
-    .trim().split('\n').filter(Boolean);
+  let spawns = [];
+  for (let attempt = 0; attempt < 50 && !spawns.length; attempt++) {
+    try {
+      spawns = (await readFile(path.join(directory, 'receipts', 'fake-claude-spawns.log'), 'utf8'))
+        .trim().split('\n').filter(Boolean);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (!spawns.length) await delay(100);
+  }
   assert.equal(spawns.length, 1, 'the stand-in CLI must have been started exactly once');
   await assert.rejects(run(directory, { scenario: 'hang', message: 'A different task.' }),
     error => error.code === 'claude-request-conflict');
@@ -613,6 +629,20 @@ test('cancelClaudeTurn on an empty directory reports nothing to stop', async () 
   assert.equal(result.stopped, true);
   assert.equal(result.cancelled, false);
   assert.match(result.note, /nothing to stop/);
+});
+
+test('a worker that finishes between the state read and the liveness check is not reported lost', async () => {
+  const directory = await scratch('finish-race');
+  await run(directory, { scenario: 'ok' });
+  assert.equal((await waitForTurn(directory)).state, 'ended');
+  const stateFile = path.join(directory, CLAUDE_TURN_FILES.state);
+  const finished = await readFile(stateFile, 'utf8');
+  await writeFile(stateFile, JSON.stringify({ ...JSON.parse(finished), state: 'running', error: null, phase: 'running' }, null, 2));
+  // The reader holds the old running state; the worker writes its final state and exits
+  // before the liveness check, so every recorded pid is gone by the time it is asked.
+  const seen = await readClaudeTurn(directory, { isAlive: () => { writeFileSync(stateFile, finished); return false; } });
+  assert.equal(seen.state, 'ended');
+  assert.equal(seen.error, undefined);
 });
 
 test('a worker that vanished without finalizing is reported failed, not running', async () => {

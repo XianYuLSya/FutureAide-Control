@@ -5,7 +5,14 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { discoverCodexBridge, notificationText, notifyCodex, parseBridgePipe, parseInspection, probeAppToolsBridge } from '../src/codex-notify.mjs';
+import { callCodexOwner, discoverCodexBridge, notificationText, notifyCodex, parseBridgePipe, parseInspection, probeAppToolsBridge } from '../src/codex-notify.mjs';
+
+test('an owner read of a not-loaded thread becomes a terminal missing thread', async () => {
+  await assert.rejects(callCodexOwner(randomUUID(), 'read_thread', {}, {
+    nativeRequest: async () => { throw Object.assign(new Error('Native Desktop rejected thread/read'),
+      { code: 'codex-native-rpc-rejected', rpcMessage: 'thread/read: thread not loaded: gone' }); },
+  }), { code: 'codex-thread-not-found', terminal: true });
+});
 
 const testRoot = path.dirname(fileURLToPath(import.meta.url));
 const windows = process.platform === 'win32';

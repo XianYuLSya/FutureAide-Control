@@ -10,12 +10,12 @@ const fail = (code, message, extra = {}) => Object.assign(new Error(message), { 
 // because its result is reduced to model fields before it leaves the renderer.
 const NATIVE_METHODS = new Set([
   'config/read', 'model/list',
-  'thread/start', 'thread/name/set', 'thread/read', 'thread/turns/list', 'thread/list',
+  'thread/start', 'thread/name/set', 'thread/read', 'thread/turns/list', 'thread/items/list', 'thread/list',
   'thread/resume', 'thread/delete',
   'turn/start', 'turn/steer', 'turn/interrupt',
 ]);
 
-const THREAD_MISSING = /(?:thread|conversation)[^.]*(?:not found|does not exist|unknown)|no (?:such )?thread|invalid thread/i;
+const THREAD_MISSING = /(?:thread|conversation)[^.]*(?:not found|does not exist|unknown|not loaded)|no (?:such )?thread|invalid thread/i;
 // Native Codex reports "rollout is empty", "rollout empty", and the path-bearing
 // form "rollout at C:\...\xxx.jsonl is empty"; all mean the thread exists but
 // its first turn has not been written yet.
@@ -219,15 +219,29 @@ export async function ensureCodexThreadNative(threadId, { request = requestCodex
   return readCodexThreadNative(threadId, { request });
 }
 
-export async function listCodexTurnsNative(threadId, { limit = 40, request = requestCodexNative } = {}) {
+export async function listCodexTurnsNative(threadId, { limit = 40, itemsView = 'summary', cursor, sortDirection = 'desc', request = requestCodexNative } = {}) {
   try {
-    const result = await request('thread/turns/list', { threadId, limit, itemsView: 'full', sortDirection: 'desc' });
+    const result = await request('thread/turns/list', { threadId, limit, itemsView,
+      sortDirection, ...(cursor ? { cursor } : {}) });
     if (!Array.isArray(result?.data)) throw fail('codex-native-rpc-invalid-response', 'Codex returned no turn page.');
     return result;
   } catch (error) {
     // A thread created by thread/start has no rollout until its first turn is
     // written; that is an empty page, not a missing thread.
     if (isCodexRolloutEmpty(error)) return { data: [], nextCursor: null };
+    if (isCodexThreadMissing(error)) throw codexThreadNotFound(threadId);
+    throw error;
+  }
+}
+
+/** Read the persisted items of exactly one turn; inspect and marker recovery use this. */
+export async function listCodexItemsNative(threadId, turnId, { limit = 100, cursor, sortDirection = 'asc', request = requestCodexNative } = {}) {
+  try {
+    const result = await request('thread/items/list', { threadId, turnId, limit, sortDirection,
+      ...(cursor ? { cursor } : {}) });
+    if (!Array.isArray(result?.data)) throw fail('codex-native-rpc-invalid-response', 'Codex returned no item page.');
+    return result;
+  } catch (error) {
     if (isCodexThreadMissing(error)) throw codexThreadNotFound(threadId);
     throw error;
   }
@@ -271,7 +285,7 @@ export async function sendCodexTextNative(threadId, text, { request = requestCod
     // turn/start instead of turning a pre-write read gap into an unknown write.
     if (error.code !== 'codex-empty-rollout') throw error;
   }
-  const page = await listCodexTurnsNative(threadId, { limit: 10, request });
+  const page = await listCodexTurnsNative(threadId, { limit: 10, itemsView: 'notLoaded', request });
   const active = (page.data ?? []).find(turn => turn?.status === 'inProgress' && typeof turn.id === 'string');
   const input = [{ type: 'text', text, text_elements: [] }];
   if (active) {

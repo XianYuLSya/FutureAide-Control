@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { createCodexHost, emptyProjection, markerLine, CODEX_FILE_COVERAGE } from './codex-host.mjs';
-import { isCodexReadRetryable, isCodexRpcUnavailable } from './codex-ipc.mjs';
+import { isCodexReadRetryable, isCodexRpcUnavailable, isCodexThreadMissing } from './codex-ipc.mjs';
 
 const METHODS = ['probe', 'create', 'beginTask', 'observe', 'history', 'answer', 'deliver', 'receipt',
   'turn', 'models', 'model', 'selectModel', 'cancel', 'destroy', 'cursor'];
@@ -139,9 +139,17 @@ export async function createCodexBackend(record, deps = {}) {
         tree: { ...tree, nodes } };
     },
     async history({ targetSessionId, maxMessages = 20 } = {}) {
-      const { value, histories } = await refresh();
+      const value = state();
       const id = !targetSessionId || targetSessionId === load().sessionId ? value.binding?.sessionId : targetSessionId;
       if (!id && !value.binding) return { messages: [], hasMore: false };
+      if (typeof host.readHistory === 'function') {
+        if (id !== value.binding?.sessionId && !(value.tree?.nodes ?? []).some(node => node.sessionId === id)) {
+          throw fail('unknown-owned-node', 'This thread is not in the managed Codex tree.');
+        }
+        const page = await host.readHistory({ nativeSessionId: id, maxMessages });
+        return { messages: page.messages.slice(-maxMessages), hasMore: page.hasMore || page.messages.length > maxMessages };
+      }
+      const { histories } = await refresh();
       if (!histories[id]) throw fail('unknown-owned-node', 'This thread is not in the managed Codex tree.');
       const page = histories[id];
       return { messages: page.messages.slice(-maxMessages), hasMore: page.hasMore || page.messages.length > maxMessages };
@@ -234,6 +242,7 @@ export async function createCodexBackend(record, deps = {}) {
         request.attempted = true; request.status = 'unknown'; save(value);
         try {
           let turnId;
+          let acceptedWrite = false;
           if (!value.binding) {
             // With no explicit selection no model, reasoning effort or permission
             // field is passed: the new thread inherits every one of them from the
@@ -247,6 +256,7 @@ export async function createCodexBackend(record, deps = {}) {
               ...(request.delivery ? { model: request.delivery.model,
                 effort: request.delivery.effort } : {}) });
             turnId = first?.turnId;
+            acceptedWrite = first?.created === true || Boolean(turnId);
             if (first?.nativeSessionId) {
               value.binding = { sessionId: first.nativeSessionId, owned: true };
               value.pendingTitle ??= { name: load().name, attempts: 0 };
@@ -257,12 +267,12 @@ export async function createCodexBackend(record, deps = {}) {
               ...(request.delivery ? { model: request.delivery.model,
                 effort: request.delivery.effort } : {}) });
             turnId = sent?.turnId;
+            acceptedWrite = sent?.sent === true || Boolean(turnId);
           }
-          // A returned native turn id is acceptance, not completion. Recording it
-          // avoids reporting a confirmed turn as unknown while the transcript page
-          // is still catching up.
-          if (turnId) {
-            Object.assign(request, { status: 'accepted', turnId });
+          // turn/start and turn/steer returning success is already acceptance. A
+          // later summary page that omits a steer message must not downgrade it.
+          if (acceptedWrite) {
+            Object.assign(request, { status: 'accepted', ...(turnId ? { turnId } : {}) });
             save(value);
           }
         } catch (error) {
@@ -349,11 +359,8 @@ export async function createCodexBackend(record, deps = {}) {
         // session to clean. A retried delete of that name must finish.
         if (error.code === 'codex-first-dispatch-unconfirmed') return { destroyed: true };
         // A previous delete may have removed the thread before its verification
-        // read; both app-server shapes mean there is nothing left to delete.
-        if (error.code === 'codex-thread-not-found'
-            || /thread not loaded|thread not found|does not exist/i.test(String(error?.rpcMessage ?? error?.message ?? ''))) {
-          return { destroyed: true };
-        }
+        // read; the global missing-thread mapping covers both native wordings.
+        if (isCodexThreadMissing(error)) return { destroyed: true };
         throw error;
       }
       if (!value.binding) return { destroyed: true };

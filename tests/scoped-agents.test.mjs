@@ -18,7 +18,8 @@ const extra = threadId => ({ _meta: { threadId } });
 // Retire the shared listener's leases whatever holder claimed them.
 const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
-async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles } = {}) {
+async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles,
+  callCodex: callCodexOverride } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -136,7 +137,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
     return { accepted: true };
   };
   const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json') }, {
-    store, clientFactory: () => api, controlFactory, callCodex,
+    store, clientFactory: () => api, controlFactory, callCodex: callCodexOverride ?? callCodex,
     // The fixture monitor announces itself exactly like the real worker does.
     startSharedMonitor: startSharedMonitor ?? ((...args) => {
       if (store.lease('idle-monitor')?.expires > Date.now()) return true;
@@ -721,6 +722,107 @@ test('cached results can return while DSH is offline; ambiguous delivery is read
   assert.equal(f.record().state, 'idle');
   assert.equal(f.statusCalls(), observed);
   assert.equal(f.notices.length, 1);
+  f.service.close();
+});
+
+test('an unconfirmed notice blocks at thirty minutes and a once name is retained', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  f.finish(); f.report('keep this body', true); f.notification('unknown');
+  await f.service.poll(f.record().agentId);
+  const r = f.record();
+  const old = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+  Object.assign(r.task.reports[0].delivery, { attemptedAt: old, nextAttemptAt: 0 });
+  f.store.save(r);
+  await f.service.poll(r.agentId);
+  const kept = f.record('artist');
+  assert.notEqual(kept, undefined, 'a blocked one-shot name stays listed');
+  assert.equal(kept.state, 'idle');
+  assert.equal(kept.task.reports[0].delivery.state, 'blocked');
+  assert.equal(kept.task.reports[0].message, 'keep this body');
+  assert.equal(f.removed.length, 0);
+  f.service.close();
+});
+
+test('a pending notice older than six hours expires without reaching the chat', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  f.finish(); f.report('keep this body', true); f.notification('reject');
+  await f.service.poll(f.record().agentId);
+  const r = f.record();
+  assert.equal(r.state, 'delivery_pending');
+  const old = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+  Object.assign(r.task.reports[0], { createdAt: old });
+  Object.assign(r.task.reports[0].delivery, { createdAt: old, attemptedAt: old, nextAttemptAt: 0 });
+  f.store.save(r);
+  await f.service.poll(r.agentId);
+  const expired = f.record();
+  assert.equal(expired.state, 'idle');
+  assert.equal(expired.task.reports[0].delivery.state, 'blocked');
+  assert.equal(expired.task.reports[0].delivery.error.reason, 'expired');
+  assert.equal(expired.task.reports[0].message, 'keep this body', 'the body is retained');
+  const listed = (await f.service.list(extra(A))).items[0];
+  assert.equal(listed.reports.latest.error.reason, 'expired');
+  assert.equal(f.notices.length, 0, 'nothing was sent to the chat');
+  f.service.close();
+});
+
+test('a missing owner thread blocks the notice with the profile reason', async () => {
+  let gone = false;
+  const missing = Object.assign(new Error('thread not loaded'), { code: 'codex-thread-not-found', terminal: true });
+  const callCodex = async (threadId, tool) => {
+    if (tool === 'read_thread') {
+      if (gone) throw missing;
+      return { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } };
+    }
+    return { accepted: true };
+  };
+  const f = await fixture({ callCodex });
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  f.finish(); f.report('keep this body', true); gone = true;
+  await f.service.poll(f.record().agentId);
+  const record = f.record();
+  assert.equal(record.task.reports[0].delivery.state, 'blocked');
+  assert.equal(record.task.reports[0].delivery.error.code, 'codex-thread-not-found');
+  assert.equal(record.task.reports[0].message, 'keep this body');
+  f.service.close();
+});
+
+test('a legacy notice without a creation time is expired, never sent', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  f.finish(); f.report('legacy body', true); f.notification('reject');
+  await f.service.poll(f.record().agentId);
+  const r = f.record();
+  delete r.task.reports[0].createdAt;
+  delete r.task.reports[0].delivery.createdAt;
+  delete r.task.startedAt;
+  f.store.save(r);
+  await f.service.poll(r.agentId);
+  const expired = f.record();
+  assert.equal(expired.task.reports[0].delivery.state, 'blocked');
+  assert.equal(expired.task.reports[0].delivery.error.reason, 'expired');
+  assert.equal(expired.task.reports[0].message, 'legacy body');
+  assert.equal(f.notices.length, 0);
+  f.service.close();
+});
+
+test('an older unknown notice does not hold back the final report', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  f.finish(); f.report('progress', false); f.notification('unknown');
+  await f.service.poll(f.record().agentId);
+  assert.equal(f.record().task.reports[0].delivery.state, 'unknown');
+  f.report('final body', true); f.finish(); f.notification('ok');
+  const done = await f.service.poll(f.record().agentId);
+  assert.equal(done.state, 'idle');
+  assert.equal(f.record().task.reports.at(-1).delivery.state, 'delivered');
+  assert.equal(f.record().task.reports[0].delivery.state, 'unknown');
   f.service.close();
 });
 

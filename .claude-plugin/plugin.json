@@ -1,6 +1,6 @@
 {
   "name": "futureaide-control",
-  "version": "0.5.15",
+  "version": "0.5.16",
   "description": "Named subagents for Codex and Claude Desktop: assign work to DSH, Codex Desktop or the Claude CLI by name, with direct questions, explicit reports, file attribution and managed lifetimes.",
   "author": {
     "name": "FutureAide"

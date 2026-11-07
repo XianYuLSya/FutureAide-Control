@@ -71,7 +71,7 @@ async function caseDir(label) {
  * A real roster and the real management entry for one case. `steps` is the scripted
  * CLI behaviour; `loggedIn` writes the stand-in's auth state before anything runs.
  */
-async function assembly(label, { steps = [], loggedIn = true } = {}) {
+async function assembly(label, { steps = [], loggedIn = true, nativeRequestFactory } = {}) {
   const root = await caseDir(label);
   const workspace = path.join(root, 'workspace');
   const home = path.join(root, 'cli-home');
@@ -95,10 +95,12 @@ async function assembly(label, { steps = [], loggedIn = true } = {}) {
     return { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } };
   };
   const store = new RosterStore(path.join(stateDirectory, 'roster.sqlite'));
+  const nativeRequest = nativeRequestFactory?.({ workspace, root, stateDirectory });
   const service = createScopedAgents({
     stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh',
   }, {
-    store, callCodex,
+    store,
+    ...(nativeRequest ? { nativeRequest } : { callCodex }),
     startSharedMonitor: () => true,
     // Archive the private directory inside this case's clean/ workspace.
     removeTree: source => rename(source, path.join(root, 'cleaned-' + path.basename(source))),
@@ -141,8 +143,37 @@ async function stopStragglers(store, stateDirectory) {
 /** The caller-side text of every notice and report this chat received. */
 const callerText = calls => calls.map(call => JSON.stringify(call.args ?? {})).join('\n');
 
+const page = (data = []) => ({ data, nextCursor: null, backwardsCursor: null });
+
+/**
+ * A native Codex owner that never serves a large full turn page, matching the
+ * live timeout. Owner reads are metadata-only; turn pages are summary/notLoaded.
+ */
+function codexOwner(workspace, { summary = () => page(), items = () => page(), onTurn = () => undefined } = {}) {
+  const calls = [];
+  const request = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/read') return { thread: { id: THREAD, cwd: workspace } };
+    if (method === 'thread/turns/list') {
+      if (params?.itemsView === 'full' && (params.limit ?? 0) > 2) {
+        throw Object.assign(new Error('Native Desktop response timed out'), { code: 'codex-native-rpc-response-timeout' });
+      }
+      return summary(params);
+    }
+    if (method === 'thread/items/list') return items(params);
+    if (method === 'thread/list') return page();
+    if (method === 'turn/start' || method === 'turn/steer') {
+      const value = onTurn(params);
+      if (value instanceof Error) throw value;
+      return value ?? { turn: { id: 'notice-turn' } };
+    }
+    throw new Error('unexpected ' + method);
+  };
+  return { request, calls };
+}
+
 /** Drive the one state machine until the caller's own condition holds. */
-async function pollUntil(f, agentId, predicate, { timeoutMs = 30000, message = 'state' } = {}) {
+async function pollUntil(f, agentId, predicate, { timeoutMs = 45000, message = 'state' } = {}) {
   const deadline = Date.now() + timeoutMs;
   let last;
   while (Date.now() < deadline) {
@@ -266,7 +297,11 @@ test('the first dispatch names the session, ask_parent reaches the caller, answe
     { message: 'the subagent to ask its parent' });
   assert.equal(asked.state, 'awaiting_input', JSON.stringify(asked.error));
 
-  const invocations = f.invocations();
+  let invocations = [];
+  for (let attempt = 0; attempt < 100 && !invocations.length; attempt++) {
+    invocations = f.invocations();
+    if (!invocations.length) await sleep(50);
+  }
   const first = turn(invocations, 0);
   assert.ok(first, 'one CLI turn ran');
   assert.ok(first.argv.includes('--session-id'), `the first turn names the conversation: ${JSON.stringify(first.argv)}`);
@@ -305,6 +340,161 @@ test('the first dispatch names the session, ask_parent reaches the caller, answe
   assert.equal(report.final, true);
   assert.equal(report.delivery.state, 'delivered');
   assert.match(callerText(f.calls), /Delivered after the answer\./);
+});
+
+test('a final report reaches a large Codex owner without a full turn page', async t => {
+  let owner;
+  const f = await assembly('codex-large-owner', { steps: [{ mode: 'final', message: 'Large-thread delivery complete.' }],
+    nativeRequestFactory: ({ workspace }) => {
+      owner = codexOwner(workspace, { summary: params => params.itemsView === 'summary' ? page() : page() });
+      return owner.request;
+    } });
+  t.after(() => f.close());
+  const created = await f.service.create({ name: 'large-owner', lifetime: 'persistent', target: 'claude-cli' }, extra);
+  assert.equal(created.created, true, JSON.stringify(created));
+  const record = f.record('large-owner');
+  await f.service.send({ name: 'large-owner', message: 'finish the work' }, extra);
+  const done = await pollUntil(f, record.agentId, item => item?.state === 'idle' || item?.state === 'failed',
+    { message: 'the final report to reach the large owner' });
+  assert.equal(done.state, 'idle', JSON.stringify(done.error));
+  assert.equal(done.task.reports[0].delivery.state, 'delivered');
+  assert.equal(owner.calls.some(call => call.method === 'thread/turns/list'
+    && call.params.itemsView === 'full' && (call.params.limit ?? 0) > 2), false);
+  assert.ok(owner.calls.some(call => call.method === 'turn/start'
+    && JSON.stringify(call.params).includes('Large-thread delivery complete.')));
+});
+
+test('a timed-out report is recovered from a summary marker instead of resending', async t => {
+  let sentPrompt;
+  let failed = false;
+  let owner;
+  const f = await assembly('codex-owner-readback', { steps: [{ mode: 'final', message: 'Recovered from the owner transcript.' }],
+    nativeRequestFactory: ({ workspace }) => {
+      owner = codexOwner(workspace, {
+        onTurn: params => {
+          if (!failed) { failed = true; sentPrompt = params.input?.[0]?.text ?? ''; return Object.assign(new Error('timed out'), { code: 'codex-native-rpc-response-timeout' }); }
+          return { turn: { id: 'notice-turn-2' } };
+        },
+        summary: params => params.itemsView === 'summary' && sentPrompt
+          ? page([{ id: 'notice-turn', status: 'completed', startedAt: Math.floor(Date.now() / 1000),
+            completedAt: Math.floor(Date.now() / 1000), items: [{ id: 'u1', type: 'userMessage',
+              content: [{ type: 'text', text: sentPrompt }] }] }])
+          : page(),
+      });
+      return owner.request;
+    } });
+  t.after(() => f.close());
+  const created = await f.service.create({ name: 'readback', lifetime: 'persistent', target: 'claude-cli' }, extra);
+  assert.equal(created.created, true, JSON.stringify(created));
+  const record = f.record('readback');
+  await f.service.send({ name: 'readback', message: 'finish and report' }, extra);
+  const done = await pollUntil(f, record.agentId, item => item?.state === 'idle' || item?.state === 'failed',
+    { message: 'the report read-back to settle' });
+  assert.equal(done.state, 'idle', JSON.stringify(done.error));
+  assert.equal(done.task.reports[0].delivery.state, 'delivered');
+  assert.ok(done.task.reports[0].delivery.recovered);
+  assert.equal(owner.calls.filter(call => call.method === 'turn/start').length, 1, 'read-back never resends');
+});
+
+test('a confirmed missing marker resends the report exactly once', async t => {
+  let sends = 0;
+  let owner;
+  const f = await assembly('codex-owner-resend', { steps: [{ mode: 'final', message: 'Resend after confirmed absence.' }],
+    nativeRequestFactory: ({ workspace }) => {
+      owner = codexOwner(workspace, {
+        onTurn: () => ++sends === 1
+          ? Object.assign(new Error('timed out'), { code: 'codex-native-rpc-response-timeout' })
+          : { turn: { id: 'notice-turn-2' } },
+        summary: () => page(),
+      });
+      return owner.request;
+    } });
+  t.after(() => f.close());
+  const created = await f.service.create({ name: 'resend', lifetime: 'persistent', target: 'claude-cli' }, extra);
+  assert.equal(created.created, true, JSON.stringify(created));
+  const record = f.record('resend');
+  await f.service.send({ name: 'resend', message: 'finish and report' }, extra);
+  let current;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    await f.service.poll(record.agentId);
+    current = f.store.get(record.agentId);
+    if (current?.task?.reports?.[0]?.delivery?.state === 'unknown') break;
+    await sleep(40);
+  }
+  assert.equal(current.task.reports[0].delivery.state, 'unknown');
+  current.task.reports[0].delivery.attemptedAt = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+  current.task.reports[0].delivery.nextAttemptAt = 0;
+  f.store.save(current);
+  const done = await pollUntil(f, record.agentId, item => item?.state === 'idle' || item?.state === 'failed',
+    { message: 'the one resend to settle' });
+  assert.equal(done.state, 'idle', JSON.stringify(done.error));
+  assert.equal(done.task.reports[0].delivery.state, 'delivered');
+  assert.equal(sends, 2, 'exactly one resend');
+});
+
+test('read-back follows item cursors so a late steer message is found', async t => {
+  let sentPrompt;
+  let itemPage = 0;
+  let owner;
+  const f = await assembly('codex-owner-item-cursor', { steps: [{ mode: 'final', message: 'Found on the second item page.' }],
+    nativeRequestFactory: ({ workspace }) => {
+      owner = codexOwner(workspace, {
+        onTurn: params => {
+          sentPrompt = params.input?.[0]?.text ?? '';
+          return Object.assign(new Error('timed out'), { code: 'codex-native-rpc-response-timeout' });
+        },
+        summary: () => page([{ id: 'notice-turn', status: 'completed', startedAt: Math.floor(Date.now() / 1000),
+          completedAt: Math.floor(Date.now() / 1000), items: [] }]),
+        items: () => {
+          itemPage++;
+          return itemPage === 1 ? { data: [], nextCursor: 'page-2' }
+            : { data: [{ turnId: 'notice-turn', item: { id: 'u2', type: 'userMessage',
+              content: [{ type: 'text', text: sentPrompt }] } }], nextCursor: null };
+        },
+      });
+      return owner.request;
+    } });
+  t.after(() => f.close());
+  const created = await f.service.create({ name: 'cursor', lifetime: 'persistent', target: 'claude-cli' }, extra);
+  assert.equal(created.created, true, JSON.stringify(created));
+  const record = f.record('cursor');
+  await f.service.send({ name: 'cursor', message: 'finish and report' }, extra);
+  const done = await pollUntil(f, record.agentId, item => item?.state === 'idle' || item?.state === 'failed',
+    { message: 'the cursor page read-back to settle' });
+  assert.equal(done.state, 'idle', JSON.stringify(done.error));
+  assert.equal(done.task.reports[0].delivery.state, 'delivered');
+  assert.equal(itemPage, 2);
+  assert.equal(owner.calls.filter(call => call.method === 'turn/start').length, 1, 'no resend was needed');
+});
+
+test('an unconfirmed final lets a new task start and returns previousReport', async t => {
+  let owner;
+  const f = await assembly('codex-owner-next-task', { steps: [
+    { mode: 'final', message: 'First task body.' },
+    { mode: 'final', message: 'Second task body.' },
+  ], nativeRequestFactory: ({ workspace }) => {
+    owner = codexOwner(workspace, {
+      onTurn: () => Object.assign(new Error('timed out'), { code: 'codex-native-rpc-response-timeout' }),
+      summary: () => page(),
+    });
+    return owner.request;
+  } });
+  t.after(() => f.close());
+  const created = await f.service.create({ name: 'next-task', lifetime: 'persistent', target: 'claude-cli' }, extra);
+  assert.equal(created.created, true, JSON.stringify(created));
+  const record = f.record('next-task');
+  await f.service.send({ name: 'next-task', message: 'first task' }, extra);
+  const pending = await pollUntil(f, record.agentId, item => item?.state === 'delivery_pending',
+    { message: 'the first final to remain unconfirmed' });
+  assert.equal(pending.task.reports[0].delivery.state, 'unknown');
+  const sent = await f.service.send({ name: 'next-task', message: 'second task' }, extra);
+  assert.equal(sent.previousReport.delivered, false);
+  assert.match(sent.previousReport.summary, /First task body/);
+  const current = f.store.get(record.agentId);
+  assert.equal(current.task.message, 'second task');
+  const old = f.store.historyFor(record.agentId).find(task => task.taskId === pending.task.taskId);
+  assert.equal(old.reports[0].delivery.state, 'blocked');
+  assert.equal(old.reports[0].delivery.error.reason, 'unconfirmed');
 });
 
 test('a persistent name keeps one conversation, and an ordinary reply only leaves the task awaiting a report', async t => {

@@ -7,7 +7,8 @@ import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { requireWorkspace } from './config.mjs';
-import { requestCodexNative, sendCodexTextNative, isCodexRpcUnavailable } from './codex-ipc.mjs';
+import { requestCodexNative, sendCodexTextNative, isCodexRpcUnavailable,
+  isCodexThreadMissing, codexThreadNotFound, listCodexTurnsNative, listCodexItemsNative } from './codex-ipc.mjs';
 
 const run = promisify(execFile);
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
@@ -368,8 +369,8 @@ export async function callCodexOwner(threadId, toolName, args, options = {}) {
       if (result?.thread) return { ...result, via: 'native-rpc' };
       throw Object.assign(new Error('Codex returned no thread metadata.'), { code: 'codex-native-rpc-invalid-response' });
     } catch (error) {
-      if (error.code === 'codex-thread-not-found') throw error;
-      if (!isCodexRpcUnavailable(error) && !/not found|no rollout|unknown thread/i.test(String(error?.message ?? ''))) throw error;
+      if (isCodexThreadMissing(error)) throw codexThreadNotFound(threadId);
+      if (!isCodexRpcUnavailable(error) && !/no rollout|unknown thread/i.test(String(error?.message ?? ''))) throw error;
       // Only an unavailable transport falls through to app-tools.
     }
   }
@@ -384,6 +385,28 @@ export async function callCodexOwner(threadId, toolName, args, options = {}) {
   }
   const invoke = settings.invoke ?? invokeCodexTool;
   return invoke(threadId, toolName, args, settings);
+}
+
+/** Summary turns for an owner chat without hydrating full history. */
+export async function readCodexOwnerTurns(threadId, params = {}, options = {}) {
+  const nativeRequest = options.nativeRequest ?? requestCodexNative;
+  try {
+    return await listCodexTurnsNative(threadId, { ...params, request: nativeRequest });
+  } catch (error) {
+    if (isCodexThreadMissing(error)) throw codexThreadNotFound(threadId);
+    throw error;
+  }
+}
+
+/** Full items of one owner turn, used only after a summary has narrowed the search. */
+export async function readCodexOwnerItems(threadId, turnId, params = {}, options = {}) {
+  const nativeRequest = options.nativeRequest ?? requestCodexNative;
+  try {
+    return await listCodexItemsNative(threadId, turnId, { ...params, request: nativeRequest });
+  } catch (error) {
+    if (isCodexThreadMissing(error)) throw codexThreadNotFound(threadId);
+    throw error;
+  }
 }
 
 // Existing notification callers rely on the small acceptance contract, not on raw MCP data. The

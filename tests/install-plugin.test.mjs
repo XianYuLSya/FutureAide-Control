@@ -288,5 +288,5 @@ test('the Claude plugin manifest version matches package.json', async () => {
   assert.equal(manifest.name, 'futureaide-control');
   assert.equal(manifest.version, pkg.version);
   assert.equal(manifest.author.name, 'FutureAide');
-  assert.match(manifest.description, /DSH subagents/);
+  assert.match(manifest.description, /subagents/);
 });

@@ -43,7 +43,7 @@ function dshFixture(calls) {
 }
 
 async function fixture(records = [legacyRecord()]) {
-  const base = path.join(workspace, '.runtime', 'tests');
+  const base = path.join(workspace, 'clean', 'removed-target-fixture');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'removed-target-'));
   const calls = [];
@@ -58,6 +58,8 @@ async function fixture(records = [legacyRecord()]) {
       async selectModel() { return { accepted: true }; } }),
     callCodex: async (threadId, tool) => (tool === 'read_thread'
       ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } } : { accepted: true }),
+    // This suite checks legacy roster records. Keep target probes inside the fixture.
+    backendAdapterLoader: async () => undefined,
     startSharedMonitor: () => true,
     removeTree: async () => {},
   });
@@ -66,7 +68,7 @@ async function fixture(records = [legacyRecord()]) {
 }
 
 test('the removed target is not one of the offered targets', () => {
-  assert.deepEqual([...TARGETS], ['dsh', 'codex-desktop']);
+  assert.deepEqual([...TARGETS], ['dsh', 'codex-desktop', 'claude-cli']);
   assert.deepEqual([...REMOVED_TARGETS], ['claude-desktop']);
   assert.throws(() => normalizeTarget('claude-desktop'), error => error.code === 'invalid-target');
   // Reading a stored record is not creation: the legacy value survives the read.
@@ -95,7 +97,7 @@ test('status and wait answer normally while that record exists', async () => {
     assert.equal(status.ready, true, 'the installation itself is still ready');
     assert.equal(status.contextVerified, true);
     assert.equal(status.agents, 1);
-    assert.deepEqual(Object.keys(status.backends).sort(), ['codex-desktop', 'dsh']);
+    assert.deepEqual(Object.keys(status.backends).sort(), ['claude-cli', 'codex-desktop', 'dsh']);
 
     const waited = await f.service.wait({ names: [LEGACY], timeoutSeconds: 0 }, extra(A));
     assert.equal(waited.items.length, 1);
@@ -146,19 +148,18 @@ test('an operation that needs a backend refuses with backend-not-ready, not a ho
   } finally { f.service.close(); }
 });
 
-test('an open record for the removed target is recorded as backend-not-ready instead of crashing the loop', async () => {
+test('writes and monitoring preserve a removed target byte for byte', async () => {
   const f = await fixture([legacyRecord({ agentId: OPEN_ID, name: '旧会话', closed: false })]);
   try {
-    const sent = await f.service.send({ name: '旧会话', message: '继续' }, extra(A));
-    assert.equal(sent.queued, true, 'the intent is durable, as for any desktop target');
+    const before = f.body(OPEN_ID);
+    for (const method of ['send', 'answer', 'cancel', 'delete']) {
+      await assert.rejects(f.service[method]({ name: '旧会话', message: '继续' }, extra(A)), { code: 'backend-not-ready' });
+    }
+    await f.service.poll(OPEN_ID);
     await f.service.monitorScan({ sweep: true });
     // The sweep starts each poll and returns before it finishes; wait for the work.
     await f.service.drainPolls();
-    const record = f.store.get(OPEN_ID);
-    assert.equal(record.error.code, 'backend-not-ready');
-    assert.match(record.error.message, /claude-desktop target was removed from this build/);
-    assert.equal(record.name, '旧会话', 'the record keeps its own identity');
-    assert.equal(record.target, 'claude-desktop');
+    assert.equal(f.body(OPEN_ID), before);
     assert.deepEqual(f.calls, [], 'no DSH call was made for it, and no local UI work either');
   } finally { f.service.close(); }
 });

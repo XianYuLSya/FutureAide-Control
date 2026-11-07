@@ -502,7 +502,7 @@ test('status keeps every DSH field and reports both targets', async () => {
     assert.equal(status.returnChannel, 'chat-verified');
     assert.equal(status.ready, true);
     // The per-target section reports both remaining targets and nothing else.
-    assert.deepEqual(Object.keys(status.backends).sort(), ['codex-desktop', 'dsh']);
+    assert.deepEqual(Object.keys(status.backends).sort(), ['claude-cli', 'codex-desktop', 'dsh']);
     assert.equal(status.backends.dsh.ready, true);
     assert.equal(status.backends.dsh.connected, true);
     assert.equal(status.backends.dsh.treeProtocol, 1);

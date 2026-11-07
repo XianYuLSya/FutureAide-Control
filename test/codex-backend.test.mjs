@@ -265,6 +265,16 @@ test('an unconfirmed first dispatch becomes terminal after the two-minute grace'
   await assert.rejects(adapter.observe(), { code: 'codex-first-dispatch-unconfirmed', terminal: true });
 });
 
+test('a successful turn/start or turn/steer without a turn id is still accepted', async () => {
+  const f = await setup();
+  const adapter = await createCodexBackend(f.record, { ...f.deps, host: { ...f.deps.host,
+    send: async () => ({ sent: true }) } });
+  f.deps.writeNativeState({ binding: { sessionId: 'native-1', owned: true }, requests: {}, projections: {} });
+  const result = await adapter.deliver({ requestId: 'r1', message: 'accepted without an id' });
+  assert.equal(result.accepted, true);
+  assert.equal(f.state().requests.r1.status, 'accepted');
+});
+
 test('selectModel refuses instead of pretending Codex changed its own picker', async () => {
   const f = await setup();
   await assert.rejects(f.adapter.selectModel({ provider: 'openai', model: 'x', reasoningEffort: 'max', requestId: 'r' }),

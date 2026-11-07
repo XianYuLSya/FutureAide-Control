@@ -12,6 +12,8 @@ import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 import { TRUSTED_CALLER } from './calling-context.mjs';
 import { compactChanges, compactCreate, compactInspect, compactList, compactStatus, compactWait } from './tool-view.mjs';
 import { FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
+import { TARGETS } from './agent-backend.mjs';
+import { RosterStore } from './roster-store.mjs';
 
 const name = z.string().min(1).max(80).describe('Subagent name in this chat. Names in other chats are unrelated.');
 const message = z.string().min(1).max(100000).describe('Task, update, or answer text. Pass it directly; do not create a communication file.');
@@ -82,17 +84,17 @@ export function registerScopedTools(server, options = {}) {
   const registerView = (tool, description, inputSchema, action, view) =>
     register(tool, description, inputSchema, action, true, false, view);
   registerView('futureaide_status', 'Check this chat context and target readiness. Each backend lists its available model IDs in catalog order and its defaultModel. An unavailable backend or catalog includes the reason. Pass detail: true for the full diagnostics.', { detail }, (s, _a, e) => s.status(e), compactStatus);
-  register('futureaide_run_agent', 'Start a subagent’s work in one call: create the name if it does not exist, then send the task; an existing name simply receives the message. Use model and effort to select what runs this and later inputs for the name. The receipt gives the resolved ID as actualModel. Omit name to have one generated. Results return to this chat through the subagent’s own ask_parent questions and report_parent reports, so do not poll; accepted or queued is a receipt, not completion. lifetime is once (the default) or persistent, and target picks the application for a new name: dsh (the default) or codex-desktop. An existing name keeps its own target and lifetime; a conflicting explicit value is refused rather than running on another application. A new name whose first send fails still returns created:true with that name and its error: the name exists, so call list before deciding whether to send again, and never rename and rerun the task. queued:true means locally saved — do not resend; retrying:true means the original request awaits background recovery, so the caller need not resend; unknown means inspect the original receipt and recipient before deciding whether a retry is safe.', {
+  register('futureaide_run_agent', 'Start a subagent’s work in one call: create the name if it does not exist, then send the task; an existing name simply receives the message. Use model and effort to select what runs this and later inputs for the name. The receipt gives the resolved ID as actualModel. Omit name to have one generated. Results return to this chat through the subagent’s own ask_parent questions and report_parent reports, so do not poll; accepted or queued is a receipt, not completion. lifetime is once (the default) or persistent, and target picks the application for a new name: dsh (the default), codex-desktop or claude-cli. An existing name keeps its own target and lifetime; a conflicting explicit value is refused rather than running on another application. A new name whose first send fails still returns created:true with that name and its error: the name exists, so call list before deciding whether to send again, and never rename and rerun the task. queued:true means locally saved — do not resend; retrying:true means the original request awaits background recovery, so the caller need not resend; unknown means inspect the original receipt and recipient before deciding whether a retry is safe.', {
     name: name.optional(), message, ...modelOptions, lifetime: z.enum(['once', 'persistent']).optional()
       .describe('Lifetime for a new name. Defaults to once. An existing name keeps its own lifetime and a conflicting explicit value is refused.'),
-    target: z.enum(['dsh', 'codex-desktop']).optional()
+    target: z.enum(TARGETS).optional()
       .describe('Execution target bound to a new name. Defaults to dsh. An existing name keeps its own target and a conflicting explicit value is refused; it never falls back to another backend.'),
   }, (s, a, e) => s.run(a, e));
-  register('futureaide_create_agent', 'Reserve a name in the current project. Optionally select its model and reasoning effort before its first input. The receipt gives the resolved ID as actualModel. target picks the application that runs it, once, at creation: dsh (the default) or codex-desktop; every later call addresses the subagent by name only. A target whose adapter is not installed is refused instead of substituting DSH. once removes session data after an explicitly submitted final report is delivered and the tree settles; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
+  register('futureaide_create_agent', 'Reserve a name in the current project. Optionally select its model and reasoning effort before its first input. The receipt gives the resolved ID as actualModel. target picks the application that runs it, once, at creation: dsh (the default), codex-desktop or claude-cli; every later call addresses the subagent by name only. A target whose adapter is not installed is refused instead of substituting DSH. once cleans up the managed name after an explicitly submitted final report is delivered and the tree settles. Claude CLI retains its native conversation history; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
     name, ...modelOptions, lifetime: z.enum(['once', 'persistent']),
-    target: z.enum(['dsh', 'codex-desktop']).optional().describe('Execution target bound to this name. Defaults to dsh. A target that is unavailable here fails explicitly; it never falls back to another backend.'),
+    target: z.enum(TARGETS).optional().describe('Execution target bound to this name. Defaults to dsh. A target that is unavailable here fails explicitly; it never falls back to another backend.'),
   }, (s, a, e) => s.create(a, e), false, false, compactCreate);
-  register('futureaide_send_agent', 'Assign work or supplement a named subagent. You can select its model and effort here. To switch a running Codex turn, wait until it ends and send the new selection. Managed dispatch and monitoring read only the session this name is bound to (DSH or Codex Desktop), not the full session list. queued:true means locally saved; do not resend. retrying:true means the original request awaits background recovery; the caller need not resend. unknown means inspect the original receipt and recipient before any retry; never blindly repeat. accepted:true means the target accepted the request, not that work is complete. Use list for queue status or changes/inspect for details. A waiting subagent treats this as its answer. Only explicit questions and reports return to this chat; ordinary replies and idle trees never notify it.', { name, message, ...modelOptions }, (s, a, e) => s.send(a, e));
+  register('futureaide_send_agent', 'Assign work or supplement a named subagent. You can select its model and effort here. To switch a running Codex turn, wait until it ends and send the new selection. Managed dispatch and monitoring read only the session this name is bound to (DSH, Codex Desktop or Claude CLI), not the full session list. queued:true means locally saved; do not resend. retrying:true means the original request awaits background recovery; the caller need not resend. unknown means inspect the original receipt and recipient before any retry; never blindly repeat. accepted:true means the target accepted the request, not that work is complete. Use list for queue status or changes/inspect for details. A waiting subagent treats this as its answer. Only explicit questions and reports return to this chat; ordinary replies and idle trees never notify it.', { name, message, ...modelOptions }, (s, a, e) => s.send(a, e));
   register('futureaide_answer_agent', 'Answer the named subagent’s pending question directly. The plugin continues its original task once; no exchange ID, command, or text file is needed.', { name, message }, (s, a, e) => s.answer(a, e));
   registerView('futureaide_list_agents', 'Show only this chat’s subagents: name, state, lifetime, actualModel, current task, pending questions, the latest report, the changed-file count and a team roster. A name that has descendants answers with team: one line per member carrying its relative path, state, activity while running and file count, capped at 30 rows and summarised by {more:n} beyond that. The default view is compact; coverage, timestamps, per-node details and the full result text are omitted. The file count includes unconfirmed paths and is paired with their own total, so the two are never added together. Pass detail: true for the complete structure when those fields are needed. Deep history is unnecessary for ordinary supervision.', { detail }, (s, _a, e) => s.list(e), compactList);
   registerView('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, submit a report, await a report, or need attention. Other work may proceed concurrently; a timeout does not cancel a task. Entries include actualModel. Pass detail: true for the complete structure.', {
@@ -106,13 +108,13 @@ export function registerScopedTools(server, options = {}) {
     node: z.string().min(1).max(200).optional().describe('Read only this tree node: its name or its team path from list. Other nodes are returned as name and status.'),
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), compactInspect);
   register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
-  register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing the managed session data of its target (DSH or Codex Desktop) and the private plugin records. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing private plugin records and managed DSH or Codex session data. Claude CLI keeps its native conversation history. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
   return server;
 }
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.14' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.15' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
@@ -123,19 +125,22 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
     return value;
   });
   registerScopedTools(server, { service, diagnostics });
-  const register = toolRegistrar(server, { service, diagnostics });
-  // Codex Desktop side of a cross-application call: the child chat asks or reports
-  // to the name that owns it. The caller is its own chat metadata, never a tool
-  // argument, so no chat id can be supplied by a model.
-  const parentMessage = z.string().min(1).max(100000).describe('Message for the managed parent of this chat. Pass it directly; never a chat id, path, or internal number.');
-  register('ask_parent', 'Ask the parent of this managed Codex subagent a question. The caller is identified from this chat itself, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer. ' + QUESTION_CONTRACT, { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
-  register('report_parent', 'Submit an explicit report from this managed Codex subagent to its parent. The caller is identified from this chat itself. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true. ' + FINAL_REPORT_CONTRACT, {
-    message: parentMessage,
-    final: z.boolean().optional().describe('Submit as the final report. Omitting it submits a progress report and keeps the task open.'),
-  }, (s, a, e) => s.submitToParent({ kind: 'report', message: a.message, final: a.final === true }, e));
+  registerParentTools(server, { service, diagnostics });
   // Restore the shared listener on connection even before the first tool call.
   void service().catch(() => {});
   return server;
+}
+
+// Both child transports supply their own trusted identity. The model can only
+// submit the message and, for a report, tell its parent when it is final.
+function registerParentTools(server, options) {
+  const register = toolRegistrar(server, options);
+  const parentMessage = z.string().min(1).max(100000).describe('Message for the managed parent of this chat. Pass it directly; never a chat id, path, or internal number.');
+  register('ask_parent', 'Ask the parent of this managed subagent a question. The caller is identified by the managed connection, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer. ' + QUESTION_CONTRACT, { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
+  register('report_parent', 'Submit an explicit report from this managed subagent to its parent. The caller is identified by the managed connection. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true. ' + FINAL_REPORT_CONTRACT, {
+    message: parentMessage,
+    final: z.boolean().optional().describe('Submit as the final report. Omitting it submits a progress report and keeps the task open.'),
+  }, (s, a, e) => s.submitToParent({ kind: 'report', message: a.message, final: a.final === true }, e));
 }
 
 /**
@@ -313,9 +318,22 @@ export function makeServer(control, { configPath, controlFactory = createControl
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const diagnostics = createMcpDiagnostics();
-  const server = process.env.FUTUREAIDE_LEGACY_TOOLS === '1' ? makeServer() : makeScopedServer({ diagnostics });
-  const transport = new StdioServerTransport();
-  diagnostics?.attach(transport);
-  await server.connect(transport);
+  if (process.argv[2] === '--claude-cli-reports') {
+    // This server belongs to a single claude -p process. The runner sets the
+    // route in its MCP config, outside the prompt and tool argument schemas.
+    const [roster, agentId, taskId, requestId] = process.argv.slice(3);
+    if (!roster || !agentId || !taskId || !requestId) throw new Error('Missing managed Claude CLI dispatch.');
+    const store = new RosterStore(roster);
+    const server = new McpServer({ name: 'futureaide', version: '1.0.0' });
+    registerParentTools(server, { service: {
+      submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId }),
+    } });
+    await server.connect(new StdioServerTransport());
+  } else {
+    const diagnostics = createMcpDiagnostics();
+    const server = process.env.FUTUREAIDE_LEGACY_TOOLS === '1' ? makeServer() : makeScopedServer({ diagnostics });
+    const transport = new StdioServerTransport();
+    diagnostics?.attach(transport);
+    await server.connect(transport);
+  }
 }

@@ -106,6 +106,8 @@ test('an idle thread gets turn/start with no model, effort or permission fields'
   const result = await sendCodexTextNative('thread-1', 'hello', { request: fake.request });
   assert.equal(result.turn.id, 'turn-1');
   assert.deepEqual(fake.calls.map(call => call.method), ['thread/read', 'thread/turns/list', 'turn/start']);
+  assert.equal(fake.calls.find(call => call.method === 'thread/turns/list').params.itemsView, 'notLoaded');
+  assert.ok(fake.calls.find(call => call.method === 'thread/turns/list').params.limit <= 10);
   const params = fake.calls.at(-1).params;
   assert.deepEqual(params.input, [{ type: 'text', text: 'hello', text_elements: [] }]);
   for (const forbidden of ['model', 'effort', 'approvalPolicy', 'approvalsReviewer', 'sandboxPolicy', 'permissions']) {
@@ -197,6 +199,7 @@ test('a missing thread becomes a terminal codex-thread-not-found error', async (
   await assert.rejects(readCodexThreadNative('gone', { request: async () => { throw missing; } }),
     { code: 'codex-thread-not-found', terminal: true });
   assert.equal(isCodexThreadMissing(missing), true);
+  assert.equal(isCodexThreadMissing({ code: 'codex-native-rpc-rejected', rpcMessage: 'thread/read: thread not loaded: gone' }), true);
   assert.equal(isCodexThreadMissing(new Error('socket closed')), false);
   assert.match(codexThreadNotFound('gone').message, /current profile/);
 });

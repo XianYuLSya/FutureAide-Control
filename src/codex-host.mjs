@@ -9,7 +9,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
   requestCodexNative, readCodexThreadNative, ensureCodexThreadNative, listCodexTurnsNative,
-  listCodexModelsNative, sendCodexTextNative,
+  listCodexItemsNative, listCodexModelsNative, sendCodexTextNative,
 } from './codex-ipc.mjs';
 
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
@@ -63,17 +63,21 @@ export function projectCodexTurns(previous, turns, requests = {}) {
         : turn.status === 'failed' ? 'failed' : 'completed';
     }
     for (const item of turn.items ?? []) {
-      if (typeof item?.id !== 'string') continue;
+      // Summary views identify the first user message and last agent message by
+      // clientId rather than a persisted item id.
+      const itemId = typeof item?.id === 'string' ? item.id
+        : typeof item?.clientId === 'string' ? item.clientId : undefined;
+      if (!itemId) continue;
       const kind = String(item.type).toLowerCase();
       if (kind === 'usermessage' || kind === 'agentmessage') {
         const role = kind === 'usermessage' ? 'user' : 'assistant';
         const text = itemText(item);
-        const index = p.messageIds[item.id];
+        const index = p.messageIds[itemId];
         if (index !== undefined) p.messages[index] = { ...p.messages[index], text };
         else {
           seq++;
-          p.messageIds[item.id] = p.messages.length;
-          p.messages.push({ id: item.id, role, text, seq, turnId: turn.id });
+          p.messageIds[itemId] = p.messages.length;
+          p.messages.push({ id: itemId, role, text, seq, turnId: turn.id });
           if (p.messages.length > 1000) {
             const dropped = p.messages.shift();
             if (dropped?.id) delete p.messageIds[dropped.id];
@@ -87,8 +91,8 @@ export function projectCodexTurns(previous, turns, requests = {}) {
             p.deliveries[id] = { seq, turnId: turn.id };
           }
         }
-      } else if (kind === 'filechange' && item.status === 'completed' && !p.changeSeen[item.id]) {
-        p.changeSeen[item.id] = true;
+      } else if (kind === 'filechange' && item.status === 'completed' && !p.changeSeen[itemId]) {
+        p.changeSeen[itemId] = true;
         seq++;
         const changes = Array.isArray(item.changes)
           ? item.changes
@@ -533,7 +537,8 @@ export function createCodexHost(options = {}) {
       const visit = async (thread, parentId) => {
         if (visited.has(thread.id)) return;
         visited.add(thread.id);
-        const page = await listCodexTurnsNative(thread.id, { limit: TURN_PAGE_LIMIT, request: nativeRequest });
+        const page = await listCodexTurnsNative(thread.id, { limit: TURN_PAGE_LIMIT,
+          itemsView: 'summary', request: nativeRequest });
         const projection = projectCodexTurns(projections[thread.id], page.data, requests);
         const model = currentModelFromThread(thread);
         if (model) projection.currentModel = model;
@@ -557,6 +562,32 @@ export function createCodexHost(options = {}) {
         at: Date.now(), result });
       return result;
     },
+    async readHistory({ nativeSessionId, maxMessages = 20 }) {
+      // Inspect is the only full-history reader. Turn summaries locate the page;
+      // one turn is hydrated at a time, so a large thread never loads wholesale.
+      const summary = await listCodexTurnsNative(nativeSessionId, { limit: Math.min(Math.max(maxMessages, 1), 30),
+        itemsView: 'summary', request: nativeRequest });
+      const turns = [...(summary.data ?? [])].sort((a, b) => (a?.startedAt ?? 0) - (b?.startedAt ?? 0));
+      const full = [];
+      let truncated = Boolean(summary.nextCursor);
+      for (const turn of turns) {
+        const items = [];
+        let cursor;
+        let pages = 0;
+        do {
+          const page = await listCodexItemsNative(nativeSessionId, turn.id, { limit: 100, cursor,
+            request: nativeRequest });
+          items.push(...page.data.map(entry => entry?.item).filter(Boolean));
+          cursor = typeof page.nextCursor === 'string' ? page.nextCursor : undefined;
+          pages++;
+        } while (cursor && items.length < 500 && pages < 5);
+        if (cursor) truncated = true;
+        full.push({ ...turn, items });
+      }
+      const projection = projectCodexTurns(emptyProjection(), full);
+      return { messages: projection.messages.slice(-maxMessages),
+        hasMore: truncated || projection.messages.length > maxMessages };
+    },
     async interrupt({ nativeSessionId, ownedNodeIds = [] }) {
       await ensureCodexThreadNative(nativeSessionId, { request: nativeRequest });
       const allowed = new Set(ownedNodeIds.length ? ownedNodeIds : [nativeSessionId]);
@@ -565,7 +596,7 @@ export function createCodexHost(options = {}) {
         if (visited.has(id) || !allowed.has(id)) return;
         visited.add(id);
         try {
-          const page = await listCodexTurnsNative(id, { limit: 10, request: nativeRequest });
+          const page = await listCodexTurnsNative(id, { limit: 10, itemsView: 'notLoaded', request: nativeRequest });
           const active = (page.data ?? []).find(turn => turn?.status === 'inProgress' && typeof turn.id === 'string');
           if (active) {
             try {
@@ -619,13 +650,7 @@ export function createCodexHost(options = {}) {
       }
       const exists = async id => {
         try { await readCodexThreadNative(id, { request: nativeRequest }); return true; }
-        catch (error) {
-          // Only this post-delete check treats "thread not loaded" as gone: a normal
-          // cold read succeeds with status notLoaded instead of rejecting.
-          if (error.code === 'codex-thread-not-found'
-              || /thread not loaded|thread not found|does not exist/i.test(String(error?.rpcMessage ?? error?.message ?? ''))) return false;
-          throw error;
-        }
+        catch (error) { if (error.code === 'codex-thread-not-found') return false; throw error; }
       };
       for (const id of rows) {
         await nativeRequest('thread/delete', { threadId: id });
@@ -646,8 +671,10 @@ export function createCodexHost(options = {}) {
         if (typeof thread?.id !== 'string' || (thread.createdAt ?? 0) < cutoff) continue;
         let turns;
         try {
-          const read = await readCodexThreadNative(thread.id, { request: nativeRequest, includeTurns: true });
-          turns = Array.isArray(read.turns) ? read.turns : [];
+          // The marker is in the first user message, which every summary turn
+          // page carries. This never hydrates full history and never resumes.
+          turns = (await listCodexTurnsNative(thread.id, { limit: 30, itemsView: 'summary',
+            request: nativeRequest })).data;
         } catch { continue; }
         const observed = projectCodexTurns(emptyProjection(), turns, { recovery: { marker: input.marker } });
         if (observed.deliveries.recovery) hits.push(thread);

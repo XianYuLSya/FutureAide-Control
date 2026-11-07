@@ -1135,20 +1135,22 @@ test('a busy delivery_pending name waits for the poll lock instead of queueing o
   } finally { await claude.close(); f.service.close(); }
 });
 
-test('a final whose receipt has not landed yet still refuses the next task without writing it twice', async () => {
+test('an unconfirmed final no longer blocks the next task and is reported back', async () => {
   const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
   const claude = await restartedClaude();
   try {
     await claude.come();
     pendingReport(f, claude, 'unread', { state: 'unknown' });
-    const error = await f.service.send({ name: 'unread', message: 'next order' }, claudeCaller(claude.sessionId))
-      .then(() => null, value => value);
-    assert.match(error.message, /final report is waiting for delivery/);
+    const sent = await f.service.send({ name: 'unread', message: 'next order' }, claudeCaller(claude.sessionId));
+    assert.equal(sent.previousReport.delivered, false);
+    assert.match(sent.previousReport.summary, /verified final artifact/);
     assert.equal(claude.received.length, 0, 'an ambiguous write is never sent a second time');
     const current = f.store.get('unread');
-    assert.equal(current.state, 'delivery_pending');
-    assert.equal(current.task.message, 'work', 'no second task was started');
-    assert.equal(current.task.reports[0].delivery.state, 'unknown');
+    assert.notEqual(current.state, 'delivery_pending');
+    assert.equal(current.task.message, 'next order', 'the next task started');
+    const old = f.store.historyFor('unread').find(task => task.taskId === 'task-unread');
+    assert.equal(old.reports[0].delivery.state, 'blocked');
+    assert.equal(old.reports[0].delivery.error.reason, 'unconfirmed');
   } finally { await claude.close(); f.service.close(); }
 });
 

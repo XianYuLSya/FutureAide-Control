@@ -358,7 +358,52 @@ test('interrupt reaches a running native child even when the root turn already e
     [{ threadId: 'child', turnId: 'turn-child' }]);
 });
 
-test('an unchanged idle thread reuses its observation without pulling turns or children', async () => {
+test('observe uses turn summaries and inspect hydrates one turn at a time', async () => {
+  const calls = [];
+  const host = createCodexHost({ nativeRequest: async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/read') return { thread: liveThread({ id: 'root', cwd: 'D:/work/p', updatedAt: 2 }) };
+    if (method === 'thread/turns/list') return livePage([liveTurn({ id: 'turn-1', startedAt: 1793932679,
+      items: [{ id: 'u1', type: 'userMessage', content: [{ type: 'text', text: 'hello' }] }] })]);
+    if (method === 'thread/items/list') return { data: [
+      { turnId: 'turn-1', item: { id: 'u1', type: 'userMessage', content: [{ type: 'text', text: 'hello' }] } },
+      { turnId: 'turn-1', item: { id: 'a1', type: 'agentMessage', text: 'world' } },
+    ], nextCursor: null };
+    if (method === 'thread/list') return livePage();
+    throw new Error('unexpected ' + method);
+  } });
+  await host.observe({ nativeSessionId: 'root', workspace: 'D:/work/p' });
+  assert.equal(calls.find(call => call.method === 'thread/turns/list').params.itemsView, 'summary');
+  const history = await host.readHistory({ nativeSessionId: 'root', maxMessages: 20 });
+  assert.deepEqual(history.messages.map(message => message.text), ['hello', 'world']);
+  assert.equal(calls.filter(call => call.method === 'thread/items/list').length, 1);
+  assert.equal(calls.some(call => call.method === 'thread/turns/list'
+    && call.params.itemsView === 'full'), false, 'observe never asks for a full turn page');
+});
+
+test('a summary observation keeps prior file changes instead of dropping them', () => {
+  const first = projectCodexTurns(emptyProjection(), [liveTurn({ id: 'turn-1', status: 'completed', items: [
+    { id: 'f1', type: 'fileChange', status: 'completed', changes: [{ path: 'D:/work/p/a.txt', kind: { type: 'add' } }] },
+  ] })]);
+  assert.equal(first.changes.length, 1);
+  const next = projectCodexTurns(first, [liveTurn({ id: 'turn-1', status: 'completed', items: [
+    { clientId: 'u1', type: 'userMessage', content: [{ type: 'text', text: 'summary only' }] },
+    { clientId: 'a1', type: 'agentMessage', text: 'done' },
+  ] })]);
+  assert.deepEqual(next.changes, first.changes);
+});
+
+test('readHistory reports hasMore when an item page is truncated', async () => {
+  const host = createCodexHost({ nativeRequest: async method => {
+    if (method === 'thread/turns/list') return livePage([liveTurn({ id: 'turn-1', startedAt: 1 })]);
+    if (method === 'thread/items/list') return { data: [], nextCursor: 'more-items' };
+    throw new Error('unexpected ' + method);
+  } });
+  const page = await host.readHistory({ nativeSessionId: 'root', maxMessages: 20 });
+  assert.equal(page.hasMore, true);
+});
+
+test('an idle thread reuses its observation without pulling turns or children', async () => {
   let updatedAt = 1, turnsReads = 0, childReads = 0;
   const host = createCodexHost({ nativeRequest: async (method, params) => {
     if (method === 'thread/read') return { thread: liveThread({ id: 'root', cwd: 'D:/work/p', updatedAt,
@@ -390,19 +435,18 @@ test('findCreatedSession is read-only, skips an unreadable candidate and confirm
       liveThread({ id: 'someone-else', cwd: 'D:/work/p', createdAt }),
       liveThread({ id: 'thread-1', cwd: 'D:/work/p', createdAt }),
     ]);
-    if (method === 'thread/read' && params.threadId === 'someone-else') throw new Error('not readable in this store');
-    if (method === 'thread/read') return { thread: liveThread({ id: 'thread-1', cwd: 'D:/work/p', turns: [
-      liveTurn({ id: 'turn-1', items: [
-        { id: 'u1', type: 'userMessage', content: [{ type: 'text', text: `${marker}\nwork` }] },
-      ] }),
-    ] }) };
-    if (method === 'thread/turns/list') throw new Error('turns should come from the read-only thread/read page');
+    if (method === 'thread/turns/list' && params.threadId === 'someone-else') throw new Error('not readable in this store');
+    if (method === 'thread/turns/list') return livePage([liveTurn({ id: 'turn-1', startedAt: createdAt, items: [
+      { clientId: 'u1', type: 'userMessage', content: [{ type: 'text', text: `${marker}\nwork` }] },
+    ] })]);
+    if (method === 'thread/read') throw new Error('recovery must not hydrate a thread');
     throw new Error('unexpected ' + method);
   } });
   assert.deepEqual(await host.findCreatedSession({ workspace: 'D:/work/p', marker, startedAt }),
     { nativeSessionId: 'thread-1' }, 'one unreadable candidate does not abort the scan');
   assert.equal(calls.find(call => call.method === 'thread/list').params.limit, 100);
-  assert.ok(calls.filter(call => call.method === 'thread/read').every(call => call.params.includeTurns === true));
+  assert.ok(calls.filter(call => call.method === 'thread/turns/list').every(call => call.params.itemsView === 'summary'));
+  assert.equal(calls.some(call => call.method === 'thread/read'), false, 'recovery never hydrates a thread');
   assert.equal(calls.some(call => call.method === 'thread/resume'), false, 'recovery never resumes a user thread');
 });
 

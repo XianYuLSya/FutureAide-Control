@@ -1,5 +1,16 @@
 # 更新记录
 
+## 0.5.15 — 2026-11-07 · Claude CLI 目标，回报不再卡死
+
+本版新增 `claude-cli` 目标，并修掉让名字永久锁住的回报问题。升级后监工第一轮会解开卡住的旧记录，超过 6 小时的旧通知不再推送，正文保留。
+
+- 新增 `target: "claude-cli"`：用官方无头模式在后台运行 Claude Code，Codex 和 Claude 调用方都能按名字派单，支持 `model` 和 `effort`，长期名字续用同一会话。需要 CLI 自己的登录。
+- 大线程不再超时：发送和观察改用轻量视图，完整内容只给 `inspect`，并逐轮分页。
+- 回报确认有结论：读回读全且确认没有才重发一次，读不全不重发。30 分钟确认不了转 `blocked`，原因 `unconfirmed`；超过 6 小时的待发通知转 `blocked`，原因 `expired`。前一条未决通知不再堵住后面的最终报告。
+- 只有最终报告真正送达，`once` 才自动清理；报告没送到时保留名字和正文。
+- 上级派新任务不再被回包确认挡住，回执用 `previousReport` 带上上一份报告的摘要。
+- `thread not loaded` 视为线程不在当前档案，通知转终态，不再无限重试。
+
 ## 0.5.14 — 2026-11-06 · 调用时选模型和思考强度
 
 本版让调用方按名字选模型。没选过的名字行为不变，继续跟随目标应用的默认值。失败通知现在带上错误代码，比如 `QUOTA`。
@@ -17,6 +28,8 @@
 - 失败通知：任务进入确定的失败终态时，复用 report 的投递与去重给直接上级发一次通知，写明助手名、“执行失败”和简短原因；Claude 与 Codex 上级同一路径。通知作为任务内的报告条目进入既有候选扫描，首投遇到瞬时不可用会在后续扫描重试；terminal 错误也同样发一次，失败重试仍在进行时不发，上级自己 cancel 造成的停止不发。
 - 稳定性：所有名字共用的原生 RPC 连接只在传输故障时重建，应用层拒绝不再关掉 socket 掐断别的名字；首派 unknown 超过 2 分钟且所有线程都找不到 marker 时转失败终态，由上级决定是否重派；`findCreatedSession` 只读、绝不 resume 用户线程；`status` 的 Codex 证据改为 `native-rpc`。
 - 收尾：删除后的核对把 `thread/read` 的“thread not loaded”视为已删除；没有 binding 的名字直接算清理完成；首次 rollout 未写入时观察按运行中处理，不闪 reconnecting；后续消息的 marker 也放最后。README 与 SKILL 记录取消不会杀掉 Codex 已启动的 shell 命令。Codex 宿主身份只比较 `application`，旧记录的 `dataRoot` 不再参与比较；清理时 `thread not loaded` 和 `codex-thread-not-found` 都按已删除处理。
+- 回包确认：Codex 发送只用 `notLoaded` 轮次页判断运行中，observe 用 `summary`，`full` 只由 inspect 对单轮 `thread/items/list` 分页读取；owner 读回先看最近 30 轮 summary，再逐轮最多 5 轮确认，确认缺失且超过 2 分钟才重发一次。未确认超过 30 分钟转 `blocked`（reason `unconfirmed`），6 小时未发转 `blocked`（reason `expired`），正文保留；前一条 unknown 不再堵住 final。`delivery_pending` 的名字可接受新任务，回执带 `previousReport`（delivered:false，摘要最多 300 字）。`thread not loaded` 纳入全局 missing 判定。
+- 审核收口：只有 final 真正 `delivered` 才允许 once 自动清理；blocked final 保留名字和正文，persistent 回 idle，once 留在名单等手动删除。通知时间只认 report/task 的真实时间，缺失的真实旧通知按 `expired` 处理；owner 读回按 `nextCursor` 翻完候选轮次（每轮有上限，未读完不重发）；`turn/start`/`turn/steer` 明确成功即 accepted；inspect 截断时 `hasMore` 为 true。
 - 观察：改用 `thread/read`、`thread/turns/list`、`thread/list` 组装状态、消息和文件改动；原生子线程按 `thread/list.parentThreadId` 入树，不再读 `state_5.sqlite`、`thread_history_1.sqlite` 或 rollout 文件。`thread/list` 的 `sourceKinds` 显式包含 subAgent 各类型。线程 `updatedAt`/状态未变时复用上轮结果，不重复拉 turns 和子线程；冷线程 resume 使用 `excludeTurns`，turn 页只取最新 20 条。
 - 调用方验证与回报送达：Codex owner 的读取、问答/报告通知统一走一个入口，优先原生 RPC；桌面没有调试端口（`codex-native-rpc-unavailable`）时退回 app-tools，普通 Codex 对话调 DSH 的基础场景不变。写入失败不自动重试，结果不明仍走 `unknown` 语义；线程在当前档案不存在时通知转 `blocked` 终态、保留报告正文并在 list 给出原因，瞬时不可用继续等待重试。
 - 状态与错误：`status` 的 Codex 就绪来自一次真实的 `thread/list` 读类 RPC；没有调试端口时给出 `codex-native-rpc-unavailable`，文字提示从 FAswitch 打开 Codex。当前档案里看不到受管线程时返回 `codex-thread-not-found` 并终止该任务的重试，不再无限轮询。

@@ -2,11 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createControl, endedState, modelTurnError } from './control.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { actualModelName, resolveModelSelection, sameModelSelection } from './model-selection.mjs';
-import { callCodexOwner } from './codex-notify.mjs';
+import { callCodexOwner, readCodexOwnerTurns, readCodexOwnerItems } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-sessions.mjs';
@@ -14,7 +15,7 @@ import { RosterStore } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, readStatusModels, resolveBackend,
+import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, readStatusModels, REMOVED_TARGETS, removedTarget, resolveBackend,
   TARGET_LABELS, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 import { FINAL_REPORT_REMINDER } from './report-contract.mjs';
@@ -26,6 +27,10 @@ const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_repor
 const METHODS = DSH_HOST_METHODS;
 const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
+const UNCONFIRMED_AFTER_MS = 30 * 60 * 1000;
+const EXPIRE_UNSENT_AFTER_MS = 6 * 60 * 60 * 1000;
+const CONFIRM_ABSENCE_AFTER_MS = 2 * 60 * 1000;
+const terminalNotice = notice => ['delivered', 'blocked'].includes(notice?.state);
 let codexProbePromise;
 /** codex-host's own registration probe, imported lazily so only the Codex path loads it. */
 function defaultCodexProbe() {
@@ -37,6 +42,11 @@ function defaultCodexProbe() {
 const reportProtocolError = (host = 'DSH') => Object.assign(new Error(`Update the ${host} plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting ${host} is not required.`), { code: 'report-protocol-required' });
 const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host} bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting ${host} is not required.`), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
+const readOnlyTarget = record => REMOVED_TARGETS.includes(record?.target);
+function requireWritableTarget(record) {
+  if (readOnlyTarget(record)) throw removedTarget(record.target);
+  return record;
+}
 
 function assertName(name) {
   if (typeof name !== 'string' || !name.trim() || name !== name.trim() || name.length > 80 || /[\x00-\x1f]/.test(name)) {
@@ -51,7 +61,7 @@ function textMessage(message) {
 function stableHost(identity, target) {
   // Codex home changes wholesale when FAswitch switches profiles, and the thread
   // read is the real ownership test. Compare only the application there.
-  if (target === 'codex-desktop') return { application: identity.application ?? null };
+  if (target === 'codex-desktop' || target === 'claude-cli') return { application: identity.application ?? null };
   return { application: identity.application ?? null, dataRoot: path.resolve(identity.dataRoot ?? '') };
 }
 // The compact view keeps the one label that stops a snapshot guess reading as a confirmed write.
@@ -175,7 +185,7 @@ function publicResult(record, { fullResult = false } = {}) {
     // list/wait must not present an intended selection as an observed model. An
     // unpinned Codex name starts null and becomes known from the live observation
     // before record.model catches up.
-    actualModel: record.modelPin
+    actualModel: record.modelPin && targetOf(record) !== 'claude-cli'
       ? actualModelName(record.model) ?? actualModelName(record.observation?.currentModel)
       : actualModelName(record.observation?.currentModel) ?? actualModelName(record.model),
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
@@ -192,10 +202,10 @@ function publicResult(record, { fullResult = false } = {}) {
       observedAt: view.capturedAt ?? null, stale: Boolean(view.stale) },
     questions: (view.questions ?? []).filter(question => question.state === 'pending').map(question => ({ message: question.message })),
     tree: publicTree(record, view),
-    reports: { total: explicitReports.length, pending: explicitReports.filter(report => report.delivery.state !== 'delivered').length,
+    reports: { total: explicitReports.length, pending: explicitReports.filter(report => !terminalNotice(report.delivery)).length,
       ...(explicitReports.length ? { latest: { summary: compactText(explicitReports.at(-1).message, 240), final: explicitReports.at(-1).final, delivery: explicitReports.at(-1).delivery.state,
         ...(explicitReports.at(-1).delivery.error ? { error: explicitReports.at(-1).delivery.error } : {}) } } : {}) },
-    delivery: explicitReports.find(report => report.delivery.state !== 'delivered')?.delivery.state ?? explicitReports.at(-1)?.delivery.state ?? null, updatedAt: record.updatedAt,
+    delivery: explicitReports.find(report => !terminalNotice(report.delivery))?.delivery.state ?? explicitReports.at(-1)?.delivery.state ?? null, updatedAt: record.updatedAt,
     ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
     ...(error ? { error } : {}),
   };
@@ -261,14 +271,14 @@ export const claudeNoticeRequestId = id => /^[a-zA-Z0-9-]{1,100}$/.test(id)
 const claudeNeverWritten = notice => notice.error?.code === 'ENOENT'
   || (claudeNoticeRequestId(notice.id) !== notice.id && notice.error?.message === 'claude-request-id-invalid');
 
-export async function findClaudeReceipt(binding, notice) {
+export async function findClaudeReceipt(binding, notice, readEvents = readClaudeEvents) {
   let cursor = Number.isSafeInteger(notice.cursor) ? notice.cursor : 0;
   for (let page = 0; page < CLAUDE_PAGES_PER_POLL; page++) {
     let read;
-    try { read = await readClaudeEvents(binding, { offset: cursor, maxBytes: CLAUDE_PAGE_BYTES }); }
+    try { read = await readEvents(binding, { offset: cursor, maxBytes: CLAUDE_PAGE_BYTES }); }
     catch (error) {
       if (!String(error?.message ?? '').includes('line-exceeds-page') || CLAUDE_PAGE_BYTES >= CLAUDE_MAX_PAGE_BYTES) throw error;
-      read = await readClaudeEvents(binding, { offset: cursor, maxBytes: CLAUDE_MAX_PAGE_BYTES });
+      read = await readEvents(binding, { offset: cursor, maxBytes: CLAUDE_MAX_PAGE_BYTES });
     }
     const matched = claudeNoticeReceipt(read.deliveries, claudeNoticeRequestId(notice.id));
     const next = Number.isSafeInteger(read.offset) ? read.offset : cursor;
@@ -370,11 +380,17 @@ export function createScopedAgents(config, {
   codexProbeRegistration = undefined,
   captureFiles = captureWorkspace,
   onPollComplete = () => {},
+  // A drill may replace the Claude transport. Production leaves this empty.
+  claudeInbox = {},
   // Work queued in this process (a supplement, a cancel, a first dispatch) is a wake
   // a listener living in the same process can act on at once. A caller in another
   // process cannot be seen this way and waits for the monitor's own sweep.
   onWorkQueued = () => {},
 } = {}) {
+  const claudeSend = claudeInbox.send ?? sendClaude;
+  const claudeDiscover = claudeInbox.discover ?? discoverClaude;
+  const claudeReadEvents = claudeInbox.readEvents ?? readClaudeEvents;
+  const claudeBind = claudeInbox.bind ?? bindClaude;
   const clients = new Map();
   const operationBackends = new WeakMap();
   const inflight = new Map(), monitorInflight = new Map();
@@ -481,7 +497,13 @@ export function createScopedAgents(config, {
       writeNativeState: value => store.saveBackendState(record.agentId, value),
       withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
       ensureCodexReports: () => beginCodexReports(record),
-      readCodexReportState: () => readCodexReportState(load()),
+      readCodexReportState: () => readParentSubmissions(load()),
+      ...(target === 'claude-cli' ? {
+        readParentSubmissions: () => readParentSubmissions(load()),
+        claudeReportConfig: requestId => ({ mcpServers: { futureaide: { type: 'stdio', command: process.execPath,
+          args: [fileURLToPath(new URL('./mcp-server.mjs', import.meta.url)), '--claude-cli-reports',
+            store.location, record.agentId, load().task.taskId, requestId] } } }),
+      } : {}),
       // The Codex probe reads its protocol readiness only; this must never start a
       // session, so it is the same read-only evidence status uses.
       readCodexReportStatus: () => readCodexReportStatus(record),
@@ -576,11 +598,11 @@ export function createScopedAgents(config, {
   }
 
   /**
-   * Codex-side explicit ask/report arrive through the shared submission queue. The
+   * Codex and Claude CLI explicit callbacks arrive through the shared submission queue. The
    * adapter surfaces them as its own questions/reports; the one state machine owns
    * delivery, so no second task or notice machine exists.
    */
-  function readCodexReportState(record) {
+  function readParentSubmissions(record) {
     if (!record?.task) return { questions: [], reports: [] };
     const pending = store.submissions(record.agentId, record.task.taskId);
     // Both lists carry the task they belong to: the Codex backend filters by taskId, so
@@ -780,6 +802,7 @@ export function createScopedAgents(config, {
   // by the monitor's existing DSH host-state wake path instead.
 
   function needsPoll(record) {
+    if (readOnlyTarget(record)) return false;
     if (record?.state === 'cleaning') return true;
     if (!record || record.closed || record.sleep) return false;
     if (ACTIVE.has(record.state)) return true;
@@ -807,7 +830,7 @@ export function createScopedAgents(config, {
   function announceWork(agentId) { try { if (agentId) onWorkQueued(agentId); } catch { /* a hint is never worth failing a call for */ } }
 
   async function ensureWorker(record, { wake = false } = {}) {
-    if (!record) return false;
+    if (!record || readOnlyTarget(record)) return false;
     if (wake && record.sleep) {
       if (!await ensureMonitor()) {
         // Nothing can watch this installation right now. Keep the sleeping
@@ -887,7 +910,7 @@ export function createScopedAgents(config, {
           status: child.closed ? 'closed' : child.state, activity: child.state, changes: [], coverage: 'Not observed',
           backendKey: child.agentId, nativeSessionId: child.sessionId, synthetic: true });
       }
-      const pendingReports = (child.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
+      const pendingReports = (child.task?.reports ?? []).some(report => !terminalNotice(report.delivery));
       const pendingQuestions = (entry.view?.questions ?? []).some(question => question.state === 'pending');
       const busy = Boolean(child.task) && (pendingReports || pendingQuestions
         || ACTIVE.has(child.state) || child.state === 'cleanup_failed'
@@ -1003,7 +1026,7 @@ export function createScopedAgents(config, {
       store.save(record);
       return;
     }
-    if (target === 'codex-desktop') {
+    if (target !== 'dsh') {
       // Native inheritance: read the actual model for display, but never select or
       // send one for a name that did not ask for an explicit selection.
       const current = observed && observed.modelSelectionObserved !== false && observed.currentModel
@@ -1155,6 +1178,54 @@ export function createScopedAgents(config, {
     record.error = { code: 'codex-thread-not-found', message: CODEX_PROFILE_MISSING, detail: safeError(error) };
   }
 
+  function blockUndelivered(notice, reason, message) {
+    notice.state = 'blocked';
+    notice.blockedAt = now();
+    notice.error = { code: reason === 'expired' ? 'delivery-expired' : 'delivery-unconfirmed', message, reason };
+  }
+
+  const noticeAge = notice => Date.now() - Date.parse(notice.createdAt ?? '');
+  const attemptAge = notice => Date.now() - Date.parse(notice.attemptedAt ?? notice.createdAt ?? '');
+
+  /**
+   * A Codex owner's notification marker sits in the first user message, which a
+   * summary page already carries. Only when that is absent do we read the few
+   * turns started (or still running) after the attempt, one turn at a time.
+   * `complete` is false when the summary page was not the whole relevant window.
+   */
+  async function findCodexNotice(owner, notice, marker) {
+    const summary = await readCodexOwnerTurns(owner.threadId, { limit: 30, itemsView: 'summary' }, { nativeRequest });
+    if (JSON.stringify(summary).includes(marker)) return { delivered: true, complete: true };
+    const attempted = Date.parse(notice.attemptedAt ?? notice.createdAt ?? '');
+    const turns = Array.isArray(summary.data) ? summary.data : [];
+    const started = turns.map(turn => Number(turn.startedAt) * 1000).filter(Number.isFinite);
+    const oldest = started.length ? Math.min(...started) : undefined;
+    const candidates = turns.filter(turn => {
+      const start = Number(turn.startedAt) * 1000, end = Number(turn.completedAt) * 1000;
+      return turn.status === 'inProgress'
+        || (Number.isFinite(start) && start >= attempted - 5000)
+        || (Number.isFinite(end) && end >= attempted - 5000);
+    });
+    const complete = (!summary.nextCursor || (Number.isFinite(attempted) && oldest !== undefined && attempted >= oldest))
+      && candidates.length <= 5;
+    let allItemsRead = true;
+    for (const turn of candidates.slice(0, 5)) {
+      if (typeof turn.id !== 'string') continue;
+      let cursor;
+      let pages = 0;
+      while (true) {
+        const page = await readCodexOwnerItems(owner.threadId, turn.id, { limit: 100,
+          ...(cursor ? { cursor } : {}) }, { nativeRequest });
+        if (JSON.stringify(page).includes(marker)) return { delivered: true, complete: true };
+        cursor = typeof page.nextCursor === 'string' ? page.nextCursor : undefined;
+        pages++;
+        if (!cursor) break;
+        if (pages >= 5) { allItemsRead = false; break; }
+      }
+    }
+    return { delivered: false, complete: complete && allItemsRead };
+  }
+
   async function verifyOwner(owner) {
     const thread = threadFromResult(await codexOwnerCall(owner.threadId, 'read_thread', {
       threadId: owner.threadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 100,
@@ -1191,7 +1262,7 @@ export function createScopedAgents(config, {
     let failure = task.reports.find(report => report.failure === true);
     if (!failure) {
       failure = { id: `failure-${task.taskId}`, taskId: task.taskId, message: text, final: false,
-        failure: true, delivery: { id: `failure-notice-${task.taskId}`, state: 'pending' } };
+        failure: true, createdAt: now(), delivery: { id: `failure-notice-${task.taskId}`, state: 'pending', createdAt: now() } };
       task.reports.push(failure);
     }
     await deliver(record, failure.delivery, failure.message);
@@ -1200,6 +1271,26 @@ export function createScopedAgents(config, {
   async function deliver(record, notice, text) {
     if (notice.state === 'delivered') return;
     if (notice.state === 'blocked') return;
+    // Only the report's own createdAt (or the notice's creation time) may date it.
+    // An old row with no real timestamp is expired, never stamped with "now".
+    if (!Number.isFinite(Date.parse(notice.createdAt ?? ''))) {
+      blockUndelivered(notice, 'expired', 'This notice has no original creation time. Its body is kept and it was not sent.');
+      store.save(record);
+      return;
+    }
+    // A monitor restart can release many old rows at once. Never flood the chat:
+    // anything older than six hours is terminal, and anything still unconfirmed
+    // after thirty minutes stops waiting so later notices and new tasks can move.
+    if (noticeAge(notice) >= EXPIRE_UNSENT_AFTER_MS) {
+      blockUndelivered(notice, 'expired', 'This notice was created more than 6 hours ago and was never sent. Its body is kept.');
+      store.save(record);
+      return;
+    }
+    if (attemptAge(notice) >= UNCONFIRMED_AFTER_MS) {
+      blockUndelivered(notice, 'unconfirmed', 'Delivery could not be confirmed within 30 minutes. Its body is kept.');
+      store.save(record);
+      return;
+    }
     if (notice.nextAttemptAt && notice.nextAttemptAt > Date.now()) return;
     const owner = store.owner(record.ownerId);
     notice.id ??= uid('notice');
@@ -1218,11 +1309,21 @@ export function createScopedAgents(config, {
           // so a long report's trailing marker is never reliable — deliveries are.
           // The scan starts at this notice's own cursor, so a long parent chat is
           // never rescanned and a page boundary simply continues on the next poll.
-          const settled = await findClaudeReceipt(await claudeNoticeBinding(owner), notice);
+          const settled = await findClaudeReceipt(await claudeNoticeBinding(owner), notice, claudeReadEvents);
           Object.assign(notice, settled
             ? { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined }
             : { state: 'unknown' });
+        } else if (typeof nativeRequest === 'function') {
+          const found = await findCodexNotice(owner, notice, marker);
+          if (found.delivered) {
+            Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
+          } else if (found.complete && Date.now() - (Date.parse(notice.attemptedAt ?? notice.createdAt ?? '') || Date.now()) >= CONFIRM_ABSENCE_AFTER_MS && !notice.resendAttempted) {
+            // The whole relevant turn window was read and the marker is absent.
+            // Re-send exactly once; this is no longer a blind write.
+            Object.assign(notice, { state: 'pending', resendAttempted: true, nextAttemptAt: undefined, error: undefined });
+          } else notice.state = 'unknown';
         } else {
+          // No debug port: the ordinary app-tools read remains the fallback.
           const history = await codexOwnerCall(owner.threadId, 'read_thread', {
             threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
           });
@@ -1261,7 +1362,7 @@ export function createScopedAgents(config, {
         // Remember where the transcript ends before writing: the receipt can only
         // appear after this point, so later polls start here instead of rescanning.
         notice.cursor = await transcriptCursor(binding).catch(() => undefined);
-        const send = target => sendClaude(target, `${text}\n\n${marker}`, { requestId: claudeNoticeRequestId(notice.id) });
+        const send = target => claudeSend(target, `${text}\n\n${marker}`, { requestId: claudeNoticeRequestId(notice.id) });
         const resend = async () => {
           const fresh = await refreshClaudeBinding(owner);
           notice.cursor = await transcriptCursor(fresh).catch(() => undefined);
@@ -1312,13 +1413,13 @@ export function createScopedAgents(config, {
     if (!owner?.nativeSessionId) throw Object.assign(new Error('This owner has no native Claude session to answer.'),
       { code: 'callback-target-missing' });
     const wanted = String(owner.nativeSessionId).toLowerCase();
-    const { sessions } = await discoverClaude();
+    const { sessions } = await claudeDiscover();
     const session = (sessions ?? []).find(item => String(item.sessionId).toLowerCase() === wanted);
     if (!session) throw Object.assign(new Error('The Claude session that owns this name is not running.'),
       { code: 'callback-target-missing' });
     // Same native session, same parent context: only the transport binding is
     // refreshed, never the conversation it belongs to.
-    const binding = await bindClaude({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
+    const binding = await claudeBind({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
     store.saveOwner({ ...(store.owner(owner.ownerId) ?? owner), hostSessionId: owner.nativeSessionId, binding });
     store.rebindOwner(owner.ownerId, binding);
     return binding;
@@ -1413,6 +1514,7 @@ export function createScopedAgents(config, {
    * cleanup_failed is retried too — closed is not the same as cleaned.
    */
   async function clearRecord(record, { autoClaimed = false } = {}) {
+    requireWritableTarget(record);
     record.state = 'cleaning'; record.closed = true;
     if (!autoClaimed) store.save(record);
     try {
@@ -1433,6 +1535,7 @@ export function createScopedAgents(config, {
         const backend = await checkHost(record);
         const result = await backend.destroy();
         if (result.destroyed !== true) throw new Error(result.message ?? `${backend.labels?.host ?? targetOf(record)} has not confirmed complete session cleanup.`);
+        if (result.nativeSessionRetained !== undefined) record.nativeSessionRetained = result.nativeSessionRetained;
         record.nativeDestroyed = true; store.save(record);
       }
       const directory = agentDirectory(record);
@@ -1450,7 +1553,8 @@ export function createScopedAgents(config, {
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       store.remove(record);
       forgetBackend(record);
-      return { name: record.name, deleted: true, sessionDataRemoved: true };
+      return { name: record.name, deleted: true, sessionDataRemoved: !record.nativeSessionRetained,
+        ...(record.nativeSessionRetained !== undefined ? { nativeSessionRetained: record.nativeSessionRetained } : {}) };
     } catch (error) {
       const current = store.get(record.agentId);
       // An uncertain destroy is a write whose outcome is unknown, not a failed cleanup:
@@ -1492,17 +1596,23 @@ export function createScopedAgents(config, {
 
   // Only persisted report_parent calls may wake the parent chat.
   async function deliverReports(record) {
+    let finalTerminal = true;
     for (const report of record.task.reports ?? []) {
+      // Prefer the report's own time. An old fixture/report without one may use the
+      // task's start time (still a real time); a truly timeless old notice expires.
+      const reportCreated = report.createdAt ?? record.task?.startedAt;
+      if (reportCreated) report.delivery.createdAt = reportCreated;
       if (report.failure) {
         await deliver(record, report.delivery, report.message);
-        if (report.delivery.state !== 'delivered') return false;
         continue;
       }
-      if (report.final && !report.treeSettledConfirmed) continue;
+      if (report.final && !report.treeSettledConfirmed) { finalTerminal = false; continue; }
       await deliver(record, report.delivery, `${hostLabel(record)}「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`);
-      if (report.delivery.state !== 'delivered') return false;
+      // An older non-final notice must never hold back the final report that
+      // follows it. The final report itself still has to reach a terminal state.
+      if (report.final && !terminalNotice(report.delivery)) finalTerminal = false;
     }
-    return true;
+    return finalTerminal;
   }
 
   /**
@@ -1523,7 +1633,7 @@ export function createScopedAgents(config, {
     const final = (task?.reports ?? []).find(report => report.final);
     // The same finish gate a poll uses, so a settled report closes its task once.
     if (final?.treeSettledConfirmed && task.result
-        && task.reports.every(report => report.delivery.state === 'delivered')) await finishDeliveredReport(record);
+        && task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))) await finishDeliveredReport(record);
   }
 
   async function finishDeliveredReport(record) {
@@ -1540,7 +1650,17 @@ export function createScopedAgents(config, {
     }
     task.state = task.cancelRequested ? 'cancelled' : task.result.state;
     task.finishedAt ??= now();
-    if (record.lifetime === 'once' && task.state === 'completed') {
+    const finalDelivered = task.reports.filter(report => report.final)
+      .every(report => report.delivery.state === 'delivered');
+    // A blocked final is a terminal delivery outcome, not a delivered report.
+    // Keep the name, task body and notification for the parent; a persistent name
+    // returns to idle so it can accept work, and a one-shot stays listed for delete.
+    if (!finalDelivered) {
+      record.state = 'idle';
+      store.save(record);
+      return publicResult(record);
+    }
+    if (record.lifetime === 'once' && task.state === 'completed' && finalDelivered) {
       if (store.claimAutoCleanup(record)) return clearRecord(record, { autoClaimed: true });
       const latest = store.get(record.agentId);
       if (latest?.task?.taskId === task.taskId && latest.task.cancelRequested) {
@@ -1572,7 +1692,8 @@ export function createScopedAgents(config, {
       if (previous) {
         if (previous.message !== incoming.message || previous.final !== incoming.final) throw new Error('A persisted report identity changed.');
       } else task.reports.push({ id: incoming.id, taskId: incoming.taskId, message: incoming.message,
-        final: incoming.final, createdAt: incoming.createdAt, delivery: { id: 'report-' + incoming.id, state: 'pending' } });
+        final: incoming.final, createdAt: incoming.createdAt, delivery: { id: 'report-' + incoming.id, state: 'pending',
+          createdAt: incoming.createdAt ?? now() } });
     }
     const final = task.reports.find(report => report.final);
     if (final && treeSettled(record, view) && !(view.questions ?? []).some(question => question.state === 'pending')) final.treeSettledConfirmed = true;
@@ -1596,12 +1717,11 @@ export function createScopedAgents(config, {
         }
         store.save(record);
       }
-      if (delivered) return finishDeliveredReport(record);
-      const terminalDelivery = final.delivery.state === 'blocked'
-        && final.delivery.error?.code === 'codex-thread-not-found';
-      if (terminalDelivery) {
-        record.state = task.state = 'failed';
-        record.error = final.delivery.error;
+      if (delivered) {
+        if (final.delivery.state === 'blocked' && final.delivery.error?.code === 'codex-thread-not-found') {
+          record.state = task.state = 'failed';
+          record.error = final.delivery.error;
+        } else return finishDeliveredReport(record);
       } else {
         record.state = record.callbackBlocked && ['failed', 'cancelled'].includes(task.result.state)
           && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled)) ? task.result.state : 'delivery_pending';
@@ -1671,7 +1791,7 @@ export function createScopedAgents(config, {
             afterSeq: prior.afterSeq, timeoutSeconds: 0, maxMessages: 100 });
           if (observed.state === 'ended' && observed.correlation === 'request-id') Object.assign(prior,
             { accepted: true, state: endedState(observed.completionReason), endSeq: observed.endSeq, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
-              failure: modelTurnError(observed.completionReason) });
+              failure: observed.failure ?? modelTurnError(observed.completionReason) });
         }
         store.save(record);
         if (prior.accepted) { store.setSupplement(item.requestId, 'accepted'); continue; }
@@ -1695,6 +1815,9 @@ export function createScopedAgents(config, {
       }
       const view = await observe(record);
       if ((view.reports ?? []).some(report => report.final)) { store.blockQueued(record.agentId, record.task.taskId, 'final-submitted'); store.setSupplement(item.requestId, 'blocked', 'final-submitted'); return; }
+      // A headless CLI turn owns the session until it exits. Leave the input
+      // in the shared queue so the next process can resume that same session.
+      if (targetOf(record) === 'claude-cli' && view.running) return;
       // A queued input keeps the selection frozen when it was accepted. Do not
       // compare it with record.modelPin: that is the latest intended selection,
       // not the model of the turn currently running, and a later pin change must
@@ -1716,6 +1839,7 @@ export function createScopedAgents(config, {
   }
 
   async function pollLocked(record) {
+    if (readOnlyTarget(record)) return publicResult(record);
     if (record.nextAttemptAt > Date.now()) return publicResult(record);
     if (firstDispatchDeferred(record)) return publicResult(record);
     if (record.state === 'cleaning') return clearRecord(record);
@@ -1749,7 +1873,7 @@ export function createScopedAgents(config, {
       if (task?.reports?.length) {
         await deliverReports(record);
         const final = task.reports.find(report => report.final && report.treeSettledConfirmed);
-        if (final && task.result && task.reports.every(report => report.delivery.state === 'delivered')
+        if (final && task.result && task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))
             && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled))) {
           return finishDeliveredReport(record);
         }
@@ -1776,7 +1900,7 @@ export function createScopedAgents(config, {
       const unanswered = (view.questions ?? []).filter(question => question.state === 'pending');
       for (const question of unanswered) {
         task.questionNotices ??= {};
-        const notice = task.questionNotices[question.id] ??= { state: 'pending' };
+        const notice = task.questionNotices[question.id] ??= { state: 'pending', createdAt: now() };
         await deliver(record, notice,
           `${hostLabel(record)} 子代理「${record.name}」等待回答：\n${question.message}\n\n请调用 futureaide_answer_agent，name=${JSON.stringify(record.name)}，message 为回答正文。任务保持等待；无需文件、命令或内部编号。`);
       }
@@ -1790,7 +1914,7 @@ export function createScopedAgents(config, {
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
           Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
-            endSeq: result.endSeq, failure: modelTurnError(result.completionReason) });
+            endSeq: result.endSeq, failure: result.failure ?? modelTurnError(result.completionReason) });
         }
       }
       // A reminder is best-effort: its own dispatch never decides how the task ended,
@@ -1891,21 +2015,23 @@ export function createScopedAgents(config, {
       } catch (error) { status.hostError = safeError(error); }
       status.ready = status.contextVerified && status.returnChannel === 'chat-verified' && status.dshConnected
         && status.treeProtocolReady === true && status.reportProtocolReady === true;
-      // Both catalogs can be read without reserving a name or starting a turn.
+      // Catalog probes do not reserve a name or start a model turn.
       const codexProbe = { agentId: 'agent-status-probe', ownerId: owner?.ownerId ?? 'status', name: 'status-probe',
         lifetime: 'once', target: 'codex-desktop', workspace: owner?.workspace ?? config.workspace,
         state: 'probing', createdAt: now(), updatedAt: now(), history: [] };
       const emptyCatalog = { models: [], defaultModel: null };
-      const [dshModels, codexEntry] = await Promise.all([
+      const probeAdapter = record => diagnoseTarget(record.target, { adapters: backendAdapters,
+        ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}), record, deps: adapterDeps(record) });
+      const [dshModels, codexEntry, claudeEntry] = await Promise.all([
         host ? readStatusModels(() => controlFactory(config, { client }).models()) : emptyCatalog,
-        diagnoseTarget('codex-desktop', { adapters: backendAdapters,
-          ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}),
-          record: codexProbe, deps: adapterDeps(codexProbe) }),
+        probeAdapter(codexProbe),
+        probeAdapter({ ...codexProbe, target: 'claude-cli' }),
       ]);
       status.backends = {
         dsh: { ...dshDiagnostics(host, status), ...dshModels },
         'codex-desktop': { ...emptyCatalog, ...codexEntry, ...(codexEntry.ready
           ? { ...codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)), evidence: 'native-rpc' } : {}) },
+        'claude-cli': { ...emptyCatalog, ...claudeEntry },
       };
       return status;
     },
@@ -1996,19 +2122,39 @@ export function createScopedAgents(config, {
       // Named so the busy retry below runs exactly this body against a fresh record.
       const operation = async record => {
         enteredOperation = true;
+        requireWritableTarget(record);
         const closing = ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'];
         if (record.closed || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
+        let previousReport;
         if (record.state === 'delivery_pending') {
+          const prior = (record.task?.reports ?? []).filter(report => !report.failure).at(-1);
+          previousReport = prior ? { delivered: prior.delivery.state === 'delivered',
+            summary: compactText(prior.message, 299) } : undefined;
           await settleDelivery(record);
           // Settling a one-shot agent's final finishes its task and removes the name on
           // the spot, so the ordinary closing error applies instead of a new dispatch.
           if (record.closed || !store.get(record.agentId) || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
-          if (record.state === 'delivery_pending') throw new Error('The final report is waiting for delivery; wait before assigning another task.');
+          if (record.state === 'delivery_pending') {
+            // The caller is demonstrably still here (it just called send). Stop
+            // waiting for confirmation, keep the body, and let the new task start.
+            for (const report of record.task?.reports ?? []) {
+              if (!terminalNotice(report.delivery)) blockUndelivered(report.delivery, 'unconfirmed',
+                'A new task was assigned before this report’s delivery was confirmed. Its body is kept.');
+            }
+            await settleDelivery(record);
+            const latest = store.get(record.agentId);
+            if (!latest || latest.closed || closing.includes(latest.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
+            record = latest;
+          }
+          const latest = store.get(record.agentId);
+          if (latest) record = latest;
+          if (previousReport) previousReport.delivered = previousReport.delivered === true
+            || (record.task?.reports ?? []).filter(report => !report.failure).at(-1)?.delivery.state === 'delivered';
         }
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
         if (targetOf(record) === 'dsh') await checkHost(record);
         const stoppedTask = record.task && ['cancelled', 'failed'].includes(record.state);
-        const pendingReports = (record.task?.reports ?? []).some(report => report.delivery.state !== 'delivered');
+        const pendingReports = (record.task?.reports ?? []).some(report => !terminalNotice(report.delivery));
         if (stoppedTask && (record.lifetime === 'once' || pendingReports)) throw new Error('This task stopped; delete the one-shot agent or wait for its submitted reports before reusing a persistent agent.');
         if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
         const existingQueued = !stoppedTask && store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
@@ -2064,7 +2210,7 @@ export function createScopedAgents(config, {
           record.nextAttemptAt = undefined; record.retryAttempts = 0; store.save(record);
           if (targetOf(record) !== 'dsh') {
             await ensureWorker(record, { wake: true });
-            return queued(record, pin);
+            return { ...queued(record, pin), ...(previousReport ? { previousReport } : {}) };
           }
           try { await beginTask(record); }
           catch (error) { record.state = 'reconnecting'; record.error = safeError(error); store.save(record); }
@@ -2076,13 +2222,14 @@ export function createScopedAgents(config, {
         return { name: current.name, accepted: dispatch?.accepted === true, state: current.state,
           actualModel: actualModelName(current.model) ?? actualModelName(current.modelPin),
           ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
+          ...(previousReport ? { previousReport } : {}),
           ...(error ? { error } : {}),
           ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}) };
       };
       try { return await withName(extra, name, operation, { waitMs: 0 }); } catch (error) {
         if (enteredOperation || error.code !== 'agent-busy') throw error;
         const owner = await context(extra);
-        const record = named(owner, name);
+        const record = requireWritableTarget(named(owner, name));
         if (wantsSelection) {
           // Resolve first: a missing ID must report the catalog, not a busy state.
           const pin = await resolveRequestedPin(record, request);
@@ -2161,7 +2308,7 @@ export function createScopedAgents(config, {
     },
     async answer({ name, message }, extra) {
       textMessage(message);
-      return withName(extra, name, record => answerLocked(record, message));
+      return withName(extra, name, record => answerLocked(requireWritableTarget(record), message));
     },
     async list(extra) {
       const owner = await context(extra);
@@ -2259,12 +2406,12 @@ export function createScopedAgents(config, {
     },
     async cancel({ name }, extra) {
       const owner = await context(extra);
-      const record = named(owner, name);
+      const record = requireWritableTarget(named(owner, name));
       if (!record.task || record.closed) return { name, accepted: false, state: record.state };
       if (!store.requestCancel(record)) return { name, accepted: false, state: store.get(record.agentId)?.state ?? 'removed' };
       if (targetOf(record) !== 'dsh') {
         for (const child of store.descendantsOf([record.agentId])) {
-          if (!child.closed && child.task && store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
+          if (!readOnlyTarget(child) && !child.closed && child.task && store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
         }
         await ensureWorker(store.get(record.agentId), { wake: true });
         return { name, accepted: false, queued: true, state: 'cancelling' };
@@ -2275,7 +2422,7 @@ export function createScopedAgents(config, {
         // Descendants on any application stop with their parent; each keeps its own
         // record and report, so nothing is dropped from the tree.
         for (const child of store.descendantsOf([record.agentId])) {
-          if (child.closed || !child.task) continue;
+          if (readOnlyTarget(child) || child.closed || !child.task) continue;
           if (targetOf(child) !== 'dsh') {
             if (store.requestCancel(child)) await ensureWorker(store.get(child.agentId), { wake: true });
             continue;
@@ -2297,7 +2444,7 @@ export function createScopedAgents(config, {
     },
     async delete({ name }, extra) {
       const owner = await context(extra);
-      const record = named(owner, name);
+      const record = requireWritableTarget(named(owner, name));
       if (targetOf(record) === 'dsh') {
         const result = await withName(extra, name, current => clearRecord(current));
         if (result.queued) await ensureWorker(store.get(record.agentId), { wake: true });
@@ -2305,7 +2452,8 @@ export function createScopedAgents(config, {
       }
       const queued = store.requestCleanup(record);
       if (queued) await ensureWorker(store.get(record.agentId), { wake: true });
-      return { name, deleted: false, queued, state: queued ? 'cleaning' : 'removed' };
+      return { name, deleted: false, queued, state: queued ? 'cleaning' : 'removed',
+        ...(targetOf(record) === 'claude-cli' ? { nativeHistoryPolicy: 'retain' } : {}) };
     },
     /**
      * Explicit ask/report from a managed Codex Desktop child, called from that
@@ -2318,19 +2466,9 @@ export function createScopedAgents(config, {
       if (!['ask', 'report'].includes(kind)) throw new Error('kind must be ask or report.');
       const threadId = callingThread(extra);
       const bound = store.agentForCodexThread(threadId);
-      const record = bound ? store.get(bound.agentId) : undefined;
-      if (!record || record.closed || !record.task) {
-        throw Object.assign(new Error('This chat is not bound to a managed subagent with a current task.'),
-          { code: 'submission-not-owned' });
-      }
-      if (record.task.reports?.some(report => report.final)) {
-        throw Object.assign(new Error('This task already submitted its final report.'), { code: 'final-already-submitted' });
-      }
-      const id = uid('submission');
-      store.enqueueSubmission({ id, ownerId: record.ownerId, agentId: record.agentId,
-        taskId: record.task.taskId, kind, message, final: final === true });
-      await ensureWorker(record, { wake: true });
-      return { accepted: true, name: record.name, taskId: record.task.taskId, submissionId: id, kind };
+      const receipt = store.submitParentMessage(bound?.agentId, { kind, message, final });
+      await ensureWorker(store.get(bound.agentId), { wake: true });
+      return receipt;
     },
     async wait({ names, timeoutSeconds = 0 } = {}, extra) {
       if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 45) throw new Error('Wait between 0 and 45 seconds.');
@@ -2479,14 +2617,14 @@ export function createScopedAgents(config, {
     fastPollNames() { return [...fastPoll]; },
     async wake(agentId, taskId) {
       const record = store.get(agentId);
-      if (!record || record.sleep?.taskId !== taskId || record.sleep.sessionId !== record.sessionId) return false;
+      if (!record || readOnlyTarget(record) || record.sleep?.taskId !== taskId || record.sleep.sessionId !== record.sessionId) return false;
       await ensureWorker(record, { wake: true });
       return true;
     },
     async trySleep(agentId) {
       return store.locked(agentId, async () => {
         const record = store.get(agentId);
-        if (!record || !canSleep(record, store.supplements(agentId), treeSettled)) return false;
+        if (!record || readOnlyTarget(record) || !canSleep(record, store.supplements(agentId), treeSettled)) return false;
         if (!await startSharedMonitor(config, store)) return false;
         return store.sleep(record, idleSignal({ ...record.observation, taskId: record.task.taskId }));
       });

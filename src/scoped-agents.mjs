@@ -11,7 +11,7 @@ import { callCodexOwner, readCodexOwnerTurns, readCodexOwnerItems } from './code
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-sessions.mjs';
-import { RosterStore } from './roster-store.mjs';
+import { RosterStore, submissionRef } from './roster-store.mjs';
 import { canSleep } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
@@ -608,9 +608,9 @@ export function createScopedAgents(config, {
     // Both lists carry the task they belong to: the Codex backend filters by taskId, so
     // a question without it would be dropped before the shared layer ever saw it.
     return {
-      questions: pending.filter(item => item.kind === 'ask').map(item => ({ id: `submission:${item.id}`,
+      questions: pending.filter(item => item.kind === 'ask').map(item => ({ id: submissionRef(item.id),
         taskId: record.task.taskId, state: 'pending', message: item.message, createdAt: item.created })),
-      reports: pending.filter(item => item.kind === 'report').map(item => ({ id: `submission:${item.id}`,
+      reports: pending.filter(item => item.kind === 'report').map(item => ({ id: submissionRef(item.id),
         taskId: record.task.taskId, message: item.message, final: item.final, createdAt: item.created })),
     };
   }
@@ -726,15 +726,15 @@ export function createScopedAgents(config, {
       changed = true;
       if (item.kind === 'report') {
         record.task.reports ??= [];
-        if (!record.task.reports.some(report => report.id === `submission:${item.id}`)) {
-          record.task.reports.push({ id: `submission:${item.id}`, taskId: record.task.taskId,
+        if (!record.task.reports.some(report => report.id === submissionRef(item.id))) {
+          record.task.reports.push({ id: submissionRef(item.id), taskId: record.task.taskId,
             message: item.message, final: item.final, createdAt: item.created, delivery: { state: 'pending' } });
         }
       } else {
         record.observation ??= {};
         record.observation.questions ??= [];
-        if (!record.observation.questions.some(question => question.id === `submission:${item.id}`)) {
-          record.observation.questions.push({ id: `submission:${item.id}`, state: 'pending', message: item.message });
+        if (!record.observation.questions.some(question => question.id === submissionRef(item.id))) {
+          record.observation.questions.push({ id: submissionRef(item.id), state: 'pending', message: item.message });
         }
         record.state = 'awaiting_input';
       }
@@ -1507,6 +1507,30 @@ export function createScopedAgents(config, {
     store.save(record);
   }
 
+  // DSH ends the asking turn inside ask_parent, and a headless CLI turn owns its
+  // session until it exits, so both read the answer as their next turn. A Codex Desktop
+  // helper keeps working after its question is recorded: its answer is sent at once
+  // and the adapter steers it into the turn that is still running.
+  const answersMidTurn = record => targetOf(record) === 'codex-desktop';
+
+  /**
+   * Send every resolved answer that has not gone out yet, joined into one input. The
+   * last answer intent owns the selection frozen for that dispatch; an answer recorded
+   * before the field existed keeps the old live-pin fallback.
+   * @returns {Promise<object|undefined>} The dispatch, or undefined when nothing was due.
+   */
+  async function dispatchAnswers(record, view) {
+    const task = record.task;
+    const ready = (task.answers ?? []).filter(answer => !answer.dispatched && answer.questionIds);
+    if (!ready.length || task.cancelRequested) return undefined;
+    for (const answer of ready) answer.dispatched = true;
+    const last = ready.at(-1);
+    const frozen = Object.prototype.hasOwnProperty.call(last, 'modelSelection')
+      ? { model: last.modelSelection, freezeModel: true } : {};
+    return sendDispatch(record, ready.map(answer => answer.continuation).join('\n\n'), 'answer',
+      ready.flatMap(answer => answer.questionIds), undefined, view, frozen);
+  }
+
   /**
    * Close one name and everything created beneath it. Children go first: a child that
    * cannot be cleaned keeps the parent in cleanup_failed (still listed, still retryable)
@@ -1897,6 +1921,9 @@ export function createScopedAgents(config, {
       // an ordinary history/read failure must not suppress an accepted report.
       const reported = await finishReports(record, view);
       if ((task.reports ?? []).some(report => report.final && report.treeSettledConfirmed)) return reported;
+      // The helper that asked is still working: its answer must not wait for that turn
+      // to end, or for a later question, before it is written into the conversation.
+      if (answersMidTurn(record) && !(task.reports ?? []).some(report => report.final)) await dispatchAnswers(record, view);
       const unanswered = (view.questions ?? []).filter(question => question.state === 'pending');
       for (const question of unanswered) {
         task.questionNotices ??= {};
@@ -1933,19 +1960,8 @@ export function createScopedAgents(config, {
       if (unanswered.length && !task.cancelRequested) {
         record.state = task.state = 'awaiting_input'; store.save(record); return await finishReports(record, view);
       }
-      const pendingAnswers = (task.answers ?? []).filter(answer => !answer.dispatched);
-      if (pendingAnswers.length && !task.cancelRequested) {
-        const ids = pendingAnswers.flatMap(answer => answer.questionIds);
-        for (const answer of pendingAnswers) answer.dispatched = true;
-        // Multiple answers are joined into one continuation; the last accepted
-        // answer intent owns the selection frozen for that dispatch. An answer
-        // recorded before this field existed keeps the old live-pin fallback.
-        const last = pendingAnswers.at(-1);
-        const frozen = Object.prototype.hasOwnProperty.call(last, 'modelSelection')
-          ? { model: last.modelSelection, freezeModel: true } : {};
-        await sendDispatch(record, pendingAnswers.map(answer => answer.continuation).join('\n\n'), 'answer', ids, undefined, view, frozen);
-        return publicResult(record);
-      }
+      // Every other target reads its answer as the next turn, once this one has ended.
+      if (await dispatchAnswers(record, view)) return publicResult(record);
       if (!treeSettled(record, view)) {
         waitForTree(record, view);
         return await finishReports(record, view);
@@ -2652,6 +2668,17 @@ export function createScopedAgents(config, {
     store.save(record);
     try { await resolveAnswer(record, answer); }
     catch (error) { record.error = safeError(error); store.save(record); await ensureWorker(record); throw error; }
+    // A final report seals its task: the helper has finished and reads nothing more.
+    // An answer that comes after it still closes the question, which releases the held
+    // report, but it is never written into the conversation, and the caller is told
+    // exactly that instead of "resuming".
+    if ([...(record.task.reports ?? []), ...(view.reports ?? [])].some(report => report.final === true)) {
+      answer.dispatched = true; answer.undelivered = 'final-submitted';
+      store.save(record);
+      await ensureWorker(record, { wake: true });
+      return { name: record.name, answered: false, state: record.state,
+        error: { code: 'answer-not-delivered', message: `“${record.name}” had already submitted its final report, so this answer was not delivered. The final report is released to you now; if the work should continue, assign it again with futureaide_send_agent or futureaide_run_agent.` } };
+    }
     record.state = 'running'; record.task.state = 'running'; store.save(record);
     await ensureWorker(record, { wake: true });
     return { name: record.name, answered: true, state: 'resuming',

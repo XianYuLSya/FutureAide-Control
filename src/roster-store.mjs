@@ -5,6 +5,20 @@ import { DatabaseSync } from 'node:sqlite';
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
+/** The id a stored ask or report carries once it is a question or report of its task. */
+export const submissionRef = id => `submission:${id}`;
+
+// A final report seals its task, so a helper may not submit one while a question it
+// asked is still open: the parent has not answered, or the answer was accepted but has
+// not been written into the helper's conversation yet. DSH enforces this in its own
+// host; Codex Desktop and the Claude CLI share this entry. Each text is the tool result
+// the helper reads, so it says what to do next.
+const QUESTION_UNANSWERED = 'Your parent has not answered your question yet, so this final report was not accepted and the task stays open. '
+  + 'Finish whatever does not depend on the answer, then end this turn without a final report; a progress report (final omitted) is still accepted. '
+  + 'The answer arrives in this conversation as a new message. Submit the final report after you have read it.';
+const ANSWER_UNDELIVERED = 'Your parent has answered your question and the answer is on its way into this conversation as a message beginning "Parent answer:", so this final report was not accepted. '
+  + 'Read that answer and apply it before you submit the final report. If it has not appeared yet, end this turn without a final report; it arrives as the next message.';
+
 /** One small local database serializes overlapping MCP and recovery-worker calls. */
 export class RosterStore {
   constructor(filename) {
@@ -605,6 +619,11 @@ export class RosterStore {
       if (task.reports?.some(report => report.final) || this.submissions(agentId, task.taskId).some(report => report.final)) {
         throw Object.assign(new Error('This task already submitted its final report.'), { code: 'final-already-submitted' });
       }
+      if (kind === 'report' && final) {
+        const open = this.openQuestions(record);
+        if (open.unanswered) throw Object.assign(new Error(QUESTION_UNANSWERED), { code: 'question-unanswered' });
+        if (open.undelivered) throw Object.assign(new Error(ANSWER_UNDELIVERED), { code: 'answer-undelivered' });
+      }
       const id = 'submission-' + randomUUID().replaceAll('-', '');
       this.enqueueSubmission({ id, ownerId: record.ownerId, agentId, taskId: task.taskId, kind, message, final });
       if (record.sleep) this.wake(agentId, task.taskId);
@@ -614,6 +633,26 @@ export class RosterStore {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+  /**
+   * Questions of the current task whose answer has not reached the helper that asked:
+   * `unanswered` have no answer yet, `undelivered` have one that is still on its way
+   * into the helper's conversation.
+   */
+  openQuestions(record) {
+    const task = record?.task;
+    if (!task) return { unanswered: 0, undelivered: 0 };
+    const asked = this.submissions(record.agentId, task.taskId).filter(item => item.kind === 'ask')
+      .map(item => submissionRef(item.id));
+    const answered = new Set((task.answers ?? []).flatMap(answer => answer.questionIds ?? []));
+    // An accepted dispatch delivered its answer. One whose write outcome is unknown is
+    // never sent again, so it is not on its way either: its error stays on the name, and
+    // waiting for it would hold the task open for ever.
+    const settled = new Set((task.dispatches ?? [])
+      .filter(dispatch => dispatch.kind === 'answer' && (dispatch.accepted === true || dispatch.state === 'unknown'))
+      .flatMap(dispatch => dispatch.answerIds ?? []));
+    return { unanswered: asked.filter(id => !answered.has(id)).length,
+      undelivered: asked.filter(id => answered.has(id) && !settled.has(id)).length };
   }
   submissions(agentId, taskId, pendingOnly = false) {
     return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created FROM submissions

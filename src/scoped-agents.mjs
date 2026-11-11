@@ -2514,8 +2514,20 @@ export function createScopedAgents(config, {
     poll(agentId) {
       if (inflight.has(agentId)) return inflight.get(agentId);
       if (draining) return Promise.resolve({ draining: true });
-      const work = store.locked(agentId, async () => { const record = store.get(agentId); return record ? pollLocked(record) : { removed: true }; }, { waitMs: 0 })
-        .finally(() => { inflight.delete(agentId); onPollComplete(); });
+      let beforeUpdatedAt, afterUpdatedAt;
+      const work = store.locked(agentId, async () => {
+        const record = store.get(agentId);
+        beforeUpdatedAt = record?.updatedAt;
+        const result = record ? await pollLocked(record) : { removed: true };
+        afterUpdatedAt = record?.updatedAt;
+        return result;
+      }, { waitMs: 0 })
+        .finally(() => {
+          inflight.delete(agentId);
+          // A quiet poll must not wake the loop; a poll that wrote durable state may
+          // have found work, exactly as the original wake contract intended.
+          if (afterUpdatedAt !== beforeUpdatedAt) onPollComplete();
+        });
       inflight.set(agentId, work);
       return work;
     },
@@ -2563,6 +2575,11 @@ export function createScopedAgents(config, {
         // hint for ever, so only a real hint is deferred.
         if (monitorInflight.has(agentId)) { if (hints.has(agentId)) deferred.push(agentId); continue; }
         if (!hinted && !urgentPoll.has(agentId) && nextPollAt.get(agentId) > Date.now()) continue;
+        if (candidate) {
+          if (owesFastPoll(candidate)) fastPoll.add(agentId); else fastPoll.delete(agentId);
+        }
+        const candidateNextAt = Math.max(candidate?.nextAttemptAt ?? 0, candidate?.noticeNextAt ?? 0);
+        if (!hinted && !urgentPoll.has(agentId) && !force && candidateNextAt > Date.now()) continue;
         // Large retained histories must not turn resolved-promise polls into a
         // single uninterrupted CPU burst that starves the shared HTTP listener.
         await yieldToIO();

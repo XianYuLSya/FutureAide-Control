@@ -61,6 +61,30 @@ test('a hint for a name whose poll is still running is handed back, not dropped'
   } finally { agents.close(); }
 });
 
+test('a reconnecting name in backoff is skipped before its body is read', async () => {
+  const { store, agents } = build();
+  try {
+    store.insert({ agentId: 'agent-backoff', ownerId: 'owner-a', name: 'backoff', sessionId: 's-b',
+      state: 'reconnecting', nextAttemptAt: Date.now() + 60000,
+      task: { taskId: 't-b', dispatches: [], answers: [], reports: [] } });
+    const original = store.get.bind(store);
+    let reads = 0;
+    store.get = id => { reads++; return original(id); };
+    await agents.monitorScan();
+    assert.equal(reads, 0, 'the candidate backoff is enough to skip the large body');
+  } finally { agents.close(); }
+});
+
+test('a poll completion alone does not signal another round', async () => {
+  let signals = 0;
+  const { store, agents } = build({ onPollComplete: () => { signals += 1; } });
+  try {
+    store.insert({ agentId: 'agent-q', ownerId: 'owner-a', name: 'q', sessionId: 's-q', state: 'idle', closed: true });
+    await agents.poll('agent-q');
+    assert.equal(signals, 0);
+  } finally { agents.close(); }
+});
+
 test('only names that owe time-critical work are polled every second', async () => {
   const { store, agents } = build();
   const owed = delivery => ({ ownerId: 'owner-a', sessionId: `s-${delivery}`, state: 'running', lifetime: 'persistent',

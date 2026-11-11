@@ -24,12 +24,13 @@ import { loadConfig } from './config.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
 import { scopedManagement } from './mcp-server.mjs';
 import { backgroundBatch, pollSleeping, scanSleeping } from './idle-monitor.mjs';
-import { createDirectoryWatchers, createWakeQueue, monitorDirectories, waitForCommit, wakeHintName,
+import { createDirectoryWatchers, createWakeQueue, monitorDirectories, throttledSignal, waitForCommit, wakeHintName,
   MONITOR_LEASE, MONITOR_READY_LEASE } from './shared-monitor.mjs';
 import { closeReportService, ensureReportService, reportPort, rosterIdentity } from './report-endpoint.mjs';
 
 const MIN_ROUND_MS = 250;      // never poll faster than this
 const BUSY_WAIT_MS = 1000;     // cadence while something still owes work
+const POLL_SIGNAL_MS = 1000;   // a completed poll may wake the loop at most this often
 const IDLE_WAIT_MS = 5000;     // cadence for a quiet installation: file events carry the rest
 const SWEEP_MS = 5000;         // whole-roster sweep ceiling when no file event names a record
 const COMMIT_POLL_MS = 1000;   // slice of the quiet wait that re-reads PRAGMA data_version
@@ -47,8 +48,14 @@ const hostDirectory = config.managedStateDirectory ?? path.join(path.dirname(con
 // Hints the next round acts on: a managed-host file event names one record, anything
 // unmapped asks for at most one sweep per second. See createWakeQueue.
 const hints = createWakeQueue({ sweepRequestMs: SWEEP_REQUEST_MS });
+// A poll that wrote durable state wakes the loop at most once a second; one inside
+// that second wakes it when the second ends instead of being dropped.
+const pollSignal = throttledSignal(signal, { intervalMs: POLL_SIGNAL_MS });
 const service = createScopedAgents(config, {
-  onPollComplete: () => { trace("wake= poll-complete"); signal(); },
+  onPollComplete: () => {
+    trace("wake= poll-complete");
+    pollSignal.request();
+  },
   // The loopback tool service runs in this process, so a queued supplement, a cancel
   // or a first dispatch to this target is a wake this loop can act on immediately
   // instead of serving it up to a sweep later.
@@ -201,6 +208,7 @@ try {
 } finally {
   await deliveries.drain();
   await service.drainPolls();
+  pollSignal.close();
   clearInterval(heartbeat);
   watchers.close();
   await closeReportService();

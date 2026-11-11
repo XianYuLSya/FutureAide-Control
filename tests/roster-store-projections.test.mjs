@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { RosterStore } from '../src/roster-store.mjs';
 
 function largeRecord() {
@@ -59,11 +63,98 @@ test('native-only rosters use an indexed empty descendant lookup and preserve cl
   try {
     store.insert({ ...largeRecord(), closed: true });
     assert.equal(store.listWorkerCandidates()[0].closed, true);
-    const plan = store.db.prepare("EXPLAIN QUERY PLAN SELECT body FROM agents WHERE json_extract(body,'$.parentAgentId')=? ORDER BY name").all('agent-large');
+    const plan = store.db.prepare("EXPLAIN QUERY PLAN SELECT id FROM agents INDEXED BY agents_parent_v2 WHERE json_extract(body,'$.parentAgentId')=? ORDER BY name").all('agent-large');
     assert.ok(plan.some(row => /USING INDEX agents_parent/.test(row.detail)), JSON.stringify(plan));
     assert.deepEqual(store.descendantsOf(['agent-large']), []);
     store.insert({ ...largeRecord(), agentId: 'child', name: 'child', parentAgentId: 'agent-large' });
     assert.deepEqual(store.descendantsOf(['agent-large']).map(row => row.agentId), ['child']);
+  } finally { store.close(); }
+});
+
+test('a quiet save of a large unchanged body writes nothing', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    store.insert(largeRecord());
+    const record = store.get('agent-large');
+    const updatedAt = record.updatedAt;
+    const changes = store.db.prepare('SELECT total_changes() AS n').get().n;
+    store.save(record);
+    assert.equal(record.updatedAt, updatedAt, 'the quiet round did not stamp a write');
+    assert.equal(store.db.prepare('SELECT total_changes() AS n').get().n, changes);
+  } finally { store.close(); }
+});
+
+test('a commit another process lands right after a save is not hidden by the cached body', () => {
+  const file = path.join(mkdtempSync(path.join(os.tmpdir(), 'futureaide-save-race-')), 'roster.sqlite');
+  const store = new RosterStore(file);
+  const other = new DatabaseSync(file);
+  try {
+    store.insert(largeRecord());
+    const record = store.get('agent-large');
+    record.state = 'running';
+    // The other process commits the moment this save's own UPDATE has committed.
+    const prepare = store.db.prepare.bind(store.db);
+    store.db.prepare = sql => {
+      const statement = prepare(sql);
+      if (!sql.includes('RETURNING body')) return statement;
+      return { get: (...args) => {
+        const row = statement.get(...args);
+        other.prepare("UPDATE agents SET body=json_set(body,'$.external',json('true')) WHERE id=?").run('agent-large');
+        return row;
+      } };
+    };
+    store.save(record);
+    delete store.db.prepare;
+    assert.equal(store.get('agent-large').external, true, 'the next read sees the other process commit');
+  } finally { other.close(); store.close(); }
+});
+
+test('an unchanged backend state is not rewritten, and a removed name still answers false', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    store.insert(largeRecord());
+    const state = { binding: { sessionId: 's' }, projections: { s: { messages: ['x'.repeat(1000)] } } };
+    assert.equal(store.saveBackendState('agent-large', state), true);
+    const changes = store.changed();
+    assert.equal(store.saveBackendState('agent-large', structuredClone(state)), true, 'an identical document still finds the name');
+    assert.equal(store.changed(), changes, 'and writes nothing');
+    assert.equal(store.saveBackendState('agent-large', { ...state, extra: 1 }), true);
+    assert.equal(store.changed(), changes + 1, 'a changed document is written');
+    assert.equal(store.backendState('agent-large').extra, 1);
+    assert.equal(store.saveBackendState('agent-missing', state), false, 'a removed name is still reported');
+  } finally { store.close(); }
+});
+
+test('taking and releasing a lease keeps the cached body and sweep', async () => {
+  const store = new RosterStore(':memory:');
+  try {
+    store.insert(largeRecord());
+    store.get('agent-large');
+    store.listWorkerCandidates();
+    const prepare = store.db.prepare.bind(store.db);
+    const reads = [];
+    store.db.prepare = sql => {
+      if (/SELECT body FROM agents WHERE id=\?|INDEXED BY agents_lifecycle_v2/.test(sql)) reads.push(sql);
+      return prepare(sql);
+    };
+    await store.locked('agent-large', async () => { store.get('agent-large'); store.listWorkerCandidates(); });
+    store.get('agent-large');
+    store.listWorkerCandidates();
+    delete store.db.prepare;
+    assert.deepEqual(reads, [], 'neither the body nor the sweep was read again');
+    // A write that bypasses the store still invalidates both.
+    store.db.prepare("UPDATE agents SET body=json_set(body,'$.state','running') WHERE id=?").run('agent-large');
+    assert.equal(store.get('agent-large').state, 'running');
+    assert.equal(store.listWorkerCandidates()[0].state, 'running');
+  } finally { store.close(); }
+});
+
+test('the roster commits without a disk flush per transaction', () => {
+  const file = path.join(mkdtempSync(path.join(os.tmpdir(), 'futureaide-sync-')), 'roster.sqlite');
+  const store = new RosterStore(file);
+  try {
+    assert.equal(store.db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal');
+    assert.equal(store.db.prepare('PRAGMA synchronous').get().synchronous, 1, 'NORMAL: the WAL is synced at checkpoints');
   } finally { store.close(); }
 });
 

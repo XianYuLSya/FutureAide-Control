@@ -1286,7 +1286,11 @@ export function createScopedAgents(config, {
       store.save(record);
       return;
     }
-    if (attemptAge(notice) >= UNCONFIRMED_AFTER_MS) {
+    // Thirty minutes counts from the send. A final that waited longer than that for
+    // its task tree was never sent at all; for a notice nobody has tried to deliver,
+    // the six-hour expiry above is the only age limit.
+    const sent = Boolean(notice.attemptedAt) || ['sending', 'unknown'].includes(notice.state);
+    if (sent && attemptAge(notice) >= UNCONFIRMED_AFTER_MS) {
       blockUndelivered(notice, 'unconfirmed', 'Delivery could not be confirmed within 30 minutes. Its body is kept.');
       store.save(record);
       return;

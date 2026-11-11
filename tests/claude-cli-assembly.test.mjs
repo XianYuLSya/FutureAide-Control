@@ -297,10 +297,11 @@ test('the first dispatch names the session, ask_parent reaches the caller, answe
     { message: 'the subagent to ask its parent' });
   assert.equal(asked.state, 'awaiting_input', JSON.stringify(asked.error));
 
+  // Wait for the turn itself: a probe invocation can be logged before it.
   let invocations = [];
-  for (let attempt = 0; attempt < 100 && !invocations.length; attempt++) {
+  for (let attempt = 0; attempt < 100 && !turn(invocations, 0); attempt++) {
     invocations = f.invocations();
-    if (!invocations.length) await sleep(50);
+    if (!turn(invocations, 0)) await sleep(50);
   }
   const first = turn(invocations, 0);
   assert.ok(first, 'one CLI turn ran');

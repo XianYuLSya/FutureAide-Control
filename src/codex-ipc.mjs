@@ -59,7 +59,11 @@ $all = @(Get-CimInstance Win32_Process)
 $native = @($all | Where-Object {
   $_.ExecutablePath -and $_.Name -match '^(ChatGPT|Codex)\.exe$' -and
   $_.CommandLine -match '--remote-debugging-port=' -and $_.CommandLine -notmatch '--type=' -and
-  (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $_.ExecutablePath) 'resources\plugins\openai-bundled\plugins\codex-app-tools\server.mjs'))
+  # A Store build is recognised by its package folder: after a background update the
+  # installer strips the old folder while that process keeps running, so a bundled file
+  # next to the exe can no longer be the test. Other installs still need the file.
+  (($_.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex_') -or
+   (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $_.ExecutablePath) 'resources\plugins\openai-bundled\plugins\codex-app-tools\server.mjs')))
 })
 @(Get-NetTCPConnection -State Listen | Where-Object {
   $_.OwningProcess -in $native.ProcessId -and $_.LocalAddress -eq '127.0.0.1'

@@ -10,7 +10,7 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { RosterStore } from '../src/roster-store.mjs';
 import { idleSignal, scanSleeping } from '../src/idle-monitor.mjs';
-import { createDirectoryWatchers, createWakeQueue, waitForCommit, wakeHintName } from '../src/shared-monitor.mjs';
+import { createDirectoryWatchers, createWakeQueue, throttledSignal, waitForCommit, wakeHintName } from '../src/shared-monitor.mjs';
 import { captureObservation, owesFastPoll, retryDelayMs } from '../src/scoped-agents.mjs';
 
 const record = (overrides = {}) => ({
@@ -334,6 +334,21 @@ test('another process commit ends the quiet wait within one slice', async () => 
   const woken = await waitForCommit({ timeoutMs: 5000, floorMs: 0, sliceMs: 1000,
     sleep: async () => {}, signalled: () => true, readVersion: () => 7, version: 7 });
   assert.equal(woken.reason, 'work');
+});
+
+test('a throttled poll completion still wakes the loop once its window ends', async () => {
+  const wakes = [];
+  const started = Date.now();
+  const gate = throttledSignal(() => wakes.push(Date.now() - started), { intervalMs: 100 });
+  try {
+    gate.request();
+    gate.request();
+    gate.request();
+    assert.equal(wakes.length, 1, 'the first completion wakes at once');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.equal(wakes.length, 2, 'completions inside the window are kept, as one wake');
+    assert.ok(wakes[1] >= 90, 'that wake waits for the window to end');
+  } finally { gate.close(); }
 });
 
 test('a poll that observed the same tree reuses the stored observation', () => {

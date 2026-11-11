@@ -132,6 +132,24 @@ export function createWakeQueue({ sweepRequestMs = 1000, now = Date.now } = {}) 
 }
 
 /**
+ * A wake that fires at most once per intervalMs and is never lost: a request inside
+ * the window schedules one wake for the end of that window, so a poll that wrote
+ * durable state is acted on within the interval, not at the next five-second sweep.
+ */
+export function throttledSignal(signal, { intervalMs = 1000, now = Date.now } = {}) {
+  let last = -Infinity, timer;
+  const fire = () => { clearTimeout(timer); timer = undefined; last = now(); signal(); };
+  return {
+    request() {
+      const wait = last + intervalMs - now();
+      if (wait <= 0) fire();
+      else timer ??= setTimeout(fire, wait);
+    },
+    close() { clearTimeout(timer); timer = undefined; },
+  };
+}
+
+/**
  * Wait for work in slices. A file event wakes the wait at once; a commit from
  * another process cannot, so every slice re-reads the roster's commit counter and
  * ends the wait so the loop can sweep. Injected functions keep this testable.

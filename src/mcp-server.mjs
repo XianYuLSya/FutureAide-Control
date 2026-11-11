@@ -114,7 +114,7 @@ export function registerScopedTools(server, options = {}) {
 
 /** Default installed surface: each request is bound to its native calling chat. */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.16' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.17' });
   let servicePromise;
   const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
     const value = scopedFactory(config);
@@ -136,7 +136,7 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
 function registerParentTools(server, options) {
   const register = toolRegistrar(server, options);
   const parentMessage = z.string().min(1).max(100000).describe('Message for the managed parent of this chat. Pass it directly; never a chat id, path, or internal number.');
-  register('ask_parent', 'Ask the parent of this managed subagent a question. The caller is identified by the managed connection, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer. ' + QUESTION_CONTRACT, { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
+  register('ask_parent', 'Ask the parent of this managed subagent a question. The caller is identified by the managed connection, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer. You may go on with whatever does not depend on it: the answer arrives in this conversation as a message beginning "Parent answer:", and a final report is not accepted before then. ' + QUESTION_CONTRACT, { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
   register('report_parent', 'Submit an explicit report from this managed subagent to its parent. The caller is identified by the managed connection. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true. ' + FINAL_REPORT_CONTRACT, {
     message: parentMessage,
     final: z.boolean().optional().describe('Submit as the final report. Omitting it submits a progress report and keeps the task open.'),

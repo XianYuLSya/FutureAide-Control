@@ -5,6 +5,20 @@ import { DatabaseSync } from 'node:sqlite';
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
+/** The id a stored ask or report carries once it is a question or report of its task. */
+export const submissionRef = id => `submission:${id}`;
+
+// A final report seals its task, so a helper may not submit one while a question it
+// asked is still open: the parent has not answered, or the answer was accepted but has
+// not been written into the helper's conversation yet. DSH enforces this in its own
+// host; Codex Desktop and the Claude CLI share this entry. Each text is the tool result
+// the helper reads, so it says what to do next.
+const QUESTION_UNANSWERED = 'Your parent has not answered your question yet, so this final report was not accepted and the task stays open. '
+  + 'Finish whatever does not depend on the answer, then end this turn without a final report; a progress report (final omitted) is still accepted. '
+  + 'The answer arrives in this conversation as a new message. Submit the final report after you have read it.';
+const ANSWER_UNDELIVERED = 'Your parent has answered your question and the answer is on its way into this conversation as a message beginning "Parent answer:", so this final report was not accepted. '
+  + 'Read that answer and apply it before you submit the final report. If it has not appeared yet, end this turn without a final report; it arrives as the next message.';
+
 /** One small local database serializes overlapping MCP and recovery-worker calls. */
 export class RosterStore {
   constructor(filename) {
@@ -13,15 +27,32 @@ export class RosterStore {
     // name for the database, never a credential.
     this.location = filename === ':memory:' ? ':memory:' : path.resolve(filename);
     this.db = new DatabaseSync(filename);
-    this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL;
+    // WAL with synchronous=NORMAL: a commit no longer flushes the disk; the WAL is
+    // synced at each checkpoint. The roster stays consistent after a crash, and a
+    // power loss can only roll back the last commits, which the next poll redoes.
+    // FULL flushed on every lease take and release, dozens of times a second.
+    this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
       CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS agents (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, body TEXT NOT NULL, UNIQUE(owner,name));
       CREATE INDEX IF NOT EXISTS agents_parent ON agents(json_extract(body,'$.parentAgentId'),name);
+      -- Child discovery only needs the identity and recency; the full child record
+      -- comes from the per-record cache unless another connection changed it.
+      CREATE INDEX IF NOT EXISTS agents_parent_v2 ON agents(
+        json_extract(body,'$.parentAgentId'),name,json_extract(body,'$.updatedAt'));
       CREATE INDEX IF NOT EXISTS agents_lifecycle ON agents(
         json_extract(body,'$.sessionId'),json_extract(body,'$.state'),json_extract(body,'$.closed'),
         json_extract(body,'$.callbackBlocked'),json_extract(body,'$.sleep'),json_extract(body,'$.task.taskId'),
         json_extract(body,'$.task.reports'),json_extract(body,'$.task.cancelRequested'),
         json_extract(body,'$.task.cancelVerified'),json_extract(body,'$.task.cancelTreeSettled'),id,owner,name);
+      -- The monitor needs the record's own retry time without opening its body.
+      -- A separate expression index lets an unchanged deployment add the column in
+      -- place; old builds keep using agents_lifecycle and simply ignore this one.
+      CREATE INDEX IF NOT EXISTS agents_lifecycle_v2 ON agents(
+        json_extract(body,'$.sessionId'),json_extract(body,'$.state'),json_extract(body,'$.closed'),
+        json_extract(body,'$.callbackBlocked'),json_extract(body,'$.sleep'),json_extract(body,'$.task.taskId'),
+        json_extract(body,'$.task.reports'),json_extract(body,'$.task.cancelRequested'),
+        json_extract(body,'$.task.cancelVerified'),json_extract(body,'$.task.cancelTreeSettled'),
+        json_extract(body,'$.nextAttemptAt'),id,owner,name);
       -- Finding a Codex child by its thread filters on target; without an index that
       -- reads every body. One small value, maintained on write.
       CREATE INDEX IF NOT EXISTS agents_target ON agents(json_extract(body,'$.target'));
@@ -42,7 +73,12 @@ export class RosterStore {
     // is always a real write.
     this.bodies = new Map();
     this.projections = new Map();
+    this.scans = new Map();
+    this.woken = new Set();
     this.settled = 0;
+    // Rows this connection changed in tables no agent body or sweep reads (leases,
+    // submissions). The body cache and the sweep ignore them; see agentChanges().
+    this.quiet = 0;
     this.migrateSupplementSelection();
     this.migrateHistory();
   }
@@ -129,13 +165,21 @@ export class RosterStore {
     this.db.prepare("UPDATE owners SET body=json_set(body,'$.pid',?,'$.binding',json(?)) WHERE id=?").run(binding.pid, JSON.stringify(binding), id);
   }
   get(id) {
+    const version = this.dataVersion();
+    const changed = this.agentChanges();
+    const cached = this.bodies.get(id);
+    // A poll reads the same row several times (parent, delivery, tree and public
+    // result). Reuse its exact text until another connection commits, this store
+    // touches the row, or a statement bypasses save() on this connection. Lease and
+    // submission writes do not count: a poll takes and releases a lease every time.
+    if (cached?.version === version && cached.changed === changed) return JSON.parse(cached.text);
     const row = this.db.prepare('SELECT body FROM agents WHERE id=?').get(id);
     if (!row) { this.bodies.delete(id); return undefined; }
     const record = JSON.parse(row.body);
     // Remember the exact text, with its recency stamp neutralised, so save() can tell
     // an unchanged record from a changed one without a second trip through SQLite and
     // without a second serialisation.
-    this.bodies.set(id, { text: row.body });
+    this.bodies.set(id, { text: row.body, version, changed });
     return record;
   }
   /** Earlier tasks of one name, oldest first. Never part of the body any more. */
@@ -165,6 +209,11 @@ export class RosterStore {
    */
   changed() { return this.db.prepare('SELECT total_changes() AS changed').get().changed; }
   /**
+   * total_changes() without the quiet writes settle() accounted for. Any other write
+   * on this connection, including one that bypassed the store, still moves it.
+   */
+  agentChanges() { return this.changed() - this.quiet; }
+  /**
    * Our own write that cannot change any projection (leases, submissions): the
    * caches stay valid and simply start from the new change counter.
    */
@@ -173,6 +222,7 @@ export class RosterStore {
     // current total would swallow a write that bypassed the store in the meantime,
     // and a projection would then look current while it is stale.
     this.settled += Math.max(0, Number(rows) || 0);
+    this.quiet += Math.max(0, Number(rows) || 0);
     for (const cached of this.projections.values()) cached.settled = this.settled;
     return this.settled;
   }
@@ -189,13 +239,58 @@ export class RosterStore {
     }
     return cached.rows;
   }
+  /**
+   * A roster sweep is intentionally a few seconds stale. It may not be rebuilt on
+   * every small field write (an active poll changes state/error continuously), but
+   * an external commit still invalidates it through PRAGMA data_version.
+   */
+  scanProjection(key, build, ttlMs = 5000) {
+    const version = this.dataVersion();
+    const changed = this.agentChanges();
+    const at = Date.now();
+    const cached = this.scans.get(key);
+    if (!cached || cached.version !== version || cached.changed !== changed || at - cached.at > ttlMs) {
+      const rows = build();
+      this.scans.set(key, { version, changed, at, rows });
+      return rows;
+    }
+    return cached.rows;
+  }
+  /** A saved record updates its cached sweep row without another table scan. */
+  syncCandidate(record) {
+    const cached = this.scans.get('candidates');
+    if (!cached || !Array.isArray(cached.rows)) return;
+    const reports = (record.task?.reports ?? []).map(report => ({ delivery: {
+      state: report.delivery?.state ?? '',
+      ...(report.delivery?.nextAttemptAt ? { nextAttemptAt: report.delivery.nextAttemptAt } : {}) } }));
+    const pendingReports = reports.filter(report => !['delivered', 'blocked'].includes(report.delivery.state));
+    const previous = cached.rows.find(row => row.agentId === record.agentId);
+    const row = {
+      agentId: record.agentId, ownerId: record.ownerId, sessionId: record.sessionId, state: record.state,
+      ...(record.closed ? { closed: true } : {}),
+      ...(record.callbackBlocked ? { callbackBlocked: true } : {}),
+      ...(record.sleep == null ? {} : { sleep: structuredClone(record.sleep) }),
+      ...(record.nextAttemptAt == null ? {} : { nextAttemptAt: record.nextAttemptAt }),
+      ...(pendingReports.length ? { noticeNextAt: pendingReports.reduce((min, report) =>
+        Math.min(min, report.delivery.nextAttemptAt ?? 0), Infinity) } : {}),
+      hasSupplement: previous?.hasSupplement ?? false,
+      pendingReports: pendingReports.length,
+      ...(record.task?.taskId == null ? {} : { task: { taskId: record.task.taskId, reports,
+        ...(record.task.cancelRequested ? { cancelRequested: true } : {}),
+        ...(record.task.cancelVerified ? { cancelVerified: true } : {}),
+        ...(record.task.cancelTreeSettled ? { cancelTreeSettled: true } : {}) } }),
+    };
+    const index = cached.rows.findIndex(item => item.agentId === record.agentId);
+    if (index >= 0) cached.rows[index] = row; else cached.rows.push(row);
+    cached.changed = this.agentChanges();
+  }
   dropProjections() { this.projections.clear(); this.settled = this.changed(); }
   /** A row changed outside save(): forget whatever we cached about this name. */
-  touched(agentId) { if (agentId) this.bodies.delete(agentId); this.dropProjections(); }
+  touched(agentId) { if (agentId) this.bodies.delete(agentId); this.dropProjections(); this.scans.clear(); }
   lease(key) { return this.db.prepare('SELECT holder,expires FROM leases WHERE key=?').get(key); }
   wake(id, taskId) {
     const changed = this.db.prepare("UPDATE agents SET body=json_remove(body,'$.sleep') WHERE id=? AND json_extract(body,'$.sleep.taskId')=? AND json_extract(body,'$.sessionId')=json_extract(body,'$.sleep.sessionId')").run(id, taskId).changes === 1;
-    if (changed) this.touched(id);
+    if (changed) { this.woken.add(id); this.touched(id); }
     return changed;
   }
   markWake(id, taskId) {
@@ -210,7 +305,7 @@ export class RosterStore {
       AND EXISTS (SELECT 1 FROM leases a JOIN leases b ON a.holder=b.holder WHERE a.key='idle-monitor' AND b.key='idle-monitor:ready' AND a.expires>? AND b.expires>?)
       AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=? AND status IN ('queued','sending','unknown'))`)
       .run(JSON.stringify({ taskId: record.task.taskId, sessionId: record.sessionId, signal }), record.agentId, record.ownerId, record.task.taskId, record.state, Date.now(), Date.now(), record.task.taskId).changes === 1;
-    if (changed) this.touched(record.agentId);
+    if (changed) { this.woken.delete(record.agentId); this.touched(record.agentId); }
     return changed;
   }
   restoreSleep(record) {
@@ -218,7 +313,7 @@ export class RosterStore {
       WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=?
       AND coalesce(json_extract(body,'$.closed'),0)=0`)
       .run(JSON.stringify(record.sleep), record.agentId, record.ownerId, record.sleep.sessionId).changes === 1;
-    if (changed) this.touched(record.agentId);
+    if (changed) { this.woken.delete(record.agentId); this.touched(record.agentId); }
     return changed;
   }
   named(owner, name) { const row = this.db.prepare('SELECT body FROM agents WHERE owner=? AND name=?').get(owner, name); return row ? JSON.parse(row.body) : undefined; }
@@ -296,10 +391,15 @@ export class RosterStore {
   }
   /** Upsert one target-state document. False means the name is already gone. */
   saveBackendState(agentId, value) {
+    // An identical document is not rewritten. A Codex poll saves its state on every
+    // refresh, and rewriting an unchanged 100+ KB row (zero-filling the old pages under
+    // secure_delete) was most of the monitor's disk writes.
     const changed = this.db.prepare(`INSERT INTO backend_state(agent,body) SELECT id,? FROM agents WHERE id=?
-      ON CONFLICT(agent) DO UPDATE SET body=excluded.body`).run(JSON.stringify(value), agentId).changes === 1;
-    this.dropProjections();
-    return changed;
+      ON CONFLICT(agent) DO UPDATE SET body=excluded.body WHERE backend_state.body IS NOT excluded.body`)
+      .run(JSON.stringify(value), agentId).changes === 1;
+    if (changed) { this.dropProjections(); return true; }
+    // Nothing written: either the document was identical, or the name is gone.
+    return this.db.prepare('SELECT 1 AS found FROM agents WHERE id=?').get(agentId) !== undefined;
   }
   deleteBackendState(agentId) { this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(agentId); this.dropProjections(); }
   /**
@@ -332,8 +432,9 @@ export class RosterStore {
    */
   childrenOf(agentId) {
     if (typeof agentId !== 'string' || !agentId) return [];
-    return this.db.prepare("SELECT body FROM agents WHERE json_extract(body,'$.parentAgentId')=? ORDER BY name")
-      .all(agentId).map(row => JSON.parse(row.body));
+    return this.db.prepare(`SELECT id FROM agents INDEXED BY agents_parent_v2
+      WHERE json_extract(body,'$.parentAgentId')=? ORDER BY name`).all(agentId)
+      .map(row => this.get(row.id)).filter(Boolean);
   }
   /** Whole descendant closure beneath these records, breadth first. */
   descendantsOf(agentIds) {
@@ -371,24 +472,12 @@ export class RosterStore {
   // SQLite maintains it even when another/older connection updates the roster.
   hasSleeping() { return this.listSleeping().length > 0; }
   listSleeping() {
-    return this.projection('sleeping', () => this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
-      json_extract(body,'$.state') AS state, json_extract(body,'$.task.taskId') AS taskId,
-      json_extract(body,'$.task.cancelRequested') AS cancelRequested,
-      json_extract(body,'$.task.cancelVerified') AS cancelVerified,
-      json_extract(body,'$.task.cancelTreeSettled') AS cancelTreeSettled,
-      json_extract(body,'$.sleep') AS sleep,
-      EXISTS (SELECT 1 FROM supplements AS queued WHERE queued.agent=agents.id
-        AND queued.task=json_extract(agents.body,'$.task.taskId')
-        AND queued.status IN ('queued','sending','unknown')) AS hasSupplement
-      FROM agents INDEXED BY agents_lifecycle WHERE json_type(json_extract(body,'$.sleep'))='object'
-        AND id NOT IN (SELECT id FROM agents WHERE json_extract(body,'$.target')='claude-desktop') ORDER BY name`).all().map(row => ({
+    // Derived from the same cached sweep: one index scan serves sleeping checks,
+    // idle-monitor scans and the monitor's own candidate list.
+    return this.listWorkerCandidates().filter(row => row.sleep).map(row => ({
       agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
-      task: row.taskId == null ? undefined : { taskId: row.taskId,
-        ...(row.cancelRequested ? { cancelRequested: true } : {}),
-        ...(row.cancelVerified ? { cancelVerified: true } : {}),
-        ...(row.cancelTreeSettled ? { cancelTreeSettled: true } : {}) },
-      sleep: JSON.parse(row.sleep), hasSupplement: Boolean(row.hasSupplement),
-    })));
+      task: row.task, sleep: row.sleep, hasSupplement: row.hasSupplement,
+    }));
   }
   /**
    * Hash -> agentId for every name. The managed host writes one state file per name,
@@ -421,7 +510,7 @@ export class RosterStore {
       ORDER BY name`).all().map(row => ({ agentId: row.agentId, taskId: row.taskId, sessionId: row.sessionId }));
   }
   listWorkerCandidates() {
-    return this.projection('candidates', () => {
+    return this.scanProjection('candidates', () => {
       // Everything selected here comes from the covering expression index. Two extra
       // correlated subqueries would each read the whole body again for every name, so
       // the supplement flag is a second small query and the report count is folded in
@@ -431,19 +520,30 @@ export class RosterStore {
       return this.db.prepare(`SELECT id AS agentId, owner AS ownerId, json_extract(body,'$.sessionId') AS sessionId,
         json_extract(body,'$.state') AS state, json_extract(body,'$.closed') AS closed, json_extract(body,'$.callbackBlocked') AS callbackBlocked,
         json_extract(body,'$.sleep') AS sleep, json_extract(body,'$.task.taskId') AS taskId,
-        json_extract(body,'$.task.reports') AS reports
-        FROM agents INDEXED BY agents_lifecycle
+        json_extract(body,'$.task.reports') AS reports, json_extract(body,'$.nextAttemptAt') AS nextAttemptAt,
+        json_extract(body,'$.task.cancelRequested') AS cancelRequested,
+        json_extract(body,'$.task.cancelVerified') AS cancelVerified,
+        json_extract(body,'$.task.cancelTreeSettled') AS cancelTreeSettled
+        FROM agents INDEXED BY agents_lifecycle_v2
         WHERE id NOT IN (SELECT id FROM agents WHERE json_extract(body,'$.target')='claude-desktop') ORDER BY name`).all().map(row => {
         const reports = (JSON.parse(row.reports ?? '[]') ?? [])
-          .map(report => ({ delivery: { state: report.delivery?.state ?? '' } }));
+          .map(report => ({ delivery: { state: report.delivery?.state ?? '',
+            ...(report.delivery?.nextAttemptAt ? { nextAttemptAt: report.delivery.nextAttemptAt } : {}) } }));
+        const pendingReports = reports.filter(report => !['delivered', 'blocked'].includes(report.delivery.state));
         return {
           agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
           ...(row.closed ? { closed: true } : {}),
           ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
           ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
+          ...(row.nextAttemptAt == null ? {} : { nextAttemptAt: row.nextAttemptAt }),
+          ...(pendingReports.length ? { noticeNextAt: pendingReports.reduce((min, report) =>
+            Math.min(min, report.delivery.nextAttemptAt ?? 0), Infinity) } : {}),
           hasSupplement: supplements.has(`${row.agentId}\n${row.taskId}`),
-          pendingReports: reports.filter(report => !['delivered', 'blocked'].includes(report.delivery.state)).length,
-          ...(row.taskId == null ? {} : { task: { taskId: row.taskId, reports } }),
+          pendingReports: pendingReports.length,
+          ...(row.taskId == null ? {} : { task: { taskId: row.taskId, reports,
+            ...(row.cancelRequested ? { cancelRequested: true } : {}),
+            ...(row.cancelVerified ? { cancelVerified: true } : {}),
+            ...(row.cancelTreeSettled ? { cancelTreeSettled: true } : {}) } }),
         };
       });
     });
@@ -491,6 +591,7 @@ export class RosterStore {
     const candidate = JSON.stringify(record);
     if (cached !== undefined && cached.text === candidate && this.stillPresent(record)) return;
     record.updatedAt = new Date().toISOString();
+    if (this.woken.delete(record.agentId)) delete record.sleep;
     // A plain second serialisation: a body can carry a nested updatedAt of its own, and
     // matching the recency stamp as text is not worth the risk of writing the wrong
     // one. Real writes are rare; quiet rounds never reach this line.
@@ -501,6 +602,10 @@ export class RosterStore {
     // Children can finish while their parent holds an older in-memory view.
     // Preserve the atomic handoff for this task when that parent next saves.
     const input = `CASE WHEN json_extract(body,'$.task.taskId')=json_extract(?1,'$.task.taskId') AND json_type(body,'$.task.childSnapshots')='array' THEN json_set(${sleeping},'$.task.childSnapshots',json_extract(body,'$.task.childSnapshots')) ELSE ${sleeping} END`;
+    // The commit counter is read before the write. Read after it, a commit another
+    // process lands between this UPDATE and that read would be stamped onto the body
+    // returned here, and the next get() would serve that body as current.
+    const version = this.dataVersion();
     const result = this.db.prepare(`UPDATE agents SET body=CASE
       WHEN json_extract(body,'$.state')='cleaning' AND coalesce(json_extract(${input},'$.state'),'') NOT IN ('cleaning','cleanup_failed')
       THEN json_set(${input},'$.state','cleaning','$.closed',json('true'))
@@ -509,10 +614,14 @@ export class RosterStore {
       WHEN json_extract(${input},'$.state')='idle' AND json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId')
         AND EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND status IN ('queued','sending','unknown'))
       THEN json_set(${input},'$.state','running') ELSE ${input} END
-      WHERE id=?2 AND owner=?3 AND name=?4`)
-      .run(body, record.agentId, record.ownerId, record.name);
-    if (!result.changes) throw new Error('This subagent instance has already been removed.');
-    this.bodies.set(record.agentId, { text: body });
+      WHERE id=?2 AND owner=?3 AND name=?4 RETURNING body`)
+      .get(body, record.agentId, record.ownerId, record.name);
+    if (!result) throw new Error('This subagent instance has already been removed.');
+    // The SQL may deliberately preserve an atomic wake or child snapshot that the
+    // in-memory record did not have; RETURNING gives us that actual body so the next
+    // read is a cache hit, not another trip through SQLite.
+    this.bodies.set(record.agentId, { text: result.body, version, changed: this.agentChanges() });
+    this.syncCandidate(record);
     this.dropProjections();
   }
   requestCancel(record) {
@@ -605,6 +714,11 @@ export class RosterStore {
       if (task.reports?.some(report => report.final) || this.submissions(agentId, task.taskId).some(report => report.final)) {
         throw Object.assign(new Error('This task already submitted its final report.'), { code: 'final-already-submitted' });
       }
+      if (kind === 'report' && final) {
+        const open = this.openQuestions(record);
+        if (open.unanswered) throw Object.assign(new Error(QUESTION_UNANSWERED), { code: 'question-unanswered' });
+        if (open.undelivered) throw Object.assign(new Error(ANSWER_UNDELIVERED), { code: 'answer-undelivered' });
+      }
       const id = 'submission-' + randomUUID().replaceAll('-', '');
       this.enqueueSubmission({ id, ownerId: record.ownerId, agentId, taskId: task.taskId, kind, message, final });
       if (record.sleep) this.wake(agentId, task.taskId);
@@ -614,6 +728,26 @@ export class RosterStore {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+  /**
+   * Questions of the current task whose answer has not reached the helper that asked:
+   * `unanswered` have no answer yet, `undelivered` have one that is still on its way
+   * into the helper's conversation.
+   */
+  openQuestions(record) {
+    const task = record?.task;
+    if (!task) return { unanswered: 0, undelivered: 0 };
+    const asked = this.submissions(record.agentId, task.taskId).filter(item => item.kind === 'ask')
+      .map(item => submissionRef(item.id));
+    const answered = new Set((task.answers ?? []).flatMap(answer => answer.questionIds ?? []));
+    // An accepted dispatch delivered its answer. One whose write outcome is unknown is
+    // never sent again, so it is not on its way either: its error stays on the name, and
+    // waiting for it would hold the task open for ever.
+    const settled = new Set((task.dispatches ?? [])
+      .filter(dispatch => dispatch.kind === 'answer' && (dispatch.accepted === true || dispatch.state === 'unknown'))
+      .flatMap(dispatch => dispatch.answerIds ?? []));
+    return { unanswered: asked.filter(id => !answered.has(id)).length,
+      undelivered: asked.filter(id => answered.has(id) && !settled.has(id)).length };
   }
   submissions(agentId, taskId, pendingOnly = false) {
     return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created FROM submissions
@@ -650,6 +784,7 @@ export class RosterStore {
           .run(JSON.stringify(snapshots), parentId);
       }
       this.db.exec('COMMIT');
+      this.bodies.delete(parentId);
       this.dropProjections();
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }

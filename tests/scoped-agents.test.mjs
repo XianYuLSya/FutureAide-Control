@@ -745,6 +745,32 @@ test('an unconfirmed notice blocks at thirty minutes and a once name is retained
   f.service.close();
 });
 
+test('a final that waited over thirty minutes for its tree is still sent once the tree settles', async () => {
+  const f = await fixture();
+  await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+  await f.service.send({ name: 'artist', message: 'task' }, extra(A));
+  // The helper reports its final while its own turn keeps running (it went on to
+  // work through follow-up messages), so the final waits for the tree.
+  f.report('final body', true); f.notification('ok');
+  await f.service.poll(f.record().agentId);
+  const r = f.record();
+  assert.equal(r.state, 'running', 'the final waits for the tree');
+  const final = r.task.reports.find(report => report.final);
+  assert.equal(final.delivery.attemptedAt, undefined, 'nothing was sent yet');
+  const old = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+  final.createdAt = old;
+  final.delivery.createdAt = old;
+  f.store.save(r);
+  f.finish();
+  await f.service.poll(r.agentId);
+  const done = f.record();
+  assert.equal(done.task.reports.find(report => report.final).delivery.state, 'delivered',
+    'a final nobody tried to send is sent, not blocked as unconfirmed');
+  assert.equal(done.state, 'idle');
+  assert.equal(f.notices.length, 1);
+  f.service.close();
+});
+
 test('a pending notice older than six hours expires without reaching the chat', async () => {
   const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));

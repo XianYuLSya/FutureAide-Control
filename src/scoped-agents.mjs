@@ -1282,7 +1282,9 @@ export function createScopedAgents(config, {
     // anything older than six hours is terminal, and anything still unconfirmed
     // after thirty minutes stops waiting so later notices and new tasks can move.
     if (noticeAge(notice) >= EXPIRE_UNSENT_AFTER_MS) {
-      blockUndelivered(notice, 'expired', 'This notice was created more than 6 hours ago and was never sent. Its body is kept.');
+      blockUndelivered(notice, 'expired', notice.attempts
+        ? `This notice could not be delivered for 6 hours (${notice.attempts} attempts). Its body is kept.`
+        : 'This notice was created more than 6 hours ago and was never sent. Its body is kept.');
       store.save(record);
       return;
     }
@@ -1418,15 +1420,25 @@ export function createScopedAgents(config, {
       { code: 'callback-target-missing' });
     const wanted = String(owner.nativeSessionId).toLowerCase();
     const { sessions } = await claudeDiscover();
-    const session = (sessions ?? []).find(item => String(item.sessionId).toLowerCase() === wanted);
-    if (!session) throw Object.assign(new Error('The Claude session that owns this name is not running.'),
+    const candidates = (sessions ?? []).filter(item => String(item.sessionId).toLowerCase() === wanted);
+    if (!candidates.length) throw Object.assign(new Error('The Claude session that owns this name is not running.'),
       { code: 'callback-target-missing' });
-    // Same native session, same parent context: only the transport binding is
-    // refreshed, never the conversation it belongs to.
-    const binding = await claudeBind({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
-    store.saveOwner({ ...(store.owner(owner.ownerId) ?? owner), hostSessionId: owner.nativeSessionId, binding });
-    store.rebindOwner(owner.ownerId, binding);
-    return binding;
+    // A crashed process leaves its record behind and Windows reuses its pid, so the
+    // same session can be listed twice. Only the record whose process really is the
+    // session binds; trying just the first one listed could miss the live session on
+    // every attempt.
+    let failure;
+    for (const session of candidates) {
+      // Same native session, same parent context: only the transport binding is
+      // refreshed, never the conversation it belongs to.
+      let binding;
+      try { binding = await claudeBind({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace }); }
+      catch (error) { failure = error; continue; }
+      store.saveOwner({ ...(store.owner(owner.ownerId) ?? owner), hostSessionId: owner.nativeSessionId, binding });
+      store.rebindOwner(owner.ownerId, binding);
+      return binding;
+    }
+    throw failure;
   }
 
   /**

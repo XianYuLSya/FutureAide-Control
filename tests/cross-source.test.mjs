@@ -12,13 +12,14 @@ import { RosterStore } from '../src/roster-store.mjs';
 import { createCodexBackend } from '../src/codex-backend.mjs';
 import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
 import { claudeTrustedCaller, registerScopedTools, scopedManagement } from '../src/mcp-server.mjs';
+import { bindClaude, discoverClaude } from '../src/claude-inbox.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const THREAD = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture({ adapters = {}, onPollComplete, captureFiles,
+async function fixture({ adapters = {}, onPollComplete, captureFiles, claudeInbox,
   clientFactory = () => { throw new Error('no DSH host is needed for these cases'); }, startSharedMonitor = () => true } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
@@ -33,6 +34,7 @@ async function fixture({ adapters = {}, onPollComplete, captureFiles,
     backendAdapters: adapters,
     ...(onPollComplete ? { onPollComplete } : {}),
     ...(captureFiles ? { captureFiles } : {}),
+    ...(claudeInbox ? { claudeInbox } : {}),
     startSharedMonitor,
     removeTree: async () => {},
   });
@@ -1068,6 +1070,24 @@ test('a crashed session leaves its record behind and the notice still finds wher
     await f.service.poll('crashed');
     assert.equal(claude.received.length, 1, JSON.stringify(f.store.get('crashed').task.reports[0].delivery));
     assert.notEqual(f.store.owner(ownerId).binding.socketPath, dead.socketPath);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a leftover record whose pid was reused does not hide the live session', async () => {
+  const claude = await restartedClaude();
+  // Windows reuses a crashed session's pid, so discovery can list a leftover record for
+  // the same session before the live one. Only the live record may bind.
+  const leftover = { pid: 4242, sessionId: claude.sessionId };
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() }, claudeInbox: {
+    discover: async () => ({ available: true, sessions: [leftover, ...(await discoverClaude()).sessions] }),
+    bind: async args => { if (args.pid === leftover.pid) throw new Error('claude-process-replaced'); return bindClaude(args); },
+  } });
+  try {
+    await claude.come();
+    const ownerId = pendingReport(f, claude, 'reused');
+    await f.service.poll('reused');
+    assert.equal(claude.received.length, 1, JSON.stringify(f.store.get('reused').task.reports[0].delivery));
+    assert.equal(f.store.owner(ownerId).binding.pid, process.pid, 'the live record is the one kept');
   } finally { await claude.close(); f.service.close(); }
 });
 

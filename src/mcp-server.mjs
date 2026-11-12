@@ -121,7 +121,7 @@ export function registerScopedTools(server, options = {}) {
  */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics,
   configReady } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.18' });
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.19' });
   let servicePromise;
   const service = () => servicePromise ??= (configReady ?? loadConfig(configPath)).then(async config => {
     const value = scopedFactory(config);

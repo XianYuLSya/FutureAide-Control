@@ -33,6 +33,19 @@ function fail(code, message, options) {
   throw new FutureAideError(code, message, options);
 }
 
+/**
+ * A dispatch the shared layer refused at the last moment. The typed answer is the point:
+ * `notSent` says the prompt was definitely never posted, so the caller records a
+ * rejection instead of an uncertain outcome. The same shape is used by the control gate,
+ * the Claude CLI adapter and the runner.
+ */
+function blockedSend(reason) {
+  return Object.assign(new Error(`Nothing was sent: ${reason === 'round-finished'
+    ? 'this task round already finished' : reason === 'dispatch-expired'
+      ? 'this dispatch is older than its task permits' : `the dispatch was refused (${reason})`}.`),
+  { code: reason, terminal: true, notSent: true });
+}
+
 function validId(value, field = 'sessionId') {
   if (typeof value !== 'string' || !ID_PATTERN.test(value)) {
     fail('invalid-input', `${field} must contain 1 to 200 letters, digits, dots, underscores, or hyphens.`);
@@ -327,7 +340,7 @@ export class FutureAideClient {
     return cookie;
   }
 
-  async #rpc(endpoint, args, { write = false, expectedInstance, channel = 'api', instanceOverride } = {}) {
+  async #rpc(endpoint, args, { write = false, expectedInstance, channel = 'api', instanceOverride, beforeWrite } = {}) {
     let instance = instanceOverride ?? await this.#discover();
     if (expectedInstance && !sameInstance(instance, expectedInstance)) {
       fail('instance-changed', 'The FutureAide instance changed after preflight; the write was not sent.');
@@ -344,6 +357,10 @@ export class FutureAideClient {
       sessionId: args.request.address.sessionId, beforeSeq: args.request.throughSeq + 1, maxMessages: args.request.maxMessages,
     };
     for (let attempt = 0; attempt < 2; attempt++) {
+      // The last question asked before anything leaves this process: the caller's gate,
+      // consulted once the instance, dialect and cookie are settled and immediately before
+      // the POST, so no discovery or authentication time can slip a finished task through.
+      if (write && typeof beforeWrite === 'function') beforeWrite();
       const result = await this.#transport(new URL(`/${channel}/${wireEndpoint}`, instance.baseUrl), {
         method: 'POST',
         headers: { 'content-type': 'application/json', cookie },
@@ -468,10 +485,10 @@ export class FutureAideClient {
     return this.#sendPrompt(sessionId, text, { mode, requestId }, expectedInstance);
   }
 
-  async #sendPrompt(sessionId, text, { mode, requestId }, expectedInstance) {
+  async #sendPrompt(sessionId, text, { mode, requestId }, expectedInstance, beforeWrite) {
     const { value } = await this.#rpc('session/prompt', { request: {
       sessionId, requestId, mode, content: [{ type: 'text', text }], clientTimeZone: 'Asia/Shanghai',
-    } }, { write: true, expectedInstance });
+    } }, { write: true, expectedInstance, beforeWrite });
     if (value?.accepted !== true) fail('invalid-response', 'FutureAide did not return a prompt receipt.', { uncertain: true });
     return { accepted: true, requestId };
   }
@@ -657,14 +674,23 @@ export class FutureAideClient {
     return { sessionId: view.sessionId, cwd: view.workspace, running: view.running,
       projections: { asOfSeq: view.throughSeq, values: { modelSelection: { next: view.currentModel } } } };
   }
-  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID() } = {}) {
+  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID(), writeBlockReason } = {}) {
     validId(requestId, 'requestId');
     if (typeof text !== 'string' || text.trim().length === 0 || Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES
         || !['queue', 'steer'].includes(mode)) fail('invalid-input', 'A nonempty message up to 128 KiB and queue or steer mode are required.');
     const row = await this.managedSession(input);
     const expectedInstance = this.#instance;
     if (this.#dialect === undefined) await this.modelCatalog();
-    return this.#sendPrompt(row.sessionId, text, { mode, requestId }, expectedInstance);
+    // This call does its own discovery, authentication and catalog reads before the POST,
+    // so a task that finished during those awaits would still go out. The shared layer's
+    // gate is therefore asked here and once more immediately before the write; a refusal
+    // is definite — nothing was sent — and never an uncertain outcome.
+    const gate = typeof writeBlockReason === 'function' ? () => {
+      const reason = writeBlockReason();
+      if (reason) throw blockedSend(reason);
+    } : undefined;
+    if (gate) gate();
+    return this.#sendPrompt(row.sessionId, text, { mode, requestId }, expectedInstance, gate);
   }
   async managedSelectModel(input, selection, { sessionOnly = false } = {}) {
     if (sessionOnly !== true) {

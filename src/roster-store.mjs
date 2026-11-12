@@ -7,6 +7,26 @@ const pause = milliseconds => new Promise(resolve => setTimeout(resolve, millise
 
 /** The id a stored ask or report carries once it is a question or report of its task. */
 export const submissionRef = id => `submission:${id}`;
+/** The notice a stored ask or report carries; the same id every round has used. */
+export const submissionNoticeId = id => `notice-${id}`;
+/**
+ * One predicate for a parent message this roster still owes a delivery. `state` stays
+ * the absorb progress (pending → consumed), so a consumed row whose notice never landed
+ * is still debt, and a row from before the notice column has NULL there and counts as
+ * not yet delivered.
+ */
+const submissionDebtSql = (table = 'submissions') => `(${table}.state='pending'
+  OR coalesce(json_extract(${table}.delivery,'$.state'),'pending') NOT IN ('delivered','blocked'))`;
+export const isCancelledRound = record => record?.task?.cancelRequested === true
+  || record?.task?.state === 'cancelled' || record?.state === 'cancelled';
+
+const submissionFromRow = row => ({ id: row.id, ownerId: row.owner, agentId: row.agent, taskId: row.task,
+  kind: row.kind, message: row.message, final: row.final === 1, created: row.created,
+  // A row from before the notice column reads as a notice that has not been sent yet: its
+  // identity is the one every round uses. A caller that writes it back still fences on the
+  // null text it actually read.
+  delivery: row.delivery ? JSON.parse(row.delivery)
+    : { id: submissionNoticeId(row.id), state: 'pending', createdAt: row.created } });
 
 // A final report seals its task, so a helper may not submit one while a question it
 // asked is still open: the parent has not answered, or the answer was accepted but has
@@ -61,7 +81,8 @@ export class RosterStore {
       CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS submissions (id TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL,
         task TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, final INTEGER NOT NULL,
-        created TEXT NOT NULL, state TEXT NOT NULL, consumed TEXT);
+        created TEXT NOT NULL, state TEXT NOT NULL, consumed TEXT, delivery TEXT);
+      CREATE INDEX IF NOT EXISTS submissions_pending ON submissions(agent,task) WHERE state='pending';
       CREATE TABLE IF NOT EXISTS agent_history (agent TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
         PRIMARY KEY (agent, seq)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);`);
@@ -79,26 +100,33 @@ export class RosterStore {
     // Rows this connection changed in tables no agent body or sweep reads (leases,
     // submissions). The body cache and the sweep ignore them; see agentChanges().
     this.quiet = 0;
-    this.migrateSupplementSelection();
+    this.addTextColumn('supplements', 'selection');
+    // A roster from an older build carries neither column. Both are plain data, and NULL
+    // keeps its rows valid: a row with no notice yet counts as not delivered.
+    this.addTextColumn('submissions', 'consumed');
+    this.addTextColumn('submissions', 'delivery');
+    // Only now can the debt index name the notice column. A roster from an older build
+    // gains that column on the line above; a new one created it with the table.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS submissions_debt ON submissions(agent, task)
+      WHERE state='pending' OR coalesce(json_extract(delivery,'$.state'),'pending') NOT IN ('delivered','blocked')`);
     this.migrateHistory();
   }
 
   /**
-   * Older rosters have no frozen model selection on queued supplements. Add the
-   * column in place; existing rows keep NULL, which means "follow the target's
-   * default when this input is finally dispatched".
+   * Add optional data to an existing roster. NULL keeps old queue rows valid.
+   * A submission needs its own delivery state only when its task no longer owns it.
    */
-  migrateSupplementSelection() {
-    const columns = () => this.db.prepare('PRAGMA table_info(supplements)').all().map(row => row.name);
+  addTextColumn(table, column) {
+    const exists = () => this.db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name=?').get(table, column);
     // New rosters already have the column; keep that path free of a write lock.
-    if (columns().includes('selection')) return;
+    if (exists()) return;
     // Claude's worker and a Codex stdio server can open the same roster at once.
     // Both may see the old table; serialize the recheck and ALTER, and recheck
     // inside the lock so the loser does not hit "duplicate column name".
     this.db.exec('PRAGMA busy_timeout=30000');
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      if (!columns().includes('selection')) this.db.exec('ALTER TABLE supplements ADD COLUMN selection TEXT');
+      if (!exists()) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -198,6 +226,29 @@ export class RosterStore {
     this.db.prepare('INSERT INTO agent_history(agent,seq,body) VALUES (?,?,?)').run(agentId, row.seq, JSON.stringify(item));
     return row.seq;
   }
+  /** A callback can commit without the name lock. Check its inbox in the same
+   * write transaction that archives the old task and publishes its successor. */
+  replaceTask(record, previous, snapshot) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const ready = this.db.prepare(`SELECT 1 FROM agents WHERE id=? AND owner=? AND name=?
+        AND coalesce(json_extract(body,'$.closed'),0)=0
+        AND json_extract(body,'$.task.taskId') IS ? AND json_extract(body,'$.state')=?
+        AND NOT EXISTS (SELECT 1 FROM submissions WHERE agent=agents.id
+          AND task=json_extract(agents.body,'$.task.taskId') AND ${submissionDebtSql()})`)
+        .get(record.agentId, record.ownerId, record.name, previous.task?.taskId ?? null, previous.state);
+      if (ready) {
+        if (snapshot) this.appendHistory(record.agentId, snapshot);
+        this.save(record);
+      }
+      this.db.exec('COMMIT');
+      return Boolean(ready);
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      this.touched(record.agentId);
+      throw error;
+    }
+  }
   leaseHeld(key, holder) { const lease = this.lease(key); return lease && lease.holder === holder && lease.expires > Date.now(); }
   /**
    * A projection query is only recomputed when the roster could have moved: another
@@ -225,6 +276,52 @@ export class RosterStore {
     this.quiet += Math.max(0, Number(rows) || 0);
     for (const cached of this.projections.values()) cached.settled = this.settled;
     return this.settled;
+  }
+  /**
+   * The team board in one read. Each open name contributes only the fields the board
+   * shows, extracted by SQL from its record, its owner, its first task and its Codex
+   * thread binding: a whole record body never enters this process. The result is a
+   * projection, so it is rebuilt only when the roster actually moved — the board's
+   * 36-hour window is applied by the caller, never by this query, so old rows cannot
+   * invalidate the cache on every request.
+   */
+  boardSnapshot() {
+    return this.projection('board', () => this.db.prepare(`
+      SELECT a.id AS id, a.owner AS owner, a.name AS name,
+        json_extract(a.body,'$.updatedAt') AS updatedAt,
+        json_extract(a.body,'$.state') AS state,
+        json_extract(a.body,'$.target') AS target,
+        json_extract(a.body,'$.parentAgentId') AS parent,
+        json_extract(a.body,'$.releaseState.state') AS release,
+        json_extract(a.body,'$.observation.activity') AS activity,
+        json_extract(a.body,'$.task.message') AS task,
+        json_extract(a.body,'$.task.modelSelection.model') AS taskModel,
+        json_extract(a.body,'$.task.modelSelection.effort') AS taskEffort,
+        json_extract(a.body,'$.modelSelection.model') AS selectionModel,
+        json_extract(a.body,'$.modelSelection.effort') AS selectionEffort,
+        (SELECT count(*) FROM json_each(json_extract(a.body,'$.observation.questions'))
+          WHERE json_extract(value,'$.state')='pending') AS pendingQuestions,
+        CASE WHEN json_type(json_extract(a.body,'$.observation.tree.nodes'))='array'
+          THEN (SELECT count(*) FROM json_each(json_extract(a.body,'$.observation.tree.nodes'))) ELSE 0 END AS treeNodes,
+        CASE WHEN json_type(json_extract(a.body,'$.task.result.changes'))='array'
+          THEN (SELECT count(*) FROM json_each(json_extract(a.body,'$.task.result.changes'))) ELSE NULL END AS fileCount,
+        (SELECT json_extract(j.value,'$.final') FROM json_each(json_extract(a.body,'$.task.reports')) j
+          WHERE json_extract(j.value,'$.failure') IS NULL ORDER BY CAST(j.key AS INTEGER) DESC LIMIT 1) AS reportFinal,
+        (SELECT json_extract(j.value,'$.message') FROM json_each(json_extract(a.body,'$.task.reports')) j
+          WHERE json_extract(j.value,'$.failure') IS NULL ORDER BY CAST(j.key AS INTEGER) DESC LIMIT 1) AS reportSummary,
+        (SELECT json_extract(j.value,'$.delivery.state') FROM json_each(json_extract(a.body,'$.task.reports')) j
+          WHERE json_extract(j.value,'$.failure') IS NULL ORDER BY CAST(j.key AS INTEGER) DESC LIMIT 1) AS reportDelivery,
+        (SELECT json_extract(h.body,'$.message') FROM agent_history h WHERE h.agent=a.id ORDER BY h.seq LIMIT 1) AS firstTaskMessage,
+        json_extract(o.body,'$.source') AS ownerSource,
+        json_extract(o.body,'$.workspace') AS ownerWorkspace,
+        json_extract(o.body,'$.binding.workspace') AS ownerBindingWorkspace,
+        json_extract(o.body,'$.nativeSessionId') AS ownerNativeSessionId,
+        json_extract(o.body,'$.threadId') AS ownerThread,
+        json_extract(s.body,'$.binding.sessionId') AS thread
+      FROM agents a
+      LEFT JOIN owners o ON o.id = a.owner
+      LEFT JOIN backend_state s ON s.agent = a.id
+      WHERE coalesce(json_extract(a.body,'$.closed'),0)=0`).all());
   }
   projection(key, build) {
     const version = this.dataVersion();
@@ -262,8 +359,12 @@ export class RosterStore {
     if (!cached || !Array.isArray(cached.rows)) return;
     const reports = (record.task?.reports ?? []).map(report => ({ delivery: {
       state: report.delivery?.state ?? '',
-      ...(report.delivery?.nextAttemptAt ? { nextAttemptAt: report.delivery.nextAttemptAt } : {}) } }));
+      ...(report.delivery?.nextAttemptAt ? { nextAttemptAt: report.delivery.nextAttemptAt } : {}),
+      ...(report.delivery?.waitingForTree ? { waitingForTree: true } : {}) } }));
     const pendingReports = reports.filter(report => !['delivered', 'blocked'].includes(report.delivery.state));
+    // Same rule as the roster sweep: a final waiting for its tree is settled by the sweep
+    // reading that tree, so the cached row must not defer the name either.
+    const waitingForTree = pendingReports.some(report => report.delivery.waitingForTree === true);
     const previous = cached.rows.find(row => row.agentId === record.agentId);
     const row = {
       agentId: record.agentId, ownerId: record.ownerId, sessionId: record.sessionId, state: record.state,
@@ -271,7 +372,7 @@ export class RosterStore {
       ...(record.callbackBlocked ? { callbackBlocked: true } : {}),
       ...(record.sleep == null ? {} : { sleep: structuredClone(record.sleep) }),
       ...(record.nextAttemptAt == null ? {} : { nextAttemptAt: record.nextAttemptAt }),
-      ...(pendingReports.length ? { noticeNextAt: pendingReports.reduce((min, report) =>
+      ...(pendingReports.length && !waitingForTree ? { noticeNextAt: pendingReports.reduce((min, report) =>
         Math.min(min, report.delivery.nextAttemptAt ?? 0), Infinity) } : {}),
       hasSupplement: previous?.hasSupplement ?? false,
       pendingReports: pendingReports.length,
@@ -288,6 +389,19 @@ export class RosterStore {
   /** A row changed outside save(): forget whatever we cached about this name. */
   touched(agentId) { if (agentId) this.bodies.delete(agentId); this.dropProjections(); this.scans.clear(); }
   lease(key) { return this.db.prepare('SELECT holder,expires FROM leases WHERE key=?').get(key); }
+  /**
+   * The same rows as lease(), for several keys, in one statement: one consistent view of
+   * a set of leases that only make sense together. Reading them one by one would let a
+   * second connection commit between two reads, and a caller that then compares holders
+   * or releases rows would be acting on a set that never existed.
+   */
+  leases(keys) {
+    const list = [...new Set(Array.isArray(keys) ? keys : [])].filter(key => typeof key === 'string');
+    if (!list.length) return new Map();
+    const rows = this.db.prepare(`SELECT key,holder,expires FROM leases WHERE key IN (${list.map(() => '?').join(',')})`)
+      .all(...list);
+    return new Map(rows.map(row => [row.key, { holder: row.holder, expires: row.expires }]));
+  }
   wake(id, taskId) {
     const changed = this.db.prepare("UPDATE agents SET body=json_remove(body,'$.sleep') WHERE id=? AND json_extract(body,'$.sleep.taskId')=? AND json_extract(body,'$.sessionId')=json_extract(body,'$.sleep.sessionId')").run(id, taskId).changes === 1;
     if (changed) { this.woken.add(id); this.touched(id); }
@@ -299,12 +413,15 @@ export class RosterStore {
     return changed;
   }
   sleep(record, signal) {
+    const taskId = record.task.taskId;
     const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.sleep',json(?)) WHERE id=? AND owner=?
       AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.state')=?
       AND (coalesce(json_extract(body,'$.task.cancelRequested'),0)=0 OR (json_extract(body,'$.task.cancelVerified')=1 AND json_extract(body,'$.task.cancelTreeSettled')=1))
       AND EXISTS (SELECT 1 FROM leases a JOIN leases b ON a.holder=b.holder WHERE a.key='idle-monitor' AND b.key='idle-monitor:ready' AND a.expires>? AND b.expires>?)
-      AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=? AND status IN ('queued','sending','unknown'))`)
-      .run(JSON.stringify({ taskId: record.task.taskId, sessionId: record.sessionId, signal }), record.agentId, record.ownerId, record.task.taskId, record.state, Date.now(), Date.now(), record.task.taskId).changes === 1;
+      AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=? AND status IN ('queued','sending','unknown'))
+      AND NOT EXISTS (SELECT 1 FROM submissions WHERE agent=agents.id AND task=? AND state='pending')`)
+      .run(JSON.stringify({ taskId, sessionId: record.sessionId, signal }), record.agentId, record.ownerId, taskId,
+        record.state, Date.now(), Date.now(), taskId, taskId).changes === 1;
     if (changed) { this.woken.delete(record.agentId); this.touched(record.agentId); }
     return changed;
   }
@@ -370,6 +487,11 @@ export class RosterStore {
         selection: row.selection ? JSON.parse(row.selection) : undefined,
       }));
   }
+  supplement(requestId) {
+    return typeof requestId === 'string'
+      ? this.db.prepare('SELECT requestId, agent, task, status, created FROM supplements WHERE requestId=?').get(requestId)
+      : undefined;
+  }
   setSupplement(requestId, status, reason = null) { this.db.prepare('UPDATE supplements SET status=?,reason=? WHERE requestId=?').run(status, reason, requestId); this.dropProjections(); }
   blockQueued(agentId, taskId, reason) { this.db.prepare("UPDATE supplements SET status='blocked',reason=? WHERE agent=? AND task=? AND status='queued'").run(reason, agentId, taskId); this.dropProjections(); }
   supplementSummary(agentId, taskId) {
@@ -390,7 +512,26 @@ export class RosterStore {
     return row ? JSON.parse(row.body) : undefined;
   }
   /** Upsert one target-state document. False means the name is already gone. */
-  saveBackendState(agentId, value) {
+  saveBackendState(agentId, value, { keepRelease = false } = {}) {
+    // A Codex document that was read before another connection wrote must not carry an
+    // older copy of the field that connection replaced. The release attempt is the one
+    // such field, so it is merged inside the statement, from the row as it is now, and
+    // the caller's copy of it is dropped before the write. Every other target keeps the
+    // plain upsert below: this option exists for the one backend that has that field.
+    if (keepRelease) {
+      const incoming = JSON.stringify(value);
+      const body = "CASE WHEN json_type(body,'$.release')='object' "
+        + "THEN json_set(json_remove(?1,'$.release'),'$.release',json_extract(body,'$.release')) "
+        + "ELSE json_remove(?1,'$.release') END";
+      const changed = this.db.prepare(`UPDATE backend_state SET body=${body} WHERE agent=?2 AND body IS NOT ${body}`)
+        .run(incoming, agentId).changes === 1;
+      if (changed) { this.dropProjections(); return true; }
+      const inserted = this.db.prepare(`INSERT INTO backend_state(agent,body)
+        SELECT id,json_remove(?1,'$.release') FROM agents WHERE id=?2
+        ON CONFLICT(agent) DO NOTHING`).run(incoming, agentId).changes === 1;
+      if (inserted) { this.dropProjections(); return true; }
+      return this.db.prepare('SELECT 1 AS found FROM agents WHERE id=?').get(agentId) !== undefined;
+    }
     // An identical document is not rewritten. A Codex poll saves its state on every
     // refresh, and rewriting an unchanged 100+ KB row (zero-filling the old pages under
     // secure_delete) was most of the monitor's disk writes.
@@ -401,12 +542,36 @@ export class RosterStore {
     // Nothing written: either the document was identical, or the name is gone.
     return this.db.prepare('SELECT 1 AS found FROM agents WHERE id=?').get(agentId) !== undefined;
   }
+
+  /**
+   * Write only the target's release attempt, atomically against the name as it is now.
+   * The fence is the shared layer's own ticket on the agent row: a newer re-check
+   * replaces it, so an older attempt cannot write even though its own document still
+   * names it. A caller that only knows the round — a dispatch that restored its own
+   * subscription — fences on the task alone.
+   * @param {string} agentId Managed name.
+   * @param {object} release Release document to store.
+   * @param {{taskId?: string, ticket?: string}} fence Round, and the attempt when known.
+   * @returns {boolean} True when it was written.
+   */
+  saveBackendRelease(agentId, release, { taskId, ticket } = {}) {
+    if (typeof taskId !== 'string' || !taskId) return false;
+    const attempt = typeof ticket === 'string' && ticket;
+    const statement = `UPDATE backend_state SET body=json_set(body,'$.release',json(?1))
+      WHERE agent=?2 AND json_extract((SELECT body FROM agents WHERE id=?2),'$.task.taskId')=?3`
+      + (attempt ? " AND json_extract((SELECT body FROM agents WHERE id=?2),'$.releaseState.ticket')=?4" : '');
+    const parameters = attempt ? [JSON.stringify(release), agentId, taskId, attempt]
+      : [JSON.stringify(release), agentId, taskId];
+    const changed = this.db.prepare(statement).run(...parameters).changes === 1;
+    if (changed) this.dropProjections();
+    return changed;
+  }
   deleteBackendState(agentId) { this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(agentId); this.dropProjections(); }
   /**
    * The same reverse lookup for a Codex Desktop child: its own chat id is the
    * binding its backend records, and only a live codex-desktop name qualifies.
    */
-  agentForCodexThread(threadId) {
+  agentForCodexThread(threadId, { includeAutoClosed = false } = {}) {
     if (typeof threadId !== 'string' || !threadId) return undefined;
     const wanted = threadId.toLowerCase();
     const row = this.db.prepare(`SELECT a.id AS agentId, a.owner AS ownerId, a.name AS name,
@@ -414,7 +579,8 @@ export class RosterStore {
       json_extract(a.body,'$.sessionId') AS logicalSessionId, b.body AS body
       FROM backend_state AS b JOIN agents AS a ON a.id=b.agent
       WHERE json_extract(a.body,'$.target')='codex-desktop'
-        AND coalesce(json_extract(a.body,'$.closed'),0)=0`).all()
+        AND (coalesce(json_extract(a.body,'$.closed'),0)=0
+          ${includeAutoClosed ? "OR coalesce(json_extract(a.body,'$.autoCleanupClosed'),0)=1" : ''})`).all()
       .find(candidate => {
         const binding = JSON.parse(candidate.body)?.binding ?? {};
         return [binding.threadId, binding.sessionId, binding.nativeSessionId]
@@ -528,17 +694,21 @@ export class RosterStore {
         WHERE id NOT IN (SELECT id FROM agents WHERE json_extract(body,'$.target')='claude-desktop') ORDER BY name`).all().map(row => {
         const reports = (JSON.parse(row.reports ?? '[]') ?? [])
           .map(report => ({ delivery: { state: report.delivery?.state ?? '',
-            ...(report.delivery?.nextAttemptAt ? { nextAttemptAt: report.delivery.nextAttemptAt } : {}) } }));
+            ...(report.delivery?.nextAttemptAt ? { nextAttemptAt: report.delivery.nextAttemptAt } : {}),
+            ...(report.delivery?.waitingForTree ? { waitingForTree: true } : {}) } }));
         const pendingReports = reports.filter(report => !['delivered', 'blocked'].includes(report.delivery.state));
+        // A final still waiting for its tree is settled by the ordinary sweep reading that
+        // tree, so any such notice makes this name due at once: dropping only its own
+        // moment would let another notice's backoff hold the whole observation back.
+        const waitingForTree = pendingReports.some(report => report.delivery.waitingForTree === true);
         return {
           agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
           ...(row.closed ? { closed: true } : {}),
           ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
           ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
           ...(row.nextAttemptAt == null ? {} : { nextAttemptAt: row.nextAttemptAt }),
-          ...(pendingReports.length ? { noticeNextAt: pendingReports.reduce((min, report) =>
-            Math.min(min, report.delivery.nextAttemptAt ?? 0), Infinity) } : {}),
-          hasSupplement: supplements.has(`${row.agentId}\n${row.taskId}`),
+          ...(pendingReports.length && !waitingForTree ? { noticeNextAt: pendingReports.reduce((min, report) =>
+            Math.min(min, report.delivery.nextAttemptAt ?? 0), Infinity) } : {}),          hasSupplement: supplements.has(`${row.agentId}\n${row.taskId}`),
           pendingReports: pendingReports.length,
           ...(row.taskId == null ? {} : { task: { taskId: row.taskId, reports,
             ...(row.cancelRequested ? { cancelRequested: true } : {}),
@@ -548,9 +718,29 @@ export class RosterStore {
       });
     });
   }
-  insert(record) {
-    try { this.db.prepare('INSERT INTO agents(id,owner,name,body) VALUES (?,?,?,?)').run(record.agentId, record.ownerId, record.name, JSON.stringify(record)); }
-    catch (error) {
+  /**
+   * Insert one record. With `requireOpenParent` a child is only written while the parent
+   * it names still exists and is open — one statement, so a create that read the parent
+   * before an automatic cleanup closed the tree cannot slip a new child in afterwards.
+   */
+  insert(record, { requireOpenParent = false } = {}) {
+    const parentId = record.parentAgentId;
+    try {
+      if (requireOpenParent && typeof parentId === 'string' && parentId) {
+        const inserted = this.db.prepare(`INSERT INTO agents(id,owner,name,body)
+          SELECT ?1,?2,?3,?4 FROM agents AS parent
+          WHERE parent.id=?5 AND coalesce(json_extract(parent.body,'$.closed'),0)=0`)
+          .run(record.agentId, record.ownerId, record.name, JSON.stringify(record), parentId).changes === 1;
+        if (!inserted) {
+          const parent = this.db.prepare('SELECT 1 AS found FROM agents WHERE id=?').get(parentId);
+          throw parent
+            ? Object.assign(new Error('The parent session is closed, so this subagent was not created.'), { code: 'parent-closed' })
+            : Object.assign(new Error('The parent session no longer exists, so this subagent was not created.'), { code: 'parent-missing' });
+        }
+      } else this.db.prepare('INSERT INTO agents(id,owner,name,body) VALUES (?,?,?,?)')
+        .run(record.agentId, record.ownerId, record.name, JSON.stringify(record));
+    } catch (error) {
+      if (error.code === 'parent-closed' || error.code === 'parent-missing') throw error;
       if (String(error.message).includes('UNIQUE')) throw Object.assign(new Error('A subagent with this name already exists in this chat.'), { code: 'name-in-use' });
       throw error;
     }
@@ -582,16 +772,16 @@ export class RosterStore {
     return this.db.prepare('SELECT 1 AS found FROM agents WHERE id=? AND owner=? AND name=?')
       .get(record.agentId, record.ownerId, record.name) !== undefined;
   }
-  save(record) {
+  save(record, { dispatch = false } = {}) {
     // Nothing durable changed: this record still serialises to exactly the body we
     // read or wrote last, so this save would rewrite megabytes for nothing. The
     // statement below parses the body once per json() argument and rebuilds the
     // expression index, which is the single largest cost of a quiet round.
     const cached = this.bodies.get(record.agentId);
     const candidate = JSON.stringify(record);
-    if (cached !== undefined && cached.text === candidate && this.stillPresent(record)) return;
+    if (!dispatch && cached !== undefined && cached.text === candidate && this.stillPresent(record)) return true;
     record.updatedAt = new Date().toISOString();
-    if (this.woken.delete(record.agentId)) delete record.sleep;
+    if (this.woken.has(record.agentId)) delete record.sleep;
     // A plain second serialisation: a body can carry a nested updatedAt of its own, and
     // matching the recency stamp as text is not worth the risk of writing the wrong
     // one. Real writes are rare; quiet rounds never reach this line.
@@ -602,32 +792,59 @@ export class RosterStore {
     // Children can finish while their parent holds an older in-memory view.
     // Preserve the atomic handoff for this task when that parent next saves.
     const input = `CASE WHEN json_extract(body,'$.task.taskId')=json_extract(?1,'$.task.taskId') AND json_type(body,'$.task.childSnapshots')='array' THEN json_set(${sleeping},'$.task.childSnapshots',json_extract(body,'$.task.childSnapshots')) ELSE ${sleeping} END`;
+    // Everything this connection keeps from the row as it is now: a wake that arrived
+    // without the lock, the child snapshot handoff, the cancel evidence and the supplement
+    // wake. This is the inner merge; the outer CASE adds one guarantee on top of it.
+    const merged = `CASE
+      WHEN json_extract(body,'$.state')='cleaning' AND coalesce(json_extract(${input},'$.state'),'') NOT IN ('cleaning','cleanup_failed')
+      THEN json_set(${input},'$.state','cleaning','$.closed',json('true'))
+      WHEN json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId') AND json_extract(body,'$.task.cancelRequested')=1
+      THEN json_set(${input},'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.task.cancelPending',json(CASE WHEN json_extract(body,'$.task.cancelPending')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(${input},'$.task.cancelRequested')=1 THEN json_extract(${input},'$.state') WHEN coalesce(json_extract(${input},'$.task.treeUnavailable'),'')='codex-thread-not-found' THEN 'failed' ELSE 'running' END)
+      WHEN json_extract(${input},'$.state')='idle' AND json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId')
+        AND EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND status IN ('queued','sending','unknown'))
+      THEN json_set(${input},'$.state','running')
+      ELSE ${input} END`;
     // The commit counter is read before the write. Read after it, a commit another
     // process lands between this UPDATE and that read would be stamped onto the body
     // returned here, and the next get() would serve that body as current.
     const version = this.dataVersion();
+    // A row an automatic claim closed stays closed, and keeps the mark that says why,
+    // whichever branch above matched and whether or not the caller's copy still knew:
+    // the closure is restored from the row, never from the copy.
+    // Dispatch preparation and receipts can outlive the name's lease. Check the
+    // task and its terminal state in the same write that merges the record.
+    const fence = dispatch ? `
+      AND json_extract(body,'$.task.taskId')=?5
+      AND coalesce(json_extract(body,'$.closed'),0)=0
+      AND coalesce(json_extract(body,'$.state'),'') NOT IN ('failed','cancelled','completed')
+      AND coalesce(json_extract(body,'$.task.state'),'') NOT IN ('failed','cancelled','completed')
+      AND coalesce(json_extract(body,'$.task.treeUnavailable'),'')<>'codex-thread-not-found'
+      AND json_type(body,'$.task.legacyAutomaticResult') IS NULL` : '';
     const result = this.db.prepare(`UPDATE agents SET body=CASE
-      WHEN json_extract(body,'$.state')='cleaning' AND coalesce(json_extract(${input},'$.state'),'') NOT IN ('cleaning','cleanup_failed')
-      THEN json_set(${input},'$.state','cleaning','$.closed',json('true'))
-      WHEN json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId') AND json_extract(body,'$.task.cancelRequested')=1
-      THEN json_set(${input},'$.task.cancelRequested',json('true'),'$.task.cancelAccepted',json(CASE WHEN json_extract(body,'$.task.cancelAccepted')=1 THEN 'true' ELSE 'false' END),'$.task.cancelPending',json(CASE WHEN json_extract(body,'$.task.cancelPending')=1 THEN 'true' ELSE 'false' END),'$.state',CASE WHEN json_extract(${input},'$.task.cancelRequested')=1 THEN json_extract(${input},'$.state') ELSE 'running' END)
-      WHEN json_extract(${input},'$.state')='idle' AND json_extract(body,'$.task.taskId')=json_extract(${input},'$.task.taskId')
-        AND EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND status IN ('queued','sending','unknown'))
-      THEN json_set(${input},'$.state','running') ELSE ${input} END
-      WHERE id=?2 AND owner=?3 AND name=?4 RETURNING body`)
-      .get(body, record.agentId, record.ownerId, record.name);
+      WHEN coalesce(json_extract(body,'$.autoCleanupClosed'),0)=1
+      THEN json_set(${merged},'$.closed',json('true'),'$.autoCleanupClosed',json('true'))
+      ELSE ${merged} END
+      WHERE id=?2 AND owner=?3 AND name=?4 ${fence} RETURNING body`)
+      .get(body, record.agentId, record.ownerId, record.name, ...(dispatch ? [record.task?.taskId ?? null] : []));
+    if (dispatch && !result) return false;
     if (!result) throw new Error('This subagent instance has already been removed.');
+    this.woken.delete(record.agentId);
     // The SQL may deliberately preserve an atomic wake or child snapshot that the
     // in-memory record did not have; RETURNING gives us that actual body so the next
     // read is a cache hit, not another trip through SQLite.
     this.bodies.set(record.agentId, { text: result.body, version, changed: this.agentChanges() });
     this.syncCandidate(record);
     this.dropProjections();
+    return true;
   }
   requestCancel(record) {
     const changed = this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.task.cancelRequested',json('true'),'$.task.cancelPending',json('true'),'$.task.cancelTreeSettled',json('false'),'$.state','running'),'$.nextAttemptAt')
       WHERE id=? AND owner=? AND name=? AND json_extract(body,'$.sessionId')=? AND json_extract(body,'$.task.taskId')=?
-      AND coalesce(json_extract(body,'$.closed'),0)=0 AND coalesce(json_extract(body,'$.state'),'') NOT IN ('cleaning','cleanup_failed')`)
+      AND coalesce(json_extract(body,'$.closed'),0)=0 AND coalesce(json_extract(body,'$.state'),'') NOT IN ('cleaning','cleanup_failed')
+      -- A round whose thread cannot be found was already marked failed: cancelling it
+      -- would only pull it back to running for a tree no read can confirm.
+      AND NOT (json_extract(body,'$.state')='failed'
+        AND coalesce(json_extract(body,'$.task.treeUnavailable'),'')='codex-thread-not-found')`)
       .run(record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
     if (changed) this.touched(record.agentId);
     return changed;
@@ -639,14 +856,80 @@ export class RosterStore {
     if (changed) this.touched(record.agentId);
     return changed;
   }
+  /**
+   * What this whole tree — the name and every descendant, read from the roster itself —
+   * still owes before an automatic cleanup may delete it. `pending` is the one debt
+   * predicate every inbox reader uses; `blocked` counts notices whose text can never be
+   * sent again and is therefore the only copy left.
+   * @param {string} agentId Root of the tree.
+   * @returns {{pending: number, blocked: number}} Counts across the tree.
+   */
+  autoCleanupHold(agentId) {
+    if (typeof agentId !== 'string' || !agentId) return { pending: 0, blocked: 0 };
+    const row = this.db.prepare(`WITH RECURSIVE tree(id) AS (
+        SELECT id FROM agents WHERE id=?1
+        UNION
+        SELECT child.id FROM agents AS child JOIN tree ON json_extract(child.body,'$.parentAgentId')=tree.id
+      )
+      SELECT coalesce(sum(CASE WHEN ${submissionDebtSql('s')} THEN 1 ELSE 0 END),0) AS pending,
+        coalesce(sum(CASE WHEN json_extract(s.delivery,'$.state')='blocked' THEN 1 ELSE 0 END),0) AS blocked
+      FROM tree JOIN submissions AS s ON s.agent=tree.id`).get(agentId);
+    // A supplement of any round in this tree is the caller's own text: queued ones are still
+    // owed, a blocked one (expired, cancelled, final-submitted) is the only copy left.
+    const supplements = this.db.prepare(`WITH RECURSIVE tree(id) AS (
+        SELECT id FROM agents WHERE id=?1
+        UNION
+        SELECT child.id FROM agents AS child JOIN tree ON json_extract(child.body,'$.parentAgentId')=tree.id
+      )
+      SELECT coalesce(sum(CASE WHEN sup.status IN ('queued','sending','unknown') THEN 1 ELSE 0 END),0) AS pending,
+        coalesce(sum(CASE WHEN sup.status='blocked' THEN 1 ELSE 0 END),0) AS blocked
+      FROM tree JOIN supplements AS sup ON sup.agent=tree.id`).get(agentId);
+    const expired = this.db.prepare(`WITH RECURSIVE tree(id) AS (
+        SELECT id FROM agents WHERE id=?1
+        UNION
+        SELECT child.id FROM agents AS child JOIN tree ON json_extract(child.body,'$.parentAgentId')=tree.id
+      )
+      SELECT count(*) AS blocked FROM tree JOIN agents ON agents.id=tree.id
+      WHERE json_extract(agents.body,'$.expired.retainBody')=1`).get(agentId);
+    return { pending: (row?.pending ?? 0) + (supplements?.pending ?? 0),
+      blocked: (row?.blocked ?? 0) + (supplements?.blocked ?? 0) + (expired?.blocked ?? 0) };
+  }
   claimAutoCleanup(record) {
-    const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.closed',json('true'),'$.state','cleaning')
-      WHERE id=? AND owner=? AND json_extract(body,'$.task.taskId')=? AND coalesce(json_extract(body,'$.task.cancelRequested'),0)=0
-      AND coalesce(json_extract(body,'$.closed'),0)=0
-      AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=json_extract(agents.body,'$.task.taskId') AND status IN ('queued','sending','unknown','blocked'))`)
-      .run(record.agentId, record.ownerId, record.task?.taskId).changes === 1;
-    if (changed) this.touched(record.agentId);
-    return changed;
+    // One transaction for the check and the claim: a child that accepts a message while
+    // this runs either lands before the hold (and blocks the delete) or after the tree is
+    // closed (and is refused). The root keeps its own cancel and supplement gates.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const hold = this.autoCleanupHold(record.agentId);
+      if (hold.pending > 0 || hold.blocked > 0) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+      const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.closed',json('true'),'$.state','cleaning','$.autoCleanupClosed',json('true'))
+        WHERE id=? AND owner=? AND json_extract(body,'$.task.taskId')=? AND coalesce(json_extract(body,'$.task.cancelRequested'),0)=0
+        AND coalesce(json_extract(body,'$.closed'),0)=0
+        AND NOT EXISTS (SELECT 1 FROM supplements WHERE agent=agents.id AND task=json_extract(agents.body,'$.task.taskId') AND status IN ('queued','sending','unknown','blocked'))`)
+        .run(record.agentId, record.ownerId, record.task?.taskId).changes === 1;
+      if (changed) {
+        // Close the rest of the tree so no child can accept a new message while the
+        // cleanup walks it. Each child keeps its own state: it is still cleaned up by its
+        // own turn, never in parallel as a second cleanup.
+        this.db.prepare(`WITH RECURSIVE tree(id) AS (
+            SELECT id FROM agents WHERE id=?1
+            UNION
+            SELECT child.id FROM agents AS child JOIN tree ON json_extract(child.body,'$.parentAgentId')=tree.id
+          )
+          UPDATE agents SET body=json_set(body,'$.closed',json('true'),'$.autoCleanupClosed',json('true'))
+          WHERE id IN (SELECT id FROM tree WHERE id<>?1)`).run(record.agentId);
+      }
+      this.db.exec('COMMIT');
+      if (changed) this.touched(record.agentId);
+      return changed;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      this.touched(record.agentId);
+      throw error;
+    }
   }
   confirmCancel(record, result = {}) {
     const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'),'$.task.cancelPending',json(?))
@@ -671,6 +954,16 @@ export class RosterStore {
     this.settle(result.changes);
     return Number(result.changes) > 0;
   }
+  /** Replace an auxiliary lease only while the expected owner still holds its lease. */
+  claimLeaseWhileHeld(key, holder, leaseMs, ownerKey, ownerHolder) {
+    const now = Date.now();
+    const result = this.db.prepare(`INSERT INTO leases(key,holder,expires)
+      SELECT ?,?,? FROM leases WHERE key=? AND holder=? AND expires>?
+      ON CONFLICT(key) DO UPDATE SET holder=excluded.holder,expires=excluded.expires`)
+      .run(key, holder, now + leaseMs, ownerKey, ownerHolder, now);
+    this.settle(result.changes);
+    return Number(result.changes) > 0;
+  }
   renewLease(key, holder, leaseMs) {
     const result = this.db.prepare('UPDATE leases SET expires=? WHERE key=? AND holder=?').run(Date.now() + leaseMs, key, holder);
     this.settle(result.changes);
@@ -687,14 +980,124 @@ export class RosterStore {
    */
   enqueueSubmission({ id, ownerId, agentId, taskId, kind, message, final = false, created = new Date().toISOString() }) {
     if (!['ask', 'report'].includes(kind)) throw new Error('A submission must be an ask or a report.');
-    const queued = this.db.prepare(`INSERT OR IGNORE INTO submissions(id,owner,agent,task,kind,message,final,created,state)
-      VALUES (?,?,?,?,?,?,?,?,'pending')`)
-      .run(id, ownerId, agentId, taskId, kind, message, final ? 1 : 0, created).changes === 1;
+    // The notice is created with the row: an accepted message owes a delivery from the
+    // moment it exists, so no reader has to invent its identity for it later.
+    const notice = JSON.stringify({ id: submissionNoticeId(id), state: 'pending', createdAt: created });
+    const queued = this.db.prepare(`INSERT OR IGNORE INTO submissions(id,owner,agent,task,kind,message,final,created,state,delivery)
+      VALUES (?,?,?,?,?,?,?,?,'pending',?)`)
+      .run(id, ownerId, agentId, taskId, kind, message, final ? 1 : 0, created, notice).changes === 1;
     this.settle(queued ? 1 : 0);
     return queued;
   }
   pendingSubmissions(agentId, taskId) {
-    return this.submissions(agentId, taskId, true);
+    if (taskId !== undefined) return this.submissions(agentId, taskId, true);
+    return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created, delivery
+      FROM submissions WHERE agent=? AND state='pending' AND coalesce(json_extract(delivery,'$.nextAttemptAt'),0)<=?
+      ORDER BY created, rowid`).all(agentId, Date.now()).map(submissionFromRow);
+  }
+  /** Is a final for this round already stored and not yet finished delivering? */
+  hasFinalNotice(agentId, taskId) {
+    if (typeof agentId !== 'string' || !agentId || typeof taskId !== 'string' || !taskId) return false;
+    const row = this.db.prepare(`SELECT 1 AS found FROM submissions
+      WHERE agent=?1 AND task=?2 AND final=1 AND ${submissionDebtSql('submissions')} LIMIT 1`).get(agentId, taskId);
+    return Boolean(row);
+  }
+  pendingSubmissionAgents() {
+    // Earliest notice a name still owes, for whatever round wrote it. A notice of an older
+    // round that is waiting for its tree is due at once: that round is over, so an ordinary
+    // send may take it now instead of the tree's own six-hour expiry.
+    return this.db.prepare(`SELECT s.agent AS agentId,
+        min(CASE WHEN s.task<>json_extract(a.body,'$.task.taskId')
+              AND json_extract(s.delivery,'$.waitingForTree')=1 THEN 0
+            ELSE coalesce(json_extract(s.delivery,'$.nextAttemptAt'),0) END) AS dueAt
+      FROM submissions AS s JOIN agents AS a ON a.id=s.agent AND a.owner=s.owner
+      WHERE ${submissionDebtSql('s')} AND coalesce(json_extract(a.body,'$.closed'),0)=0
+      GROUP BY s.agent`).all();
+  }
+  /**
+   * Every parent message this roster still owes a delivery, in the order it was written.
+   * `deliveryVersion` is the raw notice text as stored — null for a row from before the
+   * notice column — and is what a caller hands back to take the next step for it.
+   */
+  submissionWork(agentId, taskId) {
+    if (typeof agentId !== 'string' || !agentId) return [];
+    const scoped = taskId !== undefined;
+    return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created, state, delivery
+      FROM submissions WHERE agent=? ${scoped ? 'AND task=?' : ''} AND ${submissionDebtSql()}
+      ORDER BY created, rowid`).all(...(scoped ? [agentId, taskId] : [agentId]))
+      .map(row => ({ ...submissionFromRow(row), state: row.state, deliveryVersion: row.delivery ?? null }));
+  }
+  /** How many parent messages this name still owes a delivery, optionally for one round. */
+  submissionDebt(agentId, taskId) {
+    if (typeof agentId !== 'string' || !agentId) return 0;
+    const scoped = taskId !== undefined;
+    return this.db.prepare(`SELECT count(*) AS count FROM submissions WHERE agent=? ${scoped ? 'AND task=?' : ''}
+      AND ${submissionDebtSql()}`).get(...(scoped ? [agentId, taskId] : [agentId])).count;
+  }
+  /** The archived round a notice still belongs to, when this roster kept it. */
+  historyTask(agentId, taskId) {
+    if (typeof agentId !== 'string' || !agentId || typeof taskId !== 'string' || !taskId) return undefined;
+    // Archiving and the next round's save used to be two transactions, so one task can
+    // have more than one snapshot: the newest one is the one that was live longest.
+    const row = this.db.prepare(`SELECT body FROM agent_history WHERE agent=? AND json_extract(body,'$.taskId')=?
+      ORDER BY seq DESC LIMIT 1`).get(agentId, taskId);
+    return row ? JSON.parse(row.body) : undefined;
+  }
+  /**
+   * Record the next step of one message's notice. `expected` is the raw notice text the
+   * caller read (null for a row from before the column): the update lands only while the
+   * row still holds exactly that, so two connections cannot both claim this notice. A
+   * terminal notice is consumed by the same statement and never walked back to a
+   * non-terminal one; a legacy row that is already terminal is consumed with its
+   * identity normalized and its final state kept. With `record`, the caller's mirror of
+   * the name is saved in the same transaction.
+   * @returns {boolean} True when this call wrote the notice.
+   */
+  saveSubmissionDelivery(id, notice, { expected, record } = {}) {
+    if (typeof id !== 'string' || !id || !notice || typeof notice !== 'object') return false;
+    const shaped = { ...notice, id: typeof notice.id === 'string' && notice.id ? notice.id : submissionNoticeId(id) };
+    const terminal = ['delivered', 'blocked'].includes(shaped.state);
+    const parameters = [JSON.stringify(shaped)];
+    let assignments = 'delivery=?';
+    if (terminal) {
+      assignments = "delivery=?, state='consumed', consumed=coalesce(consumed, ?)";
+      parameters.push(new Date().toISOString());
+    }
+    parameters.push(id);
+    let where = 'id=?';
+    if (terminal) {
+      // A legacy row — absorb progress still pending — may be finalized here, which is
+      // what normalizes its identity, and two proofs may correct blocked to delivered. A
+      // row that already recorded a terminal outcome is never rewritten.
+      where += " AND (state='pending' OR coalesce(json_extract(delivery,'$.state'),'') NOT IN ('delivered','blocked'))";
+    } else where += " AND coalesce(json_extract(delivery,'$.state'),'') NOT IN ('delivered','blocked')";
+    if (expected === null) where += ' AND delivery IS NULL';
+    else if (expected !== undefined) { where += ' AND delivery=?'; parameters.push(expected); }
+    const write = () => {
+      const written = this.db.prepare(`UPDATE submissions SET ${assignments} WHERE ${where}`).run(...parameters).changes === 1;
+      this.settle(written ? 1 : 0);
+      return written;
+    };
+    if (!record) return write();
+    this.db.exec('PRAGMA busy_timeout=30000');
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const written = write();
+      // The caller's mirror is current only while the row still holds the same task: a
+      // worker that was replaced must not write its stale copy over the newer one.
+      if (written && this.stillSameTask(record)) this.save(record);
+      this.db.exec('COMMIT');
+      return written;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    } finally { this.db.exec('PRAGMA busy_timeout=5000'); }
+  }
+  /** Does the row still hold the exact task this record mirrors? */
+  stillSameTask(record) {
+    return this.db.prepare(`SELECT 1 AS current FROM agents WHERE id=? AND owner=? AND name=?
+      AND json_extract(body,'$.task.taskId') IS ?`)
+      .get(record.agentId, record.ownerId, record.name, record.task?.taskId ?? null) !== undefined;
   }
   /** Bind a callback to the current task before the shared monitor delivers it. */
   submitParentMessage(agentId, { kind, message, final = false }, cliDispatch) {
@@ -706,9 +1109,15 @@ export class RosterStore {
       const record = agentId && this.get(agentId);
       const task = record?.task;
       if (!task || record.closed || (cliDispatch && (record.target !== 'claude-cli'
-          || task.taskId !== cliDispatch.taskId || task.cancelRequested
-          || ['idle', 'failed', 'cancelled'].includes(record.state)
-          || task.dispatches.at(-1)?.requestId !== cliDispatch.requestId))) {
+          || task.taskId !== cliDispatch.taskId
+          || task.dispatches?.at(-1)?.requestId !== cliDispatch.requestId))) {
+        throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
+      }
+      // Callback correctness applies independently of the session cleanup switch.
+      if (isCancelledRound(record)) {
+        throw Object.assign(new Error('The task was cancelled. Questions and reports are closed for this round.'), { code: 'task-cancelled' });
+      }
+      if (cliDispatch && ['idle', 'failed'].includes(record.state)) {
         throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
       }
       if (task.reports?.some(report => report.final) || this.submissions(agentId, task.taskId).some(report => report.final)) {
@@ -750,11 +1159,9 @@ export class RosterStore {
       undelivered: asked.filter(id => answered.has(id) && !settled.has(id)).length };
   }
   submissions(agentId, taskId, pendingOnly = false) {
-    return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created FROM submissions
+    return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created, delivery FROM submissions
       WHERE agent=? AND task=? ${pendingOnly ? "AND state='pending'" : ''} ORDER BY created`)
-      .all(agentId, taskId)
-      .map(row => ({ id: row.id, ownerId: row.owner, agentId: row.agent, taskId: row.task,
-        kind: row.kind, message: row.message, final: row.final === 1, created: row.created }));
+      .all(agentId, taskId).map(submissionFromRow);
   }
   saveAndConsumeSubmissions(record, ids) {
     // A deployment migration can find another process holding the write lock; it

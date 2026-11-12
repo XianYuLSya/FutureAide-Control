@@ -65,6 +65,7 @@ const started = Date.now();
 const lines = [];
 const child = spawn(process.execPath, [path.join('src', 'scoped-worker.mjs'), '--config', configFile, '--lease', holder], {
   cwd: process.cwd(),
+  windowsHide: true,
   stdio: ['ignore', 'pipe', 'pipe'],
   env: { ...process.env, FUTUREAIDE_MONITOR_TRACE: '1', CLAUDE_CONFIG_DIR: claudeDirectory },
 });
@@ -132,7 +133,6 @@ checks.fileEventToWake = woken();
 // 3b. After the wake the loop polls once and then goes quiet: it must not answer a
 // single event with a burst of rounds, and it must not wait out the whole sweep either.
 const wakeAt = rounds.find(round => round.at >= beforeWake)?.at ?? beforeWake;
-checks.roundsAfterWakeIn2s = rounds.filter(round => round.at > wakeAt && round.at <= wakeAt + 2000).length;
 
 // 4. The lease outlives its own heartbeat window, sampled until 75s of life.
 checks.leaseSamples = [];
@@ -141,6 +141,8 @@ while (Date.now() - started < 75000) {
   checks.leaseSamples.push({ atMs: Date.now() - started, expiresInMs: lease ? lease.expires - Date.now() : null, holder: lease?.holder ?? null });
   await sleep(5000);
 }
+// Count once the full post-wake window has been observed.
+checks.roundsAfterWakeIn2s = rounds.filter(round => round.at > wakeAt && round.at <= wakeAt + 2000).length;
 checks.leaseHeldThroughout = checks.leaseSamples.every(sample => sample.expiresInMs > 0 && sample.holder === holder);
 checks.roundsIn75s = rounds.length;
 

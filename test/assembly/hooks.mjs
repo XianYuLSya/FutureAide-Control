@@ -19,7 +19,9 @@ export async function resolveStdioCaller() { return caller(); }
 export async function load(url, context, nextLoad) {
   if (process.env.FUTUREAIDE_ASSEMBLY_FAKE_CLAUDE === '1'
       && /\/src\/claude-caller-identity\.mjs$/.test(url)) {
-    return { format: 'module', shortCircuit: true, source: claudeIdentity };
+    // Only replace the caller binding. The worker still verifies its real PID.
+    const original = JSON.stringify(`${url}?assembly-original`);
+    return { format: 'module', shortCircuit: true, source: `${claudeIdentity}\nexport * from ${original};` };
   }
   if (process.env.FUTUREAIDE_ASSEMBLY_RENDERER_URL
       && /\/src\/codex-ipc\.mjs$/.test(url)) {

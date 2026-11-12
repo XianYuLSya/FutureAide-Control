@@ -31,6 +31,11 @@ export const SERVER_NAME = 'futureaide-report';
 export const SERVER_VERSION = '0.1.0';
 export const HTTP_PATH = '/mcp';
 export const DEFAULT_PORT = 17654;
+// The two read-only team-board routes this listener can mount. Kept as plain strings:
+// the listener must not import the board module, so a board that is switched off costs
+// this file nothing at all.
+export const BOARD_PATH = '/board';
+export const BOARD_DATA_PATH = '/board/data';
 // How long an idle caller connection stays pooled: one identity lookup per session
 // instead of one per call. Never below Node's 5 second default, or the socket would
 // die between two ordinary tool calls.
@@ -139,16 +144,62 @@ async function readBody(req, limitBytes = 1024 * 1024) {
  * request, so one shared process cannot leak another session's identity.
  */
 export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1',
-  resolveCaller, instructions, identity = {}, management, rosterId = undefined,
+  resolveCaller, instructions, identity = {}, management, rosterId = undefined, board = undefined,
   keepAliveTimeoutMs = DEFAULT_KEEP_ALIVE_MS, log = () => {} } = {}) {
+  // The board is a private roster view: refusing every other address here means the
+  // option cannot be widened by accident, and nothing is bound or imported when it is off.
+  if (board && host !== '127.0.0.1') {
+    throw Object.assign(new Error('The team board serves a private roster: it may only listen on 127.0.0.1.'),
+      { code: 'board-loopback-only' });
+  }
   const startedAt = new Date().toISOString();
   const stats = { requests: 0, identified: 0, unidentified: 0, served: 0 };
   // One identity per TCP connection, dropped when that socket closes.
   const identities = new WeakMap();
   let boundPort = port;
+  // The team board is mounted only when the installation switched it on: with `board`
+  // absent these two paths are not routed at all, and nothing of the board is imported
+  // or read. Both are plain GET reads on this listener's own loopback address; they are
+  // not part of the MCP surface and answer no cross-site request (no CORS headers, and
+  // the page only ever calls them from the same origin it was served from).
+  const boardPage = async (res, type) => {
+    const page = await board.page();
+    if (!page) { sendJson(res, 404, { error: { code: 'board-page-missing', message: 'The team board page is not installed.' } }); return; }
+    res.writeHead(200, { 'content-type': page.type ?? type, 'content-length': Buffer.byteLength(page.body),
+      'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+    res.end(page.body);
+  };  // The board carries a private roster, so it only ever answers for the loopback name it
+  // was reached by. A rebinding page arrives under its own host name and is refused; the
+  // MCP surface and the health document answer exactly as before, with no such check.
+  const boardHostAllowed = host => {
+    const name = String(host ?? '').toLowerCase();
+    return name === `127.0.0.1:${boundPort}` || name === `localhost:${boundPort}`;
+  };
 
   const server = http.createServer(async (req, res) => {
     const path = (req.url ?? '').split('?')[0];
+    if (board && (path === BOARD_PATH || path === BOARD_DATA_PATH)) {
+      // The roster behind this route changes constantly, so no answer — success, refusal
+      // or failure — may be cached by anything between the listener and the page.
+      res.setHeader('cache-control', 'no-store');
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: { code: 'method-not-allowed', message: 'The team board is read-only.' } }, { allow: 'GET' });
+        return;
+      }
+      if (!boardHostAllowed(req.headers.host)) {
+        sendJson(res, 403, { error: { code: 'board-host-rejected', message: `The team board answers only on 127.0.0.1:${boundPort}.` } });
+        return;
+      }
+      try {
+        if (path === BOARD_PATH) await boardPage(res, 'text/html; charset=utf-8');
+        else sendJson(res, 200, board.data());
+      } catch (error) {
+        log(`board request failed: ${String(error?.message ?? error).slice(0, 200)}`);
+        if (!res.headersSent) sendJson(res, 503, { error: { code: 'board-unavailable', message: 'The team board data could not be read.' } });
+        else res.end();
+      }
+      return;
+    }
     if (path !== HTTP_PATH) {
       if (path === '/healthz' && req.method === 'GET') {
         sendJson(res, 200, { ok: true, server: SERVER_NAME, version: SERVER_VERSION, startedAt, stats,
@@ -245,9 +296,9 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
  * whether that is fatal.
  */
 export async function startReportService({ store, port = DEFAULT_PORT, host = '127.0.0.1',
-  management, log = () => {} } = {}) {
+  management, board = undefined, log = () => {} } = {}) {
   if (!store) throw new TypeError('startReportService requires the shared RosterStore');
-  return startHttpService({ port, host, log, management,
+  return startHttpService({ port, host, log, management, ...(board ? { board } : {}),
     // The health document names the roster it serves, so a caller can prove the
     // service it reached belongs to its own database.
     rosterId: typeof store.identity === 'function' ? store.identity() : undefined });

@@ -8,35 +8,51 @@ import { hostname } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { claudeBindingStale, claudeNoticeReceipt, claudeNoticeRequestId, createScopedAgents } from '../src/scoped-agents.mjs';
-import { RosterStore } from '../src/roster-store.mjs';
+import { RosterStore, submissionNoticeId } from '../src/roster-store.mjs';
 import { createCodexBackend } from '../src/codex-backend.mjs';
 import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
 import { claudeTrustedCaller, registerScopedTools, scopedManagement } from '../src/mcp-server.mjs';
+import { bindClaude, discoverClaude } from '../src/claude-inbox.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const THREAD = '11111111-1111-4111-8111-111111111111';
 const OTHER = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
-async function fixture({ adapters = {}, onPollComplete, captureFiles,
+async function fixture({ adapters = {}, onPollComplete, captureFiles, claudeInbox, config = {},
+  notifyDesktop, persist = false,
   clientFactory = () => { throw new Error('no DSH host is needed for these cases'); }, startSharedMonitor = () => true } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'cross-'));
-  const store = new RosterStore(':memory:');
-  const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
-    store,
-    clientFactory,
-    callCodex: async (threadId, tool) => (tool === 'read_thread'
-      ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } }
-      : { accepted: true }),
-    backendAdapters: adapters,
-    ...(onPollComplete ? { onPollComplete } : {}),
-    ...(captureFiles ? { captureFiles } : {}),
-    startSharedMonitor,
-    removeTree: async () => {},
-  });
-  return { service, store, stateDirectory };
+  // A file roster is what a restarted monitor reads back; without it these cases keep
+  // the in-memory database they always had.
+  const rosterFile = persist ? path.join(stateDirectory, 'roster.sqlite') : ':memory:';
+  const open = () => {
+    const store = new RosterStore(rosterFile);
+    const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh', ...config }, {
+      store,
+      clientFactory,
+      callCodex: async (threadId, tool) => (tool === 'read_thread'
+        ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } }
+        : { accepted: true }),
+      backendAdapters: adapters,
+      ...(onPollComplete ? { onPollComplete } : {}),
+      ...(captureFiles ? { captureFiles } : {}),
+      ...(claudeInbox ? { claudeInbox } : {}),
+      ...(notifyDesktop ? { notifyDesktop } : {}),
+      startSharedMonitor,
+      removeTree: async () => {},
+    });
+    return { service, store };
+  };
+  let live = open();
+  return { stateDirectory, rosterFile,
+    get service() { return live.service; },
+    get store() { return live.store; },
+    // A monitor restart: process, service and database connection are new, and only what
+    // the roster persisted survives it.
+    reopen() { live.service.close(); live = open(); return this; } };
 }
 
 test('owner ids are namespaced per source and never collide', () => {
@@ -897,6 +913,7 @@ test('a Codex final reaches Claude through a legal native id and recovers its re
     f.store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId: binding.sessionId, workspace, binding });
     const reportId = 'submission:submission-f19a44d65e454235a643e7ce556e7c2e';
     const noticeId = `report-${reportId}`;
+    const canonicalId = submissionNoticeId(reportId.slice('submission:'.length));
     const report = { id: reportId, taskId: 'task-notice', final: true, message: 'verified final artifact', treeSettledConfirmed: true,
       delivery: { id: noticeId, state: 'unknown', error: { code: 'operation-failed', message: 'claude-request-id-invalid' } } };
     const task = { ...completedInput('notice', [report]), result: { state: 'completed', reply: report.message } };
@@ -905,13 +922,15 @@ test('a Codex final reaches Claude through a legal native id and recovers its re
     await f.service.poll('notice');
     assert.equal(received.length, 1, JSON.stringify(f.store.get('notice')));
     assert.match(received[0].uuid, /^[a-zA-Z0-9-]{1,100}$/);
-    assert.equal(received[0].uuid, claudeNoticeRequestId(noticeId));
+    assert.equal(received[0].uuid, claudeNoticeRequestId(canonicalId));
     assert.equal(claudeNoticeRequestId('legal-notice-1'), 'legal-notice-1');
-    const pending = f.store.get('notice'); pending.task.reports[0].delivery.nextAttemptAt = 0; f.store.save(pending);
+    const [pending] = f.store.submissionWork('notice', task.taskId);
+    assert.equal(f.store.saveSubmissionDelivery(pending.id, { ...pending.delivery, nextAttemptAt: 0 },
+      { expected: pending.deliveryVersion }), true);
     await f.service.poll('notice');
     const finished = f.store.get('notice');
     assert.equal(finished.task.reports[0].id, reportId);
-    assert.equal(finished.task.reports[0].delivery.id, noticeId);
+    assert.equal(finished.task.reports[0].delivery.id, canonicalId);
     assert.equal(finished.task.reports[0].delivery.state, 'delivered');
     assert.equal(finished.task.reports[0].delivery.receipt.requestId, received[0].uuid);
     assert.equal(received.length, 1, 'read-back never resends the written notice');
@@ -1053,6 +1072,194 @@ test('a notice waits for a session that is not running, then goes out when it re
   } finally { await claude.close(); f.service.close(); }
 });
 
+// --- Reminding the user about a report whose Claude session stays away ---------
+
+/** Fake notification area: records what the OS would have been asked to show. */
+const fakeNotifier = (notices, payloads = {}) => async payload => {
+  notices.push(payload);
+  if (payloads.fail) throw Object.assign(new Error('the notification area refused this reminder'), { beforeSubmit: true });
+  return { status: 'submitted' };
+};
+
+/** Move one legacy report's notice back in time and make its own retry due now. */
+const backdate = (f, name, ms, tweak = () => {}) => {
+  const record = f.store.get(name);
+  const delivery = record.task.reports[0].delivery;
+  delivery.callbackMissingSince = new Date(Date.now() - ms).toISOString();
+  delivery.nextAttemptAt = 0;
+  tweak(delivery);
+  f.store.save(record);
+  return delivery;
+};
+
+test('a report whose Claude session stays away is reminded once, kept as debt, and lands when it returns', async () => {
+  const notices = [];
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() },
+    config: { claudeCallbackReminderMs: 600000 }, notifyDesktop: fakeNotifier(notices), persist: true });
+  const claude = await restartedClaude();
+  try {
+    pendingReport(f, claude, 'remind');
+    await f.service.poll('remind');
+    let delivery = f.store.get('remind').task.reports[0].delivery;
+    assert.equal(delivery.state, 'pending', 'nothing was written, so this is not an unknown outcome');
+    assert.equal(delivery.error.code, 'callback-target-missing');
+    assert.ok(Number.isFinite(Date.parse(delivery.callbackMissingSince)), 'the first definite absence starts the wait on the original notice');
+    assert.equal(delivery.reminder, undefined);
+    assert.equal(notices.length, 0, 'a first absence inside the configured wait reminds nobody');
+
+    // The wait elapses. Only the notice's own retry schedule is involved: no timer and
+    // no background job of its own is added.
+    backdate(f, 'remind', 600001);
+    await f.service.poll('remind');
+    assert.equal(notices.length, 1, JSON.stringify(f.store.get('remind').task.reports[0].delivery));
+    assert.match(notices[0].body, /「remind」/);
+    assert.match(notices[0].body, new RegExp(claude.sessionId.slice(0, 8)));
+    assert.match(notices[0].body, /verified final artifact/);
+    assert.match(notices[0].body, /futureaide_inspect_agent\(detail=true\)/);
+    delivery = f.store.get('remind').task.reports[0].delivery;
+    assert.equal(delivery.state, 'pending', 'the reminder never marks the original report delivered');
+    assert.equal(delivery.error.code, 'callback-target-missing', 'its own retry and read-back are kept');
+    assert.equal(delivery.reminder.state, 'submitted');
+    assert.equal(delivery.reminder.id, `reminder-${delivery.id}`, 'the claim is recorded under the original notice id');
+
+    // Neither another due attempt nor a monitor restart repeats it.
+    await again(f, 'remind');
+    assert.equal(notices.length, 1);
+    f.reopen();
+    assert.equal(f.store.get('remind').task.reports[0].delivery.reminder.state, 'submitted',
+      'the claim is persisted with the notice, so a cold monitor reads it back');
+    await again(f, 'remind');
+    assert.equal(notices.length, 1, 'a restarted monitor sends no second reminder');
+
+    // The session comes back: the original channel carries the report, read back as before.
+    await claude.come();
+    await again(f, 'remind');
+    assert.equal(claude.received.length, 1);
+    assert.equal(f.store.get('remind').task.reports[0].delivery.callbackMissingSince, undefined,
+      'a session that answers again ends the absence');
+    await again(f, 'remind');
+    assert.equal(f.store.get('remind').task.reports[0].delivery.state, 'delivered');
+    assert.equal(claude.received.length, 1, 'read-back never resends the written notice');
+    assert.equal(notices.length, 1, 'recovery reminds nothing');
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a new submission report is reminded under the notice its own row already owns', async () => {
+  const notices = [];
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() },
+    config: { claudeCallbackReminderMs: 0 }, notifyDesktop: fakeNotifier(notices) });
+  const claude = await restartedClaude();
+  try {
+    const ownerId = ownerIdForSource('claude-desktop', claude.sessionId);
+    f.store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId: claude.sessionId, workspace, binding: claude.stale });
+    f.store.insert(taskRecord({ agentId: 'row', ownerId, sessionId: 'session-row', name: 'row', state: 'delivery_pending',
+      task: { ...completedInput('row'), result: { state: 'completed', reply: 'ok' } } }));
+    assert.equal(f.store.enqueueSubmission({ id: 'submission-row', ownerId, agentId: 'row', taskId: 'task-row',
+      kind: 'report', message: '审计结论：两处不一致待确认', final: false }), true);
+
+    await f.service.poll('row');
+    let [row] = f.store.submissionWork('row', 'task-row');
+    assert.equal(row.delivery.id, submissionNoticeId('submission-row'));
+    assert.equal(row.delivery.state, 'pending', 'the submission row still owes its report');
+    assert.equal(row.delivery.error.code, 'callback-target-missing');
+    assert.equal(notices.length, 1, '0 ms means the first definite absence is enough');
+    assert.match(notices[0].body, /审计结论/);
+    assert.match(notices[0].body, /「row」/);
+    assert.equal(row.delivery.reminder.state, 'submitted');
+    assert.equal(row.delivery.reminder.id, `reminder-${row.delivery.id}`);
+
+    // The claim rides the row's own CAS-protected notice, so a second attempt is silent.
+    const bumped = { ...row.delivery, nextAttemptAt: 0 };
+    assert.equal(f.store.saveSubmissionDelivery('submission-row', bumped, { expected: row.deliveryVersion }), true);
+    await f.service.poll('row');
+    [row] = f.store.submissionWork('row', 'task-row');
+    assert.equal(notices.length, 1, 'one reminder per original notice');
+    assert.equal(row.delivery.state, 'pending', 'the report is still owed, not delivered');
+    assert.equal(row.state, 'consumed', 'the row was absorbed as usual; the debt is the notice it still owes');
+    assert.equal(f.store.submissionWork('row', 'task-row').length, 1, 'and the row is still returned as debt');
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('the reminder is due at its own time instead of behind a grown delivery backoff', async () => {
+  const notices = [];
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() },
+    config: { claudeCallbackReminderMs: 1000 }, notifyDesktop: fakeNotifier(notices) });
+  const claude = await restartedClaude();
+  try {
+    pendingReport(f, claude, 'clamp');
+    // A notice that has failed often backs off to thirty seconds, far past a one-second
+    // wait: the reminder may not ride that backoff.
+    const record = f.store.get('clamp');
+    record.task.reports[0].delivery.attempts = 9;
+    f.store.save(record);
+    await f.service.poll('clamp');
+    let delivery = f.store.get('clamp').task.reports[0].delivery;
+    assert.equal(notices.length, 0, 'the wait has not elapsed yet');
+    assert.ok(delivery.nextAttemptAt - Date.parse(delivery.callbackMissingSince) <= 1000,
+      `the reminder is due at its own time: ${delivery.nextAttemptAt - Date.parse(delivery.callbackMissingSince)}ms`);
+
+    // Once due, it goes out; the report's own backoff is not touched by the reminder.
+    const due = f.store.get('clamp');
+    due.task.reports[0].delivery.callbackMissingSince = new Date(Date.now() - 1001).toISOString();
+    due.task.reports[0].delivery.nextAttemptAt = 0;
+    f.store.save(due);
+    await f.service.poll('clamp');
+    assert.equal(notices.length, 1);
+    delivery = f.store.get('clamp').task.reports[0].delivery;
+    assert.equal(delivery.reminder.state, 'submitted');
+    const againDue = f.store.get('clamp');
+    againDue.task.reports[0].delivery.nextAttemptAt = 0;
+    f.store.save(againDue);
+    await f.service.poll('clamp');
+    assert.equal(notices.length, 1, 'a submitted reminder is never repeated');
+    delivery = f.store.get('clamp').task.reports[0].delivery;
+    assert.ok(delivery.nextAttemptAt - Date.now() > 5000,
+      'after the reminder, the report keeps its own grown backoff');
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a failure notice and a session that answers are never reminded, and a refused reminder may be tried again', async () => {
+  const notices = [];
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() },
+    config: { claudeCallbackReminderMs: 0 }, notifyDesktop: fakeNotifier(notices, { fail: true }) });
+  const claude = await restartedClaude();
+  try {
+    // An execution failure notifies its parent through the same path, and is excluded.
+    failedTask(f, claude, 'failed');
+    await f.service.poll('failed');
+    let failure = f.store.get('failed').task.reports.find(report => report.failure);
+    assert.equal(failure.delivery.error.code, 'callback-target-missing');
+    assert.equal(failure.delivery.reminder, undefined, 'an automatic failure prompt is not a report reminder');
+    failure = f.store.get('failed').task.reports.find(report => report.failure);
+    failure.delivery.nextAttemptAt = 0; f.store.save(f.store.get('failed'));
+    await f.service.poll('failed');
+    assert.equal(notices.length, 0);
+
+    // A reminder the system refused before showing it is retried on the next due attempt.
+    pendingReport(f, claude, 'refused');
+    await f.service.poll('refused');
+    assert.equal(notices.length, 1);
+    let delivery = f.store.get('refused').task.reports[0].delivery;
+    assert.equal(delivery.state, 'pending');
+    assert.equal(delivery.reminder.state, 'failed', 'nothing was shown, so it is recorded as not submitted');
+    assert.equal(delivery.error.code, 'callback-target-missing', 'a failed reminder keeps the report and its diagnosis');
+    await again(f, 'refused');
+    assert.equal(notices.length, 2, 'a pre-write failure may try again at the notice cadence');
+    delivery = f.store.get('refused').task.reports[0].delivery;
+    assert.equal(delivery.reminder.attempts, 2);
+
+    // A session that answers is never an absence at all.
+    await claude.come();
+    pendingReport(f, claude, 'present');
+    await f.service.poll('present');
+    assert.equal(claude.received.length, 1);
+    const present = f.store.get('present').task.reports[0].delivery;
+    assert.equal(present.callbackMissingSince, undefined);
+    assert.equal(present.reminder, undefined);
+    assert.equal(notices.length, 2, 'nothing is reminded for a report that reached its session');
+  } finally { await claude.close(); f.service.close(); }
+});
+
 test('a crashed session leaves its record behind and the notice still finds where it came back', async () => {
   const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
   const claude = await restartedClaude();
@@ -1068,6 +1275,24 @@ test('a crashed session leaves its record behind and the notice still finds wher
     await f.service.poll('crashed');
     assert.equal(claude.received.length, 1, JSON.stringify(f.store.get('crashed').task.reports[0].delivery));
     assert.notEqual(f.store.owner(ownerId).binding.socketPath, dead.socketPath);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a leftover record whose pid was reused does not hide the live session', async () => {
+  const claude = await restartedClaude();
+  // Windows reuses a crashed session's pid, so discovery can list a leftover record for
+  // the same session before the live one. Only the live record may bind.
+  const leftover = { pid: 4242, sessionId: claude.sessionId };
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() }, claudeInbox: {
+    discover: async () => ({ available: true, sessions: [leftover, ...(await discoverClaude()).sessions] }),
+    bind: async args => { if (args.pid === leftover.pid) throw new Error('claude-process-replaced'); return bindClaude(args); },
+  } });
+  try {
+    await claude.come();
+    const ownerId = pendingReport(f, claude, 'reused');
+    await f.service.poll('reused');
+    assert.equal(claude.received.length, 1, JSON.stringify(f.store.get('reused').task.reports[0].delivery));
+    assert.equal(f.store.owner(ownerId).binding.pid, process.pid, 'the live record is the one kept');
   } finally { await claude.close(); f.service.close(); }
 });
 

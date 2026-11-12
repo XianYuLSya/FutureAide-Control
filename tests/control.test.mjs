@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -27,6 +27,41 @@ test('scope filtering excludes unrelated project sessions', async t => {
   const { control } = await fixture(t);
   assert.deepEqual((await control.sessions()).items.map(i => i.sessionId), ['parent']);
   await assert.rejects(control.read({ sessionId: 'other' }), /configured project/);
+});
+
+// P1: a live task must not go out after its round finished or its dispatch expired. The
+// cursor checkpoint has already been written when the gate is asked, so the refusal is
+// recorded as a rejected receipt — never as an unknown one — and nothing reaches the host.
+test('a refused send keeps its checkpoint and writes a rejected receipt', async t => {
+  const workspace = await mkdtemp(path.join(root, '.control-block-'));
+  t.after(async () => { assert.ok(workspace.startsWith(root + path.sep)); await rm(workspace, { recursive: true, force: true }); });
+  let sent = 0;
+  const client = {
+    listSessions: async () => ({ items: [{ sessionId: 'parent', cwd: workspace, running: true, projections: { asOfSeq: 9 } }] }),
+    sendMessage: async () => { sent += 1; return { accepted: true }; },
+  };
+  const control = createControl({ workspace, stateDirectory: path.join(workspace, 'state') }, { client });
+  let asked = 0;
+  const input = { sessionId: 'parent', message: 'late dispatch', requestId: 'late-1',
+    writeBlockReason: () => { asked += 1; return 'round-finished'; } };
+  await assert.rejects(control.send(input), error => error.code === 'round-finished'
+    && error.terminal === true && error.notSent === true && error.requestId === 'late-1');
+  assert.equal(asked, 1, 'the gate is asked once, after the checkpoint');
+  assert.equal(sent, 0, 'nothing reached the host');
+  const directory = path.join(workspace, 'state', 'requests');
+  const files = (await readdir(directory)).filter(name => name.endsWith('.json'));
+  assert.equal(files.length, 1, 'exactly one receipt exists');
+  const receipt = JSON.parse(await readFile(path.join(directory, files[0]), 'utf8'));
+  assert.equal(receipt.status, 'rejected', 'the receipt says rejected, not unknown');
+  assert.equal(receipt.afterSeq, 9, 'the checkpoint written before the gate is kept');
+  // Replaying the same request reports the same rejection and still sends nothing.
+  const replay = await control.send(input);
+  assert.deepEqual([replay.status, replay.duplicate, replay.accepted], ['rejected', true, false]);
+  assert.equal(sent, 0);
+  // An ordinary send without the gate is untouched.
+  const plain = await control.send({ sessionId: 'parent', message: 'normal', requestId: 'normal-1' });
+  assert.equal(plain.accepted, true);
+  assert.equal(sent, 1);
 });
 
 test('duplicate writes reuse the receipt and conflicting contents are rejected', async t => {

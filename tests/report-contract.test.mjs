@@ -5,7 +5,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from '../src/report-contract.mjs';
+import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from '../src/report-contract.mjs';
 import * as dsh from '../src/host-plugin.mjs';
 import { makeScopedServer } from '../src/mcp-server.mjs';
 
@@ -49,6 +49,7 @@ test('the Codex surface carries both contracts in its parent tools', async () =>
     const tools = (await client.listTools()).tools;
     assert.ok(tools.find(tool => tool.name === 'report_parent').description.includes(FINAL_REPORT_CONTRACT));
     assert.ok(tools.find(tool => tool.name === 'ask_parent').description.includes(QUESTION_CONTRACT));
+    assert.ok(tools.find(tool => tool.name === 'ask_parent').description.includes(CODEX_ASK_PARENT_INSTRUCTION));
     // The parent may be Claude or Codex, so no tool text may name Codex as the parent.
     assert.doesNotMatch(JSON.stringify(tools), /Codex parent chat|Codex chat/);
   } finally { await close(); }

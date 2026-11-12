@@ -397,7 +397,7 @@ test('a timed-out report is recovered from a summary marker instead of resending
   assert.equal(owner.calls.filter(call => call.method === 'turn/start').length, 1, 'read-back never resends');
 });
 
-test('a confirmed missing marker resends the report exactly once', async t => {
+test('a missing marker alone does not authorize a second write of an accepted report', async t => {
   let sends = 0;
   let owner;
   const f = await assembly('codex-owner-resend', { steps: [{ mode: 'final', message: 'Resend after confirmed absence.' }],
@@ -423,14 +423,25 @@ test('a confirmed missing marker resends the report exactly once', async t => {
     await sleep(40);
   }
   assert.equal(current.task.reports[0].delivery.state, 'unknown');
-  current.task.reports[0].delivery.attemptedAt = new Date(Date.now() - 3 * 60 * 1000).toISOString();
-  current.task.reports[0].delivery.nextAttemptAt = 0;
-  f.store.save(current);
+  const retryAt = minutes => {
+    const [work] = f.store.submissionWork(record.agentId, current.task.taskId);
+    assert.ok(f.store.saveSubmissionDelivery(work.id, { ...work.delivery,
+      attemptedAt: new Date(Date.now() - minutes * 60 * 1000).toISOString(), nextAttemptAt: 0 },
+    { expected: work.deliveryVersion }));
+  };
+  retryAt(3);
+  await f.service.poll(record.agentId);
+  assert.equal(sends, 1, 'an absent marker does not prove that a timed-out write cannot arrive');
+  assert.equal(f.store.get(record.agentId).task.reports[0].delivery.state, 'unknown');
+  retryAt(31);
   const done = await pollUntil(f, record.agentId, item => item?.state === 'idle' || item?.state === 'failed',
-    { message: 'the one resend to settle' });
+    { message: 'the ambiguous delivery to reach its time limit' });
   assert.equal(done.state, 'idle', JSON.stringify(done.error));
-  assert.equal(done.task.reports[0].delivery.state, 'delivered');
-  assert.equal(sends, 2, 'exactly one resend');
+  assert.equal(done.task.reports[0].delivery.state, 'blocked');
+  const [saved] = f.store.submissions(record.agentId, done.task.taskId);
+  assert.equal(saved.message, 'Resend after confirmed absence.');
+  assert.equal(saved.delivery.error.reason, 'unconfirmed');
+  assert.equal(sends, 1);
 });
 
 test('read-back follows item cursors so a late steer message is found', async t => {
@@ -468,7 +479,7 @@ test('read-back follows item cursors so a late steer message is found', async t 
   assert.equal(owner.calls.filter(call => call.method === 'turn/start').length, 1, 'no resend was needed');
 });
 
-test('an unconfirmed final lets a new task start and returns previousReport', async t => {
+test('an unconfirmed accepted final defers reassignment until the report reaches its time limit', async t => {
   let owner;
   const f = await assembly('codex-owner-next-task', { steps: [
     { mode: 'final', message: 'First task body.' },
@@ -488,6 +499,13 @@ test('an unconfirmed final lets a new task start and returns previousReport', as
   const pending = await pollUntil(f, record.agentId, item => item?.state === 'delivery_pending',
     { message: 'the first final to remain unconfirmed' });
   assert.equal(pending.task.reports[0].delivery.state, 'unknown');
+  await assert.rejects(f.service.send({ name: 'next-task', message: 'second task' }, extra),
+    { code: 'previous-delivery-pending', count: 1 });
+  assert.equal(f.store.get(record.agentId).task.taskId, pending.task.taskId);
+  const [work] = f.store.submissionWork(record.agentId, pending.task.taskId);
+  assert.ok(f.store.saveSubmissionDelivery(work.id, { ...work.delivery,
+    attemptedAt: new Date(Date.now() - 31 * 60 * 1000).toISOString(), nextAttemptAt: 0 },
+  { expected: work.deliveryVersion }));
   const sent = await f.service.send({ name: 'next-task', message: 'second task' }, extra);
   assert.equal(sent.previousReport.delivered, false);
   assert.match(sent.previousReport.summary, /First task body/);

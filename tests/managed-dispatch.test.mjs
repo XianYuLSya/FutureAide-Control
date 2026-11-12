@@ -74,6 +74,28 @@ async function fixture({ modern = false, changeInstance = false } = {}) {
   return { binding, state, client, control, config, options };
 }
 
+// The control-level gate runs before managedSendMessage, but that call still awaits the
+// managed session, the model catalog and the transport's own discovery and
+// authentication. A task can finish inside that window, so the same gate is asked again
+// immediately before the prompt is posted — and a refusal there posts nothing.
+test('the managed prompt gate is asked again immediately before the POST', async () => {
+  const f = await fixture();
+  // Control asks once before calling in; the client asks again after its session and
+  // catalog reads, and a third time in the transport, just before the prompt is posted.
+  const marks = [];
+  await assert.rejects(f.control.send({ sessionId: 'session-a', message: 'work', requestId: 'request-blocked',
+    writeBlockReason: () => { marks.push(f.state.calls.length); return marks.length < 3 ? undefined : 'dispatch-expired'; } }),
+  error => error.code === 'dispatch-expired' && error.terminal === true && error.notSent === true);
+  assert.equal(marks.length, 3, 'all three ask points ran, in order');
+  assert.ok(marks[1] >= 1, 'the second ask comes after the client has already read the session');
+  assert.ok(marks[2] >= marks[1], 'and the last one from where the prompt would be posted');
+  assert.equal(f.state.prompts, 0, 'no prompt reached the host');
+  // Without the gate, the very same dispatch still goes out.
+  const plain = await f.control.send({ sessionId: 'session-a', message: 'work', requestId: 'request-plain' });
+  assert.equal(plain.accepted, true);
+  assert.equal(f.state.prompts, 1);
+});
+
 test('managed session uses live model state and does not mistake an old host snapshot for current selection', async () => {
   const f = await fixture();
   assert.equal((await f.client.managedSession(f.binding)).projections.values.modelSelection.next, undefined);

@@ -22,6 +22,21 @@ export const FINAL_REPORT_CONTRACT = 'Write a final report for a controlling age
 export const QUESTION_CONTRACT = 'State the decision you need, the options and your recommendation in a few lines, '
   + 'so it can be answered without reading your work.';
 
+export const CODEX_ASK_PARENT_INSTRUCTION = 'No one monitors this managed Codex window. '
+  + 'Use ask_parent for every question. Do not open a native request_user_input question card.';
+
+/** Match the question the parent has already been asked to answer by name. */
+export function presentedNativeQuestion(record) {
+  const task = record?.task;
+  if (record?.target !== 'codex-desktop' || !task || record.observation?.taskId !== task.taskId) return undefined;
+  return record.observation.questions?.find(question => {
+    if (question.state !== 'pending' || typeof question.id !== 'string' || !question.id.startsWith('native-')) return false;
+    const notice = task.questionNotices?.[question.id];
+    return notice && notice.state !== 'blocked'
+      && !task.answers?.some(answer => answer.questionIds?.includes(question.id));
+  });
+}
+
 /**
  * Sent once when a managed DSH agent's turn ends without a final report: the caller
  * never sees ordinary reply text, so the agent has to be told that the turn changed

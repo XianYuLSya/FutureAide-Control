@@ -73,6 +73,71 @@ async function harness({ runner, record = {}, submissions = { questions: [], rep
 
 const setup = harness;
 
+// P1: the final gate. Refused after preflight and before any claim, so no request row
+// exists, nothing is active and the caller knows for certain that nothing was written.
+test('a dispatch refused before its claim leaves nothing active and no receipt', async () => {
+  const runner = fakeRunner();
+  const { backend, state } = await setup({ runner });
+  await assert.rejects(backend.deliver({ requestId: 'r-blocked', message: 'go',
+    writeBlockReason: () => 'round-finished' }),
+  error => error.code === 'round-finished' && error.terminal === true && error.notSent === true);
+  assert.equal(runner.calls.starts.length, 0, 'no turn was started');
+  assert.equal(state()?.active, undefined, 'nothing is left active');
+  assert.equal(state()?.requests?.['r-blocked'], undefined, 'no claim was written');
+  assert.equal(await backend.receipt({ requestId: 'r-blocked' }), undefined,
+    'undefined receipt means no write was attempted, never "unknown"');
+});
+
+// The same refusal coming from the runner: the adapter has already claimed the request,
+// so it must clear active and record a terminal rejection instead of a mystery.
+test('a dispatch refused by the runner lands rejected and clears active', async () => {
+  const runner = fakeRunner();
+  const forwarded = [];
+  const start = runner.startClaudeTurn.bind(runner);
+  runner.startClaudeTurn = async input => {
+    forwarded.push(input.writeBlockReason);
+    const reason = input.writeBlockReason?.();
+    if (reason) throw Object.assign(new Error('refused before the worker started'),
+      { code: reason, terminal: true, notSent: true });
+    return start(input);
+  };
+  const { backend, state } = await setup({ runner });
+  // The gate answers once for the adapter (still dispatchable) and once for the runner
+  // (by then the round has finished), which is exactly the ordering the real call has.
+  let gates = 0;
+  const writeBlockReason = () => (++gates === 1 ? undefined : 'dispatch-expired');
+  await assert.rejects(backend.deliver({ requestId: 'r-runner', message: 'go', writeBlockReason }),
+  error => error.code === 'dispatch-expired' && error.terminal === true && error.notSent === true);
+  assert.equal(gates, 2, 'the adapter and the runner both asked, in that order');
+  assert.equal(typeof forwarded[0], 'function', 'the gate is handed to the runner');
+  assert.equal(state().active, undefined, 'the adapter clears its active request');
+  assert.equal(state().requests['r-runner'].status, 'rejected', 'the claim lands terminal');
+  assert.deepEqual(await backend.receipt({ requestId: 'r-runner' }), { status: 'rejected', afterSeq: 0 });
+});
+
+// The window this closes: the runner wrote its terminal refusal, then the adapter process
+// died before it could save its own rejected request. The next read finds the claim still
+// active and the refusal on disk, and must keep it refused instead of reporting a turn
+// that was accepted and never ran.
+test('a runner refusal already on disk is never upgraded to accepted by a later read', async () => {
+  const runner = fakeRunner();
+  const { backend, state } = await setup({ runner });
+  await backend.beginTask();
+  const value = state();
+  value.active = 'r-crash';
+  value.requests = { 'r-crash': { messageHash: 'x', taskId: 'task-1', afterSeq: value.seq, status: 'unknown' } };
+  const turn = turnDirectory('r-crash');
+  runner.setTurn(turn, { state: 'failed', messages: [], error: { code: 'round-finished', notSent: true,
+    message: 'Nothing was dispatched: this task round already finished.' } });
+  const observed = await backend.observe();
+  assert.equal(state().active, undefined, 'the refused claim is not left active');
+  assert.equal(state().requests['r-crash'].status, 'rejected', 'the refusal on disk wins over accepted');
+  assert.equal(state().requests['r-crash'].terminal.failure.code, 'round-finished');
+  assert.equal(observed.running, false);
+  assert.deepEqual(await backend.receipt({ requestId: 'r-crash' }), { status: 'rejected',
+    afterSeq: state().requests['r-crash'].afterSeq });
+});
+
 test('create reserves the name with zero model turns and confirms a logged-in CLI', async () => {
   const runner = fakeRunner();
   const { backend, writes, record } = await setup({ runner });

@@ -11,14 +11,16 @@ import { callCodexOwner, readCodexOwnerTurns, readCodexOwnerItems } from './code
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-sessions.mjs';
-import { RosterStore, submissionRef } from './roster-store.mjs';
-import { canSleep } from './idle-monitor-eligibility.mjs';
+import { isCancelledRound, RosterStore, submissionNoticeId, submissionRef } from './roster-store.mjs';
+import { canReleaseThreads, canSleep, hasPendingDelivery, RELEASE_RECHECK_MS, releaseDue,
+  releaseRetryDelay } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
 import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, readStatusModels, REMOVED_TARGETS, removedTarget, resolveBackend,
   TARGET_LABELS, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
-import { FINAL_REPORT_REMINDER } from './report-contract.mjs';
+import { FINAL_REPORT_REMINDER, presentedNativeQuestion } from './report-contract.mjs';
+import { absentClaudeReportReminder, claudeCallbackReminderMs, createDesktopToastNotifier } from './claude-report-reminder.mjs';
 
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
@@ -29,8 +31,67 @@ const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
 const UNCONFIRMED_AFTER_MS = 30 * 60 * 1000;
 const EXPIRE_UNSENT_AFTER_MS = 6 * 60 * 60 * 1000;
+const dispatchExpired = created => Date.now() - Date.parse(created ?? '') >= EXPIRE_UNSENT_AFTER_MS;
 const CONFIRM_ABSENCE_AFTER_MS = 2 * 60 * 1000;
 const terminalNotice = notice => ['delivered', 'blocked'].includes(notice?.state);
+const awaitingNoticeReceipt = notice => ['sending', 'unknown'].includes(notice?.state);
+const fromSubmission = id => typeof id === 'string' && id.startsWith('submission:');
+const MISSING_THREAD_CODE = 'codex-thread-not-found';
+const MISSING_CODEX_TREE = '任务树无法确认：线程不在当前 Codex 档案';
+const NATIVE_ANSWER_REFUSALS = new Set(['native-answer-invalid', 'native-question-not-pending', 'native-answer-unconfirmed']);
+
+/**
+ * Has this round already ended, and how? This is the one structural answer every send
+ * path shares: a finished round settles what it owes and sends nothing more. A missing
+ * thread recorded by a build that had no `treeUnavailable` marker counts as failed —its
+ * body, its error and the notice it already got are the only evidence left.
+ * @param {object} record Live roster record.
+ * @returns {'failed'|'cancelled'|'completed'|undefined} The state it ended in.
+ */
+export function terminalRound(record) {
+  if (!record) return undefined;
+  const task = record.task;
+  // The marker our own paths write is explicit evidence; the bare error code is only
+  // trusted on a Codex row that is already failed —an active row can carry the same code
+  // in a parent notice (blockCodexNotice) and must not be judged finished by it.
+  if (task?.treeUnavailable === MISSING_THREAD_CODE) return 'failed';
+  const missingThread = record.state === 'failed' && record.error?.code === MISSING_THREAD_CODE;
+  if (missingThread) return 'failed';
+  if (['failed', 'cancelled'].includes(record.state)) return record.state;
+  if (task && ['failed', 'cancelled'].includes(task.state)) return task.state;
+  // A completed task never produces another turn, whatever its final notice still owes:
+  // delivery is a settlement and once-cleanup gate, never a permission to send.
+  if (record.state === 'completed' || task?.state === 'completed' || task?.legacyAutomaticResult) return 'completed';
+  return undefined;
+}
+
+
+/** Adopt evidence from old task bodies before any attempt with the canonical ID. */
+function submissionNotice(item, projection) {
+  const id = submissionNoticeId(item.id);
+  const sources = [item.delivery, projection].filter(Boolean);
+  const terminal = sources.find(notice => notice.state === 'delivered')
+    ?? sources.find(notice => notice.state === 'blocked');
+  const ambiguous = sources.filter(entry => awaitingNoticeReceipt(entry)
+    && !(entry.state === 'unknown' && entry.error?.message === 'claude-request-id-invalid'
+      && claudeNoticeRequestId(entry.id) !== entry.id));
+  const saved = terminal ?? ambiguous[0] ?? sources.find(entry => !awaitingNoticeReceipt(entry));
+  const notice = { state: 'pending', ...saved, id, createdAt: item.created };
+  if (!terminal && ambiguous.length) {
+    const aliases = new Set(ambiguous.flatMap(entry => [entry.id, ...(entry.readbackIds ?? [])])
+      .filter(value => typeof value === 'string' && value));
+    aliases.delete(id);
+    if (aliases.size) {
+      const newAlias = [...aliases].some(alias => !(saved.readbackIds ?? []).includes(alias) && alias !== saved.id);
+      notice.readbackIds = [...aliases];
+      if (newAlias) delete notice.cursor;
+      const oldest = ambiguous.map(entry => Date.parse(entry.attemptedAt ?? entry.createdAt ?? ''))
+        .filter(Number.isFinite).reduce((a, b) => Math.min(a, b), Infinity);
+      if (Number.isFinite(oldest)) notice.attemptedAt = new Date(oldest).toISOString();
+    }
+  }
+  return notice;
+}
 let codexProbePromise;
 /** codex-host's own registration probe, imported lazily so only the Codex path loads it. */
 function defaultCodexProbe() {
@@ -206,6 +267,13 @@ function publicResult(record, { fullResult = false } = {}) {
       ...(explicitReports.length ? { latest: { summary: compactText(explicitReports.at(-1).message, 240), final: explicitReports.at(-1).final, delivery: explicitReports.at(-1).delivery.state,
         ...(explicitReports.at(-1).delivery.error ? { error: explicitReports.at(-1).delivery.error } : {}) } } : {}) },
     delivery: explicitReports.find(report => !terminalNotice(report.delivery))?.delivery.state ?? explicitReports.at(-1)?.delivery.state ?? null, updatedAt: record.updatedAt,
+    // Why work of this round was never sent, including an expired supplement that is not
+    // the newest dispatch. Bounded on purpose: a count and the latest item, so a long-lived
+    // name never carries a growing array. `list` surfaces this at its own top level.
+    ...(task?.expired || record.expired?.latest ? { expired: {
+      ...(task?.expired ?? record.expired.latest),
+      ...(record.expired?.latest ? { count: record.expired.count,
+        ...(task?.expired ? { latestSupplement: record.expired.latest } : {}) } : {}) } } : {}),
     ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
     ...(error ? { error } : {}),
   };
@@ -272,6 +340,7 @@ const claudeNeverWritten = notice => notice.error?.code === 'ENOENT'
   || (claudeNoticeRequestId(notice.id) !== notice.id && notice.error?.message === 'claude-request-id-invalid');
 
 export async function findClaudeReceipt(binding, notice, readEvents = readClaudeEvents) {
+  const requestIds = [notice.id, ...(notice.readbackIds ?? [])].map(claudeNoticeRequestId);
   let cursor = Number.isSafeInteger(notice.cursor) ? notice.cursor : 0;
   for (let page = 0; page < CLAUDE_PAGES_PER_POLL; page++) {
     let read;
@@ -280,7 +349,7 @@ export async function findClaudeReceipt(binding, notice, readEvents = readClaude
       if (!String(error?.message ?? '').includes('line-exceeds-page') || CLAUDE_PAGE_BYTES >= CLAUDE_MAX_PAGE_BYTES) throw error;
       read = await readEvents(binding, { offset: cursor, maxBytes: CLAUDE_MAX_PAGE_BYTES });
     }
-    const matched = claudeNoticeReceipt(read.deliveries, claudeNoticeRequestId(notice.id));
+    const matched = requestIds.map(id => claudeNoticeReceipt(read.deliveries, id)).find(Boolean);
     const next = Number.isSafeInteger(read.offset) ? read.offset : cursor;
     notice.cursor = next;
     if (matched) return matched;
@@ -386,7 +455,13 @@ export function createScopedAgents(config, {
   // a listener living in the same process can act on at once. A caller in another
   // process cannot be seen this way and waits for the monitor's own sweep.
   onWorkQueued = () => {},
+  // A report that keeps finding its Claude session gone is handed to the Windows
+  // notification area. A drill replaces this seam; nothing is ever shown in a test.
+  notifyDesktop = undefined,
 } = {}) {
+  const notify = notifyDesktop ?? createDesktopToastNotifier();
+  // One reminder is due once this notice has found its session gone for this long.
+  const callbackReminderWait = claudeCallbackReminderMs(config.claudeCallbackReminderMs);
   const claudeSend = claudeInbox.send ?? sendClaude;
   const claudeDiscover = claudeInbox.discover ?? discoverClaude;
   const claudeReadEvents = claudeInbox.readEvents ?? readClaudeEvents;
@@ -394,6 +469,10 @@ export function createScopedAgents(config, {
   const clients = new Map();
   const operationBackends = new WeakMap();
   const inflight = new Map(), monitorInflight = new Map();
+  // A release attempt is deliberately NOT in `inflight`: it belongs to a round that is
+  // already over, and putting it there would make the next round's poll wait for an
+  // unload instead of running.
+  const releaseInflight = new Map(), releaseSignals = new Map();
   // One shared Codex-owner entry for reads and sends: native RPC first, app-tools
   // only when the debug port is unavailable. Tests may inject the transport seams,
   // but never replace this routing with a callCodex override.
@@ -409,6 +488,9 @@ export function createScopedAgents(config, {
   // not held back by the floor, and only once, so this cannot become a burst.
   const urgentPoll = new Set();
   let draining = false;
+  // The earliest release re-check the last sweep found; the listener sleeps to it
+  // instead of polling a finished name while it waits.
+  let releaseWakeAt;
   let monitorUnavailableSince, monitorError;
   const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
   const workspaceBaselineFile = record => path.join(agentDirectory(record), 'workspace-baseline.json');
@@ -494,7 +576,18 @@ export function createScopedAgents(config, {
       load,
       requestDirectory: () => agentDirectory(load()),
       readNativeState: () => store.backendState(record.agentId),
-      writeNativeState: value => store.saveBackendState(record.agentId, value),
+      // The release attempt is one field of the Codex document, and only this target has
+      // it: the flag that makes the store merge it inside SQL is set for Codex alone, and
+      // not at all while the feature is switched off, so no other path pays for it.
+      writeNativeState: value => store.saveBackendState(record.agentId, value,
+        { keepRelease: target === 'codex-desktop' && config.idleSessionCleanup !== false }),
+      ...(target === 'codex-desktop' ? {
+        // The atomic patch the adapter uses for that field: it names the round and the
+        // attempt, so a document read before another connection wrote cannot undo it.
+        writeNativeRelease: (value, fence = {}) => store.saveBackendRelease(record.agentId, value, fence),
+        // The adapter's own host reads the same switch the monitor's gate reads.
+        hostOptions: { idleSessionCleanup: config.idleSessionCleanup !== false },
+      } : {}),
       withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
       ensureCodexReports: () => beginCodexReports(record),
       readCodexReportState: () => readParentSubmissions(load()),
@@ -502,7 +595,8 @@ export function createScopedAgents(config, {
         readParentSubmissions: () => readParentSubmissions(load()),
         claudeReportConfig: requestId => ({ mcpServers: { futureaide: { type: 'stdio', command: process.execPath,
           args: [fileURLToPath(new URL('./mcp-server.mjs', import.meta.url)), '--claude-cli-reports',
-            store.location, record.agentId, load().task.taskId, requestId] } } }),
+            store.location, record.agentId, load().task.taskId, requestId,
+            ...(config.idleSessionCleanup === false ? ['--no-idle-session-cleanup'] : [])] } } }),
       } : {}),
       // The Codex probe reads its protocol readiness only; this must never start a
       // session, so it is the same read-only evidence status uses.
@@ -608,7 +702,7 @@ export function createScopedAgents(config, {
     // Both lists carry the task they belong to: the Codex backend filters by taskId, so
     // a question without it would be dropped before the shared layer ever saw it.
     return {
-      questions: pending.filter(item => item.kind === 'ask').map(item => ({ id: submissionRef(item.id),
+      questions: (isCancelledRound(record) ? [] : pending.filter(item => item.kind === 'ask')).map(item => ({ id: submissionRef(item.id),
         taskId: record.task.taskId, state: 'pending', message: item.message, createdAt: item.created })),
       reports: pending.filter(item => item.kind === 'report').map(item => ({ id: submissionRef(item.id),
         taskId: record.task.taskId, message: item.message, final: item.final, createdAt: item.created })),
@@ -718,28 +812,110 @@ export function createScopedAgents(config, {
    * report, an ask becomes a pending question. Task changes and consumption commit
    * together; the durable submission remains readable by the Codex backend.
    */
-  function absorbSubmissions(record) {
-    const pending = store.pendingSubmissions(record.agentId, record.task.taskId);
+  function absorbSubmissions(record, pending) {
     if (!pending.length) return;
-    let changed = false;
     for (const item of pending) {
-      changed = true;
       if (item.kind === 'report') {
         record.task.reports ??= [];
         if (!record.task.reports.some(report => report.id === submissionRef(item.id))) {
           record.task.reports.push({ id: submissionRef(item.id), taskId: record.task.taskId,
-            message: item.message, final: item.final, createdAt: item.created, delivery: { state: 'pending' } });
+            message: item.message, final: item.final, createdAt: item.created, delivery: submissionNotice(item) });
         }
-      } else {
+      } else if (!isCancelledRound(record) && !record.task.treeUnavailable) {
         record.observation ??= {};
         record.observation.questions ??= [];
         if (!record.observation.questions.some(question => question.id === submissionRef(item.id))) {
-          record.observation.questions.push({ id: submissionRef(item.id), state: 'pending', message: item.message });
+          record.observation.questions.push({ id: submissionRef(item.id), state: 'pending', message: item.message, createdAt: item.created });
         }
-        record.state = 'awaiting_input';
+        // A round that already ended still delivers the question as a notice, but it never
+        // reopens for it: reopening is what used to send an old body out again.
+        if (!terminalRound(record)) record.state = 'awaiting_input';
       }
     }
-    if (changed) store.saveAndConsumeSubmissions(record, pending.map(item => item.id));
+    // The round owes work again. Clear its sleep marker and any release ticket in
+    // the same save that transfers the raw rows to the task.
+    delete record.sleep;
+    invalidateRelease(record);
+    store.saveAndConsumeSubmissions(record, pending.map(item => item.id));
+  }
+
+  // The submission owns delivery after absorption too. Current task bodies and
+  // archives supply legacy evidence by submission ID, never a second sender.
+  async function drainSubmissions(record, { currentOnly = false, readOnDemand = false } = {}) {
+    if (record.closed || (currentOnly && !record.task)) return;
+    const task = record.task;
+    // Some old report projections carry a submission ID but no inbox row.
+    // Rehydrate them once so their old receipt can be adopted by this sender.
+    for (const report of task?.reports ?? []) {
+      if (!fromSubmission(report.id)) continue;
+      const id = report.id.slice('submission:'.length);
+      if (report.delivery?.id !== submissionNoticeId(id)) {
+        store.enqueueSubmission({ id, ownerId: record.ownerId, agentId: record.agentId, taskId: task.taskId,
+          kind: 'report', message: report.message, final: report.final, created: report.createdAt ?? task.startedAt });
+      }
+    }
+    const rows = store.submissionWork(record.agentId, currentOnly ? task.taskId : undefined);
+    absorbSubmissions(record, rows.filter(item => item.state === 'pending' && item.taskId === task?.taskId));
+    const history = new Map();
+    for (const item of rows) {
+      const current = item.taskId === task?.taskId;
+      if (!current && !history.has(item.taskId)) {
+        history.set(item.taskId, store.historyTask(record.agentId, item.taskId));
+      }
+      const round = current ? task : history.get(item.taskId);
+      const ref = submissionRef(item.id);
+      let report = item.kind === 'report' ? round?.reports?.find(entry => entry.id === ref) : undefined;
+      const notice = submissionNotice(item, report?.delivery ?? round?.questionNotices?.[ref]);
+      const persist = () => {
+        const previousReport = report, previousReports = task?.reports;
+        const previousDelivery = report?.delivery, previousQuestions = task?.questionNotices;
+        if (current) {
+          if (item.kind === 'report') {
+            if (!report) {
+              report = { id: ref, taskId: item.taskId, message: item.message, final: item.final, createdAt: item.created };
+              task.reports = [...(previousReports ?? []), report];
+            }
+            report.delivery = { ...notice };
+          } else task.questionNotices = { ...previousQuestions, [ref]: { ...notice } };
+        }
+        let saved;
+        try { saved = store.saveSubmissionDelivery(item.id, notice, { expected: item.deliveryVersion, record: current ? record : undefined }); }
+        finally {
+          if (!saved && current) {
+            if (previousReport) previousReport.delivery = previousDelivery;
+            report = previousReport;
+            task.reports = previousReports;
+            task.questionNotices = previousQuestions;
+          }
+        }
+        if (!saved) {
+          throw Object.assign(new Error('The submission delivery changed in another worker.'), { code: 'submission-delivery-changed' });
+        }
+        item.deliveryVersion = JSON.stringify(notice);
+      };
+      if (terminalNotice(notice)) { persist(); continue; }
+      const name = `${hostLabel(record)}「${record.name}」`;
+      let text;
+      const missingTree = round?.treeUnavailable === 'codex-thread-not-found' && !report?.treeSettledConfirmed;
+      let ready = item.kind !== 'report' || !item.final || !current || report?.treeSettledConfirmed || missingTree;
+      if (item.kind === 'ask') {
+        const answered = round?.answers?.some(answer => answer.questionIds?.includes(ref));
+        const active = current && !answered && !round.treeUnavailable && !terminalRound(store.get(record.agentId) ?? record)
+          && !isCancelledRound(store.get(record.agentId) ?? record);
+        if (active && presentedNativeQuestion(record)) ready = false;
+        text = active ? questionPrompt(record, item.message) : `${name}旧轮次提问：\n${item.message}`;
+      } else {
+        const label = current ? (item.final ? '交付' : '汇报') : (item.final ? '旧轮次最终汇报' : '旧轮次汇报');
+        text = `${name}${label}：\n${item.message}${item.final && missingTree ? '\n\n' + MISSING_CODEX_TREE : ''}`;
+      }
+      if ((notice.waitingForTree && ready) || (readOnDemand && awaitingNoticeReceipt(notice))) {
+        delete notice.waitingForTree;
+        delete notice.nextAttemptAt;
+      }
+      await deliver(record, notice, text, { persist, allowSend: ready, submission: true,
+        // Only a real report is reminded to the user; an ask is answered, not read later.
+        ...(item.kind === 'report' ? { reportSummary: item.message } : {}) });
+    }
   }
   async function withName(extra, name, action, options) {
     const owner = await context(extra);
@@ -801,19 +977,72 @@ export function createScopedAgents(config, {
   // Does this name still owe the shared monitor a poll? Sleeping names are driven
   // by the monitor's existing DSH host-state wake path instead.
 
-  function needsPoll(record) {
+  /**
+   * Enabled Codex name that has entered the release path for the task it holds now.
+   * Nothing else in the roster is this feature's business: DSH, Claude and a name under
+   * the switch keep the state machine they had.
+   */
+  function inReleasePath(record) {
+    return config.idleSessionCleanup !== false
+      && targetOf(record) === 'codex-desktop'
+      && typeof record.releaseState?.taskId === 'string'
+      && record.releaseState.taskId === record.task?.taskId;
+  }
+
+  /**
+   * A finished round that still carries a retry stamp. A projection can only hint this:
+   * the same field holds any target's own retry, so the caller reads that one name whole
+   * before this feature touches it.
+   */
+  function mayHoldReleaseSchedule(record) {
+    // Under the switch this field is not evidence of anything this feature wrote, and
+    // asking again is the caller's job only when the feature is on.
+    if (config.idleSessionCleanup === false) return false;
+    return Boolean(record) && record.nextAttemptAt !== undefined
+      && ['idle', 'failed', 'cancelled'].includes(record.state);
+  }
+
+  /**
+   * The release re-check this name itself still owes, and nothing else. Only a full
+   * record can prove it: the schedule the release wrote names the same task and the same
+   * moment as the record's own retry field. Anything else is left to the old state
+   * machine.
+   * @param {object} record Full record.
+   * @returns {number|undefined} Due time of the release re-check.
+   */
+  function releaseRecheckAt(record) {
+    if (!record?.releaseState || record.closed) return undefined;
+    if (!['idle', 'failed', 'cancelled'].includes(record.state)) return undefined;
+    if (!inReleasePath(record)) return undefined;
+    const release = record.releaseState;
+    if (release.nextCheckAt === undefined || release.nextCheckAt !== record.nextAttemptAt) return undefined;
+    return release.nextCheckAt;
+  }
+
+  function pendingInbox() {
+    return new Map((store.pendingSubmissionAgents?.() ?? []).map(({ agentId, dueAt }) => [agentId, dueAt]));
+  }
+
+  function needsPoll(record, hasSubmission = false) {
     if (readOnlyTarget(record)) return false;
     if (record?.state === 'cleaning') return true;
-    if (!record || record.closed || record.sleep) return false;
+    if (!record || record.closed) return false;
+    if (hasSubmission) return true;
+    if (record.sleep) return false;
     if (ACTIVE.has(record.state)) return true;
     // The scan projection already carries both of these, so a roster sweep no longer
     // runs one supplement query per name. A record loaded whole has neither field
     // and takes the queries below.
     if (record.hasSupplement === true) return true;
-    if (record.pendingReports !== undefined) return !record.callbackBlocked && record.pendingReports > 0;
+    if (record.pendingReports !== undefined) {
+      if (!record.callbackBlocked && record.pendingReports > 0) return true;
+      // A finished round may still hold a release re-check; the caller reads it whole.
+      return mayHoldReleaseSchedule(record);
+    }
     if (store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked')) return true;
-    return !record.callbackBlocked
-      && (record.task?.reports ?? []).some(report => !['delivered', 'blocked'].includes(report.delivery.state));
+    return (!record.callbackBlocked
+      && (record.task?.reports ?? []).some(report => !['delivered', 'blocked'].includes(report.delivery.state)))
+      || releaseRecheckAt(record) !== undefined;
   }
 
   async function ensureMonitor() {
@@ -829,10 +1058,10 @@ export function createScopedAgents(config, {
   /** Tell a listener in this process that a name now owes work. */
   function announceWork(agentId) { try { if (agentId) onWorkQueued(agentId); } catch { /* a hint is never worth failing a call for */ } }
 
-  async function ensureWorker(record, { wake = false } = {}) {
+  async function ensureWorker(record, { wake = false, hasSubmission = false, ensure = ensureMonitor } = {}) {
     if (!record || readOnlyTarget(record)) return false;
     if (wake && record.sleep) {
-      if (!await ensureMonitor()) {
+      if (!await ensure()) {
         // Nothing can watch this installation right now. Keep the sleeping
         // baseline so a later call resumes the same task instead of losing it.
         store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
@@ -842,8 +1071,8 @@ export function createScopedAgents(config, {
       record = store.get(record.agentId) ?? record;
     }
     if (record.sleep) return true;
-    if (!needsPoll(record)) return false;
-    const ready = await ensureMonitor();
+    if (!needsPoll(record, hasSubmission)) return false;
+    const ready = await ensure();
     if (!ready) store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
     // Only an explicit wake — new work arriving from outside — is news for the loop. A
     // poll also calls this, and announcing from there would make every poll re-hint its
@@ -874,15 +1103,16 @@ export function createScopedAgents(config, {
    * reports are delivered through that child's own state machine, never folded into
    * the root's report.
    */
-  async function observe(record) {
+  async function observe(record, { checkingRestoredProfile = false } = {}) {
     const own = await observeOwn(record);
     const keyOf = (agentId, native) => agentId === record.agentId ? native : `${agentId}:${native}`;
     const nodes = (own.tree?.nodes ?? []).map(node => ({ ...node,
       name: node.sessionId === record.sessionId ? record.name : node.name,
       backendKey: record.agentId, nativeSessionId: node.sessionId }));
     const managed = new Map([[record.agentId, { record, backend: await backendFor(record), rootKey: record.sessionId }]]);
-    let settled = own.tree?.settled === true && !record.task?.cancelPending;
-    let running = own.tree?.running === true || record.task?.cancelPending === true;
+    const cancelPending = !checkingRestoredProfile && record.task?.cancelPending === true;
+    let settled = own.tree?.settled === true && !cancelPending;
+    let running = own.tree?.running === true || cancelPending;
     for (const child of store.descendantsOf([record.agentId])) {
       const parentEntry = managed.get(child.parentAgentId);
       if (!parentEntry) continue;
@@ -912,13 +1142,11 @@ export function createScopedAgents(config, {
       }
       const pendingReports = (child.task?.reports ?? []).some(report => !terminalNotice(report.delivery));
       const pendingQuestions = (entry.view?.questions ?? []).some(question => question.state === 'pending');
-      const busy = Boolean(child.task) && (pendingReports || pendingQuestions
+      const busy = store.submissionDebt(child.agentId) > 0 || (Boolean(child.task) && (pendingReports || pendingQuestions
         || ACTIVE.has(child.state) || child.state === 'cleanup_failed'
-        || !['completed', 'failed', 'cancelled'].includes(child.task.state));
-      const childSettled = !child.task
-        ? true
-        : entry.view?.capturedAt && !entry.view.stale && entry.view?.tree?.settled === true
-          && entry.view?.tree?.running === false && !busy;
+        || !['completed', 'failed', 'cancelled'].includes(child.task.state)));
+      const childSettled = !busy && (!child.task || (entry.view?.capturedAt && !entry.view.stale
+        && entry.view?.tree?.settled === true && entry.view?.tree?.running === false));
       settled = settled && childSettled;
       running = running || entry.view?.tree?.running === true || busy;
     }
@@ -1010,8 +1238,27 @@ export function createScopedAgents(config, {
     }
   }
 
+  /**
+   * The preparation of a dispatch is asynchronous, so the round may be gone by the time it
+   * returns. Anything written after such an await is fenced on the round it belongs to.
+   */
+  const roundMovedOn = (record, latest = store.get(record.agentId)) =>
+    !latest || latest.closed || latest.task?.taskId !== record.task?.taskId || Boolean(terminalRound(latest));
+
+  function dispatchRefused(code = 'round-finished') {
+    return Object.assign(new Error(code === 'dispatch-expired'
+      ? 'This input passed its six hours before it could be sent.'
+      : 'This round already ended. Nothing was sent for it.'), { code, terminal: true, notSent: true });
+  }
+
+  function saveDispatch(record) {
+    if (!store.save(record, { dispatch: true })) throw dispatchRefused();
+  }
+
   async function followHostModel(record, dispatch, observed) {
     if (dispatch.modelReady) return;
+    // Every save below happens after an await, so each one is fenced on the round this
+    // dispatch belongs to: a stale copy must never overwrite a round that has moved on.
     const backend = await backendFor(record);
     const target = targetOf(record);
     const explicit = dispatch.explicitModel === true && dispatch.model !== undefined;
@@ -1023,7 +1270,7 @@ export function createScopedAgents(config, {
       // Codex applies the model on its own turn/start. Calling its selectModel would
       // either fake a selection or touch the user's defaults, so it is never used.
       dispatch.modelReady = true;
-      store.save(record);
+      saveDispatch(record);
       return;
     }
     if (target !== 'dsh') {
@@ -1035,24 +1282,34 @@ export function createScopedAgents(config, {
       dispatch.model = current ? { ...current } : undefined;
       if (current) record.model = { ...current };
       dispatch.modelReady = true;
-      store.save(record);
+      saveDispatch(record);
       return;
     }
     // DSH default-follow keeps the old resolveModel and its catalog validation.
     if (!dispatch.model) {
       dispatch.model = resolveModel(await backend.models(), {});
-      store.save(record);
+      saveDispatch(record);
     }
     await confirmDshSelection(backend, target, dispatch, dispatch.model, observed);
     record.model = { ...dispatch.model };
     dispatch.modelReady = true;
-    store.save(record);
+    saveDispatch(record);
   }
 
   async function sendDispatch(record, message, kind = 'task', answerIds = [], requestId = uid('request'), observed, extra = {}) {
     const task = record.task;
+    // The one structural gate every send path shares. A caller assigning new work writes a
+    // new task first, so a finished round can never produce another turn by itself.
+    if (terminalRound(record)) throw dispatchRefused();
     const baseline = Number.isSafeInteger(observed?.throughSeq)
       ? observed : await (await backendFor(record)).cursor();
+    // Waiting for the cursor is asynchronous: the round is read again before the intent is
+    // written, so a round that ended, closed or moved on in the meantime gets no dispatch.
+    const fresh = store.get(record.agentId);
+    if (!fresh || fresh.task?.taskId !== task.taskId || fresh.closed
+        || fresh.task?.cancelRequested || terminalRound(fresh)) {
+      throw dispatchRefused();
+    }
     // `extra` is written with the dispatch, before the first save, so a reminder is
     // recognisable as one even if the process dies on the way to the native send.
     // The selection is frozen here: later pin changes must not rewrite an input that
@@ -1063,16 +1320,64 @@ export function createScopedAgents(config, {
       : freezeModel === true ? undefined : record.modelPin;
     const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now(),
       ...(selected ? { model: { ...selected }, explicitModel: true } : {}), ...dispatchExtra };
+    // A new round ends any release attempt at once: the ticket stops matching, the host's
+    // own critical-point check refuses, and the subscription is restored by this write.
+    invalidateRelease(record);
     task.dispatches.push(dispatch);
     record.state = 'running'; task.state = 'running';
-    store.save(record); // The intent survives a caller or worker exiting during the write.
+    saveDispatch(record); // The intent survives a caller or worker exiting during the write.
     await dispatchOnce(record, dispatch, observed);
     return dispatch;
   }
 
+  /**
+   * The same answer an adapter asks for at its own last moment, computed the same way:
+   * synchronous, read-only, and from the original clock —a retry never refreshes it.
+   * Adapters with their own asynchronous preparation call this right before they write.
+   * @returns {'dispatch-expired'|'round-finished'|undefined} Why the write must not happen.
+   */
+  function writeBlockReason(agentId, { taskId, requestId, kind } = {}) {
+    const record = store.get(agentId);
+    if (!record || record.closed || !record.task || record.task.taskId !== taskId) return 'round-finished';
+    if (record.task.cancelRequested || terminalRound(record)) return 'round-finished';
+    // Accepted evidence beats age: an intent that already arrived is never blocked because
+    // it is old, and a matched answer's receipt is proof of the same thing.
+    const intent = requestId === undefined ? undefined
+      : (record.task.dispatches ?? []).find(entry => entry.requestId === requestId);
+    if (intent?.accepted === true) return undefined;
+    if (kind === 'task') return dispatchExpired(record.task.startedAt) ? 'dispatch-expired' : undefined;
+    // A final that arrived through the inbox while the adapter was preparing (a helper can
+    // submit one without the name lock) ends the round for everything else: a supplement,
+    // an answer or a reminder is never written after it. That final settles normally.
+    if ((record.task.reports ?? []).some(report => report.final)
+        || store.hasFinalNotice(agentId, record.task.taskId)) return 'round-finished';
+    const item = store.supplement(requestId);
+    // A direct supplement of an active round has no queue row; its own persisted intent then
+    // carries the original clock, so a retry never refreshes that either.
+    return dispatchExpired(item?.created ?? intent?.startedAt) ? 'dispatch-expired' : undefined;
+  }
+
+  /**
+   * Seal one input that will never be sent. Only that input is closed: a supplement keeps
+   * its body and the running task is untouched; the task itself becomes failed only when
+   * it is the task that expired.
+   */
+  function sealBlockedInput(record, dispatch, reason) {
+    const item = store.supplement(dispatch.requestId);
+    if (reason === 'dispatch-expired') {
+      expireInput(record, dispatch, item);
+      return;
+    }
+    dispatch.state = 'blocked';
+    dispatch.accepted = false;
+    dispatch.error = { code: reason, message: 'This round already ended; the input was not sent.' };
+    if (item) store.setSupplement(item.requestId, 'blocked', 'final-submitted');
+  }
+
   async function dispatchOnce(record, dispatch, observed) {
     const current = store.get(record.agentId);
-    if (current?.task?.taskId !== record.task?.taskId || current.closed || current.task.cancelRequested) return;
+    if (roundMovedOn(record, current)) throw dispatchRefused();
+    if (current.task.cancelRequested) return;
     if (dispatch.nextAttemptAt > Date.now()) return;
     let delivering = false;
     try {
@@ -1083,9 +1388,27 @@ export function createScopedAgents(config, {
       // every other turn keeps native inheritance and sends no model or effort.
       const backend = await backendFor(record);
       delivering = true;
+      // Preparing the write is asynchronous, so the round is read again right before it
+      // leaves: a dispatch prepared while the round was open must never land after it
+      // ended, was closed or was cancelled.
+      const beforeSend = store.get(record.agentId);
+      if (!beforeSend || beforeSend.task?.taskId !== record.task?.taskId || beforeSend.closed
+          || beforeSend.task?.cancelRequested || terminalRound(beforeSend)) {
+        // Never write this copy back: it still carries the round it was prepared for, and a
+        // save would overwrite whatever the newer round has already committed. The current
+        // round closes itself on its own poll.
+        throw dispatchRefused();
+      }
       const explicit = dispatch.explicitModel === true && dispatch.model !== undefined;
+      // The adapter has its own asynchronous preparation (host lock, state reads, preflight,
+      // writes), so it is given the same gate to consult immediately before it writes.
+      const reasonFor = () => writeBlockReason(record.agentId,
+        { taskId: dispatch.taskId ?? record.task?.taskId, requestId: dispatch.requestId, kind: dispatch.kind });
+      const blocked = reasonFor();
+      if (blocked) throw dispatchRefused(blocked);
       const sent = await backend.deliver({ requestId: dispatch.requestId,
         message: dispatch.message, kind: dispatch.kind,
+        writeBlockReason: reasonFor,
         ...(explicit ? { model: dispatch.model, explicitModel: true } : { explicitModel: false }) });
       Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
         afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined, nextAttemptAt: undefined } : {}) });
@@ -1097,6 +1420,18 @@ export function createScopedAgents(config, {
         dispatch.state = 'retrying'; deferRetry(dispatch);
       }
     } catch (error) {
+      // The adapter refused at its own last moment and proved nothing was written. A round
+      // that moved on, closed or ended must not have this copy saved back over it; a round
+      // that is merely too old seals this one input and keeps everything else.
+      if (error?.notSent === true && error?.terminal === true) {
+        const reason = error.code === 'dispatch-expired' ? 'dispatch-expired' : 'round-finished';
+        const latest = store.get(record.agentId);
+        if (!roundMovedOn(record, latest) && !latest.task?.cancelRequested) {
+          sealBlockedInput(record, dispatch, reason);
+          saveDispatch(record);
+        }
+        throw error;
+      }
       // A model request that cannot be resolved is a caller-visible refusal, never a
       // transient transport failure: retrying it would loop forever and hide the typo.
       const modelError = ['model-required', 'model-required-for-effort', 'model-not-found',
@@ -1109,7 +1444,7 @@ export function createScopedAgents(config, {
       Object.assign(dispatch, { state, afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
       if (dispatch.state === 'retrying' && targetOf(record) !== 'dsh') deferRetry(dispatch);
     }
-    store.save(record);
+    saveDispatch(record);
     const latest = store.get(record.agentId);
     if (latest?.task?.taskId === record.task.taskId && latest.task.cancelRequested) {
       record.task.cancelRequested = true;
@@ -1188,14 +1523,73 @@ export function createScopedAgents(config, {
   const attemptAge = notice => Date.now() - Date.parse(notice.attemptedAt ?? notice.createdAt ?? '');
 
   /**
+   * Record that this attempt found the Claude session that owns the name definitely
+   * gone — the attempt wrote nothing — and, for a real report only, hand that report to
+   * the operating system's notification area once the same notice has been absent for
+   * the configured wait.
+   *
+   * The original notice owns both facts: `callbackMissingSince` dates the absence and
+   * `reminder` is the one-shot claim, written through the same persist (and the same
+   * compare-and-swap for a submission) that owns the notice, before anything is shown.
+   * The report itself is untouched — still pending, still retried on its own schedule,
+   * still read back — so a session that comes back is owed the delivery it always was.
+   * Nothing here starts a timer: the notice's existing nextAttemptAt is the only clock.
+   */
+  async function noteClaudeAbsence(record, owner, notice, error, { persist, reportSummary }) {
+    if (error?.code !== 'callback-target-missing') {
+      // Another outcome says nothing about the session being away, so any wait in
+      // progress was not consecutive and restarts at the next definite absence.
+      if (notice.callbackMissingSince !== undefined) { delete notice.callbackMissingSince; persist(); }
+      return;
+    }
+    if (!Number.isFinite(Date.parse(notice.callbackMissingSince ?? ''))) {
+      notice.callbackMissingSince = now();
+      persist();
+    }
+    // A question or an automatic failure prompt is not a report: it is never turned into
+    // a user reminder, and no caller reaches here for one.
+    if (reportSummary === undefined) return;
+    const claim = notice.reminder;
+    // Only a reminder the system refused before showing it may be tried again. A claim
+    // that was submitted, or one whose call was still in flight, is never repeated, and
+    // from then on the report keeps its own retry spacing untouched.
+    if (claim && claim.state !== 'failed') return;
+    // The retry backoff grows to five minutes on a name that has been failing for long,
+    // which would hold the reminder minutes past its own time. Only the reminder's own
+    // schedule is pulled forward to that time; the delivery keeps its backoff.
+    const dueAt = Date.parse(notice.callbackMissingSince) + callbackReminderWait;
+    if (Date.now() < dueAt) {
+      if (!(notice.nextAttemptAt <= dueAt)) { notice.nextAttemptAt = dueAt; persist(); }
+      return;
+    }
+    Object.assign(notice, { reminder: { id: `reminder-${notice.id}`, claimedAt: now(), state: 'claiming',
+      attempts: (claim?.attempts ?? 0) + 1, missingSince: notice.callbackMissingSince } });
+    // The claim is durable before anything is shown: a restarted monitor reads it back
+    // and stays quiet instead of showing the same report twice.
+    persist();
+    let outcome;
+    try {
+      await notify(absentClaudeReportReminder({ name: record.name,
+        sessionId: owner?.nativeSessionId ?? owner?.binding?.sessionId, summary: reportSummary }));
+      outcome = { state: 'submitted', submittedAt: now() };
+    } catch (failure) {
+      outcome = failure?.beforeSubmit === true
+        ? { state: 'failed', error: safeError(failure) }
+        : { state: 'unknown', error: safeError(failure) };
+    }
+    notice.reminder = { ...notice.reminder, ...outcome };
+    persist();
+  }
+
+  /**
    * A Codex owner's notification marker sits in the first user message, which a
    * summary page already carries. Only when that is absent do we read the few
    * turns started (or still running) after the attempt, one turn at a time.
    * `complete` is false when the summary page was not the whole relevant window.
    */
-  async function findCodexNotice(owner, notice, marker) {
+  async function findCodexNotice(owner, notice, hasMarker) {
     const summary = await readCodexOwnerTurns(owner.threadId, { limit: 30, itemsView: 'summary' }, { nativeRequest });
-    if (JSON.stringify(summary).includes(marker)) return { delivered: true, complete: true };
+    if (hasMarker(summary)) return { delivered: true, complete: true };
     const attempted = Date.parse(notice.attemptedAt ?? notice.createdAt ?? '');
     const turns = Array.isArray(summary.data) ? summary.data : [];
     const started = turns.map(turn => Number(turn.startedAt) * 1000).filter(Number.isFinite);
@@ -1216,7 +1610,7 @@ export function createScopedAgents(config, {
       while (true) {
         const page = await readCodexOwnerItems(owner.threadId, turn.id, { limit: 100,
           ...(cursor ? { cursor } : {}) }, { nativeRequest });
-        if (JSON.stringify(page).includes(marker)) return { delivered: true, complete: true };
+        if (hasMarker(page)) return { delivered: true, complete: true };
         cursor = typeof page.nextCursor === 'string' ? page.nextCursor : undefined;
         pages++;
         if (!cursor) break;
@@ -1268,31 +1662,45 @@ export function createScopedAgents(config, {
     await deliver(record, failure.delivery, failure.message);
   }
 
-  async function deliver(record, notice, text) {
+  async function deliver(record, notice, text, {
+    persist = () => store.save(record), allowSend = true, submission = false, reportSummary = undefined,
+  } = {}) {
     if (notice.state === 'delivered') return;
     if (notice.state === 'blocked') return;
     // Only the report's own createdAt (or the notice's creation time) may date it.
     // An old row with no real timestamp is expired, never stamped with "now".
     if (!Number.isFinite(Date.parse(notice.createdAt ?? ''))) {
       blockUndelivered(notice, 'expired', 'This notice has no original creation time. Its body is kept and it was not sent.');
-      store.save(record);
+      persist();
       return;
     }
     // A monitor restart can release many old rows at once. Never flood the chat:
     // anything older than six hours is terminal, and anything still unconfirmed
     // after thirty minutes stops waiting so later notices and new tasks can move.
     if (noticeAge(notice) >= EXPIRE_UNSENT_AFTER_MS) {
-      blockUndelivered(notice, 'expired', 'This notice was created more than 6 hours ago and was never sent. Its body is kept.');
-      store.save(record);
+      blockUndelivered(notice, 'expired', notice.attempts
+        ? `This notice could not be delivered for 6 hours (${notice.attempts} attempts). Its body is kept.`
+        : 'This notice was created more than 6 hours ago and was never sent. Its body is kept.');
+      persist();
       return;
     }
     // Thirty minutes counts from the send. A final that waited longer than that for
     // its task tree was never sent at all; for a notice nobody has tried to deliver,
     // the six-hour expiry above is the only age limit.
-    const sent = Boolean(notice.attemptedAt) || ['sending', 'unknown'].includes(notice.state);
+    const sent = Boolean(notice.attemptedAt) || awaitingNoticeReceipt(notice);
     if (sent && attemptAge(notice) >= UNCONFIRMED_AFTER_MS) {
       blockUndelivered(notice, 'unconfirmed', 'Delivery could not be confirmed within 30 minutes. Its body is kept.');
-      store.save(record);
+      persist();
+      return;
+    }
+    // Waiting on a final's tree cannot disable the expiry rule. A successful
+    // tree proof clears this timer and sends it through the same notice path.
+    if (!allowSend && !awaitingNoticeReceipt(notice)) {
+      if (!notice.waitingForTree) {
+        notice.waitingForTree = true;
+        notice.nextAttemptAt = Date.parse(notice.createdAt) + EXPIRE_UNSENT_AFTER_MS;
+        persist();
+      }
       return;
     }
     if (notice.nextAttemptAt && notice.nextAttemptAt > Date.now()) return;
@@ -1301,11 +1709,16 @@ export function createScopedAgents(config, {
     notice.attempts = (notice.attempts ?? 0) + 1;
     notice.nextAttemptAt = Date.now() + retryDelayMs(notice.attempts);
     const marker = `<!-- futureaide-control:${notice.id} -->`;
+    const markers = [marker, ...(notice.readbackIds ?? []).map(id => `<!-- futureaide-control:${id} -->`)];
+    const hasMarker = value => {
+      const content = JSON.stringify(value);
+      return markers.some(entry => content?.includes(entry));
+    };
     const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
     // These exact legacy failures happened before sendClaude opened a socket. They
     // can resume; other unknown outcomes stay read-only.
-    if (claude && notice.state === 'unknown' && claudeNeverWritten(notice)) notice.state = 'pending';
-    if (notice.state === 'unknown' || notice.state === 'sending') {
+    if (!submission && claude && notice.state === 'unknown' && claudeNeverWritten(notice)) notice.state = 'pending';
+    if (awaitingNoticeReceipt(notice)) {
       try {
         if (claude) {
           // The native receipt is the request id itself: our envelope uuid survives
@@ -1318,10 +1731,10 @@ export function createScopedAgents(config, {
             ? { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined }
             : { state: 'unknown' });
         } else if (typeof nativeRequest === 'function') {
-          const found = await findCodexNotice(owner, notice, marker);
+          const found = await findCodexNotice(owner, notice, hasMarker);
           if (found.delivered) {
             Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
-          } else if (found.complete && Date.now() - (Date.parse(notice.attemptedAt ?? notice.createdAt ?? '') || Date.now()) >= CONFIRM_ABSENCE_AFTER_MS && !notice.resendAttempted) {
+          } else if (!submission && found.complete && Date.now() - (Date.parse(notice.attemptedAt ?? notice.createdAt ?? '') || Date.now()) >= CONFIRM_ABSENCE_AFTER_MS && !notice.resendAttempted) {
             // The whole relevant turn window was read and the marker is absent.
             // Re-send exactly once; this is no longer a blind write.
             Object.assign(notice, { state: 'pending', resendAttempted: true, nextAttemptAt: undefined, error: undefined });
@@ -1331,7 +1744,7 @@ export function createScopedAgents(config, {
           const history = await codexOwnerCall(owner.threadId, 'read_thread', {
             threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
           });
-          if (!history?.isError && JSON.stringify(history).includes(marker)) {
+          if (!history?.isError && hasMarker(history)) {
             Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
           } else notice.state = 'unknown';
         }
@@ -1339,22 +1752,34 @@ export function createScopedAgents(config, {
         if (terminalCodexOwnerError(error)) blockCodexNotice(record, notice, error);
         else notice.state = 'unknown';
       }
-      store.save(record);
+      persist();
       return;
     }
     // A newly confirmed channel rejection must not rewrite an older ambiguous
     // delivery: the read-back branch above remains its only recovery path.
-    if (record.callbackBlocked) { notice.state = 'blocked'; store.save(record); return; }
+    if (record.callbackBlocked) { notice.state = 'blocked'; persist(); return; }
     try { await (claude ? claudeNoticeBinding(owner) : verifyOwner(owner)); }
     catch (error) {
-      if (!claude && terminalCodexOwnerError(error)) blockCodexNotice(record, notice, error);
-      else Object.assign(notice, { state: 'pending', error: safeError(error) });
-      store.save(record);
+      if (!claude && terminalCodexOwnerError(error)) {
+        blockCodexNotice(record, notice, error);
+        persist();
+        return;
+      }
+      Object.assign(notice, { state: 'pending', error: safeError(error) });
+      // Only a real report to a Claude owner has anything to tell the user about; a
+      // question, an automatic failure prompt and every Codex row keep their own fields.
+      if (claude && reportSummary !== undefined) {
+        await noteClaudeAbsence(record, owner, notice, error, { persist, reportSummary });
+      }
+      persist();
       return;
     }
-    // A previous attempt may have reached the desktop. Never send a second copy blindly.
+    // The lookup above proves nothing by itself: a saved binding is only re-validated
+    // when the write happens, so an absence can only be ended below, by a write the
+    // session accepted. A previous attempt may also have reached the desktop, so a second
+    // copy is never sent blindly.
     Object.assign(notice, { state: 'sending', attemptedAt: now() });
-    store.save(record);
+    persist();
     try {
       if (claude) {
         // The Claude inbox answers 'written' when the channel accepted the text,
@@ -1384,7 +1809,12 @@ export function createScopedAgents(config, {
         // its old record behind, and only a fresh lookup finds where it came back.
         if (sent?.status === 'failed') sent = await resend();
         if (sent?.status === 'failed') Object.assign(notice, { state: 'pending', error: { message: 'The Claude inbox rejected this notice before acceptance.' } });
-        else Object.assign(notice, { state: 'unknown', error: undefined });
+        else {
+          // An accepted write is the only proof the session is there again, so the
+          // absence ends here and any later one starts its own wait.
+          Object.assign(notice, { state: 'unknown', error: undefined });
+          delete notice.callbackMissingSince;
+        }
       } else {
         const result = await codexOwnerCall(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
         const unavailable = result?.isError && JSON.stringify(result).includes('direct app-server input is not allowed for multi-agent v2 sub-agents');
@@ -1397,9 +1827,16 @@ export function createScopedAgents(config, {
       // never written to, so a Claude notice that lands here can be sent again. A
       // Codex owner that disappeared with the profile is a terminal notice instead.
       if (!claude && terminalCodexOwnerError(error)) blockCodexNotice(record, notice, error);
-      else Object.assign(notice, { state: claude ? 'pending' : 'unknown', error: safeError(error) });
+      else {
+        Object.assign(notice, { state: claude ? 'pending' : 'unknown', error: safeError(error) });
+        // A binding refreshed mid-send that finds no session is the same definite
+        // absence the verify above reports, and nothing reached the session.
+        if (claude && reportSummary !== undefined) {
+          await noteClaudeAbsence(record, owner, notice, error, { persist, reportSummary });
+        }
+      }
     }
-    store.save(record);
+    persist();
   }
 
   /**
@@ -1418,15 +1855,25 @@ export function createScopedAgents(config, {
       { code: 'callback-target-missing' });
     const wanted = String(owner.nativeSessionId).toLowerCase();
     const { sessions } = await claudeDiscover();
-    const session = (sessions ?? []).find(item => String(item.sessionId).toLowerCase() === wanted);
-    if (!session) throw Object.assign(new Error('The Claude session that owns this name is not running.'),
+    const candidates = (sessions ?? []).filter(item => String(item.sessionId).toLowerCase() === wanted);
+    if (!candidates.length) throw Object.assign(new Error('The Claude session that owns this name is not running.'),
       { code: 'callback-target-missing' });
-    // Same native session, same parent context: only the transport binding is
-    // refreshed, never the conversation it belongs to.
-    const binding = await claudeBind({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace });
-    store.saveOwner({ ...(store.owner(owner.ownerId) ?? owner), hostSessionId: owner.nativeSessionId, binding });
-    store.rebindOwner(owner.ownerId, binding);
-    return binding;
+    // A crashed process leaves its record behind and Windows reuses its pid, so the
+    // same session can be listed twice. Only the record whose process really is the
+    // session binds; trying just the first one listed could miss the live session on
+    // every attempt.
+    let failure;
+    for (const session of candidates) {
+      // Same native session, same parent context: only the transport binding is
+      // refreshed, never the conversation it belongs to.
+      let binding;
+      try { binding = await claudeBind({ pid: session.pid, sessionId: session.sessionId, workspace: owner.workspace }); }
+      catch (error) { failure = error; continue; }
+      store.saveOwner({ ...(store.owner(owner.ownerId) ?? owner), hostSessionId: owner.nativeSessionId, binding });
+      store.rebindOwner(owner.ownerId, binding);
+      return binding;
+    }
+    throw failure;
   }
 
   /**
@@ -1485,7 +1932,8 @@ export function createScopedAgents(config, {
     if (started.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(hostLabel(record));
     record.task.treeProtocol = TREE_PROTOCOL;
     record.task.reportProtocol = REPORT_PROTOCOL;
-    store.save(record);
+    if (record.task.cancelRequested) store.save(record);
+    else saveDispatch(record);
     return started;
   }
 
@@ -1503,12 +1951,44 @@ export function createScopedAgents(config, {
   }
 
   async function resolveAnswer(record, answer) {
-    if (answer.questionIds) return;
-    const result = await (await backendFor(record)).answer({ answerId: answer.answerId, message: answer.message });
+    if (answer.questionIds) return true;
+    const backend = await backendFor(record);
+    if (roundMovedOn(record)) throw dispatchRefused();
+    const item = store.supplement(answer.answerId);
+    if (item && dispatchExpired(item.created)) {
+      expireInput(record, undefined, item);
+      saveDispatch(record);
+      return false;
+    }
+    let result;
+    try {
+      const canAnswer = () => {
+        const latest = store.get(record.agentId);
+        return !roundMovedOn(record, latest) && !latest.task.cancelRequested && (!item || !dispatchExpired(item.created));
+      };
+      result = await backend.answer({ answerId: answer.answerId, message: answer.message,
+        ...(targetOf(record) === 'codex-desktop' ? { canAnswer } : {}) });
+    } catch (error) {
+      if (targetOf(record) === 'codex-desktop' && NATIVE_ANSWER_REFUSALS.has(error.code)) {
+        Object.assign(answer, { dispatched: true, undelivered: error.code });
+        if (item) store.setSupplement(item.requestId, 'blocked', error.code);
+        saveDispatch(record);
+      }
+      throw error;
+    }
     if (!result.consumedQuestionIds?.length) throw new Error('This subagent has no unanswered question.');
     answer.questionIds = result.consumedQuestionIds;
-    answer.continuation = result.continuation ?? `主控回答：\n${answer.message}\n请继续完成原任务。`;
-    store.save(record);
+    if (result.nativeAnswered === true) {
+      answer.dispatched = true;
+      answer.nativeAnswered = true;
+      if (record.observation?.questions) record.observation.questions = record.observation.questions.map(question =>
+        answer.questionIds.includes(question.id) ? { ...question, state: 'answered' } : question);
+    } else {
+      answer.continuation = result.continuation ?? `主控回答：\n${answer.message}\n请继续完成原任务。`;
+      if (result.nativeFallback === true) answer.nativeFallback = true;
+    }
+    saveDispatch(record);
+    return true;
   }
 
   // DSH ends the asking turn inside ask_parent, and a headless CLI turn owns its
@@ -1525,14 +2005,34 @@ export function createScopedAgents(config, {
    */
   async function dispatchAnswers(record, view) {
     const task = record.task;
-    const ready = (task.answers ?? []).filter(answer => !answer.dispatched && answer.questionIds);
-    if (!ready.length || task.cancelRequested) return undefined;
+    if (task.cancelRequested) return undefined;
+    const ready = [];
+    let expired = false;
+    let queuedAnswer;
+    for (const answer of task.answers ?? []) {
+      if (answer.dispatched || !answer.questionIds) continue;
+      const item = store.supplement(answer.answerId);
+      if (item && dispatchExpired(item.created)) {
+        expireInput(record, undefined, item);
+        expired = true;
+        continue;
+      }
+      // A supplement used as an answer keeps its original request ID and
+      // enqueue time all the way to the adapter's last send check.
+      if (item) {
+        if (!ready.length) { ready.push(answer); queuedAnswer = item; }
+        break;
+      }
+      ready.push(answer);
+    }
+    if (expired) saveDispatch(record);
+    if (!ready.length) return undefined;
     for (const answer of ready) answer.dispatched = true;
     const last = ready.at(-1);
     const frozen = Object.prototype.hasOwnProperty.call(last, 'modelSelection')
       ? { model: last.modelSelection, freezeModel: true } : {};
     return sendDispatch(record, ready.map(answer => answer.continuation).join('\n\n'), 'answer',
-      ready.flatMap(answer => answer.questionIds), undefined, view, frozen);
+      ready.flatMap(answer => answer.questionIds), queuedAnswer?.requestId, view, frozen);
   }
 
   /**
@@ -1623,9 +2123,14 @@ export function createScopedAgents(config, {
   }
 
   // Only persisted report_parent calls may wake the parent chat.
-  async function deliverReports(record) {
+  async function deliverReports(record, { readOnDemand = false } = {}) {
+    await drainSubmissions(record, { currentOnly: true, readOnDemand });
     let finalTerminal = true;
-    for (const report of record.task.reports ?? []) {
+    for (const report of record.task?.reports ?? []) {
+      if (fromSubmission(report.id)) {
+        if (report.final && !terminalNotice(report.delivery)) finalTerminal = false;
+        continue;
+      }
       // Prefer the report's own time. An old fixture/report without one may use the
       // task's start time (still a real time); a truly timeless old notice expires.
       const reportCreated = report.createdAt ?? record.task?.startedAt;
@@ -1635,12 +2140,29 @@ export function createScopedAgents(config, {
         continue;
       }
       if (report.final && !report.treeSettledConfirmed) { finalTerminal = false; continue; }
-      await deliver(record, report.delivery, `${hostLabel(record)}「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`);
+      await deliver(record, report.delivery, `${hostLabel(record)}「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`,
+        { reportSummary: report.message });
       // An older non-final notice must never hold back the final report that
       // follows it. The final report itself still has to reach a terminal state.
       if (report.final && !terminalNotice(report.delivery)) finalTerminal = false;
     }
     return finalTerminal;
+  }
+
+  const questionPrompt = (record, message) =>
+    `${hostLabel(record)} 子代理「${record.name}」等待回答：\n${message}\n\n请调用 futureaide_answer_agent，name=${JSON.stringify(record.name)}，message 为回答正文。任务保持等待；无需文件、命令或内部编号。`;
+
+  async function deliverQuestions(record, questions) {
+    for (const question of questions) {
+      if (fromSubmission(question.id)) continue;
+      if (targetOf(record) === 'codex-desktop' && typeof question.id === 'string' && question.id.startsWith('native-')
+          && !presentedNativeQuestion(record)
+          && readParentSubmissions(record).questions.some(pending =>
+            !record.task.answers?.some(answer => answer.questionIds?.includes(pending.id)))) continue;
+      record.task.questionNotices ??= {};
+      const notice = record.task.questionNotices[question.id] ??= { state: 'pending', createdAt: question.createdAt ?? now() };
+      await deliver(record, notice, questionPrompt(record, question.message));
+    }
   }
 
   /**
@@ -1653,15 +2175,24 @@ export function createScopedAgents(config, {
   async function settleDelivery(record) {
     for (const report of record.task?.reports ?? []) {
       const notice = report.delivery;
-      if (notice && ['unknown', 'sending'].includes(notice.state)) notice.nextAttemptAt = undefined;
+      if (!fromSubmission(report.id) && awaitingNoticeReceipt(notice)) notice.nextAttemptAt = undefined;
     }
     store.save(record);
-    await deliverReports(record);
+    await deliverReports(record, { readOnDemand: true });
     const task = record.task;
     const final = (task?.reports ?? []).find(report => report.final);
     // The same finish gate a poll uses, so a settled report closes its task once.
     if (final?.treeSettledConfirmed && task.result
         && task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))) await finishDeliveredReport(record);
+  }
+
+  async function requireSettledSubmissions(record) {
+    const taskId = record.task?.taskId;
+    const count = taskId ? store.submissionDebt(record.agentId, taskId) : 0;
+    if (!count) return;
+    await ensureWorker(record, { wake: true, hasSubmission: true });
+    throw Object.assign(new Error(`上一轮还有 ${count} 条请示或回报未送达。请等投递确认或进入终态后重试。`),
+      { code: 'previous-delivery-pending', retryable: true, count });
   }
 
   async function finishDeliveredReport(record) {
@@ -1686,10 +2217,18 @@ export function createScopedAgents(config, {
     if (!finalDelivered) {
       record.state = 'idle';
       store.save(record);
-      return publicResult(record);
+      return afterTerminal(record);
     }
     if (record.lifetime === 'once' && task.state === 'completed' && finalDelivered) {
       if (store.claimAutoCleanup(record)) return clearRecord(record, { autoClaimed: true });
+      const hold = store.autoCleanupHold(record.agentId);
+      if (hold.pending || hold.blocked) {
+        record.state = hold.pending ? 'delivery_pending'
+          : store.supplementSummary(record.agentId, task.taskId).blocked ? 'supplement_blocked' : 'idle';
+        if (hold.blocked) task.autoCleanupHeld = true;
+        store.save(record);
+        return hold.pending ? publicResult(record) : afterTerminal(record);
+      }
       const latest = store.get(record.agentId);
       if (latest?.task?.taskId === task.taskId && latest.task.cancelRequested) {
         task.cancelRequested = true;
@@ -1706,16 +2245,20 @@ export function createScopedAgents(config, {
     }
     record.state = task.state === 'completed' ? 'idle' : task.state;
     store.save(record);
-    return publicResult(record);
+    return afterTerminal(record);
   }
 
   async function finishReports(record, view) {
     const task = record.task;
     task.reports ??= [];
+    // An observation can see a newly accepted callback, but only its submission
+    // row can project or send it. Absorb again before proving the final gate.
+    await drainSubmissions(record, { currentOnly: true });
     for (const incoming of view.reports ?? []) {
       if (incoming.taskId !== task.taskId || typeof incoming.id !== 'string'
           || typeof incoming.message !== 'string' || !incoming.message.trim()
           || typeof incoming.final !== 'boolean') throw new Error('The bridge returned an invalid explicit report.');
+      if (fromSubmission(incoming.id)) continue;
       const previous = task.reports.find(report => report.id === incoming.id);
       if (previous) {
         if (previous.message !== incoming.message || previous.final !== incoming.final) throw new Error('A persisted report identity changed.');
@@ -1726,7 +2269,7 @@ export function createScopedAgents(config, {
     const final = task.reports.find(report => report.final);
     if (final && treeSettled(record, view) && !(view.questions ?? []).some(question => question.state === 'pending')) final.treeSettledConfirmed = true;
     if (final && final.treeSettledConfirmed) {
-      task.result = { state: task.cancelRequested || rootSummary(view)?.state === 'cancelled' ? 'cancelled' : task.state === 'failed' || rootSummary(view)?.state === 'failed' ? 'failed' : 'completed',
+      task.result = { state: task.cancelRequested || task.state === 'cancelled' || rootSummary(view)?.state === 'cancelled' ? 'cancelled' : task.state === 'failed' || rootSummary(view)?.state === 'failed' ? 'failed' : 'completed',
         reply: final.message, changes: attributedChanges(record, view), coverage: treeCoverage(record, view), tree: publicTree(record, view) };
       task.state = task.result.state;
     }
@@ -1756,7 +2299,189 @@ export function createScopedAgents(config, {
       }
     }
     store.save(record);
-    return publicResult(record);
+    return afterTerminal(record);
+  }
+
+  /**
+   * The ticket a release attempt is made with, written under the name lock and nothing
+   * else: the remote call runs outside it, so assigning the next task never waits on an
+   * unload. A dispatch invalidates the ticket, and the host re-reads the same fence at the
+   * point where it would send the unsubscribe.
+   */
+  function prepareRelease(record) {
+    const taskId = record.task?.taskId;
+    if (!taskId) return undefined;
+    const attempts = (record.releaseState?.taskId === taskId ? record.releaseState.attempts ?? 0 : 0) + 1;
+    const ticket = uid('release');
+    // The attempt keeps its own bounded re-check time while it is out. A worker that dies
+    // during the call therefore leaves a round the sweep can pick up again, and a poll
+    // before that moment cannot re-send for the same round. Only a verdict replaces it.
+    const nextCheckAt = Date.now() + RELEASE_RECHECK_MS;
+    record.releaseState = { taskId, ticket, state: 'sending', attempts, at: now(), nextCheckAt };
+    record.nextAttemptAt = nextCheckAt;
+    fastPoll.delete(record.agentId); urgentPoll.delete(record.agentId); nextPollAt.delete(record.agentId);
+    store.save(record);
+    return ticket;
+  }
+
+  /**
+   * The synchronous answer the host asks for at its own critical point: may this request
+   * still land? It reads the roster directly, so a dispatch or a parent message that
+   * arrived during the call wins without any coordination.
+   * @returns {boolean} False means the host must not send the unsubscribe.
+   */
+  function canReleaseNow(agentId, taskId, ticket) {
+    const record = store.get(agentId);
+    if (!record || record.closed) return false;
+    if (record.task?.taskId !== taskId) return false;
+    if (record.releaseState?.ticket !== ticket || record.releaseState.taskId !== taskId) return false;
+    // Absorbed is not the same as gone. Another poll can fold a late ask into this round's
+    // questions and empty the inbox, which would leave the old ticket looking valid, so the
+    // whole gate is re-read here: terminal state, nothing owed, nothing queued.
+    if (!['idle', 'failed', 'cancelled'].includes(record.state)) return false;
+    if (owesWork(record)) return false;
+    if (store.submissionDebt(agentId, taskId)) return false;
+    const view = record.observation;
+    const settled = view && view.stale !== true ? treeSettled(record, view) : undefined;
+    return canReleaseThreads(record, store.supplements(agentId), settled);
+  }
+
+  /**
+   * One release attempt, outside every name lock and outside the poll's in-flight entry:
+   * the round that asked for it is already over, and a slow unload must never hold up the
+   * next dispatch for this name.
+   */
+  function startRelease({ agentId, taskId, ticket }) {
+    // A newer ticket must not be dropped because an older attempt for the same name is
+    // still in the air: it waits its turn and then runs on its own ticket, while the older
+    // one is refused by the fence when it reaches its critical point.
+    const previous = releaseInflight.get(agentId);
+    const work = (previous ? previous.catch(() => {}) : Promise.resolve())
+      .then(() => runRelease(agentId, taskId, ticket));
+    const tracked = work.catch(() => {}).finally(() => {
+      if (releaseInflight.get(agentId) === tracked) releaseInflight.delete(agentId);
+    });
+    releaseInflight.set(agentId, tracked);
+    return tracked;
+  }
+
+  async function runRelease(agentId, taskId, ticket) {
+    const record = store.get(agentId);
+    if (!record) return;
+    const controller = new AbortController();
+    releaseSignals.set(agentId, controller);
+    try {
+      let backend;
+      try { backend = await backendFor(record); }
+      catch (error) { await finishRelease(agentId, taskId, ticket, { state: 'deferred', reason: safeError(error) }); return; }
+      // A build without the release path keeps today's behaviour; the ticket simply ends.
+      if (typeof backend.releaseIdleThreads !== 'function') {
+        await finishRelease(agentId, taskId, ticket, { state: 'deferred', reason: 'release-unsupported' });
+        return;
+      }
+      let outcome;
+      try {
+        // The ticket travels with the request: the adapter stores its own release document
+        // under the same fence, so a round that moves on cannot keep an old attempt alive.
+        outcome = await backend.releaseIdleThreads({ taskId, ticket,
+          canRelease: () => canReleaseNow(agentId, taskId, ticket), signal: controller.signal });
+      } catch (error) { outcome = { state: 'deferred', reason: safeError(error) }; }
+      await finishRelease(agentId, taskId, ticket, outcome ?? {});
+    } finally {
+      if (releaseSignals.get(agentId) === controller) releaseSignals.delete(agentId);
+    }
+  }
+
+  /**
+   * Write the verdict back only onto the same round and the same ticket. A dispatch that
+   * arrived while the request was out has already invalidated both, and its round stands.
+   */
+  async function finishRelease(agentId, taskId, ticket, outcome) {
+    let scheduled = false;
+    try {
+      await store.locked(agentId, () => {
+        const record = store.get(agentId);
+        if (!record || record.task?.taskId !== taskId) return;
+        if (record.releaseState?.ticket !== ticket) return;
+        // Only the target's own complete answer is a release: a guard, an unfinished idle
+        // grace and a transport failure are all "not confirmed" and are never recorded as
+        // done.
+        const state = ['complete', 'waiting', 'deferred'].includes(outcome?.state) ? outcome.state : 'deferred';
+        const attempts = record.releaseState.attempts ?? 1;
+        const delay = state === 'complete' ? undefined : releaseRetryDelay(attempts, outcome?.reason);
+        record.releaseState = { taskId, ticket, state, attempts, at: now(),
+          ...(delay === undefined ? {} : { nextCheckAt: Date.now() + delay }),
+          ...(outcome?.reason === undefined ? {} : { reason: outcome.reason }) };
+        record.nextAttemptAt = record.releaseState.nextCheckAt;
+        scheduled = record.nextAttemptAt !== undefined;
+        store.save(record);
+      }, { waitMs: 5000 });
+    } catch { /* A lock that stayed busy loses only this verdict; the next touch re-asks. */ }
+    // Only a schedule that was actually written needs the listener. A verdict written onto
+    // a ticket that no longer exists asks for nothing and must not start one.
+    if (scheduled) { try { await ensureMonitor(); } catch { /* the next sweep retries */ } }
+  }
+
+  /**
+   * Drop the schedule this release wrote for its own task, and nothing else. A retry
+   * stamp belonging to another target or to a name under the switch is never touched.
+   */
+  function stopRecheck(record) {
+    if (!inReleasePath(record) || releaseRecheckAt(record) === undefined) return;
+    record.nextAttemptAt = undefined;
+    store.save(record);
+  }
+
+  /**
+   * A new round invalidates any release attempt at once: the ticket stops matching, the
+   * host's own check refuses, and a signal in the air is cancelled.
+   */
+  function invalidateRelease(record) {
+    const scheduled = record.releaseState?.nextCheckAt !== undefined
+      && record.releaseState.nextCheckAt === record.nextAttemptAt;
+    if (record.releaseState === undefined && !scheduled) return false;
+    delete record.releaseState;
+    if (scheduled) record.nextAttemptAt = undefined;
+    const controller = releaseSignals.get(record.agentId);
+    if (controller) { controller.abort(); releaseSignals.delete(record.agentId); }
+    return true;
+  }
+
+  /** Is this round still owed a write, a notice or an answer? */
+  function owesWork(record) {
+    if (hasPendingDelivery(record)) return true;
+    const task = record.task;
+    if (task?.taskId && store.submissionDebt(record.agentId, task.taskId)) return true;
+    if ((task?.answers ?? []).some(answer => !answer.dispatched && !answer.undelivered)) return true;
+    if (store.supplements(record.agentId).some(item => item.task === task?.taskId && item.status !== 'blocked')) return true;
+    return (record.observation?.questions ?? []).some(question => question.state === 'pending');
+  }
+
+  /**
+   * End a round: decide whether a release is due and, if it is, leave only a ticket
+   * behind. The remote call is started by the caller after the name lock is released, so
+   * the verdict can never hold up the next dispatch for this name.
+   */
+  async function afterTerminal(record) {
+    const result = publicResult(record);
+    try {
+      if (config.idleSessionCleanup === false || targetOf(record) !== 'codex-desktop'
+          || !['persistent', 'once'].includes(record.lifetime)) return result;
+      const taskId = record.task?.taskId;
+      if (record.task?.treeUnavailable || (taskId && store.submissionDebt(record.agentId, taskId))) return result;
+      if (!releaseDue(record.releaseState, taskId)) return result;
+      const view = record.observation;
+      const settled = view && view.stale !== true ? treeSettled(record, view) : undefined;
+      // A round that stopped owing the release again —a supplement arrived, a notice is on
+      // its way once more —must not keep the sweep waking for it.
+      if (!canReleaseThreads(record, store.supplements(record.agentId), settled)) { stopRecheck(record); return result; }
+      const ticket = prepareRelease(record);
+      if (ticket) result.releaseAttempt = { agentId: record.agentId, taskId, ticket };
+    } catch (error) {
+      record.releaseState = { taskId: record.task?.taskId, state: 'deferred', attempts: 0, at: now(), reason: safeError(error) };
+      store.save(record);
+    }
+    return result;
   }
 
   function waitForTree(record, view, summaryOnly = false) {
@@ -1789,6 +2514,33 @@ export function createScopedAgents(config, {
     }
   }
 
+  async function expiredReceipt(record, dispatch) {
+    if (!dispatch) return 'not-sent';
+    if (dispatch.accepted === true) return 'accepted';
+    try {
+      const backend = await backendFor(record);
+      const receipt = await backend.receipt({ requestId: dispatch.requestId });
+      dispatch.afterSeq = receipt?.afterSeq ?? dispatch.afterSeq;
+      if (receipt?.status === 'accepted') {
+        Object.assign(dispatch, { accepted: true, state: 'running', error: undefined,
+          nextAttemptAt: undefined, retryAttempts: undefined });
+        return 'accepted';
+      }
+      if (['rejected', 'retryable', 'failed'].includes(receipt?.status)
+          || (!receipt && ['sending', 'retrying', 'failed'].includes(dispatch.state))) return 'not-sent';
+      const turn = await backend.turn({ requestId: dispatch.requestId,
+        ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}),
+        timeoutSeconds: 0, maxMessages: 100 });
+      if (turn?.correlation === 'request-id' && ['running', 'ended'].includes(turn.state)) {
+        Object.assign(dispatch, { accepted: true, state: turn.state === 'running' ? 'running' : endedState(turn.completionReason),
+          error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
+          ...(turn.state === 'ended' ? { endSeq: turn.endSeq, failure: turn.failure ?? modelTurnError(turn.completionReason) } : {}) });
+        return 'accepted';
+      }
+    } catch { /* The original write could not be confirmed. */ }
+    return 'unknown';
+  }
+
   async function drainSupplements(record) {
     if (record.task.cancelRequested) store.blockQueued(record.agentId, record.task.taskId, 'task-cancelled');
     else if (record.task.reports?.some(report => report.final)) store.blockQueued(record.agentId, record.task.taskId, 'final-submitted');
@@ -1797,13 +2549,27 @@ export function createScopedAgents(config, {
     for (const item of store.supplements(record.agentId)) {
       if (item.task !== record.task?.taskId) { store.setSupplement(item.requestId, 'blocked', 'task-changed'); continue; }
       if (item.status === 'blocked') continue;
+      // The age check runs again immediately before the send, from the moment the caller
+      // wrote the supplement: waiting behind anything does not extend its six hours.
       const current = store.get(record.agentId);
       if (!current || current.ownerId !== item.owner || current.sessionId !== item.session || current.task?.taskId !== item.task) {
         store.setSupplement(item.requestId, 'blocked', current?.task?.taskId !== item.task ? 'task-changed' : current?.task?.cancelRequested ? 'task-cancelled' : 'task-closed'); return;
       }
       const prior = record.task.dispatches.find(dispatch => dispatch.requestId === item.requestId);
       if (prior) {
+        if (dispatchExpired(item.created) && prior.accepted !== true) {
+          const outcome = await expiredReceipt(record, prior);
+          if (roundMovedOn(record)) throw dispatchRefused();
+          if (outcome === 'accepted') store.setSupplement(item.requestId, 'accepted');
+          else expireInput(record, prior, item, outcome);
+          saveDispatch(record);
+          continue;
+        }
         const recovered = await recoverDispatch(record, prior, { allowResend: false });
+        if (prior.expired) {
+          store.setSupplement(item.requestId, 'blocked', prior.expired);
+          continue;
+        }
         if (recovered === 'not-sent') {
           const view = sealed ? undefined : await observe(record);
           if (sealed || (view.reports ?? []).some(report => report.final)) {
@@ -1837,12 +2603,18 @@ export function createScopedAgents(config, {
       if (priorAnswer) {
         if (!priorAnswer.questionIds) await answerLocked(record, item.message, item.requestId,
           { modelSelection: item.selection ?? null });
-        store.setSupplement(item.requestId, 'accepted');
+        if (store.supplement(item.requestId)?.status !== 'blocked') store.setSupplement(item.requestId, 'accepted');
         if (!priorAnswer.dispatched) return;
         continue;
       }
       const view = await observe(record);
       if ((view.reports ?? []).some(report => report.final)) { store.blockQueued(record.agentId, record.task.taskId, 'final-submitted'); store.setSupplement(item.requestId, 'blocked', 'final-submitted'); return; }
+      if (dispatchExpired(item.created)) {
+        if (roundMovedOn(record)) throw dispatchRefused();
+        expireInput(record, undefined, item);
+        saveDispatch(record);
+        continue;
+      }
       // A headless CLI turn owns the session until it exits. Leave the input
       // in the shared queue so the next process can resume that same session.
       if (targetOf(record) === 'claude-cli' && view.running) return;
@@ -1855,28 +2627,243 @@ export function createScopedAgents(config, {
       store.setSupplement(item.requestId, 'sending');
       if ((view.questions ?? []).some(question => question.state === 'pending')) {
         await answerLocked(record, item.message, item.requestId, { modelSelection: item.selection ?? null });
-        store.setSupplement(item.requestId, 'accepted');
+        if (store.supplement(item.requestId)?.status !== 'blocked') store.setSupplement(item.requestId, 'accepted');
         return;
       } else {
         const dispatch = await sendDispatch(record, item.message, 'supplement', [], item.requestId, view,
           { model: item.selection, freezeModel: true });
-        store.setSupplement(item.requestId, dispatch.accepted ? 'accepted' : dispatch.state === 'failed' ? 'blocked' : 'unknown', dispatch.accepted ? null : dispatch.error?.code ?? (dispatch.state === 'failed' ? 'send-failed' : 'acceptance-unknown'));
+        store.setSupplement(item.requestId, dispatch.accepted ? 'accepted'
+          : dispatch.expired || dispatch.state === 'failed' ? 'blocked' : 'unknown',
+        dispatch.accepted ? null : dispatch.error?.code ?? (dispatch.state === 'failed' ? 'send-failed' : 'acceptance-unknown'));
         if (!dispatch.accepted) return;
       }
     }
   }
 
+  function retainMissingTreeFailure(record) {
+    // A failed Codex row whose error is the missing-thread one is the legacy shape: it has
+    // no marker yet. Writing the marker here, before the inbox is drained, lets this same
+    // round's final carry the explanation instead of looking like a live round.
+    if (record.task?.treeUnavailable === undefined && record.state === 'failed'
+        && record.error?.code === MISSING_THREAD_CODE && targetOf(record) === 'codex-desktop') {
+      record.task.treeUnavailable = MISSING_THREAD_CODE;
+      record.task.finishedAt ??= now();
+      record.observation = { ...record.observation, stale: true };
+      store.save(record);
+    }
+    if (record.task?.treeUnavailable !== MISSING_THREAD_CODE) return false;
+    if (record.state !== 'failed' || record.task.state !== 'failed') {
+      record.state = record.task.state = 'failed';
+      delete record.nextAttemptAt;
+      store.save(record);
+    }
+    return true;
+  }
+
+  /**
+   * A finished round sends nothing more. Everything it already owes is written out (its
+   * own notices, the messages an older round left behind), every queued supplement of
+   * that round is closed with its body kept, and nothing is armed to wake it again.
+   */
+  async function settleFinishedRound(record) {
+    const ended = terminalRound(record);
+    if (!ended) return publicResult(record);
+    let changed = false;
+    if (ended !== 'completed' && record.state !== ended) { record.state = ended; changed = true; }
+    if (ended !== 'completed' && record.task && record.task.state !== ended) { record.task.state = ended; changed = true; }
+    // A missing thread from an older build gains the marker now, so later polls take the
+    // cheap path instead of going looking for a thread that is gone.
+    if (ended === 'failed' && record.task && record.task.treeUnavailable === undefined
+        && record.error?.code === MISSING_THREAD_CODE) {
+      record.task.treeUnavailable = MISSING_THREAD_CODE;
+      record.task.finishedAt ??= now();
+      record.observation = { ...record.observation, stale: true };
+      changed = true;
+    }
+    // Only the schedule this feature wrote is cleared; any other retry stamp on this name
+    // belongs to something else and is left exactly as it is.
+    stopRecheck(record);
+    if (changed) store.save(record);
+    // The final a finished round still owes is settled by the same code a live round uses,
+    // from one read-only observation: nothing is dispatched here and nothing waits for a
+    // send. A tree that cannot be read keeps its notice for the usual delivery path.
+    const task = record.task;
+    const final = task?.reports?.find(report => report.final);
+    for (const item of store.supplements(record.agentId)) {
+      if (item.status === 'blocked') continue;
+      // An input whose accepted evidence already exists is kept, not closed: the receipt is
+      // the proof, whatever the round did afterwards.
+      const prior = task?.dispatches?.find(entry => entry.requestId === item.requestId);
+      if (inputAccepted(record, item)
+          || (prior && await expiredReceipt(record, prior) === 'accepted')) {
+        store.setSupplement(item.requestId, 'accepted');
+        if (prior) store.save(record);
+        continue;
+      }
+      const reason = record.task && item.task !== record.task.taskId ? 'task-changed'
+        : ended === 'cancelled' ? 'task-cancelled' : final ? 'final-submitted' : 'task-failed';
+      store.setSupplement(item.requestId, 'blocked', reason);
+    }
+    if (task?.legacyAutomaticResult && !final) return publicResult(record);
+    if (final && !final.treeSettledConfirmed && !task.treeUnavailable) {
+      let view;
+      try {
+        view = await observe(record);
+      } catch (error) {
+        record.observation = { ...record.observation, stale: true };
+        if (targetOf(record) === 'codex-desktop' && error.code === MISSING_THREAD_CODE) {
+          record.error = safeError(error);
+          task.treeUnavailable = MISSING_THREAD_CODE;
+          record.state = task.state = 'failed';
+        }
+        store.save(record);
+      }
+      if (view) return finishReports(record, view);
+    }
+    if (hasPendingDelivery(record)) await deliverReports(record);
+    if (final?.treeSettledConfirmed && task.result && task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))) {
+      return finishDeliveredReport(record);
+    }
+    return task?.treeUnavailable ? publicResult(record) : afterTerminal(record);
+  }
+
+  /** Does this queued supplement already have accepted evidence on the round? */
+  function inputAccepted(record, item) {
+    const dispatch = (record.task?.dispatches ?? []).find(entry => entry.requestId === item.requestId);
+    if (dispatch?.accepted === true) return true;
+    const answer = (record.task?.answers ?? []).find(entry => entry.answerId === item.requestId);
+    return Boolean(answer?.questionIds?.length);
+  }
+
+  function expireInput(record, dispatch, item, outcome = 'not-sent') {
+    const unconfirmed = outcome === 'unknown';
+    const createdAt = item?.created ?? (dispatch?.kind === 'task' ? record.task.startedAt : dispatch?.startedAt);
+    const reason = 'dispatch-expired';
+    if (dispatch) Object.assign(dispatch, { state: 'blocked', accepted: false, expired: reason,
+      nextAttemptAt: undefined, error: { code: reason, message: unconfirmed
+        ? 'This input expired after six hours with no confirmed receipt. Its body is kept.'
+        : 'This input expired after six hours without being sent. Its body is kept.' } });
+    if (item) {
+      store.setSupplement(item.requestId, 'blocked', reason);
+      const answer = record.task.answers?.find(entry => entry.answerId === item.requestId);
+      if (answer) Object.assign(answer, { dispatched: true, undelivered: reason });
+    }
+    if (item || dispatch?.kind !== 'task') {
+      record.expired = { count: (record.expired?.count ?? 0) + 1,
+        retainBody: record.expired?.retainBody || !item,
+        latest: { reason, kind: 'supplement', requestId: item?.requestId ?? dispatch?.requestId, createdAt,
+          ...(unconfirmed ? { unconfirmed } : {}) } };
+    } else {
+      record.state = record.task.state = 'failed';
+      record.task.finishedAt ??= now();
+      record.task.expired = { reason, kind: 'task', at: now(), startedAt: createdAt,
+        ...(unconfirmed ? { unconfirmed } : {}) };
+      record.expired = { ...record.expired, retainBody: true };
+    }
+  }
+
+  /**
+   * Nothing this round queued is sent after its own six hours. The window is the notice
+   * window and the clock is the original one: a task with no accepted dispatch is aged
+   * from its start (a retry never refreshes it), a queued supplement from the moment the
+   * caller wrote it. Expired work keeps its body and says so; an expired supplement never
+   * ends a task that is still running.
+   * @returns {Promise<boolean>} True when the task itself expired.
+   */
+  async function expireStaleWork(record) {
+    const task = record.task;
+    if (!task) return false;
+    let changed = false;
+    const dispatched = task.dispatches ?? [];
+    const primary = dispatched.find(dispatch => dispatch.kind === 'task')
+      ?? dispatched.find(dispatch => dispatch.kind === undefined && !dispatch.reminder);
+    if (dispatchExpired(task.startedAt) && primary?.accepted !== true) {
+      const outcome = await expiredReceipt(record, primary);
+      if (roundMovedOn(record)) throw dispatchRefused();
+      if (outcome !== 'accepted') {
+        if (primary) primary.kind ??= 'task';
+        expireInput(record, primary ?? { kind: 'task' }, undefined, outcome);
+      }
+      changed = true;
+    }
+    for (const item of store.supplements(record.agentId)) {
+      if (item.status === 'blocked' || item.task !== task.taskId || !dispatchExpired(item.created)) continue;
+      const prior = dispatched.find(dispatch => dispatch.requestId === item.requestId);
+      const outcome = await expiredReceipt(record, prior);
+      if (roundMovedOn(record)) throw dispatchRefused();
+      if (outcome === 'accepted') store.setSupplement(item.requestId, 'accepted');
+      else expireInput(record, prior, item, !prior && item.status === 'unknown' ? 'unknown' : outcome);
+      changed = true;
+    }
+    for (const dispatch of dispatched) {
+      if (dispatch.kind !== 'supplement' || dispatch.accepted === true || dispatch.expired
+          || !dispatchExpired(dispatch.startedAt) || store.supplement(dispatch.requestId)) continue;
+      const outcome = await expiredReceipt(record, dispatch);
+      if (roundMovedOn(record)) throw dispatchRefused();
+      if (outcome !== 'accepted') expireInput(record, dispatch, undefined, outcome);
+      changed = true;
+    }
+    if (changed) saveDispatch(record);
+    return Boolean(task.expired);
+  }
+
   async function pollLocked(record) {
     if (readOnlyTarget(record)) return publicResult(record);
-    if (record.nextAttemptAt > Date.now()) return publicResult(record);
-    if (firstDispatchDeferred(record)) return publicResult(record);
-    if (record.state === 'cleaning') return clearRecord(record);
-    if (record.closed || record.state === 'cleanup_failed' || record.state === 'idle') return publicResult(record);
+    if (record.state === 'cleaning') {
+      return record.nextAttemptAt > Date.now() ? publicResult(record) : clearRecord(record);
+    }
+    if (record.closed || record.state === 'cleanup_failed') return publicResult(record);
+    const missingTree = retainMissingTreeFailure(record);
+    // What the helper already wrote is taken in before anything decides that a finished
+    // round may skip work: an accepted late ask or report is this round's work, and a
+    // release re-check must never walk past it.
+    try { await drainSubmissions(record); }
+    catch (error) { record.error = safeError(error); store.save(record); return publicResult(record); }
+    if (missingTree) {
+      // The round is closed, so its queued input is closed with it and nothing is armed to
+      // wake it again; its own notices still go out. This is what keeps a legacy missing
+      // thread from turning into a polling hot loop.
+      return await settleFinishedRound(record);
+    }
+    // A round the target has not confirmed releasing yet owes nothing else —that is what
+    // the release gate proved when it wrote the schedule —so this poll asks the release
+    // again and reads nothing else: a conversation read is what would resume the very
+    // thread being released.
+    const recheckAt = releaseRecheckAt(record);
+    if (recheckAt !== undefined) {
+      if (owesWork(record)) stopRecheck(record);
+      else if (recheckAt > Date.now()) return publicResult(record);
+      // One attempt at a time: the ticket already in the air is the only release this
+      // round gets until it answers.
+      else if (releaseInflight.has(record.agentId)) return publicResult(record);
+      else return afterTerminal(record);
+    }
+    // A round that entered the release path and owes nothing is not read again: the
+    // observe below would subscribe the thread the release just let go of. Every other
+    // name keeps exactly the round it had before this feature existed.
+    if (inReleasePath(record) && ['idle', 'failed', 'cancelled'].includes(record.state)
+        && !owesWork(record)) return publicResult(record);
     const task = record.task;
     try {
-      // Explicit ask/report that a Codex-side tool wrote into the shared queue join
-      // the same task as questions/reports before anything else looks at them.
-      if (task) absorbSubmissions(record);
+      // Historical automatic results remain quarantined as before. Their marker
+      // makes the old round terminal for sending even if it is still listed here.
+      if (task?.result && task.reportProtocol !== REPORT_PROTOCOL) {
+        if (['sending', 'unknown'].includes(task.delivery?.state)) await deliver(record, task.delivery, '');
+        task.legacyAutomaticResult = task.result;
+        delete task.result; task.delivery = undefined;
+        record.state = 'awaiting_report';
+        store.save(record);
+        return publicResult(record);
+      }
+      const stopping = task?.cancelRequested && (!task.cancelVerified || task.cancelPending || !task.cancelTreeSettled);
+      if (terminalRound(record) && !stopping) return await settleFinishedRound(record);
+      if (!task?.cancelRequested && await expireStaleWork(record)) return await settleFinishedRound(record);
+      if (record.nextAttemptAt > Date.now() || firstDispatchDeferred(record)) return publicResult(record);
+      if (record.state === 'idle') {
+        if (!hasPendingDelivery(record)) return publicResult(record);
+        await deliverReports(record);
+        return afterTerminal(record);
+      }
       if (task?.cancelRequested && (!task.cancelVerified || task.cancelPending)) {
         const result = await (await checkHost(record)).cancel();
         retainCancelError(record, result);
@@ -1889,15 +2876,6 @@ export function createScopedAgents(config, {
         }
       }
       if (task && store.supplements(record.agentId).length) await drainSupplements(record);
-      // Never migrate an automatic result into an explicit report or cleanup.
-      if (task?.result && task.reportProtocol !== REPORT_PROTOCOL) {
-        if (['sending', 'unknown'].includes(task.delivery?.state)) await deliver(record, task.delivery, '');
-        task.legacyAutomaticResult = task.result;
-        delete task.result; task.delivery = undefined;
-        record.state = task.state = 'awaiting_report';
-        store.save(record);
-        return publicResult(record);
-      }
       if (task?.reports?.length) {
         await deliverReports(record);
         const final = task.reports.find(report => report.final && report.treeSettledConfirmed);
@@ -1914,7 +2892,12 @@ export function createScopedAgents(config, {
         if (task.dispatches[0]?.state === 'retrying' && task.dispatches[0].nextAttemptAt > Date.now()) return publicResult(record);
       }
       else await negotiateTree(record);
-      for (const answer of task.answers ?? []) if (!answer.questionIds && !task.cancelRequested) await resolveAnswer(record, answer);
+      for (const answer of task.answers ?? []) {
+        if (!answer.questionIds && !answer.dispatched && !task.cancelRequested) {
+          try { await resolveAnswer(record, answer); }
+          catch (error) { if (!NATIVE_ANSWER_REFUSALS.has(error.code)) throw error; }
+        }
+      }
       const view = await observe(record);
       if (task.cancelRequested && task.cancelVerified && !view.running && treeSettled(record, view)) {
         task.cancelTreeSettled = true;
@@ -1929,12 +2912,7 @@ export function createScopedAgents(config, {
       // to end, or for a later question, before it is written into the conversation.
       if (answersMidTurn(record) && !(task.reports ?? []).some(report => report.final)) await dispatchAnswers(record, view);
       const unanswered = (view.questions ?? []).filter(question => question.state === 'pending');
-      for (const question of unanswered) {
-        task.questionNotices ??= {};
-        const notice = task.questionNotices[question.id] ??= { state: 'pending', createdAt: now() };
-        await deliver(record, notice,
-          `${hostLabel(record)} 子代理「${record.name}」等待回答：\n${question.message}\n\n请调用 futureaide_answer_agent，name=${JSON.stringify(record.name)}，message 为回答正文。任务保持等待；无需文件、命令或内部编号。`);
-      }
+      await deliverQuestions(record, unanswered);
       for (const dispatch of task.dispatches) {
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
         await recoverDispatch(record, dispatch);
@@ -1992,16 +2970,22 @@ export function createScopedAgents(config, {
       if (terminal === 'failed' && !task.cancelRequested) await notifyFailure(record, terminal, view, finalDispatch);
       return await finishReports(record, view);
     } catch (error) {
+      // A write that refused at its own last moment and proved it was never sent: this copy
+      // is stale by definition, so none of it is saved. The newer round keeps what it has.
+      if (error?.notSent === true && error?.terminal === true) {
+        return publicResult(store.get(record.agentId) ?? record);
+      }
       // A missing thread after a profile switch is a terminal state, not a
       // transient transport failure: keep the exact error and stop polling it.
-      const terminal = error.terminal === true;
+      const missingThread = targetOf(record) === 'codex-desktop' && error.code === 'codex-thread-not-found';
+      const terminal = missingThread || error.terminal === true;
       record.state = terminal ? 'failed' : record.task?.result ? 'delivery_pending' : 'reconnecting';
       record.error = safeError(error);
       if (terminal && record.task) {
         record.task.state = 'failed';
-        if (!record.task.cancelRequested) {
-          try { await notifyFailure(record, 'failed', record.observation ?? {}, undefined); }
-          catch { /* the pending failure report is retried by the next scan */ }
+        if (missingThread) {
+          record.task.treeUnavailable = 'codex-thread-not-found';
+          record.task.finishedAt ??= now();
         }
       }
       record.observation = { ...record.observation, stale: true };
@@ -2009,7 +2993,12 @@ export function createScopedAgents(config, {
       else if (targetOf(record) !== 'dsh') deferRetry(record);
       forgetBackend(record);
       store.save(record);
-      return publicResult(record);
+      if (terminal && record.task && !store.get(record.agentId)?.task?.cancelRequested) {
+        try { await notifyFailure(record, 'failed', record.observation ?? {}, undefined); }
+        catch { /* the pending failure report is retried by the next scan */ }
+      }
+      if (missingThread) await drainSubmissions(record, { currentOnly: true });
+      return terminal ? afterTerminal(record) : publicResult(record);
     }
   }
 
@@ -2063,7 +3052,7 @@ export function createScopedAgents(config, {
       // A cross-application call: when the caller is itself a managed Codex child, the
       // new name is its child and follows that owner tree. A verified Claude caller has
       // no Codex thread to look up — it owns its names flat, so it is never asked for one.
-      const parent = trustedCaller(extra) ? undefined : store.agentForCodexThread(callingThread(extra));
+      const parent = trustedCaller(extra) ? undefined : store.agentForCodexThread(callingThread(extra), { includeAutoClosed: true });
       const record = { agentId: uid('agent'), ownerId: owner.ownerId, sessionId: uid('session-codex'), name, lifetime,
         target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
         ...(parent ? { parentAgentId: parent.agentId } : {}) };
@@ -2073,7 +3062,7 @@ export function createScopedAgents(config, {
         // creates nothing and a valid pin is part of the first durable record.
         record.modelPin = await resolveRequestedPin(record, { model, effort });
       }
-      store.insert(record); // The database's (owner,name) constraint arbitrates parallel creation.
+      store.insert(record, { requireOpenParent: Boolean(parent) });
       return store.locked(record.agentId, async () => {
         if (!store.get(record.agentId)) throw new Error('This subagent was removed while it was being created.');
         try {
@@ -2145,6 +3134,12 @@ export function createScopedAgents(config, {
         requireWritableTarget(record);
         const closing = ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'];
         if (record.closed || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
+        retainMissingTreeFailure(record);
+        // A terminal row may still have a callback accepted by another process.
+        // Fold it into that round before deciding whether this input is a new task.
+        if (!ACTIVE.has(record.state) || terminalRound(record)) {
+          await drainSubmissions(record, { currentOnly: true, readOnDemand: true });
+        }
         let previousReport;
         if (record.state === 'delivery_pending') {
           const prior = (record.task?.reports ?? []).filter(report => !report.failure).at(-1);
@@ -2154,6 +3149,7 @@ export function createScopedAgents(config, {
           // Settling a one-shot agent's final finishes its task and removes the name on
           // the spot, so the ordinary closing error applies instead of a new dispatch.
           if (record.closed || !store.get(record.agentId) || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
+          await requireSettledSubmissions(record);
           if (record.state === 'delivery_pending') {
             // The caller is demonstrably still here (it just called send). Stop
             // waiting for confirmation, keep the body, and let the new task start.
@@ -2173,10 +3169,22 @@ export function createScopedAgents(config, {
         }
         if (!record.created) throw new Error('This subagent is still connecting; check its list status before sending a task.');
         if (targetOf(record) === 'dsh') await checkHost(record);
-        const stoppedTask = record.task && ['cancelled', 'failed'].includes(record.state);
-        const pendingReports = (record.task?.reports ?? []).some(report => !terminalNotice(report.delivery));
-        if (stoppedTask && (record.lifetime === 'once' || pendingReports)) throw new Error('This task stopped; delete the one-shot agent or wait for its submitted reports before reusing a persistent agent.');
-        if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
+        const stoppedTask = Boolean(terminalRound(record));
+        if (!ACTIVE.has(record.state) || stoppedTask) await requireSettledSubmissions(record);
+        const pendingReports = (record.task?.reports ?? []).filter(report => !terminalNotice(report.delivery));
+        // A delivered final can leave an earlier callback in backoff. Keep that
+        // callback on this round until its delivery outcome is recorded.
+        const pendingIdleCallback = record.state === 'idle' && pendingReports.some(report => report.id?.startsWith('submission:'));
+        if ((stoppedTask && (record.lifetime === 'once' || pendingReports.length)) || pendingIdleCallback) {
+          if (pendingReports.length) await ensureWorker(record, { wake: true });
+          throw new Error(stoppedTask
+            ? 'This task stopped; delete the one-shot agent or wait for its submitted reports before reusing a persistent agent.'
+            : 'Wait for this task’s submitted reports before reusing the name.');
+        }
+        if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) {
+          await requireSettledSubmissions(record);
+          throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
+        }
         const existingQueued = !stoppedTask && store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
         // All rejections that must not touch the name are now past. Resolve a
         // requested substring to its real ID first, so an unknown model still lists
@@ -2198,7 +3206,7 @@ export function createScopedAgents(config, {
             ? queue(record, pin, { savePin: true })
             : queue(record, undefined, { usePinnedModel: true });
         }
-        if (record.task && ACTIVE.has(record.state)) {
+        if (record.task && !stoppedTask && ACTIVE.has(record.state)) {
           if (targetOf(record) !== 'dsh' || !record.task.dispatches.length) {
             const pin = await resolvePin();
             return wantsSelection
@@ -2215,25 +3223,51 @@ export function createScopedAgents(config, {
           if ((view.questions ?? []).some(question => question.state === 'pending')) return answerLocked(record, message);
           await sendDispatch(record, message, 'supplement', [], undefined, view);
         } else {
+          if (record.task?.treeUnavailable === MISSING_THREAD_CODE || record.task?.expired?.unconfirmed) {
+            const view = await observe(record, { checkingRestoredProfile: true });
+            // An earlier cancellation request can no longer keep a missing task open.
+            // After the profile returns, verify that the old tree has actually stopped.
+            const settled = view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
+            if (view.running || !settled) {
+              throw Object.assign(new Error('The previous task is visible again but its task tree has not settled.'),
+                { code: 'previous-task-unsettled', retryable: true });
+            }
+          }
           const pin = await resolvePin();
-          persistPin(record, pin);
-          if (record.task) store.appendHistory(record.agentId, { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
-            coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) });
+          const snapshot = record.task ? { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
+            coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) } : undefined;
           // finalReminder marks this task as one that may be reminded once when a turn
           // ends without a final report. Tasks created before this rule carry no
           // marker, so a sleeping awaiting_report from an older version stays quiet.
           // The selected model is frozen with the task: a desktop first dispatch is
           // delayed through the worker queue and must not read a later pin change.
-          record.task = { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [],
-            modelSelection: pin ? { ...pin } : null, finalReminder: 'armed' };
-          record.state = 'running'; record.observation = undefined; record.error = undefined;
-          record.nextAttemptAt = undefined; record.retryAttempts = 0; store.save(record);
+          const next = { ...record, state: 'running', observation: undefined, error: undefined,
+            nextAttemptAt: undefined, retryAttempts: 0, sleep: undefined,
+            ...(wantsSelection ? { modelPin: { ...pin } } : {}),
+            task: { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [],
+              modelSelection: pin ? { ...pin } : null, finalReminder: 'armed' } };
+          // A task assignment ends the previous round for good: its release attempt loses
+          // its ticket here, so the host refuses it at the point where it would unsubscribe
+          // and the new turn is free to subscribe the thread again.
+          invalidateRelease(next);
+          if (!store.replaceTask(next, record, snapshot)) {
+            const latest = store.get(record.agentId);
+            if (!latest) throw new Error('This subagent instance has already been removed.');
+            return operation(latest);
+          }
+          record = next;
           if (targetOf(record) !== 'dsh') {
             await ensureWorker(record, { wake: true });
             return { ...queued(record, pin), ...(previousReport ? { previousReport } : {}) };
           }
           try { await beginTask(record); }
-          catch (error) { record.state = 'reconnecting'; record.error = safeError(error); store.save(record); }
+          catch (error) {
+            if (error?.notSent === true) {
+              if (store.get(record.agentId)?.task?.taskId !== record.task.taskId) throw error;
+            } else {
+              record.state = 'reconnecting'; record.error = safeError(error); store.save(record);
+            }
+          }
         }
         await ensureWorker(record, { wake: true });
         const current = store.get(record.agentId) ?? record;
@@ -2334,10 +3368,15 @@ export function createScopedAgents(config, {
       const owner = await context(extra);
       // Own names only, each with its own composed tree; managed descendants appear
       // inside that tree, never as extra entries in this chat's list.
-      for (const record of store.list(owner.ownerId)) await ensureWorker(record);
+      let ensured;
+      const ensure = () => ensured ??= ensureMonitor();
+      for (const record of store.list(owner.ownerId)) await ensureWorker(record, { ensure });
       const records = store.list(owner.ownerId);
+      const running = records.some(record => !record.sleep)
+        && await monitorAlive(store, Date.now(), { idleSessionCleanup: config.idleSessionCleanup !== false });
       return { items: records.map(record => ({ ...publicResult(record),
-        monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping') : (monitorAlive(store) ? 'running' : 'stopped'),
+        monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping')
+          : (running ? 'running' : 'stopped'),
         supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
     },
     async changes({ name, task = 0 }, extra) {
@@ -2487,7 +3526,8 @@ export function createScopedAgents(config, {
       const threadId = callingThread(extra);
       const bound = store.agentForCodexThread(threadId);
       const receipt = store.submitParentMessage(bound?.agentId, { kind, message, final });
-      await ensureWorker(store.get(bound.agentId), { wake: true });
+      const record = store.get(bound.agentId);
+      await ensureWorker(record, { wake: true, hasSubmission: record?.task?.taskId === receipt.taskId });
       return receipt;
     },
     async wait({ names, timeoutSeconds = 0 } = {}, extra) {
@@ -2518,14 +3558,25 @@ export function createScopedAgents(config, {
     poll(agentId) {
       if (inflight.has(agentId)) return inflight.get(agentId);
       if (draining) return Promise.resolve({ draining: true });
-      let beforeUpdatedAt, afterUpdatedAt;
+      let beforeUpdatedAt, afterUpdatedAt, attempt;
       const work = store.locked(agentId, async () => {
         const record = store.get(agentId);
         beforeUpdatedAt = record?.updatedAt;
         const result = record ? await pollLocked(record) : { removed: true };
         afterUpdatedAt = record?.updatedAt;
+        if (result?.releaseAttempt) {
+          const { releaseAttempt, ...rest } = result;
+          attempt = releaseAttempt;
+          return rest;
+        }
         return result;
       }, { waitMs: 0 })
+        .then(result => {
+          // The release runs outside the name lock and outside this poll's in-flight
+          // entry, so a caller assigning the next task never waits on an unload.
+          if (attempt) startRelease(attempt);
+          return result;
+        })
         .finally(() => {
           inflight.delete(agentId);
           // A quiet poll must not wake the loop; a poll that wrote durable state may
@@ -2537,7 +3588,8 @@ export function createScopedAgents(config, {
     },
     async resume() {
       const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
-      const pending = records.filter(record => record.sleep?.wakePending === true || needsPoll(record));
+      const inbox = pendingInbox();
+      const pending = records.filter(record => record.sleep?.wakePending === true || needsPoll(record, inbox.has(record.agentId)));
       if (!pending.length) return;
       if (await ensureMonitor()) return;
       // One listener serves every name: record the failure on each waiting name
@@ -2551,7 +3603,11 @@ export function createScopedAgents(config, {
     // in-process sweep below reuses it when no monitor can be started.
     async monitorScan({ only = null, fresh = null, sweep = true, force = false, deferred = [] } = {}) {
       if (draining) return inflight.size > 0 || monitorInflight.size > 0;
+      releaseWakeAt = undefined;
+      const inbox = pendingInbox();
+      const scanAt = Date.now();
       const wanted = new Set(only ?? []);
+      for (const [agentId, dueAt] of inbox) if (dueAt <= scanAt) wanted.add(agentId);
       // Only a real hint — a file event or work queued in this process — may skip a
       // name's own one-second floor. A name that merely owes fast work is polled again
       // as soon as the floor allows, not on every round: otherwise every completion
@@ -2560,17 +3616,31 @@ export function createScopedAgents(config, {
       // A round that was pointed at particular names does not pay for the roster
       // sweep; the last sweep is at most SWEEP_MS old, and every name it would have
       // found is polled by the sweep that follows.
-      if (!sweep && !wanted.size) return inflight.size > 0 || monitorInflight.size > 0;
+      if (!sweep && !wanted.size) return inbox.size > 0 || inflight.size > 0 || monitorInflight.size > 0;
       const candidates = sweep && typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : [];
       const queue = candidates.map(candidate => ({ agentId: candidate.agentId, candidate }));
       const seen = new Set(queue.map(item => item.agentId));
       for (const agentId of wanted) if (!seen.has(agentId)) queue.push({ agentId, candidate: undefined });
-      let busy = inflight.size > 0 || monitorInflight.size > 0;
+      let busy = inbox.size > 0 || inflight.size > 0 || monitorInflight.size > 0;
       for (const { agentId, candidate } of queue) {
-        const hinted = hints.has(agentId);
+        // A durable callback is work even when its name has no release schedule.
+        // It cannot be held behind that schedule's five-minute retry.
+        const hasSubmission = (inbox.get(agentId) ?? Infinity) <= scanAt;
+        const hinted = hints.has(agentId) || hasSubmission;
         // A hint is news about that name, so it is polled even if its own last poll
         // just finished; the ordinary 1s floor still applies to the sweep.
-        if (!needsPoll(candidate ?? store.get(agentId))) { fastPoll.delete(agentId); continue; }
+        // A projection can only hint that a finished round still carries a retry stamp.
+        // Only the whole record shows whose stamp it is, so that one name is read here
+        // and every other name keeps using its projection.
+        const full = mayHoldReleaseSchedule(candidate) ? store.get(agentId) : undefined;
+        if (!needsPoll(full ?? candidate ?? store.get(agentId), hasSubmission)) { fastPoll.delete(agentId); continue; }
+        // A finished round whose only outstanding work is its own release re-check is not
+        // busy: the listener sleeps to that moment, so waiting costs no round at all.
+        const recheckAt = releaseRecheckAt(full ?? candidate ?? store.get(agentId));
+        if (recheckAt !== undefined && !hinted && !urgentPoll.has(agentId) && recheckAt > Date.now()) {
+          releaseWakeAt = Math.min(releaseWakeAt ?? Infinity, recheckAt);
+          continue;
+        }
         busy = true;
         // A poll already in flight cannot take this hint: hand it back so the round
         // after that poll ends still knows the name moved, instead of waiting for the
@@ -2589,13 +3659,13 @@ export function createScopedAgents(config, {
         await yieldToIO();
         if (draining) break;
         const record = store.get(agentId);
-        if (!record || !needsPoll(record)) { fastPoll.delete(agentId); continue; }
+        if (!record || !needsPoll(record, hasSubmission)) { fastPoll.delete(agentId); continue; }
         if (owesFastPoll(record)) fastPoll.add(record.agentId); else fastPoll.delete(record.agentId);
         busy = true;
         if (monitorInflight.has(record.agentId)) { if (hints.has(agentId)) deferred.push(agentId); continue; }
         const urgent = urgentPoll.delete(record.agentId);
         if (!hinted && !urgent && !force && nextPollAt.get(record.agentId) > Date.now()) continue;
-        if (firstDispatchDeferred(record)) continue;
+        if (!hasSubmission && firstDispatchDeferred(record)) continue;
         if (!hinted && !urgent && !force && record.nextAttemptAt > Date.now()) continue;
         let becameFast = false;
         const work = service.poll(record.agentId)
@@ -2630,13 +3700,17 @@ export function createScopedAgents(config, {
     async drainPolls() {
       draining = true;
       await Promise.allSettled([...monitorInflight.values(), ...inflight.values()]);
+      // A release that is still in the air is not a poll, but shutting down with it
+      // running would close the roster under it: wait it out here instead.
+      await Promise.allSettled([...releaseInflight.values()]);
       // A baseline write survives the poll that started it; a shutdown that only waited
       // for polls could close the database with half a snapshot still being written.
       while (baselineWrites.size) await Promise.allSettled([...baselineWrites.values()]);
     },
     async ensureIdleMonitor() {
       const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
-      const pending = records.some(record => record.sleep?.wakePending === true || needsPoll(record));
+      const inbox = pendingInbox();
+      const pending = records.some(record => record.sleep?.wakePending === true || needsPoll(record, inbox.has(record.agentId)));
       if (!store.hasSleeping() && !pending) { monitorUnavailableSince = undefined; return false; }
       let ready = false;
       try { ready = await startSharedMonitor(config, store); } catch { ready = false; }
@@ -2652,6 +3726,8 @@ export function createScopedAgents(config, {
     },
     /** Names that owe time-critical work; the listener polls these every second. */
     fastPollNames() { return [...fastPoll]; },
+    /** Due time of the next release re-check the last sweep found, if any. */
+    releaseWakeAt() { return releaseWakeAt; },
     async wake(agentId, taskId) {
       const record = store.get(agentId);
       if (!record || readOnlyTarget(record) || record.sleep?.taskId !== taskId || record.sleep.sessionId !== record.sessionId) return false;
@@ -2663,18 +3739,28 @@ export function createScopedAgents(config, {
         const record = store.get(agentId);
         if (!record || readOnlyTarget(record) || !canSleep(record, store.supplements(agentId), treeSettled)) return false;
         if (!await startSharedMonitor(config, store)) return false;
+        // A callback can arrive while the listener is being checked. The sleep write
+        // and the inbox check must share one SQLite statement.
         return store.sleep(record, idleSignal({ ...record.observation, taskId: record.task.taskId }));
       });
     },
-    close() { store.close(); },
+    close() {
+      for (const controller of releaseSignals.values()) controller.abort();
+      releaseSignals.clear();
+      store.close();
+    },
   };
 
   async function answerLocked(record, message, queuedAnswerId, { modelSelection } = {}) {
     if (!record.task || record.closed || record.task.cancelRequested) throw new Error('This subagent has no open task waiting for an answer.');
+    // A finished round cannot be answered: its question is only information by then.
+    if (terminalRound(record)) throw Object.assign(new Error('This subagent’s round has already ended, so the question is only information; the answer was not delivered.'),
+      { code: 'round-finished', terminal: true });
     await negotiateTree(record);
     await checkHost(record);
     const view = await observe(record);
-    const existing = (record.task.answers ?? []).find(answer => queuedAnswerId ? answer.answerId === queuedAnswerId : !answer.questionIds && answer.message === message);
+    const existing = (record.task.answers ?? []).find(answer => queuedAnswerId ? answer.answerId === queuedAnswerId
+      : !answer.dispatched && !answer.questionIds && answer.message === message);
     if (!existing && !(view.questions ?? []).some(question => question.state === 'pending')) throw new Error('This subagent has no unanswered question.');
     record.task.answers ??= [];
     const answer = existing ?? { answerId: queuedAnswerId ?? uid('answer'), message, dispatched: false };
@@ -2686,14 +3772,22 @@ export function createScopedAgents(config, {
       answer.modelSelection = frozen ? { ...frozen } : null;
     }
     if (!existing) record.task.answers.push(answer);
-    store.save(record);
-    try { await resolveAnswer(record, answer); }
-    catch (error) { record.error = safeError(error); store.save(record); await ensureWorker(record); throw error; }
+    saveDispatch(record);
+    try {
+      if (!(await resolveAnswer(record, answer))) {
+        return { name: record.name, answered: false, state: record.state, error: safeError(dispatchRefused('dispatch-expired')) };
+      }
+    } catch (error) {
+      if (error?.notSent !== true && !NATIVE_ANSWER_REFUSALS.has(error.code)) {
+        record.error = safeError(error); saveDispatch(record); await ensureWorker(record);
+      }
+      throw error;
+    }
     // A final report seals its task: the helper has finished and reads nothing more.
     // An answer that comes after it still closes the question, which releases the held
     // report, but it is never written into the conversation, and the caller is told
     // exactly that instead of "resuming".
-    if ([...(record.task.reports ?? []), ...(view.reports ?? [])].some(report => report.final === true)) {
+    if (!answer.nativeAnswered && [...(record.task.reports ?? []), ...(view.reports ?? [])].some(report => report.final === true)) {
       answer.dispatched = true; answer.undelivered = 'final-submitted';
       store.save(record);
       await ensureWorker(record, { wake: true });
@@ -2703,6 +3797,7 @@ export function createScopedAgents(config, {
     record.state = 'running'; record.task.state = 'running'; store.save(record);
     await ensureWorker(record, { wake: true });
     return { name: record.name, answered: true, state: 'resuming',
+      ...(answer.nativeAnswered ? { delivery: 'native-question' } : answer.nativeFallback ? { delivery: 'continuation-queued' } : {}),
       actualModel: actualModelName(answer.modelSelection) ?? actualModelName(record.model) };
   }
   return service;

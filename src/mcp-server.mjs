@@ -10,8 +10,10 @@ import { CODEX_THREAD_ID } from './codex-target.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
 import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 import { TRUSTED_CALLER } from './calling-context.mjs';
+import { monitorAlive } from './shared-monitor.mjs';
+import { exitWhenInputCloses } from './stdio-exit.mjs';
 import { compactChanges, compactCreate, compactInspect, compactList, compactStatus, compactWait } from './tool-view.mjs';
-import { FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
+import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
 import { TARGETS } from './agent-backend.mjs';
 import { RosterStore } from './roster-store.mjs';
 
@@ -112,15 +114,33 @@ export function registerScopedTools(server, options = {}) {
   return server;
 }
 
-/** Default installed surface: each request is bound to its native calling chat. */
-export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.18' });
+/**
+ * Default installed surface: each request is bound to its native calling chat.
+ * The stdio entry can supply its configuration read so the service and transport
+ * use the same settings.
+ */
+export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics,
+  configReady } = {}) {
+  const server = new McpServer({ name: 'futureaide-control', version: '0.5.19' });
   let servicePromise;
-  const service = () => servicePromise ??= loadConfig(configPath).then(async config => {
+  const service = () => servicePromise ??= (configReady ?? loadConfig(configPath)).then(async config => {
     const value = scopedFactory(config);
     await value.resume?.();
     await value.ensureIdleMonitor?.();
-    const monitorHealth = setInterval(() => { void value.ensureIdleMonitor?.().catch(() => {}); }, 30000);
+    const monitorHealth = setInterval(async () => {
+      // A live shared listener already polls every name it owns, so re-confirming it
+      // from this connection would scan the whole roster to reach the answer it already
+      // has: measured on an idle installed server, that was two scans of a 412-name
+      // roster every thirty seconds, from every connected server. The leases and
+      // process probe leave pending work recoverable when the monitor is gone.
+      try {
+        if (config.idleSessionCleanup !== false) {
+          const store = value.store;
+          if (store && typeof store.lease === 'function' && await monitorAlive(store)) return;
+        }
+        await value.ensureIdleMonitor?.();
+      } catch { /* The next health check retries a transient roster or monitor error. */ }
+    }, 30000);
     monitorHealth.unref();
     return value;
   });
@@ -136,7 +156,7 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
 function registerParentTools(server, options) {
   const register = toolRegistrar(server, options);
   const parentMessage = z.string().min(1).max(100000).describe('Message for the managed parent of this chat. Pass it directly; never a chat id, path, or internal number.');
-  register('ask_parent', 'Ask the parent of this managed subagent a question. The caller is identified by the managed connection, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer. You may go on with whatever does not depend on it: the answer arrives in this conversation as a message beginning "Parent answer:", and a final report is not accepted before then. ' + QUESTION_CONTRACT, { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
+  register('ask_parent', 'Ask the parent of this managed subagent a question. The caller is identified by the managed connection, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer. You may go on with whatever does not depend on it: the answer arrives in this conversation as a message beginning "Parent answer:", and a final report is not accepted before then. ' + QUESTION_CONTRACT + ' ' + CODEX_ASK_PARENT_INSTRUCTION, { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
   register('report_parent', 'Submit an explicit report from this managed subagent to its parent. The caller is identified by the managed connection. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true. ' + FINAL_REPORT_CONTRACT, {
     message: parentMessage,
     final: z.boolean().optional().describe('Submit as the final report. Omitting it submits a progress report and keeps the task open.'),
@@ -317,23 +337,41 @@ export function makeServer(control, { configPath, controlFactory = createControl
   return server;
 }
 
+/**
+ * The host closes this pipe when it unloads the thread, and that is the only signal
+ * the plugin gets that nobody is waiting any more. An MCP SDK 1.30.0 stdio transport
+ * has no 'end' handler of its own, so without this the process lives on whatever the
+ * rest of the event loop still holds: a poll retry timer or a keep-alive socket is
+ * enough to keep an unloaded thread's server alive indefinitely. The wait for answers
+ * is shared by every stdio entry point: see src/stdio-exit.mjs.
+ */
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (process.argv[2] === '--claude-cli-reports') {
     // This server belongs to a single claude -p process. The runner sets the
     // route in its MCP config, outside the prompt and tool argument schemas.
-    const [roster, agentId, taskId, requestId] = process.argv.slice(3);
+    const [roster, agentId, taskId, requestId, mode] = process.argv.slice(3);
     if (!roster || !agentId || !taskId || !requestId) throw new Error('Missing managed Claude CLI dispatch.');
     const store = new RosterStore(roster);
     const server = new McpServer({ name: 'futureaide', version: '1.0.0' });
     registerParentTools(server, { service: {
       submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId }),
     } });
-    await server.connect(new StdioServerTransport());
+    const transport = new StdioServerTransport();
+    if (mode !== '--no-idle-session-cleanup') {
+      exitWhenInputCloses({ transport, close: () => server.close() });
+    }
+    await server.connect(transport);
   } else {
     const diagnostics = createMcpDiagnostics();
-    const server = process.env.FUTUREAIDE_LEGACY_TOOLS === '1' ? makeServer() : makeScopedServer({ diagnostics });
+    const legacy = process.env.FUTUREAIDE_LEGACY_TOOLS === '1';
+    const configReady = legacy ? undefined : loadConfig();
+    const server = legacy ? makeServer() : makeScopedServer({ diagnostics, configReady });
+    // Decide before connecting stdin. An early EOF must never install or enter
+    // the new shutdown path on an installation with cleanup disabled.
+    const cleanup = await configReady?.then(config => config.idleSessionCleanup !== false, () => false);
     const transport = new StdioServerTransport();
     diagnostics?.attach(transport);
+    if (cleanup) exitWhenInputCloses({ transport, close: () => server.close() });
     await server.connect(transport);
   }
 }

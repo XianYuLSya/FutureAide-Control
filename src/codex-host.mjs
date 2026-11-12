@@ -9,7 +9,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
   requestCodexNative, readCodexThreadNative, ensureCodexThreadNative, listCodexTurnsNative,
-  listCodexItemsNative, listCodexModelsNative, sendCodexTextNative,
+  listCodexItemsNative, listCodexModelsNative, sendCodexTextNative, releaseCodexThreadNative,
+  readCodexUserInput, replyCodexUserInput, RELEASE_STATUSES,
 } from './codex-ipc.mjs';
 
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
@@ -25,6 +26,17 @@ export const markerLine = (requestId, nonce) => `[FutureAide dispatch ${JSON.str
 const ALL_SOURCE_KINDS = ['cli', 'vscode', 'exec', 'appServer', 'subAgent', 'subAgentReview',
   'subAgentCompact', 'subAgentThreadSpawn', 'subAgentOther', 'unknown'];
 const TURN_PAGE_LIMIT = 20;
+// thread/unsubscribe answers with the load state it acted on. Only `notLoaded` proves
+// the desktop really dropped the thread: an accepted request is still a request, and
+// inUse/unverified mean the guard refused to speak for this connection at all. This is
+// the wire vocabulary of the method itself, kept here so this module does not depend on
+// how the transport happens to spell it.
+const UNSUBSCRIBE_ACKNOWLEDGED = new Set(RELEASE_STATUSES.acknowledged);
+const UNSUBSCRIBE_ACCEPTED = new Set(Object.values(RELEASE_STATUSES).flat());
+// The load states a thread may report while a release is being verified. Anything else
+// is a state this build does not know, which is never guessed at.
+const RELEASE_LOAD_STATES = new Set(['idle', 'systemError', 'notLoaded']);
+const RELEASE_NODE_LIMIT = 200;
 
 export function emptyProjection() {
   return { offset: 0, seq: 0, running: false, messages: [], changes: [], deliveries: {}, turns: {},
@@ -397,17 +409,60 @@ export function createCodexHost(options = {}) {
     const provider = modelText(configured?.provider) || modelText(options.provider) || 'openai';
     return sharedCodexCatalog(page.data, { provider, configured });
   };
-  const childrenOf = async parentThreadId => {
+  const childrenOf = async (parentThreadId, request = nativeRequest, budget) => {
     const data = [];
+    const seenCursors = new Set();
     let cursor;
     do {
-      const page = await nativeRequest('thread/list', { parentThreadId, limit: 100,
+      const page = await request('thread/list', { parentThreadId, limit: 100,
         ...(cursor ? { cursor } : {}), archived: false, useStateDbOnly: true, sourceKinds: ALL_SOURCE_KINDS });
       if (!Array.isArray(page?.data)) throw fail('codex-native-rpc-invalid-response', 'Codex returned no child list.');
       data.push(...page.data);
+      if (budget !== undefined) {
+        if (page.nextCursor != null && (typeof page.nextCursor !== 'string' || !page.nextCursor
+            || !page.data.length || seenCursors.has(page.nextCursor))) {
+          throw fail('release-tree-unverified', 'The native child list did not finish paging.');
+        }
+        if (data.length > budget || (page.nextCursor && data.length >= budget)) {
+          throw fail('release-tree-too-large', 'The native thread tree exceeds the release limit.');
+        }
+        if (page.nextCursor) seenCursors.add(page.nextCursor);
+      }
       cursor = typeof page?.nextCursor === 'string' ? page.nextCursor : undefined;
     } while (cursor && data.length < 1000);
     return data;
+  };
+  // Real ancestry for a release, read through the same parent relation the tree was
+  // discovered with. It reads the state DB and never loads a thread.
+  const descendantIds = async (rootThreadId, request) => {
+    const found = new Map(), pending = [rootThreadId];
+    for (const parent of pending) {
+      const children = await childrenOf(parent, request, RELEASE_NODE_LIMIT - 1 - found.size);
+      for (const child of children) {
+        if (typeof child?.id !== 'string' || !child.id || child.id === rootThreadId || found.has(child.id)) {
+          throw fail('release-tree-unverified', 'The native child list has ambiguous ancestry.');
+        }
+        found.set(child.id, parent);
+        pending.push(child.id);
+      }
+    }
+    return found;
+  };
+  // With the release switch off this module keeps HEAD's behaviour exactly: a status or
+  // model read may still resume a cold thread. With it on, an idle list/inspect or a
+  // status poll must never subscribe a thread the desktop already dropped.
+  const releaseEnabled = options.idleSessionCleanup !== false;
+  const readThreadForStatus = id => (releaseEnabled
+    ? readCodexThreadNative(id, { request: nativeRequest })
+    : ensureCodexThreadNative(id, { request: nativeRequest }));
+  // The guard in front of the renderer answers inUse/unverified rather than forwarding
+  // a request it cannot prove is this connection's own subscription. The caller's
+  // authorization and the abort signal travel as the request's third argument, so the
+  // layer that speaks for the connection re-checks both at the moment it sends.
+  const requestUnsubscribe = async (threadId, options = {}) => {
+    const exchange = (method, params, extra = {}) => nativeRequest(method, params, { ...extra, ...options });
+    const { status } = await releaseCodexThreadNative(threadId, { request: exchange });
+    return { status: UNSUBSCRIBE_ACCEPTED.has(status) ? status : 'unverified' };
   };
   async function probeCapabilities() {
     const workspace = options.workspace ?? process.cwd();
@@ -448,7 +503,10 @@ export function createCodexHost(options = {}) {
     async readCurrentModel(id) {
       let thread;
       try {
-        thread = await ensureCodexThreadNative(id, { request: nativeRequest });
+        // A metadata read, never a resume: reading the selection of a released thread
+        // must not subscribe it again just to answer a status question. Only the switch
+        // off keeps HEAD's cold read.
+        thread = await readThreadForStatus(id);
       } catch (error) {
         // An empty rollout is a read gap before the first turn, not a failed
         // binding. Status/beginTask must not turn it into reconnecting.
@@ -466,19 +524,37 @@ export function createCodexHost(options = {}) {
       // approval, reviewer, sandbox, permissions and config leaves every one of
       // them to the user's Codex defaults. An explicit selection is applied to
       // the first turn itself, never to the user's global defaults.
-      const started = await nativeRequest('thread/start', { cwd: path.resolve(input.workspace), threadSource: 'user' });
+      // The fence travels with the request too: a cold page is opened first, and the round
+      // can end before the page commits the thread.
+      const started = await nativeRequest('thread/start', { cwd: path.resolve(input.workspace), threadSource: 'user' },
+        typeof input.blockReason === 'function' ? { blockReason: input.blockReason } : undefined);
       const threadId = started?.thread?.id;
       if (typeof threadId !== 'string') throw fail('codex-native-rpc-invalid-response', 'Codex did not return a new thread id.');
+      // The round can end while the thread is being created. The thread that exists stays
+      // this name's (the caller keeps the binding) but its first turn is not started, and
+      // that refusal is "never sent", never an unknown write.
+      const refused = typeof input.blockReason === 'function' ? input.blockReason() : undefined;
+      if (refused) {
+        throw fail(refused, 'The round ended before this input was written; the thread was created, no turn was started.',
+          { terminal: true, notSent: true, nativeSessionId: threadId });
+      }
       let turn;
       try {
         turn = await nativeRequest('turn/start', { threadId, clientUserMessageId: randomUUID(),
           input: [{ type: 'text', text: input.message, text_elements: [] }],
           ...(input.model === undefined ? {} : { model: input.model }),
-          ...(input.effort === undefined ? {} : { effort: input.effort }) });
+          ...(input.effort === undefined ? {} : { effort: input.effort }) },
+        typeof input.blockReason === 'function' ? { blockReason: input.blockReason } : undefined);
         if (typeof turn?.turn?.id !== 'string') throw fail('codex-native-rpc-invalid-response', 'Codex accepted the thread but returned no turn.');
       } catch (error) {
         // The thread exists even when the first turn was not confirmed. Keep the
         // binding so a later read can reconcile instead of creating a second chat.
+        // A refused fence is not an unconfirmed write: the turn provably never left,
+        // so the typed answer survives with the thread it did create.
+        if (error.notSent === true || error.terminal === true) {
+          throw fail(error.code ?? 'codex-first-turn-refused', error.message,
+            { terminal: true, ...(error.notSent === true ? { notSent: true } : {}), nativeSessionId: threadId });
+        }
         throw fail(error.code ?? 'codex-first-turn-unconfirmed', error.message,
           { uncertain: true, nativeSessionId: threadId });
       }
@@ -491,24 +567,62 @@ export function createCodexHost(options = {}) {
       await nativeRequest('thread/name/set', { threadId: nativeSessionId, name });
       return { renamed: true };
     },
-    async send({ nativeSessionId, message, model, effort }) {
+    async send({ nativeSessionId, message, model, effort, resubscribe = false, blockReason }) {
+      // A thread whose release we already asked for may still read as idle while this
+      // connection holds no subscription: the request was acknowledged, the idle grace
+      // is running. Only a resume puts the subscription back before a turn rides it, so
+      // it is sent here rather than assumed from turn/start.
+      if (resubscribe) {
+        try { await nativeRequest('thread/resume', { threadId: nativeSessionId, excludeTurns: true }); }
+        catch { /* the write below reports the real reason, missing thread included */ }
+      }
       const result = await sendCodexTextNative(nativeSessionId, message,
-        { request: nativeRequest, ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) });
+        { request: nativeRequest, ...(blockReason === undefined ? {} : { blockReason }),
+          ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) });
       return { sent: true, turnId: result?.turn?.id ?? result?.turnId };
+    },
+    /** The native user-input cards of one managed thread. Read-only; an unverifiable read
+     * stays `unverified` and is never turned into "there is nothing pending". */
+    async readUserInput({ nativeSessionId }) {
+      return readCodexUserInput(nativeSessionId, { request: nativeRequest });
+    },
+    /** Answer or withdraw exactly one card. The page re-reads the conversation first and
+     * writes only when that same request is still pending. */
+    async replyUserInput({ card, answers, canAnswer }) {
+      return replyCodexUserInput(card, { answers }, { request: nativeRequest, canAnswer });
+    },
+    /** Interrupt one turn of one thread. Only the card's own thread and turn are ever
+     * passed here; the adapter proves the card is gone before claiming anything. */
+    async interruptTurn({ nativeSessionId, turnId, canAnswer }) {
+      await nativeRequest('turn/interrupt', { threadId: nativeSessionId, turnId },
+        ...(typeof canAnswer === 'function' ? [{ blockReason: () => canAnswer() === true ? undefined : 'round-finished' }] : []));
+      return { interrupted: true };
+    },
+    /** Read one turn's own status, so a fallback can prove the turn stopped instead of
+     * inferring it from an empty card list. */
+    async readTurnStatus({ nativeSessionId, turnId }) {
+      const page = await listCodexTurnsNative(nativeSessionId, { limit: 20, itemsView: 'notLoaded', request: nativeRequest });
+      const turn = (page.data ?? []).find(entry => entry?.id === turnId);
+      return { present: Boolean(turn), status: typeof turn?.status === 'string' ? turn.status : null };
     },
     async observe({ nativeSessionId, workspace, projections = {}, requests = {} }) {
       let root;
-      try { root = await ensureCodexThreadNative(nativeSessionId, { request: nativeRequest }); }
-      catch (error) {
+      try {
+        // Read-only on purpose: ensureCodexThreadNative would resume a cold thread, and
+        // an idle list/inspect or a status poll must leave a released thread released.
+        // Persisted turns and children stay readable while the thread is unloaded.
+        root = await readThreadForStatus(nativeSessionId);
+      } catch (error) {
         if (error.code === 'codex-empty-rollout') {
           // thread/start succeeded but the first rollout has not been written.
           // The thread exists; report it as running without a transient error.
           const prior = projections[nativeSessionId];
           return { projections: prior ? { [nativeSessionId]: prior } : {},
             histories: prior ? { [nativeSessionId]: { messages: prior.messages ?? [], hasMore: false } } : {},
-            hasMore: false,
-            tree: { running: true, settled: false, nodes: [{ sessionId: nativeSessionId, parentSessionId: null,
-              status: 'running', activity: 'running', changes: prior?.changes ?? [], coverage: CODEX_FILE_COVERAGE }] } };
+            hasMore: false, activeFlags: null, statusType: null,
+            tree: { running: true, settled: false, activeFlags: null, statusType: null,
+              nodes: [{ sessionId: nativeSessionId, parentSessionId: null,
+                status: 'running', activity: 'running', changes: prior?.changes ?? [], coverage: CODEX_FILE_COVERAGE }] } };
         }
         throw error;
       }
@@ -555,9 +669,17 @@ export function createCodexHost(options = {}) {
         for (const child of children) if (typeof child?.id === 'string') await visit(child, thread.id);
       };
       await visit(root, null);
-      const result = { projections: next, histories, hasMore,
+      // The root's own active flags are what says whether the desktop is waiting for a
+      // human. They ride with the tree so the adapter reads a native question only when
+      // the thread itself claims `waitingOnUserInput`, never on every poll.
+      //  activeFlags is passed through exactly as the desktop reported it: an absent field
+      // and an empty list mean different things to the adapter, and only the latter says
+      // the thread stopped waiting on a human.
+      const activeFlags = Array.isArray(root.status?.activeFlags) ? [...root.status.activeFlags] : null;
+      const statusType = typeof root.status?.type === 'string' ? root.status.type : null;
+      const result = { projections: next, histories, hasMore, activeFlags, statusType,
         tree: { nodes, running: nodes.some(node => node.status === 'running'),
-          settled: nodes.every(node => node.status === 'idle') } };
+          settled: nodes.every(node => node.status === 'idle'), activeFlags, statusType } };
       observeCache.set(nativeSessionId, { updatedAt: root.updatedAt, statusType: root.status?.type,
         at: Date.now(), result });
       return result;
@@ -616,6 +738,162 @@ export function createCodexHost(options = {}) {
       // descendant can still be running after the root turn ended, so every
       // owned node with an in-progress turn is interrupted explicitly.
       return { interrupted: true, interruptedTurns };
+    },
+    /**
+     * Let the desktop drop this plugin's own load of one finished round's threads.
+     * Nothing here resumes a thread: the reads are thread/read and the child listing,
+     * both metadata-only, because thread/resume would subscribe the thread again right
+     * after the release. A node that is active, in a state this build does not know,
+     * no longer a native descendant of the root or no longer in the managed workspace
+     * is left exactly as it is.
+     *
+     * `submitted` carries the ids whose earlier answer was an acknowledgement. It is
+     * not a skip list: a thread that still reads idle may have been subscribed again
+     * during the vendor's grace, so the guard is asked once per check while it is
+     * loaded. Only a read that reports `notLoaded` ends a release.
+     *
+     * This never waits and never takes a lock a dispatch could be queued behind:
+     * `canRelease` is re-checked immediately before every request and `signal` aborts
+     * the rest, so a round that ends mid-release stops asking instead of unsubscribing
+     * the threads the next round is already using. `onAttempt` records the attempt
+     * before the request leaves and may refuse it, which is what lets that next round
+     * resubscribe even when no answer ever comes back.
+     */
+    async releaseThreads({ nativeSessionId, ownedNodes = [], workspace, submitted = [],
+      canRelease, signal, onAttempt } = {}) {
+      if (typeof nativeSessionId !== 'string' || !nativeSessionId) return { state: 'deferred', reason: 'release-no-root' };
+      const acknowledged = new Set((Array.isArray(submitted) ? submitted : []).filter(id => typeof id === 'string'));
+      // Synchronous by contract: the same callback is handed to the transport, which
+      // checks it once more right before it commits the request.
+      const mayAsk = () => {
+        if (signal?.aborted) return false;
+        if (typeof canRelease !== 'function') return true;
+        return canRelease() === true;
+      };
+      if (!mayAsk()) return { state: 'deferred', reason: 'release-round-moved-on' };
+      const request = (method, params) => {
+        if (!mayAsk()) throw fail('release-round-moved-on', 'The managed round has new work.');
+        return nativeRequest(method, params, { background: true });
+      };
+      const kept = (Array.isArray(ownedNodes) ? ownedNodes : [])
+        .map(entry => typeof entry === 'string' ? { sessionId: entry } : entry)
+        .filter(entry => typeof entry?.sessionId === 'string' && entry.sessionId);
+      const wanted = [...new Set([nativeSessionId, ...kept.map(entry => entry.sessionId)])];
+      if (wanted.length > RELEASE_NODE_LIMIT) return { state: 'deferred', reason: 'release-tree-too-large' };
+      let root;
+      try { root = await readCodexThreadNative(nativeSessionId, { request }); }
+      catch (error) {
+        // A missing or not-yet-written root is a profile switch or a pre-write gap:
+        // nothing about the load is proven, so nothing is sent.
+        if (error.code === 'codex-thread-not-found') return { state: 'deferred', reason: 'release-root-missing' };
+        if (error.code === 'codex-empty-rollout') return { state: 'deferred', reason: 'release-node-status-unknown' };
+        return { state: 'deferred', reason: error.code === 'release-round-moved-on' ? error.code : 'release-tree-unverified' };
+      }
+      if (!samePath(root.cwd, workspace)) return { state: 'deferred', reason: 'release-root-foreign-workspace' };
+      let descendants;
+      try { descendants = await descendantIds(nativeSessionId, request); }
+      catch (error) {
+        return { state: 'deferred', reason: ['release-round-moved-on', 'release-tree-too-large'].includes(error.code)
+          ? error.code : 'release-tree-unverified' };
+      }
+      // A recorded node that is no longer under this root is not ours to unsubscribe.
+      const stray = wanted.filter(id => id !== nativeSessionId && !descendants.has(id));
+      if (stray.length) return { state: 'deferred', reason: 'release-node-not-descendant',
+        nodes: Object.fromEntries(stray.map(id => [id, 'not-descendant'])) };
+      // A native child this name never observed means the tree may still be working:
+      // unloading the root could take down something whose activity is unproven.
+      for (const id of descendants.keys()) {
+        if (wanted.includes(id)) continue;
+        let thread;
+        try { thread = await readCodexThreadNative(id, { request }); }
+        catch (error) {
+          // An unobserved child that cannot be read is unproven, and the native "thread
+          // child not loaded" rejection carries the same missing-thread code a deleted
+          // thread uses: an error is never a deletion, so this release stops whole.
+          return { state: 'deferred',
+            reason: error.code === 'release-round-moved-on' ? error.code : 'release-tree-unexpected-node',
+            nodes: { [id]: 'unreadable' } };
+        }
+        if (thread.status?.type !== 'notLoaded') {
+          return { state: 'deferred', reason: 'release-tree-unexpected-node', nodes: { [id]: thread.status?.type ?? 'unknown' } };
+        }
+      }
+      const states = {}, loaded = [];
+      for (const id of wanted) {
+        let thread;
+        try { thread = await readCodexThreadNative(id, { request }); }
+        catch (error) {
+          // A child this connection cannot read is unproven, and the native "thread child
+          // not loaded" rejection arrives with the same missing-thread code as a deleted
+          // thread. Reading the error as a deletion would release the parent around a
+          // child nobody could read, so any child read failure stops the release whole.
+          if (id !== nativeSessionId) {
+            return { state: 'deferred', reason: 'release-node-unreadable', nodes: { ...states, [id]: 'unreadable' } };
+          }
+          if (error.code === 'codex-thread-not-found') return { state: 'deferred', reason: 'release-root-missing' };
+          if (error.code === 'codex-empty-rollout') return { state: 'deferred', reason: 'release-node-status-unknown' };
+          return { state: 'deferred', reason: error.code === 'release-round-moved-on' ? error.code : 'release-tree-unverified' };
+        }
+        const type = thread.status?.type;
+        if (type === 'active') return { state: 'deferred', reason: 'release-tree-active' };
+        if (!RELEASE_LOAD_STATES.has(type)) return { state: 'deferred', reason: 'release-node-status-unknown' };
+        states[id] = type === 'notLoaded' ? 'notLoaded' : 'loaded';
+        if (type !== 'notLoaded') loaded.push(id);
+      }
+      // The app-server's own read is the only thing that may end a release.
+      if (!loaded.length) return { state: 'complete', reason: 'release-already-unloaded', nodes: states };
+      // The tree is proven quiet by the reads above; the round still has to be the one
+      // that asked for this before anything is sent.
+      if (!mayAsk()) return { state: 'deferred', reason: 'release-round-moved-on' };
+      // Children before the root: this build cannot prove that unloading a parent leaves
+      // a still-protected child alone, so a refused child blocks its ancestors instead.
+      const depth = id => {
+        let steps = 0;
+        for (let parent = descendants.get(id); parent; parent = descendants.get(parent)) steps++;
+        return steps;
+      };
+      const ordered = loaded.slice().sort((a, b) => depth(b) - depth(a));
+      const blocked = new Set();
+      let refused, movedOn = false;
+      for (const id of ordered) {
+        if (blocked.has(id)) { states[id] = 'blocked-by-descendant'; continue; }
+        if (!mayAsk()) { movedOn = true; states[id] = 'cancelled'; continue; }
+        // A refused attempt record means the round is already superseded by the store's
+        // own fence: nothing is sent for it.
+        if (typeof onAttempt === 'function' && (await onAttempt(id)) === false) {
+          movedOn = true; states[id] = 'cancelled'; continue;
+        }
+        let answer;
+        try { answer = await requestUnsubscribe(id, { canRelease, signal }); }
+        catch {
+          // A failed request proves nothing about the load: stop, report it, and let
+          // the next check read the state again instead of guessing here.
+          states[id] = 'unverified';
+          return { state: 'deferred', reason: 'release-unsubscribe-unverified', nodes: states };
+        }
+        if (answer.status === 'notSubscribed') {
+          // Without an earlier acknowledgement this connection never held the
+          // subscription, so no grace was started and none can be counted on. After
+          // one, this is the same thread answering a repeated ask, and the grace the
+          // first answer started still stands.
+          if (acknowledged.has(id)) { states[id] = 'submitted'; continue; }
+        }
+        // An acknowledged request is `submitted` on the record, not `done`: the thread
+        // is still loaded until a later read reports notLoaded.
+        const submitted = answer.status !== 'notSubscribed' && UNSUBSCRIBE_ACKNOWLEDGED.has(answer.status);
+        states[id] = submitted ? 'submitted' : answer.status;
+        if (submitted || answer.status === 'notLoaded') continue;
+        refused ??= answer.status;
+        for (let parent = descendants.get(id); parent; parent = descendants.get(parent)) blocked.add(parent);
+      }
+      const values = Object.values(states);
+      if (movedOn) return { state: 'deferred', reason: 'release-round-moved-on', nodes: states };
+      if (refused) return { state: 'deferred', reason: `release-unsubscribe-${refused}`, nodes: states };
+      if (values.includes('submitted')) return { state: 'waiting', reason: 'release-unsubscribe-accepted', nodes: states };
+      if (values.every(status => status === 'notLoaded')) {
+        return { state: 'complete', reason: 'release-unsubscribe-not-loaded', nodes: states };
+      }
+      return { state: 'deferred', reason: 'release-unsubscribe-unresolved', nodes: states };
     },
     async destroy(input) {
       const { nativeSessionId, workspace, ownedNodeIds = [] } = input;

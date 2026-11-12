@@ -24,9 +24,11 @@ import { loadConfig } from './config.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
 import { scopedManagement } from './mcp-server.mjs';
 import { backgroundBatch, pollSleeping, scanSleeping } from './idle-monitor.mjs';
-import { createDirectoryWatchers, createWakeQueue, monitorDirectories, throttledSignal, waitForCommit, wakeHintName,
-  MONITOR_LEASE, MONITOR_READY_LEASE } from './shared-monitor.mjs';
+import { createDirectoryWatchers, createWakeQueue, ensureSharedMonitor, monitorDirectories, monitorSelfHeld, monitorWaitMs,
+  recordMonitorPid, renewMonitorPid, throttledSignal, waitForCommit, wakeHintName, MONITOR_LEASE, MONITOR_PROCESS_LEASE,
+  MONITOR_READY_LEASE } from './shared-monitor.mjs';
 import { closeReportService, ensureReportService, reportPort, rosterIdentity } from './report-endpoint.mjs';
+import { processStartTime } from './claude-caller-identity.mjs';
 
 const MIN_ROUND_MS = 250;      // never poll faster than this
 const BUSY_WAIT_MS = 1000;     // cadence while something still owes work
@@ -52,6 +54,20 @@ const hints = createWakeQueue({ sweepRequestMs: SWEEP_REQUEST_MS });
 // that second wakes it when the second ends instead of being dropped.
 const pollSignal = throttledSignal(signal, { intervalMs: POLL_SIGNAL_MS });
 const service = createScopedAgents(config, {
+  // This process IS the shared listener. Its own work paths — waking a sleeping name,
+  // parking one, a first dispatch — ask "is a listener running?", and the honest answer
+  // for that question about oneself is known without asking the OS: a process that holds
+  // this holder's current holder and readiness leases and is executing this line is
+  // alive by construction. Verifying it instead costs an OS creation-time query for our
+  // own PID (a PowerShell start: 1.3s idle, 2.7s under load) inside the round that owes
+  // the answer, which is how a wake drifted past the one file-event second the cadence
+  // promises. Only that self case skips the check; every other caller still goes to
+  // ensureSharedMonitor, and with the switch off nothing changes at all.
+  startSharedMonitor: async (serviceConfig, serviceStore) => {
+    const lease = values['--lease'], state = serviceStore ?? store;
+    if (config.idleSessionCleanup !== false && monitorSelfHeld(state, lease)) return true;
+    return ensureSharedMonitor(serviceConfig, state);
+  },
   onPollComplete: () => {
     trace("wake= poll-complete");
     pollSignal.request();
@@ -62,7 +78,7 @@ const service = createScopedAgents(config, {
   onWorkQueued: agentId => { trace("wake= queued " + agentId); if (hints.queued(agentId)) signal(); },
 }), store = service.store, holder = values['--lease'];
 
-let wake, heartbeat, running = true, signalled = false, lastDelivery = 0;
+let wake, heartbeat, running = true, signalled = false, lastDelivery = 0, identity;
 let idleSince, lastVersion = store.dataVersion(), rounds = 0, lastSweepAt = 0;
 // Measurement aid only: FUTUREAIDE_MONITOR_TRACE=1 prints one line per round so a
 // test or a manual run can count rounds without reading the database.
@@ -118,12 +134,33 @@ async function waitForWork(timeoutMs, floor) {
 }
 
 try {
+  if (config.idleSessionCleanup !== false) {
+    const startedAt = await processStartTime(process.pid);
+    if (startedAt !== null) {
+      if (!recordMonitorPid(store, holder, process.pid, startedAt)) throw new Error('Monitor holder lease was lost.');
+      identity = startedAt;
+    }
+  }
   // The loopback management tool service is hosted here (config.reportPort, then
   // FUTUREAIDE_REPORT_PORT, then the default) so a calling Claude Desktop session
   // always finds it; DSH work alone does not need it. A service answering for another
   // roster is reported and never reused.
+  // The team board is mounted on this same loopback listener, and only when the
+  // installation switched it on: with teamBoard off the module is never imported, no
+  // projection is read and no route exists. Nothing here polls, scans processes or opens
+  // a conversation; both routes answer whatever a request asks for at that moment.
+  let board;
+  if (config.teamBoard === true) {
+    try {
+      const { boardRoutes } = await import('./team-board.mjs');
+      board = boardRoutes(store);
+    } catch (error) {
+      trace(`board not mounted: ${error?.code ?? error?.message ?? 'unknown'}`);
+      process.stderr.write(`[futureaide-monitor] team board not mounted: ${error?.code ?? error?.message ?? 'unknown'}\n`);
+    }
+  }
   const reports = await ensureReportService({ store, port: reportPort(config),
-    management: scopedManagement({ service }), log: message => trace(`report: ${message}`) });
+    management: scopedManagement({ service }), ...(board ? { board } : {}), log: message => trace(`report: ${message}`) });
   if (reports.ready !== true) {
     trace(`tool service not ready: ${reports.reason?.code ?? 'unknown'} roster=${rosterIdentity(store).slice(0, 12)}`);
     process.stderr.write(`[futureaide-monitor] tool service not ready: ${reports.reason?.code ?? 'unknown'}\n`);
@@ -136,7 +173,8 @@ try {
   }
   if (!store.claimLease(MONITOR_READY_LEASE, holder, 60000)) throw new Error('Monitor readiness lease is occupied.');
   heartbeat = setInterval(() => {
-    if (!store.renewLease(MONITOR_LEASE, holder, 60000) || !store.renewLease(MONITOR_READY_LEASE, holder, 60000)) {
+    if (!store.renewLease(MONITOR_LEASE, holder, 60000) || !store.renewLease(MONITOR_READY_LEASE, holder, 60000)
+      || (identity !== undefined && !renewMonitorPid(store, holder, process.pid, identity))) {
       running = false;
       signal();
     }
@@ -171,8 +209,15 @@ try {
     // `only` is what to poll without a sweep; `fresh` is only the real hints, which are
     // the only ones allowed to skip a name's own one-second floor.
     try { busy = await service.monitorScan({ only, fresh: taken.names, sweep: sweepDue, force: taken.force, deferred }); }
-    catch { busy = true; } // Keep the monitor alive; the next round retries from durable state.
+    catch (error) {
+      busy = true;
+      trace(`scan= ${error?.code ?? error?.message ?? 'error'}`);
+    }
     if (sweepDue) lastSweepAt = Date.now();
+    // A finished round waiting on its release confirmation is not work: the listener
+    // sleeps to that exact moment, and a pending re-check keeps the process from ending
+    // as idle before it can happen.
+    const releaseAt = service.releaseWakeAt();
     // A hint for a name whose own poll was still running is handed back, so the round
     // after that poll ends acts on it instead of waiting for the next sweep.
     if (hints.defer(deferred)) { trace(`wake= deferred ${deferred.join(",")}`); signalled = true; }
@@ -186,11 +231,13 @@ try {
       lastDelivery = Date.now();
       deliveries.start();
     }
-    if (busy || external) idleSince = undefined;
+    // A pending release re-check is work this listener is waiting for, so it never
+    // counts as idle dwell and cannot lose the moment by exiting first.
+    if (busy || external || releaseAt !== undefined) idleSince = undefined;
     else idleSince ??= Date.now();
     rounds += 1;
     trace(`round=${rounds} busy=${busy} external=${external} sweep=${sweepDue ? 1 : 0} idleMs=${idleSince === undefined ? 0 : Date.now() - idleSince} watched=${watchers.size}`);
-    const quiet = !busy && !external && !store.hasSleeping();
+    const quiet = !busy && !external && !store.hasSleeping() && releaseAt === undefined;
     if (quiet && Date.now() - idleSince >= IDLE_EXIT_MS) {
       store.releaseLease(MONITOR_READY_LEASE, holder);
       const stillQuiet = !store.hasSleeping() && store.dataVersion() === lastVersion;
@@ -202,8 +249,14 @@ try {
     const floor = Math.max(0, MIN_ROUND_MS - (Date.now() - roundStarted));
     const immediate = signalled || external;
     signalled = false;
+    const waitMs = monitorWaitMs({ busy, busyMs: BUSY_WAIT_MS, idleMs: IDLE_WAIT_MS,
+      // A pending release re-check may shorten this wait, never lengthen it: the round
+      // that follows is the roster sweep and the DSH sleeping scan, so it is capped by
+      // whichever comes first, the next sweep or the re-check itself.
+      sweepInMs: lastSweepAt + SWEEP_MS - Date.now(),
+      releaseInMs: releaseAt === undefined ? undefined : releaseAt - Date.now(), floorMs: floor });
     if (immediate) await sleepUntilSignalled(floor);
-    else await waitForWork(busy ? BUSY_WAIT_MS : IDLE_WAIT_MS, floor);
+    else await waitForWork(waitMs, floor);
   }
 } finally {
   await deliveries.drain();
@@ -213,6 +266,7 @@ try {
   watchers.close();
   await closeReportService();
   store.releaseLease(MONITOR_READY_LEASE, holder);
+  if (identity !== undefined) store.releaseLease(MONITOR_PROCESS_LEASE, `${holder}:${process.pid}:${identity}`);
   store.releaseLease(MONITOR_LEASE, holder);
   service.close();
 }

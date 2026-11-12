@@ -23,7 +23,7 @@ const extra = threadId => ({ _meta: { threadId } });
 
 /** The Codex Desktop RPC, reduced to threads and turns the adapter reads and writes. */
 function codexDesktop() {
-  const threads = new Map(), calls = [];
+  const threads = new Map(), calls = [], nativeAnswers = [];
   let created = 0, clock = 1793932679;
   const textOf = input => (input ?? []).map(item => item.text ?? '').join('');
   const userItem = text => ({ id: `item-${++clock}`, type: 'userMessage', content: [{ type: 'text', text }] });
@@ -49,7 +49,8 @@ function codexDesktop() {
         const thread = find(params.threadId);
         return { thread: liveThread({ id: thread.id, cwd: thread.cwd, name: thread.name, updatedAt: thread.updatedAt,
           model: thread.model, reasoningEffort: thread.reasoningEffort,
-          status: { type: running(thread) ? 'active' : 'idle' } }) };
+          status: running(thread) ? { type: 'active', activeFlags: thread.nativeCard ? ['waitingOnUserInput'] : [] }
+            : { type: 'idle' } }) };
       }
       case 'thread/name/set': {
         const thread = find(params.threadId);
@@ -80,6 +81,26 @@ function codexDesktop() {
         turn.items.push(userItem(textOf(params.input))); thread.updatedAt = ++clock;
         return { turnId: turn.id };
       }
+      case 'futureaide/userInput/read': {
+        const thread = find(params.threadId);
+        return { status: 'observed', requests: thread.nativeCard ? [thread.nativeCard] : [] };
+      }
+      case 'futureaide/userInput/reply': {
+        const thread = find(params.card.threadId);
+        if (thread.nativeCard?.requestId !== params.card.requestId) return { status: 'not-pending' };
+        if (thread.forceInterrupt) return { status: 'unsupported' };
+        nativeAnswers.push(params.answers);
+        delete thread.nativeCard;
+        return { status: 'answered' };
+      }
+      case 'turn/interrupt': {
+        const thread = find(params.threadId), turn = running(thread);
+        assert.equal(params.turnId, turn?.id);
+        turn.status = 'interrupted';
+        delete thread.nativeCard;
+        thread.updatedAt = ++clock;
+        return {};
+      }
       default: throw new Error(`unexpected native method ${method}`);
     }
   }
@@ -87,6 +108,18 @@ function codexDesktop() {
     request,
     threadIds: () => [...threads.keys()],
     runningTurn: threadId => running(find(threadId))?.id,
+    nativeAnswers,
+    interruptCalls: () => calls.filter(call => call.method === 'turn/interrupt'),
+    askNative(threadId, { forceInterrupt = false } = {}) {
+      const thread = find(threadId);
+      thread.forceInterrupt = forceInterrupt;
+      thread.nativeCard = { requestId: 91, threadId, turnId: running(thread).id, itemId: 'native-item',
+        kind: 'question', isBlocking: true, questions: [{ id: 'location', header: 'First run',
+          question: 'Where should the first run start?', isOther: false, isSecret: false,
+          options: [{ label: 'Local', description: 'Start it in the current project.' },
+            { label: 'Remote', description: 'Start it on the test server.' }] }] };
+      thread.updatedAt = ++clock;
+    },
     /** Text the helper thread received, optionally by the RPC that carried it. */
     inputs: method => calls.filter(call => ['turn/start', 'turn/steer'].includes(call.method) && (!method || call.method === method))
       .map(call => ({ method: call.method, turnId: call.params.expectedTurnId, text: textOf(call.params.input), params: call.params })),
@@ -144,6 +177,80 @@ async function fixture() {
 }
 
 const outcome = promise => promise.then(() => 'accepted', error => error);
+
+test('a native card reaches the parent once and the answer returns to that same turn', async () => {
+  const f = await fixture();
+  try {
+    const lead = await f.start('lead', 'Prepare the first run.');
+    const taskId = f.record(lead.name).task.taskId;
+    f.codex.askNative(lead.threadId);
+    await f.poll(lead); await f.poll(lead);
+    assert.equal(f.record(lead.name).state, 'awaiting_input');
+    assert.equal(f.notices.filter(text => text.includes('Where should the first run start?')).length, 1);
+    assert.match(f.notices.at(-1), /Local[\s\S]*Remote[\s\S]*futureaide_answer_agent/);
+
+    await assert.rejects(f.answer(lead, 'Invalid label'), { code: 'native-answer-invalid' });
+    await f.poll(lead);
+    assert.equal(f.record(lead.name).state, 'awaiting_input');
+    assert.equal(f.codex.nativeAnswers.length, 0);
+    assert.equal((await f.answer(lead, 'Local')).delivery, 'native-question');
+    await f.poll(lead);
+
+    assert.deepEqual(f.codex.nativeAnswers, [{ location: { answers: ['Local'] } }]);
+    assert.equal(f.codex.runningTurn(lead.threadId), lead.turnId);
+    assert.equal(f.codex.inputs().length, 1, 'the native response needs no ordinary input');
+    assert.equal(f.record(lead.name).task.taskId, taskId);
+    assert.equal(f.record(lead.name).state, 'running');
+  } finally { f.service.close(); }
+});
+
+test('a card that cannot be answered is withdrawn before one ordinary continuation', async () => {
+  const f = await fixture();
+  try {
+    const lead = await f.start('lead', 'Prepare the first run.');
+    const taskId = f.record(lead.name).task.taskId;
+    f.codex.askNative(lead.threadId, { forceInterrupt: true });
+    await f.poll(lead);
+    assert.equal((await f.answer(lead, 'Local')).delivery, 'continuation-queued');
+    await f.poll(lead); await f.poll(lead);
+    assert.deepEqual(f.codex.interruptCalls().map(call => call.params), [{ threadId: lead.threadId, turnId: lead.turnId }]);
+    assert.equal(f.codex.nativeAnswers.length, 0);
+    assert.equal(f.codex.inputs('turn/start').length, 2);
+    assert.match(f.codex.inputs('turn/start').at(-1).text, /^Parent answer:\nLocal\b/);
+    assert.equal(f.record(lead.name).task.taskId, taskId);
+  } finally { f.service.close(); }
+});
+
+test('an explicit question and a native card are answered in the order they were presented', async () => {
+  for (const nativeFirst of [false, true]) {
+    const f = await fixture();
+    try {
+      const lead = await f.start('lead', 'Prepare the first run.');
+      if (nativeFirst) {
+        f.codex.askNative(lead.threadId);
+        await f.poll(lead);
+      }
+      await f.ask(lead, 'Which input should the preparation use?');
+      if (!nativeFirst) f.codex.askNative(lead.threadId);
+      await f.poll(lead);
+      const first = nativeFirst ? 'Where should the first run start?' : 'Which input should the preparation use?';
+      const next = nativeFirst ? 'Which input should the preparation use?' : 'Where should the first run start?';
+      assert.equal(f.notices.length, 1);
+      assert.ok(f.notices[0].includes(first));
+
+      assert.equal((await f.answer(lead, 'Local')).answered, true);
+      await f.poll(lead);
+      assert.equal(f.codex.nativeAnswers.length, nativeFirst ? 1 : 0);
+      assert.ok(f.notices[1]?.includes(next));
+      assert.equal((await f.answer(lead, 'Remote')).answered, true);
+      await f.poll(lead);
+      assert.deepEqual(f.codex.nativeAnswers, [{ location: { answers: [nativeFirst ? 'Local' : 'Remote'] } }]);
+      const steered = f.codex.inputs('turn/steer');
+      assert.equal(steered.length, 1);
+      assert.ok(steered[0].text.includes(nativeFirst ? 'Remote' : 'Local'));
+    } finally { f.service.close(); }
+  }
+});
 
 test('an answer given while the Codex turn is running is steered into that turn', async () => {
   const f = await fixture();

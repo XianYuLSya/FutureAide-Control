@@ -260,12 +260,16 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
         ...(history.note ? { note: history.note } : {}), ...(failure ? { failure } : {}) };
     },
     async answer({ answerId, message } = {}) { return client.managedAnswer({ ...args(), answerId, message }); },
-    async deliver({ requestId, message, kind } = {}) {
+    async deliver({ requestId, message, kind, writeBlockReason } = {}) {
       // A supplement has to be read on the model's next step. A queued input waits for
       // the current turn to end, and by then the model has usually submitted its final
       // report already, which seals the task and strands the input forever.
+      // The shared layer's final gate travels with the dispatch: it is asked once the
+      // receipt checkpoint exists and before the native write, so a task that finished
+      // while this call was preparing is refused with nothing sent.
       return control().send({ sessionId: args().sessionId, message, requestId,
-        background: false, suppressCallback: true, mode: kind === 'supplement' ? 'steer' : 'queue' });
+        background: false, suppressCallback: true, mode: kind === 'supplement' ? 'steer' : 'queue',
+        ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) });
     },
     async receipt({ requestId } = {}) {
       if (typeof requestId !== 'string' || !requestId) return undefined;

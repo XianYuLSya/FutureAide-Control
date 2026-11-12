@@ -56,8 +56,14 @@ export function createClaudeCliBackend(record, deps = {}) {
       }
       throw error;
     }
-    let changed = request.status !== 'accepted';
-    request.status = 'accepted';
+    // A refusal the runner wrote down stays a refusal: the state on disk says nothing was
+    // dispatched, so a later read must never turn it into an accepted turn. This is the
+    // window where the adapter process dies after the runner recorded the refusal and
+    // before it could save its own rejected request.
+    const refused = native?.notSent === true || native?.error?.notSent === true;
+    const next = refused ? 'rejected' : 'accepted';
+    let changed = request.status !== next;
+    request.status = next;
     if (native.model && native.model !== value.currentModel?.model) {
       value.currentModel = { provider: 'claude-cli', model: native.model };
       changed = true;
@@ -68,7 +74,11 @@ export function createClaudeCliBackend(record, deps = {}) {
     }
     if (native.state !== 'running') {
       const failure = native.state === 'failed'
-        ? { source: 'model', code: 'claude-cli-failed', message: 'The Claude CLI turn failed.', ...native.error } : undefined;
+        ? (refused
+          ? { source: 'dispatch', code: native.error?.code ?? 'dispatch-refused',
+            message: native.error?.message ?? 'The dispatch was refused before anything ran.' }
+          : { source: 'model', code: 'claude-cli-failed', message: 'The Claude CLI turn failed.', ...native.error })
+        : undefined;
       const kind = failure ? 'error' : native.state === 'cancelled' ? 'cancelled' : 'completed';
       request.terminal = { completionReason: failure ? { kind, error: failure } : { kind },
         endSeq: ++value.seq, ...(failure ? { failure } : {}) };
@@ -162,7 +172,7 @@ export function createClaudeCliBackend(record, deps = {}) {
       const result = { consumedQuestionIds: ids, continuation: 'Parent answer:\n' + message + '\nContinue the same task.' };
       value.answers[answerId] = result; save(value); return result;
     },
-    async deliver({ requestId, message, model, explicitModel = false }) {
+    async deliver({ requestId, message, model, explicitModel = false, writeBlockReason }) {
       if (!message?.trim() || !requestId || Boolean(model) !== explicitModel || (explicitModel && !model.model)) {
         throw fail('invalid-dispatch', 'A request id, message and consistent model selection are required.', { terminal: true });
       }
@@ -180,6 +190,14 @@ export function createClaudeCliBackend(record, deps = {}) {
       }
       if (value.active) return { accepted: false, status: 'retryable' };
       const cli = await preflight();
+      // The shared layer's final gate, asked after every internal await and before any
+      // claim is written: a round that finished while this call was preparing is refused
+      // here, with no request row, nothing active, and nothing sent.
+      const blocked = typeof writeBlockReason === 'function' ? writeBlockReason() : undefined;
+      if (blocked) throw fail(blocked, `Nothing was dispatched: ${blocked === 'round-finished'
+        ? 'this task round already finished' : blocked === 'dispatch-expired'
+          ? 'this dispatch is older than its task permits' : `the dispatch was refused (${blocked})`}.`,
+      { terminal: true, notSent: true });
       const mcpConfig = deps.claudeReportConfig(requestId);
       value.sessionId ??= randomUUID();
       const request = { messageHash: hash, taskId: load().task?.taskId, afterSeq: value.seq, model, status: 'unknown' };
@@ -187,7 +205,8 @@ export function createClaudeCliBackend(record, deps = {}) {
       try {
         const result = await runner.startClaudeTurn({ cli, directory: dir, workspace: load().workspace, name: load().name,
           sessionId: value.sessionId, resume: value.started === true, message, model: model?.model,
-          effort: model?.reasoningEffort, mcpConfig });
+          effort: model?.reasoningEffort, mcpConfig,
+          ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) });
         if (result?.accepted !== true && !result?.duplicate) throw fail('claude-cli-start-refused', 'The CLI worker refused the turn.', { terminal: true });
       } catch (error) {
         request.status = error.terminal ? 'rejected' : error.retryable || error.retryableRead ? 'retryable' : 'unknown';

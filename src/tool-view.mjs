@@ -146,6 +146,7 @@ export function compactAgent(item = {}) {
     ...fileField(item),
     ...teamField(item),
     ...supplementField(item),
+    ...(item.expired ? { expired: item.expired } : {}),
     // Only a stopped monitor needs a decision from the caller; every other state is
     // either normal or already visible through the name's own state.
     ...(item.monitor === 'stopped' ? { monitor: 'stopped' } : {}),

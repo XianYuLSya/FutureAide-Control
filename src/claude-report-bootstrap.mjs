@@ -23,6 +23,7 @@ import { loadConfig } from './config.mjs';
 import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './report-endpoint.mjs';
 import { ensureSharedMonitor } from './shared-monitor.mjs';
 import { RosterStore } from './roster-store.mjs';
+import { exitWhenInputCloses } from './stdio-exit.mjs';
 
 export const BOOTSTRAP_NAME = 'futureaide-report';
 export const BOOTSTRAP_VERSION = '1.0.0';
@@ -251,7 +252,10 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     const store = state.store; state.store = undefined;
     try { store?.close?.(); } catch { /* ignore */ }
   };
-  return { server, ready, tools, port: state.port, url: state.url, close, checkToolList };
+  // The switch rides on the configuration load this bridge already did: the stdio entry
+  // must not read the file a second time to learn it.
+  return { server, ready, tools, port: state.port, url: state.url,
+    idleSessionCleanup: state.config?.idleSessionCleanup !== false, close, checkToolList };
 }
 
 async function main() {
@@ -259,10 +263,17 @@ async function main() {
   const index = argv.indexOf('--config');
   const configPath = index === -1 ? process.env.DSH_CONTROL_CONFIG : argv[index + 1];
   const bridge = await startColdStartBridge({ configPath });
-  await bridge.server.connect(new StdioServerTransport());
+  const transport = new StdioServerTransport();
+  // Installed before connect() so the protocol's handler is wrapped from the first
+  // message. A forwarded call that is already being answered still goes out before the
+  // bridge closes its loopback client and roster handle. When idleSessionCleanup is off
+  // this does nothing at all, which leaves the previous behaviour untouched.
+  if (bridge.idleSessionCleanup) exitWhenInputCloses({ transport, close: () => bridge.close() });
+  // Signals keep their original meaning whatever the switch says.
   const stop = async () => { await bridge.close(); process.exit(0); };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
+  await bridge.server.connect(transport);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

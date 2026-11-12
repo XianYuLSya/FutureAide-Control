@@ -345,7 +345,7 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
       return view === 'events' ? page : historyMessages(page, row);
     },
     async send({ sessionId, message, requestId, mode = 'queue', background = false, agentId, codexThreadId,
-      suppressCallback = false, archive = false, taskName } = {}) {
+      suppressCallback = false, archive = false, taskName, writeBlockReason } = {}) {
       // The callback target is only what this connection was explicitly given: an agent's own
       // bound task, or a profile that names one. Nothing is guessed from the environment.
       const target = codexThreadId === undefined ? config.codexThreadId : codexThreadId;
@@ -359,7 +359,20 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
         // Attach the pre-dispatch cursor so the watcher knows which turn belongs to this send.
         const afterSeq = managed ? session.projections.asOfSeq : await sessionCursor(id);
         await checkpoint({ afterSeq });
-        const sent = managed ? await api.managedSendMessage(managed, message, { requestId, mode })
+        // The last gate before the native write. The shared layer asks it synchronously,
+        // after all of its own awaiting, so a task whose round finished or whose dispatch
+        // expired while this call was preparing cannot slip out. Nothing has been written
+        // at this point, and the checkpoint above stays: the receipt records a rejection,
+        // not an unknown outcome.
+        const blocked = typeof writeBlockReason === 'function' ? writeBlockReason() : undefined;
+        if (blocked) {
+          throw Object.assign(new Error(`Nothing was sent: ${blocked === 'round-finished'
+            ? 'this task round already finished' : blocked === 'dispatch-expired'
+              ? 'this dispatch is older than its task permits' : `the dispatch was refused (${blocked})`}.`),
+          { code: blocked, terminal: true, notSent: true });
+        }
+        const sent = managed ? await api.managedSendMessage(managed, message, { requestId, mode,
+          ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) })
           : await api.sendMessage(id, message, { requestId, mode });
         return { ...sent, afterSeq };
       });

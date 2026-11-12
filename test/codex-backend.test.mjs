@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createCodexBackend } from '../src/codex-backend.mjs';
 import { createCodexHost, emptyProjection, projectCodexTurns } from '../src/codex-host.mjs';
+import { CODEX_ASK_PARENT_INSTRUCTION } from '../src/report-contract.mjs';
 import { liveThread } from './live-thread-fixture.mjs';
 
 async function setup() {
@@ -83,12 +84,14 @@ test('zero-model reservation, first fresh thread, persistent follow-up and nativ
   assert.equal((await f.adapter.deliver({ requestId: 'r1', message: 'first' })).accepted, true);
   f.complete(); f.record.task.taskId = 'task-2';
   await f.adapter.beginTask();
-  await f.adapter.deliver({ requestId: 'r2', message: 'followup' });
+  await f.adapter.deliver({ requestId: 'r2', message: 'followup', kind: 'task' });
   assert.equal(f.counts.create, 1); assert.equal(f.counts.send, 1);
   assert.equal('model' in f.state().requests.r2, false, 'a name without a pin stores no model selection');
   assert.equal(f.state().requests.r2.explicitModel, false);
   assert.equal(f.state().binding.sessionId, 'native-1');
   assert.ok(f.inputs[1].message.startsWith('followup'));
+  assert.ok(f.inputs[0].message.includes(CODEX_ASK_PARENT_INSTRUCTION));
+  assert.ok(f.inputs[1].message.includes(CODEX_ASK_PARENT_INSTRUCTION));
   assert.match(f.inputs[1].message, /\[FutureAide dispatch .*\]$/m, 'later messages also keep the marker last');
   assert.equal('model' in f.inputs[0], false, 'no model reaches the native create');
   assert.equal('effort' in f.inputs[0], false, 'no effort reaches the native create');

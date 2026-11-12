@@ -8,7 +8,7 @@ import { mkdtempSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from 
 import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { RosterStore } from '../src/roster-store.mjs';
+import { RosterStore, submissionNoticeId } from '../src/roster-store.mjs';
 import { idleSignal, scanSleeping } from '../src/idle-monitor.mjs';
 import { createDirectoryWatchers, createWakeQueue, throttledSignal, waitForCommit, wakeHintName } from '../src/shared-monitor.mjs';
 import { captureObservation, owesFastPoll, retryDelayMs } from '../src/scoped-agents.mjs';
@@ -410,4 +410,438 @@ test('a delivery abandoned for a long time backs off to five minutes', () => {
   assert.equal(retryDelayMs(20), 30000);
   assert.equal(retryDelayMs(21), 300000, 'past 20 attempts it is clearly abandoned');
   assert.equal(retryDelayMs(8259), 300000);
+});
+
+// An accepted parent message is a delivery debt until its own notice is terminal, even
+// after the task stopped owning it. One predicate decides that for the inbox, for task
+// rotation and for cleanup; these cases pin it on the real schema, including two
+// connections writing the same roster at once.
+const mailOwner = (overrides = {}) => record({ agentId: 'agent-mail', ownerId: 'owner-mail', name: 'mailer',
+  sessionId: 'session-mail', state: 'idle',
+  task: { taskId: 'task-old', message: 'do it', answers: [],
+    dispatches: [{ requestId: 'request-1', kind: 'task', state: 'completed', accepted: true }],
+    reports: [{ id: 'report-1', final: true, message: 'done', delivery: { state: 'delivered' } }] },
+  observation: { questions: [], tree: { settled: true, running: false } }, ...overrides });
+
+test('a new submission starts with its notice identity and is debt until that notice ends', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    store.enqueueSubmission({ id: 'sub-1', ownerId: 'owner-a', agentId: 'agent-a', taskId: 'task-a',
+      kind: 'report', message: 'hi', created: '2026-11-12T00:00:00.000Z' });
+    const [work] = store.submissionWork('agent-a');
+    assert.equal(work.delivery.id, submissionNoticeId('sub-1'), 'the notice id is the submission id');
+    assert.equal(work.delivery.state, 'pending');
+    assert.equal(work.delivery.createdAt, '2026-11-12T00:00:00.000Z');
+    assert.equal(work.deliveryVersion, JSON.stringify(work.delivery), 'the raw text is the compare-and-swap version');
+    assert.equal(store.submissionDebt('agent-a'), 1);
+
+    // Taking the row into the task is absorb progress, not delivery: the notice is still owed.
+    assert.equal(store.consumeSubmission('sub-1'), true);
+    assert.equal(store.submissionDebt('agent-a'), 1, 'an absorbed message still owes its notice');
+    assert.equal(store.saveSubmissionDelivery('sub-1', { state: 'delivered' }, { expected: work.deliveryVersion }), true);
+    assert.equal(store.submissionDebt('agent-a'), 0);
+    assert.deepEqual(store.submissionWork('agent-a'), []);
+  } finally { store.close(); }
+});
+
+test('a previous round keeps rotating blocked until its accepted message is delivered', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const current = mailOwner();
+    store.insert(current);
+    store.enqueueSubmission({ id: 'old-1', ownerId: current.ownerId, agentId: current.agentId,
+      taskId: 'task-old', kind: 'report', message: 'older' });
+    // The build before this one consumed the row without recording any notice.
+    store.db.prepare("UPDATE submissions SET state='consumed', consumed=?, delivery=NULL WHERE id='old-1'").run(new Date().toISOString());
+    const next = { ...current, state: 'running',
+      task: { taskId: 'task-new', message: 'again', dispatches: [], answers: [], reports: [] } };
+
+    assert.equal(store.replaceTask(next, current), false, 'an undelivered accepted message blocks the next round');
+    const [legacy] = store.submissionWork(current.agentId, 'task-old');
+    assert.equal(legacy.deliveryVersion, null, 'a legacy row has no version to compare');
+    assert.equal(store.saveSubmissionDelivery('old-1', { state: 'delivered' }, { expected: null }), true);
+    assert.equal(store.submissionDebt(current.agentId), 0);
+    assert.equal(store.replaceTask(next, current), true, 'once delivered, the next round may replace it');
+    assert.equal(store.get(current.agentId).task.taskId, 'task-new');
+  } finally { store.close(); }
+});
+
+test('two connections cannot both win the same notice', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'roster-cas-'));
+  const file = path.join(directory, 'roster.sqlite');
+  const first = new RosterStore(file), second = new RosterStore(file);
+  try {
+    first.enqueueSubmission({ id: 'sub-cas', ownerId: 'owner-a', agentId: 'agent-a', taskId: 'task-a',
+      kind: 'report', message: 'hi' });
+    const seenFirst = first.submissionWork('agent-a')[0].deliveryVersion;
+    const seenSecond = second.submissionWork('agent-a')[0].deliveryVersion;
+    assert.equal(seenFirst, seenSecond, 'both readers see the same version');
+    assert.equal(first.saveSubmissionDelivery('sub-cas', { state: 'sending' }, { expected: seenFirst }), true);
+    assert.equal(second.saveSubmissionDelivery('sub-cas', { state: 'sending' }, { expected: seenSecond }), false,
+      'the writer that read the same version must lose the race');
+
+    // A legacy row without a notice compares as null, so the same rule holds there.
+    first.db.prepare("UPDATE submissions SET delivery=NULL WHERE id='sub-cas'").run();
+    assert.equal(first.submissionWork('agent-a')[0].deliveryVersion, null);
+    assert.equal(second.submissionWork('agent-a')[0].deliveryVersion, null);
+    assert.equal(first.saveSubmissionDelivery('sub-cas', { state: 'pending', attempts: 1 }, { expected: null }), true);
+    assert.equal(second.saveSubmissionDelivery('sub-cas', { state: 'pending', attempts: 1 }, { expected: null }), false);
+
+    // A terminal notice is never walked back to a non-terminal one.
+    assert.equal(first.saveSubmissionDelivery('sub-cas', { state: 'delivered' }), true);
+    assert.equal(second.saveSubmissionDelivery('sub-cas', { state: 'pending' }), false);
+    assert.equal(second.submissionDebt('agent-a'), 0);
+  } finally { first.close(); second.close(); }
+});
+
+test('a roster from before the notice column still opens and counts what it owes', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'roster-oldschema-'));
+  const file = path.join(directory, 'roster.sqlite');
+  const legacy = new DatabaseSync(file);
+  // Exactly the table the build before this one shipped: absorb progress, but no notice.
+  legacy.exec(`CREATE TABLE submissions (id TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL,
+    task TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, final INTEGER NOT NULL, created TEXT NOT NULL,
+    state TEXT NOT NULL, consumed TEXT)`);
+  legacy.prepare('INSERT INTO submissions VALUES(?,?,?,?,?,?,?,?,?,?)')
+    .run('legacy-old', 'owner-a', 'agent-a', 'task-a', 'report', 'hi', 0, '2026-11-01T00:00:00.000Z', 'consumed',
+      '2026-11-01T00:00:01.000Z');
+  legacy.close();
+
+  const store = new RosterStore(file);
+  try {
+    const [work] = store.submissionWork('agent-a');
+    assert.equal(work.id, 'legacy-old');
+    assert.equal(work.deliveryVersion, null, 'an old row simply has no notice yet');
+    assert.equal(store.submissionDebt('agent-a'), 1);
+    store.insert(mailOwner({ agentId: 'agent-a', ownerId: 'owner-a', name: 'mailer',
+      task: { taskId: 'task-a', message: 'do it', dispatches: [], answers: [], reports: [] } }));
+    assert.deepEqual(store.pendingSubmissionAgents().map(row => ({ ...row })), [{ agentId: 'agent-a', dueAt: 0 }]);
+    assert.equal(store.saveSubmissionDelivery('legacy-old', { state: 'delivered' }, { expected: null }), true);
+    assert.equal(store.submissionDebt('agent-a'), 0);
+    assert.deepEqual(store.pendingSubmissionAgents(), [], 'a delivered notice stops waking the name');
+  } finally { store.close(); }
+});
+
+test('a notice for an old round finds that round in the history', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const current = mailOwner();
+    store.insert(current);
+    const archived = { ...current.task, changes: [], coverage: {}, tree: {} };
+    store.appendHistory(current.agentId, archived);
+    assert.deepEqual(store.historyTask(current.agentId, 'task-old'), archived);
+    assert.equal(store.historyTask(current.agentId, 'task-missing'), undefined);
+
+    // Archiving and the next round's save used to be separate transactions, so one round
+    // can have two snapshots: the notice follows the newer one.
+    const later = { ...archived, reports: [{ id: 'report-2', final: false, message: 'later', delivery: { state: 'pending' } }] };
+    store.appendHistory(current.agentId, later);
+    assert.deepEqual(store.historyTask(current.agentId, 'task-old'), later);
+  } finally { store.close(); }
+});
+
+test('an auto-cleaned name is kept while any round still owes a notice', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const current = mailOwner();
+    store.insert(current);
+    // An accepted message from an earlier round, still undelivered.
+    store.enqueueSubmission({ id: 'old-clean', ownerId: current.ownerId, agentId: current.agentId,
+      taskId: 'task-older', kind: 'report', message: 'older' });
+    assert.equal(store.claimAutoCleanup(current), false, 'a message from an earlier round is still owed');
+    assert.equal(store.saveSubmissionDelivery('old-clean', { state: 'delivered' }), true);
+    assert.equal(store.claimAutoCleanup(current), true);
+  } finally { store.close(); }
+});
+
+test('a terminal notice is final, and only a legacy row may still be finalized once', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    // A legacy row: accepted, never absorbed, already carrying a terminal outcome.
+    store.enqueueSubmission({ id: 'sub-legacy', ownerId: 'owner-a', agentId: 'agent-a', taskId: 'task-a',
+      kind: 'report', message: 'hi', created: '2026-11-01T00:00:00.000Z' });
+    store.db.prepare("UPDATE submissions SET delivery=? WHERE id='sub-legacy'")
+      .run(JSON.stringify({ id: 'old-marker-1', state: 'blocked', createdAt: '2026-11-01T00:00:00.000Z' }));
+    const [legacy] = store.submissionWork('agent-a');
+    assert.equal(legacy.state, 'pending', 'the row was never absorbed');
+
+    // Two proofs say delivered: finalizing it normalizes the identity and consumes it.
+    assert.equal(store.saveSubmissionDelivery('sub-legacy', { state: 'delivered' },
+      { expected: legacy.deliveryVersion }), true);
+    const after = store.db.prepare("SELECT state, delivery FROM submissions WHERE id='sub-legacy'").get();
+    assert.equal(after.state, 'consumed');
+    assert.equal(JSON.parse(after.delivery).id, submissionNoticeId('sub-legacy'));
+    assert.equal(JSON.parse(after.delivery).state, 'delivered');
+    assert.equal(store.submissionDebt('agent-a'), 0);
+
+    // Once consumed and terminal, the row is never rewritten — not even back to pending.
+    assert.equal(store.saveSubmissionDelivery('sub-legacy', { state: 'blocked' }), false);
+    assert.equal(store.saveSubmissionDelivery('sub-legacy', { state: 'pending' }), false);
+  } finally { store.close(); }
+});
+
+test('a mirror from before the task moved is not written back', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const current = mailOwner();
+    store.insert(current);
+    store.enqueueSubmission({ id: 'sub-mirror', ownerId: current.ownerId, agentId: current.agentId,
+      taskId: 'task-old', kind: 'report', message: 'hi' });
+    const stale = current; // what a replaced worker still holds
+    store.save({ ...current, state: 'running',
+      task: { taskId: 'task-next', message: 'again', dispatches: [], answers: [], reports: [] } });
+
+    const [row] = store.submissionWork(current.agentId);
+    assert.equal(store.saveSubmissionDelivery('sub-mirror', { state: 'delivered' },
+      { expected: row.deliveryVersion, record: stale }), true);
+    assert.equal(store.get(current.agentId).task.taskId, 'task-next', 'the stale mirror did not overwrite the newer task');
+    assert.equal(store.submissionDebt(current.agentId), 0, 'the notice itself was still recorded');
+  } finally { store.close(); }
+});
+
+test('a final waiting for its tree makes the name due at once, whatever else is backing off', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const waiting = mailOwner({ agentId: 'agent-wait', name: 'waiter', sessionId: 'session-wait',
+      state: 'delivery_pending',
+      task: { taskId: 'task-wait', message: 'work', dispatches: [], answers: [],
+        reports: [
+          // A progress notice with its own backoff, next to a final still waiting for its tree.
+          { id: 'report-progress', final: false,
+            delivery: { id: 'notice-progress', state: 'pending', nextAttemptAt: Date.now() + 60000 } },
+          { id: 'report-wait', final: true, treeSettledConfirmed: false,
+            delivery: { id: 'notice-wait', state: 'pending', waitingForTree: true,
+              nextAttemptAt: Date.now() + 6 * 60 * 60 * 1000 } },
+        ] } });
+    store.insert(waiting);
+    const candidate = () => store.listWorkerCandidates().find(row => row.agentId === 'agent-wait');
+    assert.equal(candidate().pendingReports, 2, 'both notices are still owed');
+    assert.equal(candidate().noticeNextAt, undefined,
+      'reading that tree is the sweep’s job, so no notice moment may defer this name');
+
+    // Once the tree is settled and the notice is a plain retry, its own moment counts.
+    const due = store.get('agent-wait');
+    due.task.reports = [due.task.reports[0]];
+    store.save(due);
+    assert.ok(candidate().noticeNextAt > Date.now(), 'an ordinary notice keeps its own next attempt');
+
+    // A notice of an earlier round that waits for a tree is due at once: that round is over.
+    store.insert(mailOwner({ agentId: 'agent-old', name: 'older', sessionId: 'session-old',
+      task: { taskId: 'task-now', message: 'now', dispatches: [], answers: [], reports: [] } }));
+    store.enqueueSubmission({ id: 'old-wait', ownerId: 'owner-mail', agentId: 'agent-old',
+      taskId: 'task-previous', kind: 'report', message: 'older text' });
+    store.saveSubmissionDelivery('old-wait', { state: 'pending', waitingForTree: true,
+      nextAttemptAt: Date.now() + 6 * 60 * 60 * 1000 });
+    assert.deepEqual(store.pendingSubmissionAgents().map(row => ({ ...row })), [{ agentId: 'agent-old', dueAt: 0 }]);
+  } finally { store.close(); }
+});
+
+// An automatic cleanup deletes a whole tree, so it must answer for the whole tree. One
+// transaction decides it, and the claim closes the tree so nothing can be accepted after.
+const treeRoot = (overrides = {}) => record({ agentId: 'root-1', ownerId: 'owner-t', name: 'root',
+  sessionId: 'session-root', state: 'idle',
+  task: { taskId: 'task-root', message: 'lead', dispatches: [], answers: [], reports: [] }, ...overrides });
+const treeChild = (overrides = {}) => record({ agentId: 'child-1', ownerId: 'owner-t', name: 'child',
+  sessionId: 'session-child', parentAgentId: 'root-1', state: 'idle',
+  task: { taskId: 'task-child', message: 'help', dispatches: [], answers: [], reports: [] }, ...overrides });
+
+test('the hold counts a whole tree, and a childs undelivered message blocks the claim', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const root = treeRoot(), kid = treeChild();
+    store.insert(root);
+    store.insert(kid, { requireOpenParent: true });
+    assert.deepEqual(store.autoCleanupHold('root-1'), { pending: 0, blocked: 0 });
+
+    store.enqueueSubmission({ id: 'kid-early', ownerId: kid.ownerId, agentId: kid.agentId,
+      taskId: kid.task.taskId, kind: 'report', message: 'from the child' });
+    assert.deepEqual(store.autoCleanupHold('root-1'), { pending: 1, blocked: 0 }, 'the child is part of the tree');
+    assert.equal(store.claimAutoCleanup(root), false, 'an undelivered message anywhere in the tree blocks the delete');
+    assert.equal(store.get('root-1').closed, undefined, 'and nothing was closed by the refusal');
+    assert.equal(store.get('child-1').closed, undefined);
+
+    assert.equal(store.saveSubmissionDelivery('kid-early', { state: 'delivered' }), true);
+    assert.deepEqual(store.autoCleanupHold('root-1'), { pending: 0, blocked: 0 });
+    assert.equal(store.claimAutoCleanup(root), true);
+  } finally { store.close(); }
+});
+
+test('a claimed tree closes its children and keeps their own state', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const root = treeRoot(), kid = treeChild();
+    store.insert(root);
+    store.insert(kid, { requireOpenParent: true });
+    assert.equal(store.claimAutoCleanup(root), true);
+
+    const child = store.get('child-1');
+    assert.equal(child.closed, true, 'the child is closed with the tree');
+    assert.equal(child.state, 'idle', 'but keeps its own state, so it is cleaned up by its own turn');
+    assert.equal(child.autoCleanupClosed, true);
+    assert.equal(store.get('root-1').autoCleanupClosed, true);
+    // A message the child would have accepted a moment earlier is refused now.
+    assert.throws(() => store.submitParentMessage('child-1', { kind: 'report', message: 'late' }),
+      { code: 'submission-not-owned' });
+  } finally { store.close(); }
+});
+
+test('a copy read before the claim cannot open a closed child again', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const root = treeRoot(), kid = treeChild();
+    store.insert(root);
+    store.insert(kid, { requireOpenParent: true });
+    const stale = store.get('child-1'); // a worker that read the child before the claim
+    assert.equal(store.claimAutoCleanup(root), true);
+    stale.closed = false;
+    store.save(stale);
+    const child = store.get('child-1');
+    assert.equal(child.closed, true, 'the closure is restored from the row, not from the copy');
+    assert.equal(child.autoCleanupClosed, true);
+  } finally { store.close(); }
+});
+
+test('a blocked notice keeps its text and blocks automatic cleanup, while a delete still works', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const root = treeRoot();
+    store.insert(root);
+    store.enqueueSubmission({ id: 'blocked-1', ownerId: root.ownerId, agentId: root.agentId,
+      taskId: root.task.taskId, kind: 'report', message: 'the only copy' });
+    assert.equal(store.saveSubmissionDelivery('blocked-1', { state: 'blocked' }), true);
+    assert.deepEqual(store.autoCleanupHold('root-1'), { pending: 0, blocked: 1 });
+    assert.equal(store.claimAutoCleanup(root), false, 'a blocked text is still the only copy of what was said');
+
+    // Removing a name on request stays an explicit authorization of its own.
+    store.remove(root);
+    assert.equal(store.get('root-1'), undefined);
+  } finally { store.close(); }
+});
+
+test('a child created after the tree was claimed is refused', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const root = treeRoot();
+    store.insert(root);
+    assert.equal(store.claimAutoCleanup(root), true);
+    assert.throws(() => store.insert(treeChild(), { requireOpenParent: true }), { code: 'parent-closed' });
+    assert.equal(store.get('child-1'), undefined);
+
+    // Without the guard the plain insert path is unchanged.
+    store.insert(record({ agentId: 'loose-1', ownerId: 'owner-t', name: 'loose', sessionId: 'session-loose', state: 'idle' }));
+    assert.equal(store.get('loose-1').name, 'loose');
+    store.insert(treeChild({ parentAgentId: 'missing-parent' }));
+    assert.equal(store.get('child-1').parentAgentId, 'missing-parent');
+  } finally { store.close(); }
+});
+
+test('two connections cannot both claim a tree and accept a late message', () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'roster-tree-'));
+  const file = path.join(directory, 'roster.sqlite');
+  const first = new RosterStore(file), second = new RosterStore(file);
+  try {
+    const root = treeRoot(), kid = treeChild();
+    first.insert(root);
+    first.insert(kid, { requireOpenParent: true });
+
+    // The child's message is accepted on the other connection before the claim.
+    second.enqueueSubmission({ id: 'kid-race', ownerId: kid.ownerId, agentId: kid.agentId,
+      taskId: kid.task.taskId, kind: 'report', message: 'raced in' });
+    assert.deepEqual({ ...first.autoCleanupHold('root-1') }, { pending: 1, blocked: 0 }, 'the claim sees it');
+    assert.equal(first.claimAutoCleanup(root), false, 'the message that arrived first wins');
+
+    second.saveSubmissionDelivery('kid-race', { state: 'delivered' });
+    assert.equal(first.claimAutoCleanup(root), true, 'once nothing is owed the claim goes through');
+    assert.throws(() => second.submitParentMessage('child-1', { kind: 'report', message: 'after the claim' }),
+      { code: 'submission-not-owned' }, 'the other connection reads the closure from the row');
+    assert.throws(() => second.insert(treeChild({ agentId: 'child-2', name: 'child2' }), { requireOpenParent: true }),
+      { code: 'parent-closed' });
+  } finally { first.close(); second.close(); }
+});
+
+test('an auto-closed row stays closed through every merge branch, mark included', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const root = treeRoot(), kid = treeChild();
+    store.insert(root);
+    store.insert(kid, { requireOpenParent: true });
+    assert.equal(store.claimAutoCleanup(root), true);
+
+    // A copy that still believes it is open.
+    const open = { ...store.get('child-1') };
+    delete open.closed; delete open.autoCleanupClosed;
+    store.save(open);
+    let child = store.get('child-1');
+    assert.equal(child.closed, true, 'the closure comes back from the row');
+    assert.equal(child.autoCleanupClosed, true);
+
+    // A copy that kept closed but lost the mark: the mark comes back too.
+    const unmarked = { ...child, closed: true };
+    delete unmarked.autoCleanupClosed;
+    store.save(unmarked);
+    child = store.get('child-1');
+    assert.equal(child.closed, true);
+    assert.equal(child.autoCleanupClosed, true, 'the mark is restored from the row');
+
+    // Even a copy that lands on the cancel branch of the merge cannot reopen it.
+    store.db.prepare("UPDATE agents SET body=json_set(body,'$.task.cancelRequested',json('true')) WHERE id='child-1'").run();
+    const rowwise = JSON.parse(store.db.prepare("SELECT body FROM agents WHERE id='child-1'").get().body);
+    delete rowwise.closed; delete rowwise.autoCleanupClosed;
+    store.save(rowwise);
+    child = store.get('child-1');
+    assert.equal(child.task.cancelRequested, true, 'the cancel evidence stays');
+    assert.equal(child.closed, true, 'the closure survives the cancel branch');
+    assert.equal(child.autoCleanupClosed, true);
+  } finally { store.close(); }
+});
+
+test('a failed round whose thread is gone is never pulled back to running', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const base = mailOwner();
+    const gone = mailOwner({ state: 'failed', task: { ...base.task, taskId: 'task-gone', state: 'failed',
+      treeUnavailable: 'codex-thread-not-found' } });
+    store.insert(gone);
+    // The caller asked to cancel while the round was still alive; the row recorded it.
+    store.db.prepare("UPDATE agents SET body=json_set(body,'$.task.cancelRequested',json('true')) WHERE id=?")
+      .run(gone.agentId);
+
+    assert.equal(store.requestCancel(store.get(gone.agentId)), false,
+      'an unqueryable failed round is not revived by a cancel');
+    const stale = store.get(gone.agentId);
+    assert.equal(stale.task.cancelRequested, true);
+    store.save(stale);
+    const after = store.get(gone.agentId);
+    assert.equal(after.task.cancelRequested, true, 'the cancel evidence is kept');
+    assert.equal(after.state, 'failed', 'and the round stays failed instead of running');
+
+    // A round whose thread is still there keeps the old wake behaviour.
+    const live = mailOwner({ agentId: 'agent-live', name: 'live', sessionId: 'session-live', state: 'running',
+      task: { taskId: 'task-live', message: 'work', dispatches: [], answers: [], reports: [] } });
+    store.insert(live);
+    store.db.prepare("UPDATE agents SET body=json_set(body,'$.task.cancelRequested',json('true'),'$.state','running') WHERE id=?")
+      .run(live.agentId);
+    store.save(store.get(live.agentId));
+    assert.equal(store.get(live.agentId).state, 'running');
+  } finally { store.close(); }
+});
+
+test('a create can still see the auto-closed parent it must refuse', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const parent = record({ agentId: 'codex-parent', ownerId: 'owner-c', name: 'parent', sessionId: 'session-parent',
+      target: 'codex-desktop', state: 'idle',
+      task: { taskId: 'task-parent', message: 'work', dispatches: [], answers: [], reports: [] } });
+    store.insert(parent);
+    store.saveBackendState('codex-parent', { binding: { sessionId: 'thread-parent', owned: true }, requests: {} });
+    assert.equal(store.agentForCodexThread('thread-parent').agentId, 'codex-parent');
+
+    assert.equal(store.claimAutoCleanup(parent), true);
+    assert.equal(store.agentForCodexThread('thread-parent'), undefined, 'a closed name is no longer a live parent');
+    const found = store.agentForCodexThread('thread-parent', { includeAutoClosed: true });
+    assert.equal(found.agentId, 'codex-parent', 'but create can still see the parent it must refuse');
+    // The child is recorded under it and then refused, instead of being taken as top level.
+    assert.throws(() => store.insert(treeChild({ parentAgentId: 'codex-parent' }), { requireOpenParent: true }),
+      { code: 'parent-closed' });
+  } finally { store.close(); }
 });

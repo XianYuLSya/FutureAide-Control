@@ -83,6 +83,13 @@ test('pending input states and errors survive compaction unchanged', () => {
   assert.deepEqual(compact.files, { count: 2 });
 });
 
+test('expired dispatch reasons remain visible in the default list', () => {
+  const expired = { reason: 'dispatch-expired', kind: 'supplement', count: 1, createdAt: '2026-11-10T12:39:30.864Z' };
+  const result = compactList({ items: [{ name: 'helper', lifetime: 'persistent', state: 'failed', expired,
+    supplements: { blocked: 1, latest: { status: 'accepted' } } }] });
+  assert.deepEqual(result.items[0].expired, expired);
+});
+
 test('an undelivered earlier report and a stopped monitor stay visible', () => {
   const stuck = compactAgent({ name: 'artist', lifetime: 'persistent', target: 'dsh', state: 'idle',
     reports: { total: 2, pending: 1, latest: { summary: 'latest', final: false, delivery: 'delivered' } }, monitor: 'stopped' });

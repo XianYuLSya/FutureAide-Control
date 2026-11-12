@@ -1,11 +1,16 @@
 import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { claudeCallbackReminderMs } from './claude-report-reminder.mjs';
 
 export const defaultConfigPath = () => path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'futureaide-control', 'config.json');
 
 const configPath = filename => path.resolve(filename || process.env.DSH_CONTROL_CONFIG || process.env.FUTUREAIDE_CONTROL_CONFIG || defaultConfigPath());
 const transportFields = ['dataRoot', 'dshDataRoot', 'target', 'baseUrl', 'instanceFile', 'preferredInstanceFile', 'timeoutMs', 'hostBridgeFile', 'managedStateDirectory', 'reportPort'];
+// Behaviour switches a named profile may set for itself. They are deliberately not
+// transport fields: creating a profile copies only the connection, and a profile that
+// says nothing inherits the base configuration.
+const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs'];
 const targetFields = ['futureaideSessionId', 'codexThreadId'];
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -14,9 +19,25 @@ function dshConfig(value) {
   if (value.target !== undefined && value.target !== 'dsh') throw new Error('Only target=dsh is supported. Select the DSH data directory or an explicit DSH instance.');
   if (value.managedStateDirectory !== undefined && (typeof value.managedStateDirectory !== 'string' || !path.isAbsolute(value.managedStateDirectory))) throw new Error('The managed host state path must be absolute.');
   if (value.reportPort !== undefined && (!Number.isInteger(value.reportPort) || value.reportPort < 0 || value.reportPort > 65535)) throw new Error('The loopback report port must be an integer between 0 and 65535.');
+  if (value.idleSessionCleanup !== undefined && typeof value.idleSessionCleanup !== 'boolean') throw new Error('idleSessionCleanup must be true or false.');
+  if (value.teamBoard !== undefined && typeof value.teamBoard !== 'boolean') throw new Error('teamBoard must be true or false.');
+  // A wait that is not a whole number of milliseconds cannot be scheduled; 0 is allowed
+  // and means the first definite absence is enough.
+  if (value.claudeCallbackReminderMs !== undefined) claudeCallbackReminderMs(value.claudeCallbackReminderMs);
   const dataRoot = value.dshDataRoot ?? value.dataRoot ?? process.env.DSH_HOME ?? path.join(homedir(), '.dsh');
   return { ...value, target: 'dsh', dataRoot, dshDataRoot: dataRoot };
 }
+
+/** Defaults on for unsubscribe, EOF shutdown, cold reads and monitor recovery.
+ * Cancelled-round rejection and inbox delivery apply at either setting. */
+const idleSessionCleanup = (value, fallback = true) => typeof value === 'boolean' ? value : fallback;
+
+/**
+ * The team board is a viewer, not a feature of the monitor: it stays off unless the
+ * installation asks for it, and off means the listener never registers a board route,
+ * never imports the board module and never reads a projection for it.
+ */
+const teamBoard = (value, fallback = false) => typeof value === 'boolean' ? value : fallback;
 
 function validateProfileName(profile) {
   if (typeof profile !== 'string' || !PROFILE_NAME_PATTERN.test(profile)
@@ -61,7 +82,7 @@ function validateProfile(value) {
   if (value.codexThreadId !== undefined && (typeof value.codexThreadId !== 'string' || !UUID.test(value.codexThreadId))) {
     throw new Error('Configure a valid target Codex task ID.');
   }
-  return { ...pick(value, [...transportFields, ...targetFields]), workspace: path.resolve(workspace) };
+  return { ...pick(value, [...transportFields, ...targetFields, ...behaviorFields]), workspace: path.resolve(workspace) };
 }
 
 async function profileDirectory(filename, { create = false } = {}) {
@@ -100,6 +121,12 @@ export async function loadConfig(filename, profile) {
       hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
       ...pick(supplied, transportFields),
       ...selected,
+      // A selected profile overrides the base value it inherits; the switch is on by
+      // default so an older configuration keeps releasing.
+      idleSessionCleanup: idleSessionCleanup(selected.idleSessionCleanup, idleSessionCleanup(supplied.idleSessionCleanup)),
+      teamBoard: teamBoard(selected.teamBoard, teamBoard(supplied.teamBoard)),
+      claudeCallbackReminderMs: claudeCallbackReminderMs(selected.claudeCallbackReminderMs,
+        claudeCallbackReminderMs(supplied.claudeCallbackReminderMs)),
       stateDirectory: path.join(path.dirname(filename), 'state', 'profiles', profile),
       registryDirectory: path.join(path.dirname(filename), 'agents'),
       configFile: filename,
@@ -109,6 +136,9 @@ export async function loadConfig(filename, profile) {
     hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
     workspace: process.cwd(),
     ...supplied,
+    idleSessionCleanup: idleSessionCleanup(supplied.idleSessionCleanup),
+    teamBoard: teamBoard(supplied.teamBoard),
+    claudeCallbackReminderMs: claudeCallbackReminderMs(supplied.claudeCallbackReminderMs),
     stateDirectory: path.join(path.dirname(filename), 'state'),
     registryDirectory: path.join(path.dirname(filename), 'agents'),
     configFile: filename,

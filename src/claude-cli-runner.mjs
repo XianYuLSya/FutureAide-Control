@@ -87,7 +87,7 @@ export const CLAUDE_TURN_FILES = Object.freeze({
 
 const TERMINAL_STATES = Object.freeze(['ended', 'failed', 'cancelled']);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const fail = (code, message) => Object.assign(new Error(message), { code });
+const fail = (code, message, extra) => Object.assign(new Error(message), { code, ...extra });
 const isUuid = value => typeof value === 'string' && UUID.test(value);
 
 async function readJson(filename) {
@@ -731,6 +731,22 @@ export async function startClaudeTurn(input = {}, deps = {}) {
         message: 'The request files could not be written, so this turn never began: ' + String(error?.message ?? error).slice(0, 400) } });
     await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state).catch(() => undefined);
     throw fail('claude-turn-not-prepared', state.error.message);
+  }
+
+  // The turn is fully prepared and no process exists yet: the last moment at which a
+  // refusal leaves nothing running. The shared layer asks this gate synchronously after
+  // all of its own awaiting, so a task whose round finished or whose dispatch expired
+  // while this call was preparing is refused here. The claim is recorded as terminal, so
+  // the directory never looks busy for a turn that never began.
+  const blocked = typeof input.writeBlockReason === 'function' ? input.writeBlockReason() : undefined;
+  if (blocked) {
+    Object.assign(state, { state: 'failed', phase: 'exited', endedAt: new Date().toISOString(),
+      error: { code: blocked, notSent: true,
+        message: `Nothing was dispatched: ${blocked === 'round-finished'
+          ? 'this task round already finished' : blocked === 'dispatch-expired'
+            ? 'this dispatch is older than its task permits' : `the dispatch was refused (${blocked})`}.` } });
+    await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state).catch(() => undefined);
+    throw fail(blocked, state.error.message, { terminal: true, notSent: true });
   }
 
   let worker;

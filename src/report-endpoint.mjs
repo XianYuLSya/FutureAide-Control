@@ -65,7 +65,7 @@ export async function readReportStatus({ port = reportPort(), expectedRoster, fe
  * reported and left alone.
  * @returns {{port:number,url:string,ready:boolean,started?:boolean,reason?:object}}
  */
-export async function ensureReportService({ store, port = reportPort(), timeoutMs = 1500, fetchImpl, management, log = () => {} } = {}) {
+export async function ensureReportService({ store, port = reportPort(), timeoutMs = 1500, fetchImpl, management, board, log = () => {} } = {}) {
   const expectedRoster = rosterIdentity(store);
   const current = await readReportStatus({ port, expectedRoster, fetchImpl });
   if (current.ready) return { ...current, started: false };
@@ -77,7 +77,7 @@ export async function ensureReportService({ store, port = reportPort(), timeoutM
     try {
       // management mounts the shared management tools on the same MCP server; the
       // report surface owns that hook and adds no service or database of its own.
-      const service = await startReportService({ store, port, log, ...(management ? { management } : {}) });
+      const service = await startReportService({ store, port, log, ...(management ? { management } : {}), ...(board ? { board } : {}) });
       hosted = { port: service.port ?? port, service };
       // The listener loop owns this process's lifetime; the server must not keep
       // the process alive after that loop ends.

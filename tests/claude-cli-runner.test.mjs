@@ -707,6 +707,31 @@ test('one accepted request spawns exactly one worker and writes the private file
   assert.deepEqual(JSON.parse(await readFile(path.join(directory, CLAUDE_TURN_FILES.mcp), 'utf8')), MCP_CONFIG);
 });
 
+// P1: a live task must never be dispatched after its round finished or its dispatch
+// expired. The refusal happens once the turn is fully prepared and before any process
+// exists, so the claim can only land terminal, and the caller is told nothing was sent.
+test('a refused preparation never spawns a worker and leaves a terminal claim', async () => {
+  const directory = await scratch('write-blocked');
+  let spawned = 0, asked = 0;
+  await assert.rejects(startClaudeTurn({ directory, cli: fixtureCli, workspace: directory, sessionId: SESSION,
+    message: 'hello', mcpConfig: MCP_CONFIG,
+    writeBlockReason: () => { asked += 1; return 'dispatch-expired'; } },
+  { spawnWorker: async () => { spawned += 1; return { pid: process.pid }; } }),
+  error => error.code === 'dispatch-expired' && error.terminal === true && error.notSent === true);
+  assert.equal(asked, 1, 'the gate is asked once, after the files were prepared');
+  assert.equal(spawned, 0, 'no process was started for a refused dispatch');
+  const turn = await readClaudeTurn(directory);
+  assert.equal(turn.state, 'failed', 'the claim is terminal, never running');
+  assert.equal(turn.error.code, 'dispatch-expired');
+  assert.equal(turn.error.notSent, true);
+  // The prepared files are the record of a turn that never began: a re-dispatch of the
+  // same content reports that refusal instead of starting anything.
+  const replay = await startClaudeTurn({ directory, cli: fixtureCli, workspace: directory, sessionId: SESSION,
+    message: 'hello', mcpConfig: MCP_CONFIG }, { spawnWorker: async () => { spawned += 1; return { pid: process.pid }; } });
+  assert.deepEqual([replay.accepted, replay.duplicate, replay.state], [false, true, 'failed']);
+  assert.equal(spawned, 0, 'a refused turn is never retried as a new process');
+});
+
 test('a worker that cannot be started is recorded failed, not left running', async () => {
   const directory = await scratch('spawn-fail');
   await assert.rejects(startClaudeTurn({ directory, cli: fixtureCli, workspace: directory, sessionId: SESSION,

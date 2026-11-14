@@ -20,7 +20,7 @@ function hostServices() {
     llm: { listProviders: () => [], listModels: async () => [], resolveCallConfig: async value => value },
     sessionPersistence: { resolveCurrentLog: async () => undefined, stat: async () => undefined, config: { root: 'C:/sessions' } },
     workspaceRegistry: { resolveByPath: async () => undefined, create: async () => undefined, get: () => undefined, list: () => [] },
-    subagents: { listDescendants: async () => [], waitForChildren: async () => false, drainDescendants: async () => {} },
+    subagents: { listDescendants: async () => [], waitForTreeWork: async () => false, drainDescendants: async () => {} },
     apiProxy: { sessions: { list: async () => ({}) } },
     agentDefaultModel: { currentSelection: () => undefined },
     sessionProjectionCache: { requireTable: () => ({ delete: async () => {}, get: () => undefined }) },
@@ -106,6 +106,23 @@ test('either reader satisfies the session inspection pair, and only losing both 
     ['sessionController.inspect or sessionQuery.readSession']);
 });
 
+test('either tree wait satisfies the subagents pair, and only losing both is missing', () => {
+  const modern = hostServices();
+  assert.deepEqual(checkHostCompatibility(lookup(modern), lookup(modern)).missing, [],
+    'DSH 0.2.2-rc.3 names it waitForTreeWork');
+
+  const legacy = hostServices();
+  delete legacy.services.subagents.waitForTreeWork;
+  legacy.services.subagents.waitForChildren = async () => false;
+  assert.deepEqual(checkHostCompatibility(lookup(legacy), lookup(legacy)).missing, [],
+    'the previous host keeps working through waitForChildren');
+
+  const neither = hostServices();
+  delete neither.services.subagents.waitForTreeWork;
+  assert.deepEqual(checkHostCompatibility(lookup(neither), lookup(neither)).missing,
+    ['subagents.waitForTreeWork or subagents.waitForChildren']);
+});
+
 test('optional services may be absent without reading as a changed host', () => {
   const host = hostServices();
   for (const entry of DSH_INTERNALS.filter(item => item.optional)) delete host.services[entry.service];
@@ -114,10 +131,10 @@ test('optional services may be absent without reading as a changed host', () => 
 
 test('an agent-scope internal is judged only when an agent can be asked', () => {
   const host = hostServices();
-  delete host.services.subagents.waitForChildren;
-  assert.deepEqual(checkHostCompatibility(lookup(host)).missing, ['subagents.waitForChildren'],
+  delete host.services.subagents.drainDescendants;
+  assert.deepEqual(checkHostCompatibility(lookup(host)).missing, ['subagents.drainDescendants'],
     'host-scope entries are always checked');
-  assert.deepEqual(checkHostCompatibility(lookup(host), lookup(host)).missing, ['subagents.waitForChildren']);
+  assert.deepEqual(checkHostCompatibility(lookup(host), lookup(host)).missing, ['subagents.drainDescendants']);
   const agentOnly = hostServices();
   agentOnly.tools = {};
   assert.deepEqual(checkHostCompatibility(lookup(agentOnly), lookup(agentOnly)).missing, ['tools.register', 'tools.guard'],

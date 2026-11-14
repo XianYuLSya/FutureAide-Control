@@ -57,14 +57,19 @@ export async function readManagedTree(subagents, agents, root, changesBySession 
   return nodes;
 }
 
-/** DSH SDK's completion barrier, scoped to the exact live root and task. */
+/**
+ * DSH SDK's completion barrier, scoped to the exact live root and task. DSH 0.2.2-rc.3
+ * renamed subagents.waitForChildren to waitForTreeWork with the same contract (true
+ * means work was joined and the root must be rechecked); both are accepted.
+ */
 export async function waitManagedTree(subagents, agents, root, isCurrent) {
-  if (typeof subagents?.waitForChildren !== 'function' || typeof root.whenIdle !== 'function') throw new Error('managed-tree-unavailable');
+  const waitForTree = subagents?.waitForTreeWork ?? subagents?.waitForChildren;
+  if (typeof waitForTree !== 'function' || typeof root.whenIdle !== 'function') throw new Error('managed-tree-unavailable');
   while (isCurrent()) {
     if (agents.get(root.id) !== root) throw new Error('managed-handle-unavailable');
     await root.whenIdle();
     const seq = root.session.seq;
-    const joined = await subagents.waitForChildren(root);
+    const joined = await waitForTree.call(subagents, root);
     if (!isCurrent()) return null;
     if (agents.get(root.id) !== root) throw new Error('managed-handle-unavailable');
     if (!joined && root.status === 'idle' && root.session.seq === seq) return seq;
@@ -105,7 +110,9 @@ export const DSH_INTERNALS = Object.freeze([
   { service: 'llm', members: ['listProviders', 'listModels', 'resolveCallConfig'], optional: true },
   { service: 'sessionPersistence', members: ['resolveCurrentLog', 'stat', 'config.root'] },
   { service: 'workspaceRegistry', members: ['resolveByPath', 'create', 'get', 'list'] },
-  { service: 'subagents', members: ['listDescendants', 'waitForChildren', 'drainDescendants'] },
+  { service: 'subagents', members: ['listDescendants', 'drainDescendants'] },
+  // 0.2.2-rc.3 renamed waitForChildren to waitForTreeWork with the same contract.
+  { choices: [{ service: 'subagents', member: 'waitForTreeWork' }, { service: 'subagents', member: 'waitForChildren' }] },
   { service: 'agentDefaultModel', members: ['currentSelection'], optional: true },
   { service: 'sessionProjectionCache', members: ['requireTable'], optional: true },
   { service: 'spillStore', optional: true },

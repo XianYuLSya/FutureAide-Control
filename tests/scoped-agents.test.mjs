@@ -19,7 +19,7 @@ const extra = threadId => ({ _meta: { threadId } });
 const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
 async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles,
-  callCodex: callCodexOverride } = {}) {
+  callCodex: callCodexOverride, config: extraConfig = {} } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -136,7 +136,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
     if (notificationMode === 'unknown') throw new Error('Lost delivery acknowledgement');
     return { accepted: true };
   };
-  const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json') }, {
+  const service = createScopedAgents({ stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), ...extraConfig }, {
     store, clientFactory: () => api, controlFactory, callCodex: callCodexOverride ?? callCodex,
     // The fixture monitor announces itself exactly like the real worker does.
     startSharedMonitor: startSharedMonitor ?? ((...args) => {
@@ -1928,6 +1928,72 @@ test('effort alone without a pin is refused without touching the name or sending
     assert.equal(f.record().modelPin, undefined);
     assert.equal(f.sends.length, 0);
   } finally { f.service.close(); }
+});
+
+const LOCKED = { config: { dshDefaultModelOnly: true } };
+
+test('locked to the DSH default, a caller model and effort never select anything', async () => {
+  const f = await fixture(LOCKED);
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    const created = await f.service.create({ name: 'artist', lifetime: 'persistent', model: 'alpha', effort: 'max' }, extra(A));
+    assert.equal(created.created, true);
+    assert.equal(f.record().modelPin, undefined, 'no pin is saved');
+    assert.equal(f.selections.length, 0, 'creation selects nothing');
+
+    const sent = await f.service.send({ name: 'artist', message: 'go', model: 'alpha-pro', effort: 'max' }, extra(A));
+    assert.equal(sent.accepted, true);
+    assert.equal(sent.actualModel, 'base', 'the task runs on the host default');
+    assert.equal(f.record().modelPin, undefined);
+    assert.notEqual(f.record().task.dispatches.at(-1).explicitModel, true);
+    assert.equal(f.selections.some(item => item.sessionOnly === true || item.model !== 'base'), false,
+      'only the host default was ever selected');
+  } finally { f.service.close(); }
+});
+
+test('locked to the DSH default, an effort alone is ignored instead of refused', async () => {
+  const f = await fixture(LOCKED);
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const sent = await f.service.send({ name: 'artist', message: 'work', effort: 'max' }, extra(A));
+    assert.equal(sent.accepted, true);
+    assert.equal(f.selections.some(item => item.reasoningEffort === 'max'), false);
+  } finally { f.service.close(); }
+});
+
+test('locked to the DSH default, a pin saved before the lock is never applied and leaves with the next task', async () => {
+  const f = await fixture(LOCKED);
+  try {
+    f.catalog(MULTI_MODEL_CATALOG);
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const record = f.record();
+    record.modelPin = { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'max' };
+    f.store.save(record);
+    const sent = await f.service.send({ name: 'artist', message: 'go' }, extra(A));
+    assert.equal(sent.accepted, true);
+    assert.equal(sent.actualModel, 'base');
+    assert.equal(f.selections.some(item => item.model === 'alpha-pro'), false, 'the old pin is never selected');
+    assert.equal(f.record().modelPin, undefined, 'the next task drops it');
+  } finally { f.service.close(); }
+});
+
+test('locked to the DSH default, status offers callers that one model and says so', async () => {
+  const locked = await fixture(LOCKED);
+  try {
+    locked.catalog(MULTI_MODEL_CATALOG);
+    const dsh = (await locked.service.status(extra(A))).backends.dsh;
+    assert.deepEqual(dsh.models, ['base']);
+    assert.equal(dsh.defaultModel, 'base');
+    assert.equal(dsh.modelLocked, true);
+  } finally { locked.service.close(); }
+  const open = await fixture();
+  try {
+    open.catalog(MULTI_MODEL_CATALOG);
+    const dsh = (await open.service.status(extra(A))).backends.dsh;
+    assert.deepEqual(dsh.models, ['base', 'alpha-pro', 'beta-mini'], 'without the switch every model stays offered');
+    assert.equal('modelLocked' in dsh, false);
+  } finally { open.service.close(); }
 });
 
 test('an unknown model lists the catalog IDs and creates no durable pin or dispatch', async () => {

@@ -10,7 +10,7 @@ const transportFields = ['dataRoot', 'dshDataRoot', 'target', 'baseUrl', 'instan
 // Behaviour switches a named profile may set for itself. They are deliberately not
 // transport fields: creating a profile copies only the connection, and a profile that
 // says nothing inherits the base configuration.
-const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs'];
+const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs', 'dshDefaultModelOnly'];
 const targetFields = ['futureaideSessionId', 'codexThreadId'];
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -21,6 +21,7 @@ function dshConfig(value) {
   if (value.reportPort !== undefined && (!Number.isInteger(value.reportPort) || value.reportPort < 0 || value.reportPort > 65535)) throw new Error('The loopback report port must be an integer between 0 and 65535.');
   if (value.idleSessionCleanup !== undefined && typeof value.idleSessionCleanup !== 'boolean') throw new Error('idleSessionCleanup must be true or false.');
   if (value.teamBoard !== undefined && typeof value.teamBoard !== 'boolean') throw new Error('teamBoard must be true or false.');
+  if (value.dshDefaultModelOnly !== undefined && typeof value.dshDefaultModelOnly !== 'boolean') throw new Error('dshDefaultModelOnly must be true or false.');
   // A wait that is not a whole number of milliseconds cannot be scheduled; 0 is allowed
   // and means the first definite absence is enough.
   if (value.claudeCallbackReminderMs !== undefined) claudeCallbackReminderMs(value.claudeCallbackReminderMs);
@@ -38,6 +39,13 @@ const idleSessionCleanup = (value, fallback = true) => typeof value === 'boolean
  * never imports the board module and never reads a projection for it.
  */
 const teamBoard = (value, fallback = false) => typeof value === 'boolean' ? value : fallback;
+
+/**
+ * Off unless the installation asks for it. On, every DSH name runs DSH's own default
+ * model and effort: a caller's model and effort are ignored for DSH, and the host
+ * bridge installed from this configuration refuses any other session selection.
+ */
+const dshDefaultModelOnly = (value, fallback = false) => typeof value === 'boolean' ? value : fallback;
 
 function validateProfileName(profile) {
   if (typeof profile !== 'string' || !PROFILE_NAME_PATTERN.test(profile)
@@ -130,6 +138,7 @@ export async function loadConfig(filename, profile) {
       teamBoard: teamBoard(selected.teamBoard, teamBoard(supplied.teamBoard)),
       claudeCallbackReminderMs: claudeCallbackReminderMs(selected.claudeCallbackReminderMs,
         claudeCallbackReminderMs(supplied.claudeCallbackReminderMs)),
+      dshDefaultModelOnly: dshDefaultModelOnly(selected.dshDefaultModelOnly, dshDefaultModelOnly(supplied.dshDefaultModelOnly)),
       stateDirectory: path.join(path.dirname(filename), 'state', 'profiles', profile),
       registryDirectory: path.join(path.dirname(filename), 'agents'),
       configFile: filename,
@@ -142,6 +151,7 @@ export async function loadConfig(filename, profile) {
     idleSessionCleanup: idleSessionCleanup(supplied.idleSessionCleanup),
     teamBoard: teamBoard(supplied.teamBoard),
     claudeCallbackReminderMs: claudeCallbackReminderMs(supplied.claudeCallbackReminderMs),
+    dshDefaultModelOnly: dshDefaultModelOnly(supplied.dshDefaultModelOnly),
     stateDirectory: path.join(path.dirname(filename), 'state'),
     registryDirectory: path.join(path.dirname(filename), 'agents'),
     configFile: filename,

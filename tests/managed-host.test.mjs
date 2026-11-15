@@ -94,8 +94,8 @@ async function fixture() {
     modelSelections, defaultSaves, imageAdmissions,
     failNextRemoval: () => { failRemoval = true; },
     own: (childId, parent) => ownedBy.set(childId, parent),
-    create: (context = ctx) => createManagedHost(context, { stateDirectory: path.join(root, 'managed'), store, removeDirectory,
-      installDelegation: async agentCtx => { agentCtx.get('tools').register({name:'managed_subagent'}); } }) };
+    create: (context = ctx, options = {}) => createManagedHost(context, { stateDirectory: path.join(root, 'managed'), store, removeDirectory,
+      installDelegation: async agentCtx => { agentCtx.get('tools').register({name:'managed_subagent'}); }, ...options }) };
 }
 
 const identity = workspace => ({ ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a', workspace, treeProtocol: 1, reportProtocol: 1 });
@@ -137,6 +137,27 @@ test('managed explicit model selection changes only the named session and never 
     error => error.controlCode === 'managed-model-unavailable');
   await assert.rejects(host.managedSelectModel({ ...a, sessionId: 'session-other', selection }),
     error => error.controlCode === 'managed-session-mismatch');
+  assert.equal(f.defaultSaves.length, 0);
+});
+
+test('a bridge locked to the default model refuses every other session selection', async () => {
+  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
+  await host.managedCreate(input);
+  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'other', model: 'alpha' } }),
+    error => error.controlCode === 'managed-model-locked');
+  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } }),
+    error => error.controlCode === 'managed-model-locked', 'the default model with another effort is another choice');
+  assert.deepEqual(f.modelSelections, [], 'no refused choice reached the Agent');
+  const same = await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model' } });
+  assert.equal(same.accepted, true, 'the default itself stays selectable');
+
+  // A default with an effort: that effort and an older pin that names none both pass.
+  f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'model', reasoningEffort: 'high' });
+  assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'high' } })).accepted, true);
+  assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model' } })).accepted, true,
+    'a pin saved without an effort is still the default model');
+  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } }),
+    error => error.controlCode === 'managed-model-locked');
   assert.equal(f.defaultSaves.length, 0);
 });
 

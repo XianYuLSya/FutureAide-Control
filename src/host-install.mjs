@@ -90,8 +90,10 @@ export async function installDesktopHostBridge(config, profileDirectory, { refre
   const discoveryFile = config.instanceFile;
   const discoveryConfig = discoveryFile ? `        discoveryFile: ${JSON.stringify(discoveryFile)}\n        dataRoot: ${JSON.stringify(config.dshDataRoot ?? config.dataRoot)}\n` : '';
   const stateConfig = config.managedStateDirectory ? `        managedStateDirectory: ${JSON.stringify(config.managedStateDirectory)}\n` : '';
+  // The bridge enforces the same lock as the plugin, for callers still on an older one.
+  const policyConfig = config.dshDefaultModelOnly === true ? '        defaultModelOnly: true\n' : '';
   const registration = createHash('sha256').update(JSON.stringify(stateConfig ? [module.href, credentialFile, discoveryConfig, stateConfig] : [module.href, credentialFile, discoveryConfig])).digest('hex').slice(0, 16);
-  const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${registration}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${stateConfig}${discoveryConfig}${end}\n`;
+  const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${registration}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${stateConfig}${discoveryConfig}${policyConfig}${end}\n`;
   const content = before.trimEnd() + '\n' + patch;
   if (content !== original) {
     const backup = path.join(path.dirname(credentialFile), 'rollback', `desktop-bridge-${Date.now()}`);

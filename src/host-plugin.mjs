@@ -202,7 +202,8 @@ function managedFileStore(directory) {
  * adapter below targets the JSONL, workspace and projection services verified in
  * DSH 0.2.1-rc.3; unsupported storage refuses cleanup instead of archiving it.
  */
-export function createManagedHost(ctx, { stateDirectory, store, removeDirectory = rm, installDelegation: testInstallDelegation } = {}) {
+export function createManagedHost(ctx, { stateDirectory, store, removeDirectory = rm, installDelegation: testInstallDelegation,
+  defaultModelOnly = false } = {}) {
   const root = ctx.root ?? ctx;
   const runtimeKey = Symbol.for('futureaide-control.managed-runtimes');
   const runtimes = root[runtimeKey] ??= new Map();
@@ -675,6 +676,17 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       const record = await load(input);
       if (record.closing) reject('managed-agent-closing');
       const selection = modelValue(input.selection);
+      // An installation that runs DSH on its default model only refuses every other
+      // session choice here, so a caller still on an older plugin cannot get around it.
+      if (defaultModelOnly) {
+        const current = service('agentDefaultModel')?.currentSelection();
+        const fallback = current ? modelValue(current) : undefined;
+        // The default model with no effort named is still the default: older pins were
+        // saved that way. Any other model, or another effort, is refused.
+        const allowed = fallback && selection.provider === fallback.provider && selection.model === fallback.model
+          && (selection.reasoningEffort === undefined || selection.reasoningEffort === fallback.reasoningEffort);
+        if (!allowed) reject('managed-model-locked');
+      }
       const agent = await activate(record);
       if (!agent) reject('managed-handle-unavailable');
       const controller = service('sessionController');
@@ -1044,6 +1056,7 @@ export function createHostHandler(ctx, token, options = {}) {
       if (!['capabilities', 'historyCursor', 'ping'].includes(endpoint)) reject('unknown-method');
       if (endpoint === 'ping') return { ok: true, value: { version: 1, revision: options.revision ?? null, ...(managed ? { treeProtocol: 1, reportProtocol: 1 } : {}),
         methods: ['capabilities', 'historyCursor', ...(managed ? MANAGED_METHODS : [])], pid: process.pid,
+        ...(managed && options.defaultModelOnly === true ? { modelPolicy: 'default-only' } : {}),
         compatibility: checkHostCompatibility(name => ctx.get(name)) } };
       if (endpoint === 'historyCursor') return { ok: true, value: await historyCursor(ctx, input.sessionId, input.workspace) };
       const { agent, activated } = await resolveAgent(ctx, input.sessionId, input.workspace, input.activate === true);
@@ -1063,6 +1076,7 @@ export async function apply(ctx, config) {
   const handler = createHostHandler(ctx, record.token, {
     stateDirectory: config.managedStateDirectory ?? path.join(path.dirname(config.credentialFile), 'managed-host'),
     revision: new URL(import.meta.url).searchParams.get('v'),
+    defaultModelOnly: config.defaultModelOnly === true,
   });
   const key = Symbol.for('futureaide-control.host-handler');
   const current = ctx.root[key];

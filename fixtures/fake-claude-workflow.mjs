@@ -29,10 +29,11 @@
 //   FAKE_CLAUDE_HOME           auth state, per-session turn records, invocation log
 //   FAKE_CLAUDE_SCENARIO_FILE  JSON {"steps":[{mode:'text'|'ask'|'final'|'deny'|'fail'|'hang', ...}]}
 //                              Step N drives turn N of each conversation.
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 const selfPath = fileURLToPath(import.meta.url);
 
@@ -211,6 +212,13 @@ async function runPrint(options) {
       calls.push({ tool: 'ask_parent', ...answer });
       emit(toolResult('toolu_ask', answer.ok === true ? JSON.stringify(answer.result) : String(answer.error), answer.ok !== true));
     } else if (step.mode === 'final') {
+      if (step.waitForFile) {
+        const deadline = Date.now() + 15000;
+        while (!existsSync(step.waitForFile)) {
+          if (Date.now() >= deadline) throw new Error('Timed out waiting for the fixture report gate.');
+          await sleep(40);
+        }
+      }
       const message = step.message ?? 'Fixture report: the work is done.';
       const final = step.final !== false;
       if (step.tryBlank) {

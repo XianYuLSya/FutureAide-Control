@@ -16,6 +16,7 @@
 //   stdout.stream.jsonl  raw CLI stdout, appended by the CLI itself
 //   stderr.log           raw CLI stderr
 //   state.json           normalized snapshot, replaced atomically by the worker
+//   terminal.json        final snapshot, only when state.json stays locked on Windows
 //   cancel.json          the cancel attempt and whether the whole tree really stopped
 //
 // Environment: every child inherits this process's environment unchanged. Proxy
@@ -44,7 +45,7 @@
 //   returned.
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -82,9 +83,11 @@ const PROBE_TIMEOUT_MS = 30000;
 
 export const CLAUDE_TURN_FILES = Object.freeze({
   owner: 'owner.json', turn: 'turn.json', prompt: 'prompt.txt', mcp: 'mcp.json',
-  stdout: 'stdout.stream.jsonl', stderr: 'stderr.log', state: 'state.json', cancel: 'cancel.json',
+  stdout: 'stdout.stream.jsonl', stderr: 'stderr.log', workerStderr: 'worker.stderr.log',
+  state: 'state.json', terminal: 'terminal.json', cancel: 'cancel.json',
 });
 
+export const CLAUDE_WORKER_ERROR_PREFIX = 'claude-cli-worker: ';
 const TERMINAL_STATES = Object.freeze(['ended', 'failed', 'cancelled']);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const fail = (code, message, extra) => Object.assign(new Error(message), { code, ...extra });
@@ -95,12 +98,30 @@ async function readJson(filename) {
   catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
 }
 
-/** Replace one JSON file in place; a reader never sees a half-written state. */
-export async function writeJsonFile(directory, name, value) {
+export function isClaudeStateFileBusy(error) {
+  return process.platform === 'win32' && error?.syscall === 'rename'
+    && ['EPERM', 'EBUSY', 'EACCES'].includes(error.code);
+}
+
+/** Keep the same complete snapshot through a rename retry. */
+export async function writeJsonFile(directory, name, value, { retryMs = 0 } = {}) {
   const target = path.join(directory, name);
   const temporary = target + '.' + process.pid + '.' + Math.random().toString(16).slice(2) + '.tmp';
-  await writeFile(temporary, JSON.stringify(value, null, 2) + '\n', { encoding: 'utf8' });
-  await replaceStateFile(temporary, target);
+  try {
+    await writeFile(temporary, JSON.stringify(value, null, 2) + '\n', { encoding: 'utf8' });
+    const deadline = performance.now() + retryMs;
+    for (;;) {
+      try { return await replaceStateFile(temporary, target); }
+      catch (error) {
+        const remaining = deadline - performance.now();
+        if (!isClaudeStateFileBusy(error) || remaining <= 0) throw error;
+        await delay(Math.min(100, remaining));
+      }
+    }
+  } catch (error) {
+    await unlink(temporary).catch(() => undefined);
+    throw error;
+  }
 }
 
 function processAlive(pid) {
@@ -778,6 +799,36 @@ export async function startClaudeTurn(input = {}, deps = {}) {
 // Reading
 // ---------------------------------------------------------------------------
 
+async function readTerminalSnapshot(directory, turn) {
+  if (!turn?.requestId || !turn.sessionId) return undefined;
+  const terminal = await readJson(path.join(directory, CLAUDE_TURN_FILES.terminal));
+  if (terminal?.requestId === turn.requestId && terminal.sessionId === turn.sessionId
+    && terminal.phase === 'exited' && TERMINAL_STATES.includes(terminal.state)) return terminal;
+  return undefined;
+}
+
+async function readTurnState(directory, turn, { checkTerminal = false } = {}) {
+  let state;
+  try {
+    state = await readJson(path.join(directory, CLAUDE_TURN_FILES.state));
+  } catch (error) {
+    const terminal = await readTerminalSnapshot(directory, turn);
+    if (terminal) return terminal;
+    throw error;
+  }
+  if (checkTerminal && !TERMINAL_STATES.includes(state?.state)) {
+    return await readTerminalSnapshot(directory, turn) ?? state;
+  }
+  return state;
+}
+
+async function workerLostError(directory, message) {
+  const stderr = await readFile(path.join(directory, CLAUDE_TURN_FILES.workerStderr), 'utf8').catch(() => '');
+  const diagnostic = stderr.split(/\r?\n/).find(line => line.startsWith(CLAUDE_WORKER_ERROR_PREFIX))
+    ?.slice(CLAUDE_WORKER_ERROR_PREFIX.length, CLAUDE_WORKER_ERROR_PREFIX.length + 400);
+  return { code: 'claude-turn-worker-lost', message: diagnostic ? message + ' Worker error: ' + diagnostic : message };
+}
+
 /**
  * Read one turn. Read-only: it never dispatches and never writes.
  * A worker that died without finalizing is reported failed (or cancelled) instead of
@@ -789,17 +840,17 @@ export async function startClaudeTurn(input = {}, deps = {}) {
  * @returns {Promise<object>} {state, model, messages, error?, sessionStarted, ...}
  */
 export async function readClaudeTurn(directory, { isAlive = processAlive } = {}) {
-  const state = await readJson(path.join(directory, CLAUDE_TURN_FILES.state));
   const turn = await readJson(path.join(directory, CLAUDE_TURN_FILES.turn));
+  let state = await readTurnState(directory, turn);
+  const alive = !state && Number.isSafeInteger(turn?.workerPid) && isAlive(turn.workerPid);
+  if (!state && turn && !alive) state = await readTurnState(directory, turn, { checkTerminal: true });
   if (!state) {
     if (!turn) throw fail('claude-turn-not-found', `No Claude turn is recorded in ${directory}.`);
-    const alive = Number.isSafeInteger(turn.workerPid) && isAlive(turn.workerPid);
-    if (!alive && await readJson(path.join(directory, CLAUDE_TURN_FILES.state))) return readClaudeTurn(directory, { isAlive });
     return {
       directory, state: alive ? 'running' : 'failed', requestId: turn.requestId ?? null,
       sessionId: turn.sessionId ?? null, cliSessionId: null, model: null, messages: [], sessionStarted: false,
-      ...(alive ? {} : { error: { code: 'claude-turn-worker-lost',
-        message: 'The detached Claude worker is gone and never wrote a state file. Nothing can be recovered from this turn.' } }),
+      ...(alive ? {} : { error: await workerLostError(directory,
+        'The detached Claude worker is gone and never wrote a state file. Nothing can be recovered from this turn.') }),
       workerPid: turn.workerPid ?? null, startedAt: turn.startedAt ?? null, endedAt: null,
     };
   }
@@ -809,20 +860,20 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
   const owned = [...new Set([workerPid, claudePid].filter(pid => pid !== null))];
   const live = new Map(owned.map(pid => [pid, isAlive(pid)]));
   const alivePids = owned.filter(pid => live.get(pid));
+  const workerAlive = workerPid !== null && live.get(workerPid) === true;
+  const heartbeat = Date.parse(state.heartbeatAt ?? state.updatedAt ?? state.startedAt ?? '');
+  const fresh = Number.isFinite(heartbeat) && Date.now() - heartbeat <= LOST_HEARTBEAT_MS;
   // The worker writes its final state and then exits, so a state read just before that
   // write can meet pids that are already gone. Only a read taken after they died may call
   // the turn lost; otherwise a finished turn would be reported failed.
-  if (!alivePids.length && !TERMINAL_STATES.includes(state.state)) {
-    const latest = await readJson(path.join(directory, CLAUDE_TURN_FILES.state));
-    if (TERMINAL_STATES.includes(latest?.state)) return readClaudeTurn(directory, { isAlive });
+  if ((!workerAlive || !fresh) && !TERMINAL_STATES.includes(state.state)) {
+    const latest = await readTurnState(directory, turn, { checkTerminal: true });
+    if (TERMINAL_STATES.includes(latest?.state)) state = latest;
   }
   let reported = state.state === undefined ? 'running' : state.state;
   let error = state.error ?? undefined;
   let orphaned;
   if (!TERMINAL_STATES.includes(reported)) {
-    const heartbeat = Date.parse(state.heartbeatAt ?? state.updatedAt ?? state.startedAt ?? '');
-    const fresh = Number.isFinite(heartbeat) && Date.now() - heartbeat <= LOST_HEARTBEAT_MS;
-    const workerAlive = workerPid !== null && live.get(workerPid) === true;
     if (marker?.stopped === true && !alivePids.length) {
       // Only a cancel that was confirmed against the whole tree makes a dead worker's turn
       // read as cancelled.
@@ -832,19 +883,19 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
       // happened to the worker. Reporting a terminal state here is what loses ownership of a
       // live CLI tree and lets cancel and delete claim a stop that never happened.
       if (!workerAlive) {
-        orphaned = { code: 'claude-turn-worker-lost',
-          message: 'The detached Claude worker is gone, but the CLI process tree it started is still running, so this turn is not settled. Cancel it to stop that whole tree.' };
+        orphaned = await workerLostError(directory,
+          'The detached Claude worker is gone, but the CLI process tree it started is still running, so this turn is not settled. Cancel it to stop that whole tree.');
       }
     } else if (owned.length) {
       // Every process this turn recorded is gone: the worker died mid-turn.
       reported = 'failed';
-      error = { code: 'claude-turn-worker-lost',
-        message: 'The detached Claude worker exited without recording a final state, and no process it started is still running. The turn did not finish and nothing was resent.' };
+      error = await workerLostError(directory,
+        'The detached Claude worker exited without recording a final state, and no process it started is still running. The turn has no recorded outcome. Nothing was resent.');
     } else if (!fresh) {
       // No process was ever recorded and nothing is beating: the worker never got that far.
       reported = 'failed';
-      error = { code: 'claude-turn-worker-lost',
-        message: 'The detached Claude worker stopped updating this turn for longer than the heartbeat window, so it is treated as gone.' };
+      error = await workerLostError(directory,
+        'The detached Claude worker stopped updating this turn for longer than the heartbeat window, so it is treated as gone.');
     }
   }
   return {
@@ -978,8 +1029,8 @@ async function markCancelled(directory, state) {
  */
 export async function cancelClaudeTurn(directory, { isAlive = processAlive, killTree = stopClaudeTree,
   commandLines = readCommandLines } = {}) {
-  const state = await readJson(path.join(directory, CLAUDE_TURN_FILES.state));
   const turn = await readJson(path.join(directory, CLAUDE_TURN_FILES.turn));
+  const state = await readTurnState(directory, turn, { checkTerminal: true });
   const pids = { worker: recordedWorkerPid(turn, state),
     claude: Number.isSafeInteger(state?.pid) && state.pid > 0 ? state.pid : null };
   if (!state && !turn) {
@@ -1012,7 +1063,7 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
   if (!targets.length) {
     // Every recorded process is already gone: the tree is stopped, whether or not the
     // worker got to write its own final state.
-    const latest = await readJson(path.join(directory, CLAUDE_TURN_FILES.state));
+    const latest = await readTurnState(directory, turn, { checkTerminal: true });
     const current = TERMINAL_STATES.includes(latest?.state) ? latest.state : 'cancelled';
     if (!TERMINAL_STATES.includes(latest?.state)) await markCancelled(directory, latest ?? state);
     await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel, { requestId, requestedAt, stopped: true, remaining: [], pids });
@@ -1063,7 +1114,7 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
         + (unknown.some(pid => remaining.includes(pid)) ? ' (its identity could not be read yet, so it was not killed)' : '')
         + '. The turn stays running and cancel can be retried.' };
   }
-  const latest = await readJson(path.join(directory, CLAUDE_TURN_FILES.state));
+  const latest = await readTurnState(directory, turn, { checkTerminal: true });
   const reusedNote = reused.length
     ? { note: 'Left alone because these pids now belong to other processes, so the original processes had already left: '
       + reused.join(', ') + '.' }

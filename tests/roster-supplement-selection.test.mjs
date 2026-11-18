@@ -72,6 +72,38 @@ test('an explicit pin and its queued supplement commit or roll back together', a
   } finally { store.close(); }
 });
 
+test('a Claude CLI callback fences earlier and later queue writes at final submission', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const record = { ...agent('d', 'headless'), target: 'claude-cli' };
+    const { taskId } = record.task;
+    record.task.dispatches.push({ requestId: 'current-input', kind: 'supplement', state: 'sending' });
+    store.insert(record);
+    const submit = final => store.submitParentMessage(record.agentId, { kind: 'report', message: 'work status', final },
+      { taskId, requestId: 'current-input' });
+
+    assert.equal(store.enqueueSupplement(record, 'current-input', 'already being read by this turn'), true);
+    store.setSupplement('current-input', 'sending');
+    assert.equal(store.enqueueSupplement(record, 'later-input', 'the next turn will receive this'), true);
+    assert.equal(submit(false).accepted, true, 'progress reports can pass while input is pending');
+    for (const status of ['queued', 'sending', 'unknown']) {
+      store.setSupplement('later-input', status);
+      assert.throws(() => submit(true), { code: 'supplement-undelivered' });
+    }
+    assert.equal(store.submissions(record.agentId, taskId).some(item => item.final), false);
+
+    store.setSupplement('later-input', 'blocked', 'final-submitted');
+    assert.equal(submit(true).accepted, true, 'the current input and a historical blocked input do not prevent final');
+    const lateSelection = { provider: 'claude-cli', model: 'claude-sonnet-5-5', reasoningEffort: 'high' };
+    record.modelPin = lateSelection;
+    assert.equal(store.enqueueSupplement(record, 'too-late', 'arrives after final was submitted', lateSelection,
+      { saveRecord: true }), false, 'the final inbox row closes the queue before it is absorbed');
+    assert.equal(store.get(record.agentId).modelPin, undefined);
+    assert.equal(store.supplement('too-late'), undefined);
+    assert.equal(store.supplement('later-input').status, 'blocked');
+  } finally { store.close(); }
+});
+
 test('an older roster gains the selection column without losing queued rows', async () => {
   const dir = await directory();
   const file = path.join(dir, 'roster.sqlite');

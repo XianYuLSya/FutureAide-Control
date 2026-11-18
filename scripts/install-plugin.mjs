@@ -146,22 +146,33 @@ export async function findClaudeCli({
   return found[0]?.cli;
 }
 
-/** Claude prints progress lines before its result, so only the last stdout line is JSON. */
+/** Plugin commands end with one JSON receipt, while plugin list prints a JSON array. */
 export async function runClaudeCommand(cli, args, { exec = execFileAsync } = {}) {
   if (!cli) throw new Error('The Claude CLI was not found.');
-  let stdout;
+  const listing = args[0] === 'plugin' && args[1] === 'list';
+  let stdout, failure;
   try { ({ stdout } = await exec(cli, args, { encoding: 'utf8', windowsHide: true })); }
   catch (error) {
-    // execFile rejects on a non-zero exit; its stderr is more specific than the error text.
-    throw new Error('Claude command failed: ' + args.join(' ') + ': ' + (error.stderr?.trim() || error.message));
+    failure = error;
+    stdout = error.stdout;
   }
-  const line = String(stdout ?? '').trim().split(/\r?\n/).pop() ?? '';
+  const output = String(stdout ?? '').trim();
+  const json = listing ? output : output.split(/\r?\n/).at(-1);
   let result;
-  try { result = JSON.parse(line); }
-  catch { throw new Error('Claude returned no JSON result for: ' + args.join(' ') + ': ' + line); }
+  try { result = JSON.parse(json); } catch { /* Some CLI failures only write stderr. */ }
+  if (failure) {
+    const detail = result?.message || failure.stderr?.trim() || failure.message;
+    throw Object.assign(new Error('Claude command failed: ' + args.join(' ') + ': ' + detail), { code: result?.failureCode });
+  }
+  if (result === undefined) throw new Error('Claude returned no JSON result for: ' + args.join(' ') + ': ' + json);
+  if (listing) {
+    if (Array.isArray(result)) return result;
+    throw new Error('Claude returned an invalid installed plugin list.');
+  }
   if (result?.outcome !== 'ok') {
-    throw new Error('Claude reported outcome ' + JSON.stringify(result?.outcome ?? null) + ' for: ' + args.join(' ')
-      + (result?.message ? ': ' + result.message : ''));
+    const detail = result?.message ? ': ' + result.message : '';
+    throw Object.assign(new Error('Claude reported outcome ' + JSON.stringify(result?.outcome ?? null) + ' for: ' + args.join(' ') + detail),
+      { code: result?.failureCode });
   }
   return result;
 }
@@ -192,10 +203,23 @@ export async function installClaudePlugin({
     name: CLAUDE_MARKETPLACE, owner: { name: 'FutureAide' },
     plugins: [{ name: PLUGIN, source: './plugins/' + PLUGIN, description: manifest.description, version }],
   });
-  // Both commands exit 0 when repeated, so re-registering is how an upgrade happens.
-  await runClaude(claudeCli, ['plugin', 'marketplace', 'add', marketplaceRoot, '--scope', 'user', '--json']);
-  await runClaude(claudeCli, ['plugin', 'install', claudePluginId, '--scope', 'user', '--json']);
-  return { registered: true, marketplaceRoot, pluginId: claudePluginId };
+  const userOptions = ['--scope', 'user', '--json'];
+  await runClaude(claudeCli, ['plugin', 'marketplace', 'add', marketplaceRoot, ...userOptions]);
+  // Re-running install re-enables a disabled plugin. Use it only when Claude
+  // confirms there is no installation at the requested scope.
+  let update;
+  try { update = await runClaude(claudeCli, ['plugin', 'update', claudePluginId, ...userOptions]); }
+  catch (error) {
+    if (!['not_installed', 'not_installed_at_scope'].includes(error.code)) throw error;
+    await runClaude(claudeCli, ['plugin', 'install', claudePluginId, ...userOptions]);
+  }
+  const installedVersion = update?.newVersion ?? (await runClaude(claudeCli, ['plugin', 'list', '--json']))
+    .find(plugin => plugin.id === claudePluginId && plugin.scope === 'user')?.version;
+  if (!installedVersion || installedVersion !== version) {
+    throw new Error(`Expected version ${version} for ${claudePluginId}. Claude reports ${installedVersion ?? 'no user installation'}.`);
+  }
+  return { registered: true, marketplaceRoot, pluginId: claudePluginId, version: installedVersion,
+    ...(update?.updateOutcome ? { updateOutcome: update.updateOutcome } : {}) };
 }
 
 export async function checkRuntime() {
@@ -295,7 +319,7 @@ export async function installPlugin({
       const cli = claudeCli || await findCli();
       if (!cli) throw new Error('The Claude CLI was not found. Put claude on PATH, pass --claude-cli <path>, or use --skip-claude.');
       claude = await installClaudePlugin({ sourceRoot, configFile, claudeCli: cli, runClaude });
-    } catch (error) { claude = { registered: false, reason: error.message }; }
+    } catch (error) { claude = { registered: false, reason: error.message, ...(error.code ? { code: error.code } : {}) }; }
   }
   const host = skipHost ? { ready: false, skipped: true } : await connectHost({ configFile, dshHome });
   return {

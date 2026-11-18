@@ -38,6 +38,8 @@ const QUESTION_UNANSWERED = 'Your parent has not answered your question yet, so 
   + 'The answer arrives in this conversation as a new message. Submit the final report after you have read it.';
 const ANSWER_UNDELIVERED = 'Your parent has answered your question and the answer is on its way into this conversation as a message beginning "Parent answer:", so this final report was not accepted. '
   + 'Read that answer and apply it before you submit the final report. If it has not appeared yet, end this turn without a final report; it arrives as the next message.';
+const SUPPLEMENT_UNDELIVERED = 'This final report was declined because your parent has queued more input. '
+  + 'End this turn to receive the next queued message in this conversation. Read and apply it before submitting a final report.';
 
 /** One small local database serializes overlapping MCP and recovery-worker calls. */
 export class RosterStore {
@@ -442,6 +444,8 @@ export class RosterStore {
    * commits this record (for example a new explicit pin) in the same transaction:
    * a caller holding the name lock gets an all-or-nothing queue write, and the
    * worker is only woken after both the supplement and the pin are durable.
+   * The CLI may submit its final before the monitor absorbs it onto the task.
+   * Check those submissions in the same write that queues more input.
    */
   enqueueSupplement(record, requestId, message, selection = undefined, { usePinnedModel = false, saveRecord = false } = {}) {
     const body = selection === undefined ? null : JSON.stringify(selection);
@@ -452,7 +456,9 @@ export class RosterStore {
       AND json_extract(id.body,'$.task.taskId')=? AND coalesce(json_extract(id.body,'$.closed'),0)=0
       AND coalesce(json_extract(id.body,'$.task.cancelRequested'),0)=0
       AND json_extract(id.body,'$.state') IN ('running','awaiting_input','awaiting_report','reconnecting')
-      AND NOT EXISTS (SELECT 1 FROM json_each(id.body,'$.task.reports') WHERE json_extract(value,'$.final')=1)`)
+      AND NOT EXISTS (SELECT 1 FROM json_each(id.body,'$.task.reports') WHERE json_extract(value,'$.final')=1)
+      AND (coalesce(json_extract(id.body,'$.target'),'dsh')<>'claude-cli' OR NOT EXISTS (
+        SELECT 1 FROM submissions WHERE owner=id.owner AND agent=id.id AND task=json_extract(id.body,'$.task.taskId') AND final=1))`)
       .run(requestId, message, new Date().toISOString(), usePinnedModel ? 1 : 0, body,
         record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
     if (!saveRecord) {
@@ -1127,6 +1133,15 @@ export class RosterStore {
         const open = this.openQuestions(record);
         if (open.unanswered) throw Object.assign(new Error(QUESTION_UNANSWERED), { code: 'question-unanswered' });
         if (open.undelivered) throw Object.assign(new Error(ANSWER_UNDELIVERED), { code: 'answer-undelivered' });
+        // A CLI turn must end before the next queued supplement can reach it. Its
+        // bound callback proves the current request arrived even if its receipt
+        // is still being recorded. This check and the final insert share the lock.
+        if (cliDispatch && this.db.prepare(`SELECT 1 FROM supplements
+          WHERE owner=? AND agent=? AND session=? AND task=? AND requestId<>?
+          AND status IN ('queued','sending','unknown') LIMIT 1`)
+          .get(record.ownerId, agentId, record.sessionId, task.taskId, cliDispatch.requestId)) {
+          throw Object.assign(new Error(SUPPLEMENT_UNDELIVERED), { code: 'supplement-undelivered' });
+        }
       }
       const id = 'submission-' + randomUUID().replaceAll('-', '');
       this.enqueueSubmission({ id, ownerId: record.ownerId, agentId, taskId: task.taskId, kind, message, final });

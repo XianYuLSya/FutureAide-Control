@@ -22,18 +22,20 @@
 // stdout.stream.jsonl by the CLI itself, so the raw transcript survives a worker crash and
 // nothing here needs a pipe that a confined sandbox could refuse to open.
 import { spawn } from 'node:child_process';
-import { open, readFile } from 'node:fs/promises';
+import { appendFile, open, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
-  CANCEL_CONFIRM_MS, CLAUDE_TURN_FILES, WORKER_HEARTBEAT_MS, applyClaudeLine, claudeInitError,
-  claudeTurnOutcome, createClaudeTurnState, stopClaudeTree, writeJsonFile,
+  CANCEL_CONFIRM_MS, CLAUDE_TURN_FILES, CLAUDE_WORKER_ERROR_PREFIX, WORKER_HEARTBEAT_MS,
+  applyClaudeLine, claudeInitError, claudeTurnOutcome, createClaudeTurnState, isClaudeStateFileBusy,
+  stopClaudeTree, writeJsonFile,
 } from './claude-cli-runner.mjs';
 
 const POLL_MS = 120;
 const READ_CHUNK = 1024 * 1024;
 const STDERR_TAIL_BYTES = 4000;
+const STATE_PUBLISH_RETRY_MS = 30000;
 
 async function readTextOptional(filename) {
   try { return await readFile(filename, 'utf8'); }
@@ -92,21 +94,23 @@ function createStdoutReader(directory, state) {
 /**
  * Run one turn to completion.
  * @param {string} directory The request's private directory.
- * @param {object} [deps] Test seams: spawn, sleep, pollMs, heartbeatMs, killTree.
+ * @param {object} [deps] Test seams: spawn, sleep, pollMs, heartbeatMs, killTree, statePublishRetryMs.
  * @returns {Promise<{state: string, exitCode: number|null, error?: object}>}
  */
 export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep = delay,
-  pollMs = POLL_MS, heartbeatMs = WORKER_HEARTBEAT_MS, killTree = stopClaudeTree } = {}) {
+  pollMs = POLL_MS, heartbeatMs = WORKER_HEARTBEAT_MS, killTree = stopClaudeTree,
+  statePublishRetryMs = STATE_PUBLISH_RETRY_MS } = {}) {
   const turn = JSON.parse(await readFile(path.join(directory, CLAUDE_TURN_FILES.turn), 'utf8'));
   const state = await readState(directory, turn);
+  const finish = options => finalize(directory, state, { ...options, retryMs: statePublishRetryMs });
   // This process owns the turn from here on, so it records its own pid before anything else
   // runs: the caller normally writes the same pid right after spawning, but it can die in that
   // gap, and a request nobody names is a CLI tree nobody can stop.
   turn.workerPid = Number.isSafeInteger(process.pid) ? process.pid : (turn.workerPid ?? null);
   state.workerPid = turn.workerPid;
   state.heartbeatAt = new Date().toISOString();
-  await writeJsonFile(directory, CLAUDE_TURN_FILES.turn, turn);
-  await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state);
+  await writeJsonFile(directory, CLAUDE_TURN_FILES.turn, turn, { retryMs: statePublishRetryMs });
+  await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state, { retryMs: statePublishRetryMs });
   const fileName = name => path.join(directory, name);
   const stdin = await open(fileName(CLAUDE_TURN_FILES.prompt), 'r');
   const stdout = await open(fileName(CLAUDE_TURN_FILES.stdout), 'a');
@@ -125,7 +129,7 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
     });
   } catch (error) {
     await closeAll();
-    return finalize(directory, state, { exitCode: null, cancelled: false,
+    return finish({ exitCode: null, cancelled: false,
       spawnFailure: 'The Claude CLI could not be started: ' + String(error?.message ?? error) });
   }
   // Registered immediately: a CLI that fails at once must not be missed while a file is written.
@@ -135,31 +139,41 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
   state.pid = Number.isSafeInteger(child.pid) ? child.pid : null;
   state.phase = 'running';
   state.heartbeatAt = new Date().toISOString();
-  await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state);
+  // A reader can hold the destination open on Windows. Keep polling the CLI, and
+  // publish the latest snapshot after it releases the file, including events read meanwhile.
+  const saveRunningState = async () => {
+    try {
+      await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state);
+      return true;
+    } catch (error) {
+      if (!isClaudeStateFileBusy(error)) throw error;
+      return false;
+    }
+  };
+  let pendingState = !await saveRunningState();
 
   const drain = createStdoutReader(directory, state);
-  const save = async () => {
-    try { if (await drain()) await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state); }
-    catch (error) { addWarning(state, 'claude-stream-read-failed', error); }
-  };
   let lastBeat = Date.now();
   let result;
   let initError;
   for (;;) {
-    await save();
+    try { if (await drain()) pendingState = true; }
+    catch (error) { addWarning(state, 'claude-stream-read-failed', error); }
     // The first system/init already says whether this CLI may keep running: a permission mode
     // other than the auto mode that was asked for, no mode at all, or a rejected callback server
     // means the turn is wrong, and the model must not keep acting under it. The check is the
     // runner's, so the reason that stops the CLI is the same one the turn ends with.
     if (state.sessionStarted) initError = claudeInitError(state);
     if (initError) break;
+    const now = Date.now();
+    if (now - lastBeat >= heartbeatMs) {
+      lastBeat = now;
+      state.heartbeatAt = new Date(now).toISOString();
+      pendingState = true;
+    }
+    if (pendingState) pendingState = !await saveRunningState();
     result = await Promise.race([finished, sleep(pollMs).then(() => null)]);
     if (result) break;
-    if (Date.now() - lastBeat >= heartbeatMs) {
-      lastBeat = Date.now();
-      state.heartbeatAt = new Date().toISOString();
-      await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state);
-    }
   }
 
   if (initError) {
@@ -173,7 +187,7 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
       addWarning(state, 'claude-cli-stop-unconfirmed',
         'The Claude CLI did not stop after system/init reported ' + initError.code + '; the turn stays open so a cancel can stop this tree.');
       state.heartbeatAt = new Date().toISOString();
-      await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state);
+      await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state, { retryMs: statePublishRetryMs });
       await closeAll();
       return { state: 'running', exitCode: null, error: initError };
     }
@@ -181,19 +195,17 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
 
   // The CLI may flush its final result line just before it dies, and that line may have no
   // trailing newline: drain everything that is left before deciding the outcome.
-  try {
-    await drain({ final: true });
-    await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state);
-  } catch (error) { addWarning(state, 'claude-stream-read-failed', error); }
+  try { await drain({ final: true }); }
+  catch (error) { addWarning(state, 'claude-stream-read-failed', error); }
   await closeAll();
 
   if (result.spawnError) {
-    return finalize(directory, state, { exitCode: null, cancelled: false,
+    return finish({ exitCode: null, cancelled: false,
       spawnFailure: 'The Claude CLI could not be started: ' + String(result.spawnError.message ?? result.spawnError) });
   }
   const marker = await readJsonOptional(fileName(CLAUDE_TURN_FILES.cancel));
   const stderrTail = (await readTextOptional(fileName(CLAUDE_TURN_FILES.stderr))).slice(-STDERR_TAIL_BYTES);
-  return finalize(directory, state, { exitCode: result.code ?? null,
+  return finish({ exitCode: result.code ?? null,
     cancelled: initError ? false : marker?.stopped === true, stderrTail, stopError: initError });
 }
 
@@ -206,7 +218,7 @@ function addWarning(state, code, error) {
   state.warnings = [...(state.warnings ?? []), { code, message: String(error?.message ?? error).slice(0, 400) }];
 }
 
-async function finalize(directory, state, { exitCode, cancelled, stderrTail = '', spawnFailure, stopError }) {
+async function finalize(directory, state, { exitCode, cancelled, stderrTail = '', spawnFailure, stopError, retryMs }) {
   const outcome = spawnFailure
     ? { state: 'failed', error: { code: 'claude-cli-spawn-failed',
       message: spawnFailure.slice(0, 700) + ' The turn never reached the model.' } }
@@ -219,7 +231,14 @@ async function finalize(directory, state, { exitCode, cancelled, stderrTail = ''
     state: outcome.state, phase: 'exited', exitCode, updatedAt: now, heartbeatAt: now,
     endedAt: state.endedAt ?? now, error: outcome.error ?? null,
   });
-  await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state);
+  try {
+    await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state, { retryMs });
+  } catch (error) {
+    if (!isClaudeStateFileBusy(error)) throw error;
+    // The CLI has exited, so the outcome can live in a separate file while the
+    // running snapshot is still locked.
+    await writeJsonFile(directory, CLAUDE_TURN_FILES.terminal, state);
+  }
   return { state: outcome.state, exitCode, ...(outcome.error ? { error: outcome.error } : {}) };
 }
 
@@ -237,14 +256,18 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const args = workerArguments(process.argv);
   const directory = args.get('turn');
   if (!directory) {
-    console.error('claude-cli-worker: --turn <directory> is required.');
+    console.error(CLAUDE_WORKER_ERROR_PREFIX + '--turn <directory> is required.');
     process.exit(2);
   }
   try {
     await runClaudeTurn({ directory });
     process.exit(0);
   } catch (error) {
-    console.error('claude-cli-worker: ' + (error?.message ?? error));
+    // The worker may lose access to state.json and its launcher discards stderr.
+    const diagnostic = CLAUDE_WORKER_ERROR_PREFIX + (error?.message ?? error);
+    await appendFile(path.join(directory, CLAUDE_TURN_FILES.workerStderr), diagnostic + '\n', { mode: 0o600 })
+      .catch(() => undefined);
+    console.error(diagnostic);
     process.exit(1);
   }
 }

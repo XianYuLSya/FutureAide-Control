@@ -343,6 +343,54 @@ test('the first dispatch names the session, ask_parent reaches the caller, answe
   assert.match(callerText(f.calls), /Delivered after the answer\./);
 });
 
+test('a Claude CLI final waits for all three supplements in the same session', async t => {
+  const gate = 'release-first-report';
+  const readyText = 'Working on the first input before reporting.';
+  const supplements = ['first extra instruction', 'second extra instruction', 'third extra instruction'];
+  const f = await assembly('queued-supplements', { steps: [
+    { mode: 'final', message: 'Early report 1', text: readyText, waitForFile: gate },
+    { mode: 'final', message: 'Early report 2' },
+    { mode: 'final', message: 'Early report 3' },
+    { mode: 'final', message: 'Final report after three supplements.' },
+  ] });
+  t.after(f.close);
+  const name = 'queued-cli';
+  await f.service.run({ name, target: 'claude-cli', lifetime: 'once', message: 'initial task' }, extra);
+  const { agentId } = f.record(name);
+  const running = await pollUntil(f, agentId, async record => {
+    const turn = await f.turnState(record);
+    return turn?.state?.state === 'running' && turn.state.messages.some(message => message.text === readyText);
+  }, { message: 'the first CLI turn to reach its report gate' });
+
+  for (const message of supplements) {
+    const sent = await f.service.send({ name, message }, extra);
+    assert.equal(sent.queued, true);
+    assert.equal(sent.accepted, false);
+  }
+  await f.service.poll(agentId);
+  assert.equal(f.store.supplementSummary(agentId, running.task.taskId).queued, 3);
+  assert.equal(f.store.get(agentId).task.dispatches.length, 1);
+  await writeFile(path.join(f.workspace, gate), 'open');
+
+  await pollUntil(f, agentId, () => Boolean(turn(f.invocations(), 0)),
+    { message: 'the first report attempt' });
+  const first = turn(f.invocations(), 0);
+  assert.equal(first.calls[0].error?.error?.code, 'supplement-undelivered');
+  assert.match(first.calls[0].error.error.message, /end this turn.*next queued message in this conversation/i);
+
+  await pollUntil(f, agentId, record => !record || record.state === 'supplement_blocked' || record.state === 'failed',
+    { message: 'the one-shot final to deliver and clean up' });
+  assert.equal(f.record(name), undefined);
+  const turns = f.invocations().filter(invocation => invocation.command === 'print');
+  assert.deepEqual(turns.map(invocation => invocation.prompt), ['initial task', ...supplements]);
+  assert.equal(new Set(turns.map(invocation => invocation.sessionId)).size, 1);
+  assert.deepEqual(turns.map(invocation => invocation.resumed), [false, true, true, true]);
+  assert.deepEqual(turns.map(invocation => invocation.calls.map(call => call.ok ? 'accepted' : call.error.error.code)),
+    [['supplement-undelivered'], ['supplement-undelivered'], ['supplement-undelivered'], ['accepted']]);
+  assert.doesNotMatch(callerText(f.calls), /Early report/);
+  assert.equal(callerText(f.calls).match(/Final report after three supplements\./g)?.length, 1);
+});
+
 test('a final report reaches a large Codex owner without a full turn page', async t => {
   let owner;
   const f = await assembly('codex-large-owner', { steps: [{ mode: 'final', message: 'Large-thread delivery complete.' }],

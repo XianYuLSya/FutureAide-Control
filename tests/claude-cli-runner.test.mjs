@@ -6,6 +6,8 @@
 // Scratch directories are created under clean/claude-cli-runner-tests/ and are left in
 // place on purpose: this project moves work aside instead of deleting it.
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { writeFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -15,7 +17,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   CLAUDE_TURN_FILES, allowedCallbackTools, applyClaudeLine, cancelClaudeTurn, claudeSystemPrompt,
   claudeTurnArguments, claudeTurnOutcome, createClaudeTurnState, mcpServerFromConfig,
-  permissionSupportFromHelp, probeClaudeCli, readClaudeTurn, startClaudeTurn,
+  permissionSupportFromHelp, probeClaudeCli, readClaudeTurn, startClaudeTurn, WORKER_HEARTBEAT_MS,
 } from '../src/claude-cli-runner.mjs';
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -37,7 +39,7 @@ async function waitForTurn(directory, done = value => value.state !== 'running',
   const deadline = Date.now() + timeout;
   for (;;) {
     const current = await readClaudeTurn(directory);
-    if (done(current)) return current;
+    if (await done(current)) return current;
     if (Date.now() > deadline) {
       throw new Error('turn did not settle: ' + JSON.stringify({ state: current.state, error: current.error,
         messages: current.messages.length, warnings: current.warnings }));
@@ -53,14 +55,14 @@ function alive(pid) {
 }
 
 const hanging = [];
-function run(directory, { scenario = 'ok', message = 'Do the task.', ...rest } = {}) {
+function run(directory, { scenario = 'ok', message = 'Do the task.', spawnWorker, ...rest } = {}) {
   // A hanging turn is cancelled at the end of the suite even if an assertion fails first:
   // a leaked stand-in CLI would keep running, because a real turn is meant to outlive its caller.
   if (scenario === 'hang') hanging.push(directory);
   process.env.FAKE_CLAUDE_SCENARIO = scenario;
   process.env.FAKE_CLAUDE_RECEIPT_DIR = path.join(directory, 'receipts');
   return startClaudeTurn({ directory, cli: fixtureCli, workspace: directory, sessionId: SESSION,
-    message, mcpConfig: MCP_CONFIG, ...rest }).then(async started => {
+    message, mcpConfig: MCP_CONFIG, ...rest }, { spawnWorker }).then(async started => {
     // The detached worker reads FAKE_CLAUDE_SCENARIO when it spawns. Do not let the
     // next case replace that environment before this worker has really started.
     const spawnLog = path.join(directory, 'receipts', 'fake-claude-spawns.log');
@@ -391,6 +393,98 @@ test('a full turn streams to ended with the real model and a connected MCP serve
   assert.match(await readFile(path.join(directory, CLAUDE_TURN_FILES.stdout), 'utf8'), /"type":"result"/);
 });
 
+async function lockStateFile(t, directory) {
+  const stateFile = path.join(directory, CLAUDE_TURN_FILES.state);
+  const lock = spawn('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', [
+    '$ErrorActionPreference = "Stop"',
+    '$holder = [IO.File]::Open($env:FA_TEST_STATE_FILE, "Open", "Read", "ReadWrite")',
+    '[Console]::WriteLine("locked")',
+    'try { [void][Console]::ReadLine() } finally { $holder.Dispose() }',
+  ].join('\n')], { windowsHide: true, stdio: ['pipe', 'pipe', 'inherit'],
+    env: { ...process.env, FA_TEST_STATE_FILE: stateFile } });
+  const lockExited = once(lock, 'close');
+  async function unlock() {
+    if (lock.stdin.writable) lock.stdin.end();
+    await lockExited;
+  }
+  t.after(unlock);
+  const [ready] = await Promise.race([once(lock.stdout, 'data'), lockExited]);
+  assert.equal(String(ready).trim(), 'locked');
+  return unlock;
+}
+
+test('the detached worker survives a Windows state-file lock through a heartbeat and CLI exit',
+  { skip: process.platform !== 'win32', timeout: 30000 }, async t => {
+    const directory = await scratch('locked-state');
+    hanging.push(directory);
+    const started = await run(directory, { scenario: 'wait-to-finish' });
+    const before = await waitForTurn(directory, turn => turn.sessionStarted);
+    const unlock = await lockStateFile(t, directory);
+    // Keep the lock longer than a heartbeat and the short atomic-rename retry window.
+    await delay(WORKER_HEARTBEAT_MS + 500);
+    assert.ok(alive(started.workerPid), 'the heartbeat must not take down the worker');
+    assert.ok(alive(before.claudePid), 'the same CLI is still running');
+    await writeFile(path.join(directory, 'finish-claude'), '');
+    const duringFinalPublish = await waitForTurn(directory, async turn => {
+      if (turn.state !== 'running') return true;
+      const prefix = `${CLAUDE_TURN_FILES.state}.${started.workerPid}.`;
+      for (const name of await readdir(directory)) {
+        if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue;
+        const draft = await readFile(path.join(directory, name), 'utf8').catch(error => {
+          if (error.code === 'ENOENT') return '';
+          throw error;
+        });
+        if (draft.includes('"state": "ended"')) return true;
+      }
+      return false;
+    }, { timeout: 5000 });
+    assert.equal(duringFinalPublish.state, 'running');
+    assert.equal(alive(before.claudePid), false);
+    await delay(500);
+    assert.ok(alive(started.workerPid), 'the worker still owns the result while state.json is locked');
+    assert.equal((await readClaudeTurn(directory)).state, 'running');
+
+    await unlock();
+    const turn = await waitForTurn(directory);
+    assert.equal(turn.state, 'ended');
+    assert.equal(turn.resultText, 'Finished after the signal.');
+    assert.equal(turn.claudePid, before.claudePid);
+    const starts = await readFile(path.join(directory, 'receipts', 'fake-claude-spawns.log'), 'utf8');
+    assert.equal(starts.trim().split(/\r?\n/).length, 1);
+    assert.ok(!(await readdir(directory)).some(name => name.endsWith('.tmp')));
+    await assert.rejects(stat(path.join(directory, CLAUDE_TURN_FILES.terminal)), { code: 'ENOENT' });
+  });
+
+test('a Windows lock past the retry window saves the same CLI result in terminal.json',
+  { skip: process.platform !== 'win32', timeout: 30000 }, async t => {
+    const directory = await scratch('persistent-state-lock');
+    hanging.push(directory);
+    const workerUrl = new URL('../src/claude-cli-worker.mjs', import.meta.url).href;
+    const started = await run(directory, { scenario: 'wait-to-finish', spawnWorker: requestDirectory => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e',
+        `import { runClaudeTurn } from ${JSON.stringify(workerUrl)};
+         await runClaudeTurn({ directory: process.argv[1], statePublishRetryMs: 0 });`, requestDirectory],
+      { detached: true, stdio: 'ignore', windowsHide: true });
+      child.unref();
+      return { pid: child.pid };
+    } });
+    const before = await waitForTurn(directory, turn => turn.sessionStarted);
+    await lockStateFile(t, directory);
+    await writeFile(path.join(directory, 'finish-claude'), '');
+    const turn = await waitForTurn(directory, value => value.state !== 'running', { timeout: 5000 });
+    assert.equal(turn.state, 'ended');
+    assert.equal(turn.resultText, 'Finished after the signal.');
+    assert.equal(turn.requestId, started.requestId);
+    assert.equal(turn.claudePid, before.claudePid);
+    const readSnapshot = async name => JSON.parse(await readFile(path.join(directory, name), 'utf8'));
+    assert.equal((await readSnapshot(CLAUDE_TURN_FILES.state)).state, 'running');
+    assert.equal((await readSnapshot(CLAUDE_TURN_FILES.terminal)).state, 'ended');
+    assert.ok(!(await readdir(directory)).some(name => name.endsWith('.tmp')));
+    const stopped = await cancelClaudeTurn(directory, { killTree: () => assert.fail('the completed turn was killed') });
+    assert.equal(stopped.state, 'ended');
+    assert.equal(stopped.cancelled, false);
+  });
+
 test('the CLI receives exactly the documented argv, prompt and MCP config', { timeout: 60000 }, async () => {
   const directory = await scratch('echo');
   await run(directory, { scenario: 'echo' });
@@ -655,10 +749,17 @@ test('a worker that vanished without finalizing is reported failed, not running'
   await writeFile(stateFile, JSON.stringify({ ...state, state: 'running', error: null, phase: 'running' }, null, 2));
   const turnFile = path.join(directory, CLAUDE_TURN_FILES.turn);
   await writeFile(turnFile, JSON.stringify({ ...JSON.parse(await readFile(turnFile, 'utf8')), workerPid: 2147483000 }, null, 2));
+  await writeFile(path.join(directory, CLAUDE_TURN_FILES.terminal), JSON.stringify({ ...state, requestId: 'different-request' }));
   const lost = await readClaudeTurn(directory, { isAlive: () => false });
   assert.equal(lost.state, 'failed');
   assert.equal(lost.error.code, 'claude-turn-worker-lost');
   assert.ok(lost.messages.length > 0, 'what the CLI printed is still readable');
+  assert.match(lost.error.message, /no recorded outcome\. Nothing was resent/);
+  await writeFile(path.join(directory, CLAUDE_TURN_FILES.workerStderr),
+    'claude-cli-worker: EPERM: operation not permitted, rename state.json\n');
+  const diagnosed = await readClaudeTurn(directory, { isAlive: () => false });
+  assert.equal(diagnosed.error.code, 'claude-turn-worker-lost');
+  assert.match(diagnosed.error.message, /Worker error: EPERM.*rename state\.json/);
   // Only a confirmed cancel can make a dead worker's turn read as cancelled.
   await writeFile(path.join(directory, CLAUDE_TURN_FILES.cancel), JSON.stringify({ requestedAt: new Date().toISOString(), stopped: true }));
   const cancelled = await readClaudeTurn(directory, { isAlive: () => false });

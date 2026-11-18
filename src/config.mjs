@@ -87,13 +87,16 @@ function validateProfile(value) {
 
 async function profileDirectory(filename, { create = false } = {}) {
   const directory = path.join(path.dirname(filename), 'profiles');
-  if (create) await mkdir(directory, { recursive: true });
+  let metadata;
   try {
-    const metadata = await lstat(directory);
-    if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error('Profiles directory must be a local directory, not a link.');
+    metadata = await lstat(directory);
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
+    if (!create) return directory;
+    await mkdir(directory, { recursive: true });
+    metadata = await lstat(directory);
   }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error('Profiles directory must be a local directory, not a link.');
   return directory;
 }
 

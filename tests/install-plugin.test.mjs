@@ -150,12 +150,22 @@ function claudeOptions(pkg, extra) {
 test('installation registers a thin Claude plugin that points at the runtime', async () => {
   const pkg = await claudePackage();
   const calls = [];
-  const runClaude = async (cli, args) => { calls.push([cli, args]); return { outcome: 'ok' }; };
-  const result = await installPlugin(claudeOptions(pkg, { runClaude }));
+  const exec = async (cli, args) => {
+    calls.push([cli, args]);
+    if (args[1] === 'update') throw Object.assign(new Error('Command failed'), {
+      stdout: '{"outcome":"failed","failureCode":"not_installed","message":"Plugin is not installed"}',
+    });
+    if (args[1] === 'list') return { stdout: JSON.stringify([
+      { id: 'futureaide-control@futureaide', scope: 'project', version: '0.5.6' },
+      { id: 'futureaide-control@futureaide', scope: 'user', version: '0.5.7' },
+    ], null, 2) };
+    return { stdout: '{"outcome":"ok"}' };
+  };
+  const result = await installPlugin(claudeOptions(pkg, { runClaude: (cli, args) => runClaudeCommand(cli, args, { exec }) }));
   const marketplaceRoot = path.join(pkg.sourceRoot, '.runtime', 'claude-marketplace');
   const pluginRoot = path.join(marketplaceRoot, 'plugins', 'futureaide-control');
   assert.equal(result.installed, true);
-  assert.deepEqual(result.claude, { registered: true, marketplaceRoot, pluginId: 'futureaide-control@futureaide' });
+  assert.deepEqual(result.claude, { registered: true, marketplaceRoot, pluginId: 'futureaide-control@futureaide', version: '0.5.7' });
   assert.match(result.next, /start a new chat/);
   const marketplace = JSON.parse(await readFile(path.join(marketplaceRoot, '.claude-plugin', 'marketplace.json'), 'utf8'));
   assert.equal(marketplace.name, 'futureaide');
@@ -173,20 +183,34 @@ test('installation registers a thin Claude plugin that points at the runtime', a
   assert.equal(await readFile(path.join(pluginRoot, 'skills', 'futureaide-control', 'SKILL.md'), 'utf8'), '# fixture skill');
   assert.deepEqual(calls, [
     ['C:\\Claude\\claude.exe', ['plugin', 'marketplace', 'add', marketplaceRoot, '--scope', 'user', '--json']],
+    ['C:\\Claude\\claude.exe', ['plugin', 'update', 'futureaide-control@futureaide', '--scope', 'user', '--json']],
     ['C:\\Claude\\claude.exe', ['plugin', 'install', 'futureaide-control@futureaide', '--scope', 'user', '--json']],
+    ['C:\\Claude\\claude.exe', ['plugin', 'list', '--json']],
   ]);
 });
 
-test('re-registering the Claude plugin is how an upgrade happens and does not fail', async () => {
+test('an existing Claude plugin uses update, including when it is already current', async () => {
   const pkg = await claudePackage();
   const calls = [];
-  const runClaude = async (cli, args) => { calls.push([cli, args]); return { outcome: 'ok', alreadyInstalled: true }; };
+  let installed = '0.5.6';
+  const runClaude = async (cli, args) => {
+    calls.push([cli, args]);
+    if (args[1] !== 'update') return { outcome: 'ok' };
+    const oldVersion = installed;
+    installed = pkg.manifest.version;
+    return { outcome: 'ok', oldVersion, newVersion: installed,
+      updateOutcome: oldVersion === installed ? 'up_to_date' : 'updated' };
+  };
   const options = claudeOptions(pkg, { runClaude });
   const first = await installPlugin(options);
   const second = await installPlugin(options);
   assert.equal(first.claude.registered, true);
   assert.equal(second.claude.registered, true);
-  assert.equal(calls.length, 4);
+  assert.equal(first.claude.version, '0.5.7');
+  assert.equal(first.claude.updateOutcome, 'updated');
+  assert.equal(second.claude.version, '0.5.7');
+  assert.equal(second.claude.updateOutcome, 'up_to_date');
+  assert.deepEqual(calls.map(([, args]) => args[1]), ['marketplace', 'update', 'marketplace', 'update']);
   assert.deepEqual(calls.slice(2), calls.slice(0, 2));
 });
 
@@ -204,7 +228,7 @@ test('a missing Claude CLI leaves the rest of the installation successful', asyn
 
 test('a refused Claude registration is reported without failing the installation', async () => {
   const pkg = await claudePackage();
-  const exec = async (cli, args) => Promise.resolve(args[1] === 'install'
+  const exec = async (cli, args) => Promise.resolve(args[1] === 'update'
     ? { stdout: '{"outcome":"error","message":"marketplace futureaide is not trusted"}' }
     : { stdout: 'progress line\n{"outcome":"ok"}' });
   const result = await installPlugin(claudeOptions(pkg, { runClaude: (cli, args) => runClaudeCommand(cli, args, { exec }) }));
@@ -223,11 +247,39 @@ test('a non-zero Claude exit is reported with its output', async () => {
   assert.match(result.claude.reason, /unknown command: plugin/);
 });
 
+test('a Claude update failure is surfaced with its machine receipt and does not call install', async () => {
+  const pkg = await claudePackage();
+  const commands = [];
+  const exec = async (cli, args) => {
+    commands.push(args[1]);
+    if (args[1] === 'update') throw Object.assign(new Error('Command failed'), {
+      stdout: 'Reading marketplace...\n{"outcome":"failed","failureCode":"invalid_source","message":"Plugin source is invalid"}',
+    });
+    return { stdout: '{"outcome":"ok"}' };
+  };
+  const result = await installPlugin(claudeOptions(pkg, { runClaude: (cli, args) => runClaudeCommand(cli, args, { exec }) }));
+  assert.deepEqual(commands, ['marketplace', 'update']);
+  assert.equal(result.claude.registered, false);
+  assert.equal(result.claude.code, 'invalid_source');
+  assert.match(result.claude.reason, /Plugin source is invalid/);
+  assert.equal(result.codex.registered, true);
+});
+
+test('Claude is not reported as registered when its marketplace serves an old version', async () => {
+  const pkg = await claudePackage();
+  const runClaude = async (cli, args) => args[1] === 'update'
+    ? { outcome: 'ok', updateOutcome: 'up_to_date', newVersion: '0.5.6' }
+    : { outcome: 'ok' };
+  const result = await installPlugin(claudeOptions(pkg, { runClaude }));
+  assert.equal(result.claude.registered, false);
+  assert.match(result.claude.reason, /Expected version 0\.5\.7.*Claude reports 0\.5\.6/);
+});
+
 test('the last stdout line must be a JSON result', async () => {
-  const ok = await runClaudeCommand('claude', ['plugin', 'list'],
+  const ok = await runClaudeCommand('claude', ['plugin', 'update'],
     { exec: async () => ({ stdout: 'Downloading marketplace…\n{"outcome":"ok","name":"futureaide"}\n' }) });
   assert.equal(ok.name, 'futureaide');
-  await assert.rejects(runClaudeCommand('claude', ['plugin', 'list'], { exec: async () => ({ stdout: 'not json' }) }),
+  await assert.rejects(runClaudeCommand('claude', ['plugin', 'update'], { exec: async () => ({ stdout: 'not json' }) }),
     /returned no JSON result/);
 });
 

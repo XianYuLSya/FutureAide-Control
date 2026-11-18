@@ -19,6 +19,7 @@
 //   crash         exits non-zero with stderr only, before init
 //   permission-rejected  exits non-zero saying --permission-mode auto is invalid
 //   hang          init only, then stays alive until killed (cancel tests)
+//   wait-to-finish init, then only emits a result after the test writes finish-claude
 //   echo          reports the exact argv, stdin and mcp config it received
 //   no-init       never prints system/init, only an assistant message and a result
 //   no-newline    ends with a result line that has no trailing newline
@@ -31,6 +32,7 @@
 //   FAKE_CLAUDE_RECEIPT_DIR  directory for fake-claude-receipt.json (what it saw) and
 //                            fake-claude-spawns.log (one line per CLI start)
 //   FAKE_CLAUDE_DELAY_MS     delay between emitted lines (default 5)
+import { existsSync } from 'node:fs';
 import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -187,6 +189,16 @@ switch (scenario) {
     // Stays alive until the test kills the tree.
     setInterval(() => {}, 1000);
     await sleep(120000);
+    break;
+  }
+  case 'wait-to-finish': {
+    init();
+    const deadline = Date.now() + 25000;
+    while (!existsSync('finish-claude')) {
+      if (Date.now() >= deadline) throw new Error('test did not release the fixture');
+      await sleep(25);
+    }
+    result({ text: 'Finished after the signal.' });
     break;
   }
   case 'echo': {

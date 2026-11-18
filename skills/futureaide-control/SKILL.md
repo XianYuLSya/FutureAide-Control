@@ -13,6 +13,8 @@ Codex Desktop targets require Codex to be started from FAswitch so its local deb
 
 Do not provide workspace paths, chat/session/agent IDs, profiles, callback targets, or private configuration. Do not use shell commands, communication txt files, or the legacy peer protocol for normal subagent work. If the tools are unavailable, report the actual plugin loading issue rather than impersonating the new workflow with old CLI calls.
 
+A running Claude CLI helper receives queued supplements in order as subsequent turns in the same session. If its final report returns `supplement-undelivered`, end the current turn so the next message can arrive. Submit the final report after applying the queued input.
+
 ## Selecting a model
 
 Run, create and send accept a full model ID or a substring such as `astra`. Matching ignores case and checks exact IDs first, then takes the first substring match in catalog order. A missing match returns an error listing available IDs. Set `effort` to a supported level or omit it when selecting a model to use its default effort. DSH applies explicit selections to the managed session only. If the bridge reports that it lacks session-only selection, update the DSH host bridge before retrying. Later sends, answers and reminders keep the name's selection. Pass `model` again to replace it, or `effort` alone to adjust an already selected model. Receipts and list/wait entries show the full ID as `actualModel` once known.

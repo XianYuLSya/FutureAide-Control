@@ -891,12 +891,16 @@ export async function createCodexBackend(record, deps = {}) {
               ...(startOnly ? { startOnly: true } : {}),
               onIntent });
             if (sent?.waiting === true) {
-              // Queue met an active root turn: durable "after A", no native write.
+              // The active root kept this input waiting. Save the current no-write
+              // intent with the receipt so a later cancellation can identify it.
               Object.assign(request, { status: 'waiting', route: 'after-current',
-                afterTurnId: sent.afterTurnId, attempted: false,
-                ...(sent.reschedule === true && sent.notSent === true ? {
-                  reschedule: { reason: sent.reason ?? 'turn-started-before-write',
-                    notSent: true, afterTurnId: sent.afterTurnId ?? null, at: new Date().toISOString() } } : {}) });
+                afterTurnId: sent.afterTurnId, attempted: false });
+              if (sent.reschedule === true && sent.notSent === true) {
+                const at = new Date().toISOString();
+                request.reschedule = { reason: sent.reason ?? 'turn-started-before-write',
+                  notSent: true, afterTurnId: sent.afterTurnId ?? null, at };
+                if (sent.notSentIntent) request.intent = { ...sent.notSentIntent, at };
+              }
               save(value);
               waiting = true;
               return;

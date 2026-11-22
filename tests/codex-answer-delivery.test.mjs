@@ -15,6 +15,7 @@ import { createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { createCodexBackend } from '../src/codex-backend.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
+import { answerOutcome, cancelledUnsentAnswer } from '../src/cleanup-input-receipts.mjs';
 import { liveThread, liveTurn, livePage } from '../test/live-thread-fixture.mjs';
 import { CODEX_MODELS } from '../test/assembly/renderer.mjs';
 
@@ -157,7 +158,7 @@ function codexDesktop(snapshot, { raceAnswer = false, loseStartReply = false, ra
 }
 
 async function fixture({ onBackend, host, directory, snapshot, raceAnswer = false, loseStartReply = false, raceExternalTurn = false,
-  registration = { ready: true } } = {}) {
+  raceBeforeAnswer, registration = { ready: true } } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = directory ?? await mkdtemp(path.join(base, 'answer-'));
@@ -174,7 +175,26 @@ async function fixture({ onBackend, host, directory, snapshot, raceAnswer = fals
       return { accepted: true };
     },
     backendAdapters: { 'codex-desktop': async (record, deps) => {
-      const backend = await createCodexBackend(record, { ...deps, ...(host ? { host } : {}), hostOptions: { nativeRequest: codex.request } });
+      let insideAnswer = false;
+      const options = { ...deps, ...(host ? { host } : {}), hostOptions: { nativeRequest: codex.request } };
+      if (raceBeforeAnswer) {
+        options.withHostLock = (action, ...args) => deps.withHostLock(async () => {
+          if (insideAnswer && raceBeforeAnswer) {
+            const inject = raceBeforeAnswer;
+            raceBeforeAnswer = undefined;
+            await inject(codex);
+          }
+          return action();
+        }, ...args);
+      }
+      const backend = await createCodexBackend(record, options);
+      if (raceBeforeAnswer) {
+        const deliver = backend.deliver.bind(backend);
+        backend.deliver = async args => {
+          insideAnswer = args.kind === 'answer';
+          try { return await deliver(args); } finally { insideAnswer = false; }
+        };
+      }
       onBackend?.(backend);
       return backend;
     } },
@@ -1026,4 +1046,112 @@ test('legacy failed answer migration skips cancelled, final and expired rounds',
       assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
     } finally { f.service.close(); }
   }
+});
+
+// Cross-package regression from the hotfix review: a verified cancellation must
+// expose the planned-but-unwritten native intent of an answer that lost the
+// write-time race, so the cleanup package can seal it as blocked after restart.
+test('a cancelled answer that loses the write-time external turn race stays blocked across restart', async () => {
+  const seed = await answerRaceSeed({ queuedInput: true });
+  let external;
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop,
+    raceBeforeAnswer: async desktop => {
+      external = (await desktop.request('turn/start', { threadId: seed.threadId,
+        input: [{ type: 'text', text: 'another client' }] })).turn.id;
+    } });
+  let snapshot, writesBeforeCancel;
+  try {
+    await pollTimes(f, seed, 2);
+    const request = f.store.backendState(seed.agentId).requests[seed.requestId];
+    assert.equal(f.codex.runningTurn(seed.threadId), external);
+    assert.equal(request.status, 'waiting');
+    assert.equal(request.attempted, false);
+    assert.equal(request.afterTurnId, external);
+    assert.equal(request.reschedule?.reason, 'turn-started-before-write');
+    assert.equal(request.reschedule?.notSent, true);
+    assert.equal(request.reschedule?.afterTurnId, external);
+    assert.equal(request.intent?.method, 'turn/start');
+    assert.equal(request.intent?.outcome, 'not-sent');
+    assert.equal(request.intent?.priorTurnId, external);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer'],
+      'the race wrote no answer turn');
+
+    writesBeforeCancel = f.codex.inputs().length;
+    await f.service.cancel({ name: 'lead' }, extra(BOSS));
+    await pollTimes(f, seed, 4);
+    assert.equal(f.codex.inputs().length, writesBeforeCancel, 'cancellation writes nothing');
+    const task = f.record('lead').task, dispatch = answerDispatch(f, seed.requestId);
+    assert.equal(task.state, 'cancelled');
+    assert.equal(task.cancelVerified, true);
+    assert.equal(task.cancelTreeSettled, true);
+    assert.equal(dispatch.state, 'cancelled');
+    assert.equal(dispatch.accepted, false);
+    assert.equal(dispatch.deliveryIntent?.method, 'start');
+    snapshot = f.codex.snapshot();
+  } finally { f.service.close(); }
+
+  // Reopen from the persisted roster only: the request must not be replayed and
+  // its planned turn must still have no native write receipt.
+  const reopened = await fixture({ directory: seed.directory, snapshot });
+  try {
+    const task = reopened.record('lead').task;
+    const dispatch = answerDispatch(reopened, seed.requestId);
+    const answer = task.answers.find(entry => entry.answerId === seed.requestId);
+    const backend = reopened.store.backendState(seed.agentId);
+    const request = backend.requests[seed.requestId];
+    assert.equal(reopened.codex.inputs().length, writesBeforeCancel, 'restart writes nothing');
+    assert.deepEqual(answerWrites(reopened).map(input => input.method), ['turn/steer']);
+    assert.deepEqual([request.status, request.route, request.attempted], ['waiting', 'after-current', false]);
+    assert.equal(request.afterTurnId, external);
+    assert.equal(request.reschedule?.reason, 'turn-started-before-write');
+    assert.equal(request.reschedule?.notSent, true);
+    assert.equal(request.reschedule?.afterTurnId, external);
+    assert.equal(request.intent?.method, 'turn/start');
+    assert.equal(request.intent?.outcome, 'not-sent');
+    assert.equal(request.intent?.threadId, seed.threadId);
+    assert.equal(request.intent?.priorTurnId, external);
+    assert.equal(request.native, undefined, 'the planned turn has no native write');
+
+    const row = (await reopened.service.inspect({ name: 'lead' }, extra(BOSS))).inputs
+      .find(entry => entry.requestId === seed.requestId);
+    assert.deepEqual([row.delivery, row.status, row.queued], ['blocked', 'blocked', false]);
+    assert.equal(cancelledUnsentAnswer(task, dispatch, backend), true);
+    assert.equal(answerOutcome(task, answer, backend), 'blocked');
+
+    // The ordinary queue input shares the wait but is not an answer: it can never
+    // produce answer proof, and it was never written.
+    const queueRow = reopened.store.supplements(seed.agentId).find(entry => entry.mode === 'queue');
+    assert.ok(queueRow, 'the ordinary queue input is still recorded');
+    assert.equal(task.answers.some(entry => entry.answerId === queueRow.requestId), false);
+    assert.equal(cancelledUnsentAnswer(task, queueRow, backend), false);
+    assert.deepEqual(queueWrites(reopened), [], 'the ordinary queue input was never written');
+  } finally { reopened.service.close(); }
+});
+
+test('a later unknown answer write stays unknown even when an older receipt was not sent', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop, loseStartReply: true });
+  try {
+    await pollTimes(f, seed, 2);
+    const dispatch = answerDispatch(f, seed.requestId);
+    const request = f.store.backendState(seed.agentId).requests[seed.requestId];
+    assert.equal(dispatch.state, 'unknown');
+    assert.deepEqual([request.status, request.attempted], ['unknown', true]);
+    assert.equal(request.reschedule?.notSent, true, 'the older no-write receipt still exists');
+    assert.equal(request.intent?.method, 'turn/start');
+    assert.equal(request.intent?.outcome, undefined, 'the later write never proved itself not sent');
+
+    await f.service.cancel({ name: 'lead' }, extra(BOSS));
+    await pollTimes(f, seed, 4);
+    const task = f.record('lead').task;
+    const answer = task.answers.find(entry => entry.answerId === seed.requestId);
+    const cancelled = answerDispatch(f, seed.requestId);
+    const backend = f.store.backendState(seed.agentId);
+    const row = (await f.service.inspect({ name: 'lead' }, extra(BOSS))).inputs
+      .find(entry => entry.requestId === seed.requestId);
+    assert.equal(row.delivery, 'unknown');
+    assert.equal(cancelledUnsentAnswer(task, cancelled, backend), false);
+    assert.equal(answerOutcome(task, answer, backend), 'unknown',
+      'an older notSent receipt cannot seal a later unknown write');
+  } finally { f.service.close(); }
 });

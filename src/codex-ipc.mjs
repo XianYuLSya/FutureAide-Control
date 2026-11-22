@@ -1607,7 +1607,9 @@ export async function sendCodexTextNative(threadId, text, {
     // turn. If another turn appeared before this write, it is not steered: report
     // a definite not-sent wait behind that turn and let the scheduler retry later.
     return { waiting: true, delivery: 'after-current', afterTurnId: active.id,
-      reschedule: true, notSent: true, reason: 'turn-started-before-write' };
+      reschedule: true, notSent: true, reason: 'turn-started-before-write',
+      notSentIntent: { method: 'turn/start', threadId, priorTurnId: active.id,
+        mode: intendedMode, outcome: 'not-sent' } };
   }
   if (!active && thread?.status?.type === 'active') {
     // The thread claims to be running but the turn page cannot name the turn. Starting

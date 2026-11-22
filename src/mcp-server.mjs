@@ -90,7 +90,7 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
       return { content: [{ type: 'text', text }],
         ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
-      if (trusted && !['feedback', 'futureaide_feedback'].includes(tool)) rememberError(trusted, args?.name, tool, error);
+      if (trusted && !['feedback', 'futureaide_feedback'].includes(tool)) rememberError(trusted, args?.name, tool, { code: error?.code ?? 'operation-failed', httpStatus: error?.httpStatus });
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
     } finally { finished?.(); }
   });

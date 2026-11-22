@@ -329,3 +329,28 @@ test('feedback lost reply is never replayed and tells secretary to check inbox',
     assert.match(result.content[0].text, /secretary.*inbox.*do not resend/i);
   } finally { await close(); await bridge.close(); }
 });
+import { mkdtemp } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { submitFeedback } from '../src/feedback-client.mjs';
+import { pendingFeedback } from '../src/feedback-inbox.mjs';
+
+test('feedback actually saved before reply loss remains one write', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'feedback-bootstrap-'));
+  const configFile = path.join(root, 'config.json');
+  const dead = remote({ tools: [{ name: 'futureaide_feedback', inputSchema: { type: 'object' } }], onCall: async () => {
+    const saved = await submitFeedback({kind:'problem',message:'response lost after successful save'}, {source:'claude-desktop',caller:'claude-desktop',target:'plugin',name:null,error:null}, {configFile});
+    assert.equal(saved.saved, true);
+    throw Error('connection closed after commit');
+  } });
+  const { bridge } = await bridgeWith({ remotes: [dead] });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    const response = await client.callTool({name:'futureaide_feedback',arguments:{kind:'problem',message:'response lost after successful save'}});
+    assert.equal(dead.calls.length, 1);
+    assert.match(response.content[0].text, /write-outcome-unknown/);
+    assert.match(response.content[0].text, /secretary.*inbox.*do not resend/i);
+    const rows = pendingFeedback(configFile); assert.equal(rows.length,1); assert.equal(rows[0].count,1); assert.equal(rows[0].occurrences.length,1);
+    assert.equal(pendingFeedback(configFile)[0].count,1);
+  } finally { await close(); await bridge.close(); }
+});

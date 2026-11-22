@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { withCodexInstrumentation } from './codex-instrumentation.mjs';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
@@ -642,7 +643,7 @@ export function createCodexHost(options = {}) {
       return { renamed: true };
     },
     async send({ nativeSessionId, message, model, effort, mode, selection, selectionExplicit,
-      legacySelection = false, knownSelections, onIntent, allowStart = true, resubscribe = false, blockReason }) {
+      legacySelection = false, knownSelections, onIntent, allowStart = true, startOnly = false, resubscribe = false, blockReason }) {
       // A thread whose release we already asked for may still read as idle while this
       // connection holds no subscription: the request was acknowledged, the idle grace
       // is running. Only a resume puts the subscription back before a turn rides it, so
@@ -663,6 +664,7 @@ export function createCodexHost(options = {}) {
         ...(knownSelections === undefined ? {} : { knownSelections }),
         ...(onIntent === undefined ? {} : { onIntent }),
         ...(allowStart === false ? { allowStart: false } : {}),
+        ...(startOnly ? { startOnly: true } : {}),
       });
       // A queue that met an active root turn is a durable "after A" answer, not a send.
       if (result?.waiting === true) return result;
@@ -702,7 +704,8 @@ export function createCodexHost(options = {}) {
         // Read-only on purpose: ensureCodexThreadNative would resume a cold thread, and
         // an idle list/inspect or a status poll must leave a released thread released.
         // Persisted turns and children stay readable while the thread is unloaded.
-        root = await readThreadForStatus(nativeSessionId);
+        root = await withCodexInstrumentation({ rootId: nativeSessionId, nodeId: nativeSessionId },
+          () => readThreadForStatus(nativeSessionId));
       } catch (error) {
         if (error.code === 'codex-empty-rollout') {
           // thread/start succeeded but the first rollout has not been written.
@@ -742,8 +745,9 @@ export function createCodexHost(options = {}) {
       const visit = async (thread, parentId) => {
         if (visited.has(thread.id)) return;
         visited.add(thread.id);
-        const page = await listCodexTurnsNative(thread.id, { limit: TURN_PAGE_LIMIT,
-          itemsView: 'summary', request: nativeRequest });
+        const page = await withCodexInstrumentation({ rootId: nativeSessionId, nodeId: thread.id },
+          () => listCodexTurnsNative(thread.id, { limit: TURN_PAGE_LIMIT,
+            itemsView: 'summary', request: nativeRequest }));
         const projection = projectCodexTurns(projections[thread.id], page.data, requests);
         const model = currentModelFromThread(thread);
         if (model) projection.currentModel = model;
@@ -756,7 +760,8 @@ export function createCodexHost(options = {}) {
         histories[thread.id] = { messages: projection.messages,
           hasMore: Boolean(page.nextCursor) || Boolean(projection.messagesOmitted) };
         hasMore ||= Boolean(page.nextCursor);
-        const children = await childrenOf(thread.id);
+        const children = await withCodexInstrumentation({ rootId: nativeSessionId, nodeId: thread.id },
+          () => childrenOf(thread.id));
         for (const child of children) if (typeof child?.id === 'string') await visit(child, thread.id);
       };
       await visit(root, null);

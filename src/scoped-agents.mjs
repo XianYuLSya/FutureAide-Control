@@ -254,9 +254,10 @@ function publicResult(record, { fullResult = false } = {}) {
     // list/wait must not present an intended selection as an observed model. An
     // unpinned Codex name starts null and becomes known from the live observation
     // before record.model catches up.
-    actualModel: record.modelPin && targetOf(record) !== 'claude-cli'
-      ? actualModelName(record.model) ?? actualModelName(record.observation?.currentModel)
-      : actualModelName(record.observation?.currentModel) ?? actualModelName(record.model),
+    actualModel: activeDispatch && Object.hasOwn(activeDispatch, 'actualModel') ? actualModelName(activeDispatch.actualModel)
+      : record.modelPin && targetOf(record) !== 'claude-cli'
+        ? actualModelName(record.model) ?? actualModelName(record.observation?.currentModel)
+        : actualModelName(record.observation?.currentModel) ?? actualModelName(record.model),
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
       ...(task.finishedAt ? { finishedAt: task.finishedAt } : {}),
       ...(task.result ? { result: { state: task.result.state,
@@ -361,6 +362,7 @@ function taskInputs(store, record) {
     put(dispatch.requestId, {
       requestId: dispatch.requestId,
       ...inputEffort(dispatch.model, dispatch.accepted ? dispatch.actualEffort ?? null : null, dispatch.effortAdjustment, dispatch.actualEffortSource),
+      actualModel: dispatch.accepted && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel) : null,
       ...(dispatch.mode ? { mode: dispatch.mode } : {}),
       ...(delivery ? { delivery } : {}),
       accepted: dispatch.accepted === true,
@@ -424,6 +426,7 @@ function taskInputs(store, record) {
     put(answer.answerId, {
       requestId: answer.answerId,
       ...inputEffort(dispatch?.model ?? answer.modelSelection, dispatch?.accepted ? dispatch.actualEffort ?? null : answer.actualEffort ?? null, dispatch?.effortAdjustment, dispatch?.actualEffortSource ?? answer.actualEffortSource),
+      actualModel: dispatch?.accepted && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel) : null,
       mode: 'steer',
       delivery,
       accepted,
@@ -1628,8 +1631,9 @@ export function createScopedAgents(config, {
         ? 'This input passed its six hours before it could be sent.'
         : 'This input could not be delivered; its body is kept.' } } : {}),
       ...effortReceipt(item?.selection ?? fallback.pin, dispatch?.actualEffort ?? stored.actualEffort ?? null, dispatch?.effortAdjustment ?? stored.effortAdjustment, dispatch?.actualEffortSource ?? stored.actualEffortSource),
-      actualModel: actualModelName(dispatch?.actualModel) ?? actualModelName(item?.selection) ?? actualModelName(fallback.pin)
-        ?? actualModelName(current.model) ?? actualModelName(current.modelPin),
+      actualModel: dispatch && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel)
+        : actualModelName(item?.selection) ?? actualModelName(fallback.pin)
+          ?? actualModelName(current.model) ?? actualModelName(current.modelPin),
       ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable',
         message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
       ...(fallback.previousReport ? { previousReport: fallback.previousReport } : {}),
@@ -1961,7 +1965,8 @@ export function createScopedAgents(config, {
       Object.assign(dispatch, { delivery, state, accepted,
         ...(sent.turnId ? { turnId: sent.turnId } : {}),
         ...(accepted ? { actualEffort: sent.actualEffort ?? null } : {}),
-        ...(accepted && (sent.actualModel || dispatch.deliveryModel?.model) ? { actualModel: sent.actualModel ?? dispatch.deliveryModel.model } : {}),
+        ...(accepted && Object.hasOwn(sent, 'actualModel') ? { actualModel: sent.actualModel }
+          : accepted && dispatch.deliveryModel?.model ? { actualModel: dispatch.deliveryModel.model } : {}),
         ...(accepted && sent.effortAdjustment ? { effortAdjustment: sent.effortAdjustment } : {}),
         ...(accepted && sent.actualEffort != null ? { actualEffortSource: sent.actualEffortSource ?? (target === 'dsh' || target === 'claude-cli' ? 'host-readback' : 'native-turn-start') } : {}),
         ...(sent.afterTurnId ?? (delivery === 'after-current' ? sent.turnId ?? root?.turnId : undefined)
@@ -3189,7 +3194,7 @@ export function createScopedAgents(config, {
       ...(Object.hasOwn(receipt, 'actualEffort') ? { actualEffort: receipt.actualEffort } : {}),
       ...(receipt.actualEffort != null && receipt.actualEffortSource ? { actualEffortSource: receipt.actualEffortSource } : {}),
       ...(receipt.effortAdjustment ? { effortAdjustment: receipt.effortAdjustment } : {}),
-      ...(receipt.actualModel ? { actualModel: receipt.actualModel } : {}),
+      ...(Object.hasOwn(receipt, 'actualModel') ? { actualModel: receipt.actualModel } : {}),
       ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}) });
     if (receipt.status === 'accepted' && receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
     if (receipt.status === 'rejected' || receipt.status === 'failed') {
@@ -4327,7 +4332,8 @@ export function createScopedAgents(config, {
           ...(dispatch?.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
           ...effortReceipt(dispatch?.model, dispatch?.actualEffort, dispatch?.effortAdjustment, dispatch?.actualEffortSource),
           ...(dshDefaultOnly(record) ? { modelLocked: true } : {}),
-          actualModel: actualModelName(current.model) ?? actualModelName(current.modelPin),
+          actualModel: dispatch && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel)
+            : actualModelName(current.model) ?? actualModelName(current.modelPin),
           ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
           ...(previousReport ? { previousReport } : {}),
           ...(error ? { error } : {}),

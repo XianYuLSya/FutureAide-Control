@@ -116,7 +116,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
       s.running = true; s.seq += 1;
       s.turns.set(input.requestId, { afterSeq, state: 'running' });
       sends.push(input);
-      return { accepted: true, afterSeq, actualEffort: reportedEffort === null ? null : s.model.reasoningEffort ?? null, actualEffortSource: reportedEffort === null ? null : 'host-readback' };
+      return { accepted: true, afterSeq, actualEffort: reportedEffort === null ? null : s.model.reasoningEffort ?? null, actualEffortSource: reportedEffort === null ? null : 'host-readback', ...(reportedEffort === null ? { actualModel: null } : {}) };
     },
     async wait(input) {
       const s = sessions.get(input.sessionId);
@@ -2366,6 +2366,9 @@ test('DSH accepted receipt with unknown actual effort never falls back to select
     assert.equal(receipt.selectedEffort, 'high');
     assert.equal(receipt.actualEffort, null);
     assert.equal(receipt.actualEffortSource, null);
-    assert.equal((await f.service.list(extra(A))).items[0].actualEffort, null);
+    assert.equal(receipt.actualModel, null);
+    const item = (await f.service.list(extra(A))).items[0];
+    assert.equal(item.actualEffort, null);
+    assert.equal(item.actualModel, null);
   } finally { f.service.close(); }
 });

@@ -302,13 +302,23 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
       return session?.projections?.values?.modelSelection?.next ?? null;
     },
     async selectModel({ requestId, provider, model, reasoningEffort, sessionOnly } = {}) {
+      let host;
       if (sessionOnly === true) {
-        const host = await client.hostStatus();
+        host = await client.hostStatus();
         if (!host?.methods?.includes('managedPrompt') || !host.methods.includes('managedPromptReceipt')) throw Object.assign(new Error('This DSH host bridge cannot safely validate model changes and recover prompt receipts. Update and reinstall the host bridge.'), { code: 'managed-prompt-unsupported', terminal: true });
       }
-      return control().selectModel({ sessionId: args().sessionId, provider, model,
-        ...(reasoningEffort === undefined ? {} : { reasoningEffort }), requestId,
-        ...(sessionOnly === true ? { sessionOnly: true } : {}) });
+      try {
+        return await control().selectModel({ sessionId: args().sessionId, provider, model,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }), requestId,
+          ...(sessionOnly === true ? { sessionOnly: true } : {}) });
+      } catch (error) {
+        // This explicit lock refusal is from the verified current bridge before any
+        // business prompt; the host default may have changed since catalog resolution.
+        if (sessionOnly === true && host?.modelPolicy === 'default-only' && error.code === 'managed-model-locked') {
+          throw Object.assign(new Error('DSH default model changed before session selection.'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
+        }
+        throw error;
+      }
     },
     async cancel() { return client.managedCancel(args()); },
     async destroy() { return client.managedDestroy(args()); },

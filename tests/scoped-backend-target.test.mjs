@@ -77,7 +77,7 @@ function dshFixture(events) {
     async hostStatus() {
       events.push('hostStatus');
       return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus',
-        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPrompt', 'managedPromptReceipt'] };
+        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPromptV2', 'managedPromptReceipt'] };
     },
     async managedCreate(input) {
       events.push('managedCreate');

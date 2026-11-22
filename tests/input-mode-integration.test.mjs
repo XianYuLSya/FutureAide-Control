@@ -281,7 +281,7 @@ function fakeDsh() {
   const api = {
     async connectionIdentity() { return { application: 'dsh', dataRoot: 'fixture' }; },
     async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask',
-      'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPrompt', 'managedPromptReceipt'] }; },
+      'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPromptV2', 'managedPromptReceipt'] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId,
         { sessionId: input.sessionId, taskId: undefined, model: { ...MODEL }, running: false,

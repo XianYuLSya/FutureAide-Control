@@ -281,7 +281,7 @@ function fakeDsh() {
   const api = {
     async connectionIdentity() { return { application: 'dsh', dataRoot: 'fixture' }; },
     async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask',
-      'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
+      'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPrompt', 'managedPromptReceipt'] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId,
         { sessionId: input.sessionId, taskId: undefined, model: { ...MODEL }, running: false,
@@ -449,7 +449,7 @@ function fakeCodex() {
       }
       const delivery = state.running ? 'current-turn' : 'new-turn';
       if (!state.running) { state.running = true; state.turnId = `turn-${++state.turnSeq}`; state.actualEffort = input.model?.reasoningEffort ?? null; }
-      const receipt = { status: 'accepted', accepted: true, delivery, turnId: state.turnId, actualEffort: state.actualEffort };
+      const receipt = { status: 'accepted', accepted: true, delivery, turnId: state.turnId, actualEffort: state.actualEffort, actualEffortSource: 'native-turn-start' };
       receipts.set(input.requestId, receipt);
       if (state.loseNext) { state.loseNext = false; throw Object.assign(new Error('lost response after native write'), { uncertain: true }); }
       return receipt;
@@ -701,6 +701,7 @@ for (const route of ['steer', 'start']) test(`Codex answer after a lost ${route}
     assert.equal(writes[0].model.requestedEffort, 'max');
     const row = inputFor(await restarted.inspect({ name }, extra(THREAD)), answer.requestId);
     assert.equal(row.actualEffort, route === 'steer' ? 'high' : 'max');
+    assert.equal(row.actualEffortSource, 'native-turn-start');
     assert.equal(row.turnId, route === 'steer' ? turnA : f.codex.state.turnId);
     assert.equal((await restarted.list(extra(THREAD))).items[0].actualEffort, row.actualEffort);
   } finally { f.service.close(); }

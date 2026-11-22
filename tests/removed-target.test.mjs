@@ -33,7 +33,7 @@ function dshFixture(calls) {
     async hostStatus() {
       calls.push('hostStatus');
       return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus',
-        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] };
+        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPrompt', 'managedPromptReceipt'] };
     },
     async managedCreate() { calls.push('managedCreate'); return { sessionId: 'never', modelRequestsStarted: 0 }; },
     async managedBeginTask() { calls.push('managedBeginTask'); return { treeProtocol: 1, reportProtocol: 1 }; },

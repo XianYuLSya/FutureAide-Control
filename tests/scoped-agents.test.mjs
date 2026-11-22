@@ -19,7 +19,7 @@ const extra = threadId => ({ _meta: { threadId } });
 const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
 async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles,
-  callCodex: callCodexOverride, config: extraConfig = {} } = {}) {
+  callCodex: callCodexOverride, config: extraConfig = {}, reportedEffort } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -32,7 +32,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
   const selections = [];
   const api = {
     async connectionIdentity() { if (offline) throw new Error('DSH offline'); return { application: 'dsh', dataRoot: path.join(stateDirectory, 'native') }; },
-    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
+    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPrompt', 'managedPromptReceipt'] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId, { ...input, model: { provider: 'fixture', model: 'test' }, running: false, seq: 0, questions: [], changes: [], turns: new Map() });
       return { ...sessions.get(input.sessionId), modelRequestsStarted: 0 };
@@ -116,7 +116,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
       s.running = true; s.seq += 1;
       s.turns.set(input.requestId, { afterSeq, state: 'running' });
       sends.push(input);
-      return { accepted: true, afterSeq };
+      return { accepted: true, afterSeq, actualEffort: reportedEffort === null ? null : s.model.reasoningEffort ?? null, actualEffortSource: reportedEffort === null ? null : 'host-readback' };
     },
     async wait(input) {
       const s = sessions.get(input.sessionId);
@@ -192,8 +192,8 @@ test('default model follows live host for new tasks, supplements and answers wit
     await f.service.send({ name: 'artist', message: 'switch back' }, extra(A));
     f.defaultModel(newModel);
     await f.service.send({ name: 'artist', message: 'switch again' }, extra(A));
-    assert.equal(f.selections.length, 3);
-    assert.equal(new Set(f.selections.map(item => item.requestId)).size, 3, 'each input owns its model receipt');
+    assert.equal(f.selections.length, 1, 'active supplements keep the running selection');
+    assert.equal(new Set(f.selections.map(item => item.requestId)).size, 1);
     assert.equal(f.catalogCalls(), 5);
     assert.equal(f.cursorCalls(), 0, 'begin/status observations supply the cursor');
     f.finish();
@@ -203,7 +203,7 @@ test('default model follows live host for new tasks, supplements and answers wit
     f.defaultModel({ provider: 'fixture', model: 'test' });
     await f.service.answer({ name: 'artist', message: 'yes' }, extra(A));
     await f.service.poll(record.agentId);
-    assert.equal(f.selections.length, 4);
+    assert.equal(f.selections.length, 2);
     assert.equal(f.sends.at(-1).message, 'Answer: yes');
     assert.equal(f.record().task.dispatches.at(-1).kind, 'answer');
     assert.equal(f.cursorCalls(), 0);
@@ -1130,6 +1130,7 @@ test('tree inspection and file attribution follow only this root lineage without
       f.sessions.set(id, { sessionId: id, turns: new Map([['native-turn', { afterSeq: 0, state: 'ended', endSeq: 2,
         messages: [{ seq: 1, text }] }]]) });
     }
+    const readsBeforeInspection = f.reads.length;
     const changes = await f.service.changes({ name: 'artist' }, extra(A));
     assert.deepEqual(changes.changes.map(item => item.agentPath), [['artist'], ['artist', 'designer'], ['artist', 'designer', 'reviewer']]);
     const list = await f.service.list(extra(A));
@@ -1140,7 +1141,7 @@ test('tree inspection and file attribution follow only this root lineage without
     assert.equal(inspected.tree.nodes[2].messages[0].text, 'Grandchild review');
     const visible = JSON.stringify([list, changes, inspected]);
     for (const hidden of ['native-child', 'native-grandchild', foreign.sessionId, 'foreign-secret.md', 'foreign chat']) assert.ok(!visible.includes(hidden));
-    assert.ok(!f.reads.includes(foreign.sessionId));
+    assert.ok(!f.reads.slice(readsBeforeInspection).includes(foreign.sessionId));
     assert.equal((await f.service.list(extra(B))).items[0].tree.nodes.length, 0);
   } finally { f.service.close(); }
 });
@@ -1580,7 +1581,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   ];
   f.store.save(record);
   const result = await f.service.send({ name: 'artist', message: 'private supplement' }, extra(A));
-  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualEffort', 'actualModel', 'callbackError', 'delivery', 'effortSource', 'mode', 'name', 'queued', 'requestId', 'requestedEffort', 'selectedEffort', 'state']);
+  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualEffort', 'actualEffortSource', 'actualModel', 'callbackError', 'delivery', 'effortSource', 'mode', 'name', 'queued', 'requestId', 'requestedEffort', 'selectedEffort', 'state']);
   assert.equal(result.accepted, true);
   assert.equal(result.callbackError.code, 'native-callback-unavailable');
   assert.doesNotMatch(JSON.stringify(result), /private|deep child|coverage/);
@@ -1987,7 +1988,7 @@ test('create resolves a model substring and keeps it across sends, effort change
     assert.equal(lastSelection.model, 'alpha-pro');
     assert.equal(lastSelection.reasoningEffort, 'max');
     assert.equal(lastSelection.sessionOnly, true);
-    assert.match(lastSelection.requestId, /-model(?:-[a-f0-9]{12})?$/);
+    assert.match(lastSelection.requestId, /-model(?:-\d+)?$/);
     assert.equal(f.record().task.dispatches.at(-1).model.reasoningEffort, 'max');
   } finally { f.service.close(); }
 });
@@ -2203,7 +2204,7 @@ test('create effort is consumed once and later inputs use the current default', 
     assert.equal(first.actualEffort, 'high');
     const second = await f.service.send({ name: 'artist', message: 'second' }, extra(A));
     assert.equal(second.requestedEffort, 'max');
-    assert.equal(second.actualEffort, 'max');
+    assert.equal(second.actualEffort, 'high', 'steer stays on the active turn');
     assert.equal(f.record().modelPin, undefined);
   } finally { f.service.close(); }
 });
@@ -2301,7 +2302,7 @@ test('a locked DSH supplement with uncertain write is never resent after default
     assert.equal(dispatch.delivery, 'unknown');
   } finally { f.service.close(); }
 });
-test('a locked DSH supplement retries its original ID on confirmed pre-write failure', async () => {
+test('a locked DSH supplement retries its original ID and keeps the active selection', async () => {
   let attempts = 0;
   const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
     if (++attempts === 2) throw Object.assign(new Error('default changed'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
@@ -2318,6 +2319,53 @@ test('a locked DSH supplement retries its original ID on confirmed pre-write fai
     assert.equal(attempts, 3);
     assert.equal(f.sends.length, 2);
     assert.equal(f.sends[1].requestId, receipt.requestId);
-    assert.equal(f.record().task.dispatches.find(item => item.requestId === receipt.requestId).model.provider, 'new-route');
+    assert.equal(f.record().task.dispatches.find(item => item.requestId === receipt.requestId).deliveryModel.provider, 'fixture');
+  } finally { f.service.close(); }
+});
+test('locked DSH reselects A then B then A with fresh selection steps and one business input', async () => {
+  let attempts = 0;
+  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
+    if (++attempts <= 2) throw Object.assign(new Error('default changed before write'), { notSent: true, retryableRead: true });
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'only once', effort: 'high' }, extra(A));
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    let record = f.record(); record.task.dispatches[0].nextAttemptAt = 0; f.store.save(record);
+    await f.service.poll(record.agentId);
+    f.defaultModel({ provider: 'fixture', model: 'test' });
+    record = f.record(); record.task.dispatches[0].nextAttemptAt = 0; f.store.save(record);
+    await f.service.poll(record.agentId);
+    assert.deepEqual(f.selections.map(item => item.provider), ['fixture', 'new-route', 'fixture']);
+    assert.equal(new Set(f.selections.map(item => item.requestId)).size, 3);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.sends[0].requestId, receipt.requestId);
+  } finally { f.service.close(); }
+});
+test('DSH steer keeps active high while freezing max as the next-start choice', async () => {
+  const f = await fixture({ config: { dshDefaultModelOnly: true } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'start', effort: 'high' }, extra(A));
+    const steer = await f.service.send({ name: 'artist', message: 'continue' }, extra(A));
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === steer.requestId);
+    assert.equal(dispatch.model.requestedEffort, 'max');
+    assert.equal(dispatch.model.reasoningEffort, 'max');
+    assert.equal(dispatch.deliveryModel.reasoningEffort, 'high');
+    assert.equal(steer.actualEffort, 'high');
+    assert.equal(f.selections.length, 1, 'no session selection changed during the active turn');
+  } finally { f.service.close(); }
+});
+
+test('DSH accepted receipt with unknown actual effort never falls back to selected effort', async () => {
+  const f = await fixture({ reportedEffort: null });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'accepted with missing effort', effort: 'high' }, extra(A));
+    assert.equal(receipt.accepted, true);
+    assert.equal(receipt.selectedEffort, 'high');
+    assert.equal(receipt.actualEffort, null);
+    assert.equal(receipt.actualEffortSource, null);
+    assert.equal((await f.service.list(extra(A))).items[0].actualEffort, null);
   } finally { f.service.close(); }
 });

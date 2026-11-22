@@ -82,7 +82,7 @@ export const name = 'futureaide-control-host';
 export const inject = ['connection', 'webServer', 'agents', 'sessions'];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedSelectModel',
-  'managedPrompt', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+  'managedPrompt', 'managedPromptReceipt', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
 
 // DSH's own question tool opens a prompt in the DSH window, which the chat that
 // dispatched the task never sees: the agent waits and the caller is never asked.
@@ -734,13 +734,13 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       const controller = service('sessionController'), commands = controller?.commands, agents = controller?.agents;
       if (typeof commands?.prompt !== 'function' || typeof commands?.hasPromptRequest !== 'function' || typeof agents?.serializeImageAdmission !== 'function') reject('managed-prompt-unsupported');
       record.promptSelections ??= {};
+      const messageHash = createHash('sha256').update(input.message).digest('hex');
       const prior = record.promptSelections[input.requestId];
-      if (prior && (prior.message !== input.message || prior.mode !== input.mode)) reject('managed-prompt-conflict');
+      if (prior && (prior.messageHash !== messageHash || prior.mode !== input.mode)) reject('managed-prompt-conflict');
       if (commands.hasPromptRequest(agent.session, input.requestId)) {
-        if (!prior?.selection) reject('managed-prompt-receipt-unavailable');
-        return { accepted: true, requestId: input.requestId, selected: prior.selection, duplicate: true };
+        return { accepted: true, requestId: input.requestId, selected: prior?.confirmedSelection ?? null, duplicate: true };
       }
-      record.promptSelections[input.requestId] = { message: input.message, mode: input.mode, selection };
+      record.promptSelections[input.requestId] = { messageHash, mode: input.mode, selection };
       await persist(record);
       return agents.serializeImageAdmission(agent, async () => {
         let mismatch = false, intercepted = false;
@@ -761,12 +761,24 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
           const request = { sessionId: input.sessionId, requestId: input.requestId, mode: input.mode, content: [{ type: 'text', text: input.message }], clientTimeZone: 'Asia/Shanghai' };
           const result = await commands.prompt(request, { kind: 'user', rpcId: input.requestId, clientTimeZone: 'Asia/Shanghai' });
           if (result?.accepted !== true || (!intercepted && !commands.hasPromptRequest(agent.session, input.requestId))) reject('managed-prompt-unconfirmed');
+          if (!intercepted) return { accepted: true, requestId: input.requestId, selected: null };
+          record.promptSelections[input.requestId].confirmedSelection = selection;
+          try { await persist(record); } catch (error) { delete record.promptSelections[input.requestId].confirmedSelection; throw error; }
           return { accepted: true, requestId: input.requestId, selected: selection };
         } catch (error) {
           if (mismatch && !commands.hasPromptRequest(agent.session, input.requestId)) return { accepted: false, status: 'retryable', notSent: true, code: 'managed-model-changed' };
           throw error;
         } finally { agent.steer = originals.steer; agent.followup = originals.followup; }
       });
+    }); },
+    managedPromptReceipt(input) { return serial(input, async () => {
+      managedId(input.requestId);
+      const record = await load(input), agent = await activate(record);
+      const prior = record.promptSelections?.[input.requestId];
+      const commands = service('sessionController')?.commands;
+      if (typeof commands?.hasPromptRequest !== 'function') reject('managed-prompt-unsupported');
+      if (!commands.hasPromptRequest(agent.session, input.requestId)) return { status: 'unknown', requestId: input.requestId };
+      return { status: 'accepted', requestId: input.requestId, selected: prior?.confirmedSelection ?? null };
     }); },
     managedHistory(input) { return serial(input, async () => {
       const record = await load(input);

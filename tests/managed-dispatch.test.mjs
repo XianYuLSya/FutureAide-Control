@@ -28,6 +28,8 @@ async function fixture({ modern = false, changeInstance = false } = {}) {
     state.calls.push(body);
     const reply = value => new Response(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value } }));
     const reject = code => new Response(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: false, error: { code } } }));
+    if (method === 'managedPromptReceipt') return reply(state.nativeReceipt ?? { status: 'unknown' });
+    if (method === 'ping') return reply({ methods: state.oldBridge ? ['managedSelectModel'] : ['managedPrompt', 'managedPromptReceipt'] });
     if (method === 'managedPrompt') {
       const args = body.payload.args;
       if (state.oldBridge) return reject('unknown-method');
@@ -223,5 +225,24 @@ test('DSH recovered accepted receipt exposes confirmed model and effort includin
     const receipt = await backend.receipt({ requestId });
     assert.equal(receipt.status, 'accepted'); assert.equal(receipt.actualModel, 'm');
     assert.equal(receipt.actualEffort, expected); assert.ok(Object.hasOwn(receipt, 'actualEffort'));
+    assert.equal(receipt.actualEffortSource, expected ? 'host-readback' : undefined);
   }
+});
+
+
+test('DSH checks host prompt capability before selection and recovers native receipt by read only', async () => {
+  const f = await fixture();
+  const backend = createDshBackend({ client: f.client, control: () => f.control, hostArgs: () => f.binding, requestDirectory: () => f.config.stateDirectory });
+  f.state.oldBridge = true;
+  await assert.rejects(backend.selectModel({ requestId: 'select', provider: 'fixture', model: 'm', sessionOnly: true }), e => e.code === 'managed-prompt-unsupported' && /Update/.test(e.message));
+  assert.equal(f.state.managedSelections.length, 0);
+  f.state.oldBridge = false; f.state.losePromptReply = true;
+  await assert.rejects(f.control.send({ sessionId: 'session-a', message: 'work', requestId: 'lost-native', selection: { provider: 'fixture', model: 'm', reasoningEffort: 'high' } }), e => e.uncertain);
+  f.state.nativeReceipt = { status: 'accepted', requestId: 'lost-native', selected: { provider: 'fixture', model: 'm', reasoningEffort: 'high' } };
+  const receipt = await backend.receipt({ requestId: 'lost-native' });
+  assert.equal(receipt.status, 'accepted'); assert.equal(receipt.actualEffort, 'high'); assert.equal(receipt.actualModel, 'm'); assert.equal(receipt.actualEffortSource, 'host-readback');
+  f.state.nativeReceipt = { status: 'accepted', requestId: 'lost-native', selected: null };
+  const unknown = await backend.receipt({ requestId: 'lost-native' });
+  assert.equal(unknown.status, 'accepted'); assert.equal(unknown.actualEffort, null); assert.equal(unknown.actualModel, null); assert.equal(unknown.actualEffortSource, undefined);
+  assert.equal(f.state.prompts, 1);
 });

@@ -699,10 +699,14 @@ export class FutureAideClient {
         throw error;
       }
       if (value?.status === 'retryable' && value.notSent === true) throw Object.assign(new Error('DSH default model or session selection changed before writing.'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
-      if (value?.accepted !== true || value.requestId !== requestId || !value.selected) fail('invalid-response', 'DSH did not confirm the managed prompt.', { uncertain: true });
-      return { ...value, accepted: true, requestId, actualEffort: value.selected.reasoningEffort ?? null, actualModel: value.selected.model };
+      if (value?.accepted !== true || value.requestId !== requestId || !Object.hasOwn(value, 'selected')) fail('invalid-response', 'DSH did not confirm the managed prompt.', { uncertain: true });
+      return { ...value, accepted: true, requestId, actualEffort: value.selected?.reasoningEffort ?? null, ...(value.selected?.reasoningEffort ? { actualEffortSource: 'host-readback' } : {}), actualModel: value.selected?.model ?? null };
     }
     return this.#sendPrompt(row.sessionId, text, { mode, requestId }, expectedInstance, gate);
+  }
+  async managedPromptReceipt(input, requestId) {
+    validId(requestId, 'requestId');
+    return this.#managedCall('managedPromptReceipt', { ...input, requestId }, false);
   }
   async managedSelectModel(input, selection, { sessionOnly = false } = {}) {
     if (sessionOnly !== true) {

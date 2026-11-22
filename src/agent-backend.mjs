@@ -275,8 +275,19 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
       if (typeof requestId !== 'string' || !requestId) return undefined;
       try {
         const value = JSON.parse(await readFile(receiptFile(requestId), 'utf8'));
+        if (['unknown', 'sending'].includes(value.status) && typeof client.managedPromptReceipt === 'function') {
+          try {
+            const currentHost = await client.connectionIdentity();
+            const identity = host => { const { instanceFile, ...rest } = host ?? {}; return JSON.stringify(rest); };
+            if (!value.instance || identity(value.instance) !== identity(currentHost)) return { status: 'unknown', afterSeq: value.afterSeq };
+            const native = await client.managedPromptReceipt(args(), requestId);
+            if (native?.status === 'accepted' && Object.hasOwn(native, 'selected')) return { status: 'accepted', afterSeq: value.afterSeq,
+              actualModel: native.selected?.model ?? null, actualEffort: native.selected?.reasoningEffort ?? null, ...(native.selected?.reasoningEffort ? { actualEffortSource: 'host-readback' } : {}) };
+          } catch { /* A read failure never authorizes another write. */ }
+        }
         return { status: value.status ?? 'unknown', afterSeq: value.result?.afterSeq ?? value.afterSeq,
           ...(value.result && Object.hasOwn(value.result, 'actualEffort') ? { actualEffort: value.result.actualEffort } : {}),
+          ...(value.result && Object.hasOwn(value.result, 'actualEffortSource') ? { actualEffortSource: value.result.actualEffortSource } : {}),
           ...(value.result && Object.hasOwn(value.result, 'actualModel') ? { actualModel: value.result.actualModel } : {}),
           ...(value.result ? { result: value.result } : {}) };
       } catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
@@ -291,6 +302,10 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
       return session?.projections?.values?.modelSelection?.next ?? null;
     },
     async selectModel({ requestId, provider, model, reasoningEffort, sessionOnly } = {}) {
+      if (sessionOnly === true) {
+        const host = await client.hostStatus();
+        if (!host?.methods?.includes('managedPrompt') || !host.methods.includes('managedPromptReceipt')) throw Object.assign(new Error('This DSH host bridge cannot safely validate model changes and recover prompt receipts. Update and reinstall the host bridge.'), { code: 'managed-prompt-unsupported', terminal: true });
+      }
       return control().selectModel({ sessionId: args().sessionId, provider, model,
         ...(reasoningEffort === undefined ? {} : { reasoningEffort }), requestId,
         ...(sessionOnly === true ? { sessionOnly: true } : {}) });

@@ -112,3 +112,11 @@ test('dispatch defaults, explicit effort and nearest supported effort', () => {
   assert.throws(() => resolveDispatchSelection(c, { model: 'unknown' }), { code: 'effort-capability-unknown' });
   assert.throws(() => resolveDispatchSelection({}), { code: 'model-catalog-unavailable' });
 });
+
+
+test('implicit model matches exact catalog or native ID and provider, never substring', () => {
+  const c = { groups: [{ id: 'p', models: [{ id: 'preset', resolvedModel: 'native-model', reasoningEfforts: ['high'] }, { id: 'native-model-extra', reasoningEfforts: ['high'] }] }] };
+  assert.equal(resolveDispatchSelection(c, {}, { current: { provider: 'p', model: 'native-model' } }).model, 'preset');
+  assert.throws(() => resolveDispatchSelection(c, {}, { current: { provider: 'p', model: 'native' } }), { code: 'model-not-found' });
+  assert.throws(() => resolveDispatchSelection(c, {}, { pinned: { provider: 'wrong', model: 'preset' } }), { code: 'model-not-found' });
+});

@@ -190,7 +190,15 @@ export function resolveDispatchSelection(catalog, input = {}, { pinned, current,
   const fallback = pinned || current || catalog?.default;
   const query = input.model ?? fallback?.model ?? (typeof catalog?.defaultModel === 'string' ? catalog.defaultModel : catalog?.defaultModel?.model);
   if (!entriesOf(catalog).length) throw failure('model-catalog-unavailable', 'The target model catalog is unavailable or empty.');
-  const entry = findCatalogModel(catalog, query);
+  let entry;
+  if (input.model !== undefined && input.model !== null) entry = findCatalogModel(catalog, query);
+  else {
+    const wanted = text(query).toLowerCase();
+    const provider = text(fallback?.provider).toLowerCase();
+    entry = entriesOf(catalog).find(item => (!provider || item.provider.toLowerCase() === provider)
+      && [item.id, item.model?.resolvedModel, item.model?.model].some(id => text(id).toLowerCase() === wanted && wanted));
+    if (!entry) throw failure('model-not-found', 'The effective model "' + text(query) + '" is not present in the target catalog.', { availableModels: modelCatalogSummary(catalog).models });
+  }
   const explicit = input.effort !== undefined && input.effort !== null;
   const normalized = Object.fromEntries(Object.entries(config.modelDefaultEfforts || FACTORY_MODEL_DEFAULT_EFFORTS).map(([k, v]) => [k.toLowerCase(), v]));
   const keys = [entry.id, entry.model?.resolvedModel, entry.model?.model].filter(v => text(v)).map(v => text(v).toLowerCase());

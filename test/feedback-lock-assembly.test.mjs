@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { writeFile, readFile } from 'node:fs/promises';
+import { writeFile, readFile, appendFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -40,6 +42,40 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
   const reportPort = await freePort();
   const configPath = await writeControlConfig({ root, workspace, dsh, reportPort });
   const claudeHome = await writeClaudeSession({ root, workspace });
+  // The existing assembly identity belongs to this test PID. Give that identity
+  // a unique real local pipe and matching key, and mirror received frames into
+  // the isolated transcript just as the existing Claude assembly fixture does.
+  const recordFile = path.join(claudeHome, 'sessions', `${process.pid}.json`);
+  const claudeRecord = JSON.parse(await readFile(recordFile, 'utf8'));
+  const socketPath = '\\\\.\\pipe\\feedback-lock-' + randomUUID();
+  claudeRecord.messagingSocketPath = socketPath;
+  await writeFile(recordFile, JSON.stringify(claudeRecord));
+  const keyName = `${process.pid}.${createHash('sha256').update(socketPath).digest('hex')}.key`;
+  await writeFile(path.join(claudeHome, 'sessions', keyName), JSON.stringify({
+    peerToken: '0'.repeat(32), procStart: claudeRecord.procStart, pidDomain: claudeRecord.pidDomain,
+  }));
+  const transcript = path.join(claudeHome, 'projects', 'assembly-project', `${claudeRecord.sessionId}.jsonl`);
+  const receivedFrames = [];
+  const sockets = new Set();
+  const inbox = createServer({ allowHalfOpen: true }, socket => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    let incoming = '';
+    socket.setEncoding('utf8');
+    socket.on('data', chunk => { incoming += chunk; });
+    socket.on('end', async () => {
+      const [auth, frame] = incoming.trim().split('\n').map(line => JSON.parse(line));
+      assert.equal(auth.token, '0'.repeat(32));
+      receivedFrames.push({ frame, receivedAt: Date.now() });
+      await appendFile(transcript, JSON.stringify({ ...frame, sessionId: frame.session_id }) + '\n');
+      socket.end();
+    });
+  });
+  await new Promise((resolve, reject) => { inbox.once('error', reject); inbox.listen(socketPath, resolve); });
+  t.after(() => new Promise(resolve => {
+    for (const socket of sockets) socket.destroy();
+    inbox.close(resolve);
+  }));
   const codexHome = await writeCodexHome({ root, configPath });
   const env = assemblyEnv({ claudeHome, codexHome, fakeClaude: true });
   env.FUTUREAIDE_ASSEMBLY_CLAUDE_WORKSPACE = workspace;
@@ -73,29 +109,38 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
     }
   }
 
-  const agentId = 'lock-report-agent';
-  const taskId = 'lock-report-task';
-  const requestId = 'lock-report-request';
-  worker.store.insert({
-    ...existing, agentId, name: agentId, target: 'claude-cli', state: 'working',
-    task: { taskId, dispatches: [{ requestId }], reports: [], answers: [] },
-  });
-  const transport = new StdioClientTransport({
-    command: process.execPath,
-    args: [path.join(devRoot, 'src', 'mcp-server.mjs'), '--claude-cli-reports',
-      worker.store.location, agentId, taskId, requestId, configPath],
-    env, stderr: 'pipe',
-  });
-  const reports = new Client({ name: 'lock-report-fixture', version: '1' });
-  await reports.connect(transport);
-  t.after(() => reports.close());
+  // Separate already-bound private CLI tasks for each group and batch.
+  // Otherwise a fixture-only failed Claude inbox delivery keeps the one task's
+  // monitor poll busy retrying earlier reports while later samples queue behind it.
+  const reportClients = new Map();
+  for (const phase of ['baseline', 'locked']) {
+    for (let batch = 0; batch < 2; batch++) {
+      const agentId = `report-${phase}-${batch}`;
+      const taskId = `task-${phase}-${batch}`;
+      const requestId = `request-${phase}-${batch}`;
+      worker.store.insert({
+        ...existing, agentId, name: agentId, target: 'claude-cli', state: 'working',
+        task: { taskId, dispatches: [{ requestId }], reports: [], answers: [] },
+      });
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [path.join(devRoot, 'src', 'mcp-server.mjs'), '--claude-cli-reports',
+          worker.store.location, agentId, taskId, requestId, configPath],
+        env, stderr: 'pipe',
+      });
+      const client = new Client({ name: `fixture-${phase}-${batch}`, version: '1' });
+      await client.connect(transport);
+      reportClients.set(`${phase}-${batch}`, client);
+      t.after(() => client.close());
+    }
+  }
   pendingFeedback(configPath);
   const metrics = {
     configPath, root, reportPort, dshBaseUrl: dsh.baseUrl, codexHome,
     monitorPid: worker.child.pid,
     baseline: { dispatch: [], report: [], feedback: [] },
     locked: { dispatch: [], report: [], feedback: [] },
-    lock: [], monitorProgress: [],
+    lock: [], monitorProgress: [], receivedFrames,
   };
   let iteration = 0;
   let baselineIteration = 0;
@@ -118,7 +163,7 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
       assert.equal(baselineFinished, false, 'baseline feedback must overlap the operations');
       const [dispatch, report, fb] = await Promise.all([
         measure(mcp.client, 'futureaide_send_agent', { name: `baseline-${n}`, message: `baseline ${n}` }),
-        measure(reports, 'report_parent', { message: `baseline ${n}`, final: false }),
+        measure(reportClients.get(`baseline-${Math.floor(n / 5)}`), 'report_parent', { message: `baseline ${n}`, final: false }),
         feedback,
       ]);
       assert.equal(dispatch.value.accepted, true, JSON.stringify(dispatch.value));
@@ -156,7 +201,7 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
       assert.equal(finished, false, 'feedback must still be waiting when operations begin');
       const [dispatch, report, fb] = await Promise.all([
         measure(mcp.client, 'futureaide_send_agent', { name: `locked-${n}`, message: `locked ${n}` }),
-        measure(reports, 'report_parent', { message: `locked ${n}`, final: false }),
+        measure(reportClients.get(`locked-${Math.floor(n / 5)}`), 'report_parent', { message: `locked ${n}`, final: false }),
         feedback,
       ]);
       assert.equal(dispatch.value.accepted, true, JSON.stringify(dispatch.value));
@@ -215,6 +260,10 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
     item.lockedAt === lock.lockedAt && Date.parse(item.consumed) >= lock.lockedAt
       && Date.parse(item.consumed) < lock.releasedAt && item.observedAt < lock.releasedAt)),
   'shared monitor must consume a locked-interval report before release');
+  assert.ok(receivedFrames.some(item => metrics.lock.some(lock =>
+    item.receivedAt >= lock.lockedAt && item.receivedAt < lock.releasedAt
+      && /locked \d+/.test(item.frame.message?.content ?? ''))),
+  'the isolated Claude inbox must receive a locked-interval report before release');
   assert.ok(metrics.p95.dispatchIncrease <= 250, JSON.stringify(metrics.p95));
   assert.ok(metrics.p95.reportIncrease <= 250, JSON.stringify(metrics.p95));
 });

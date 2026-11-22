@@ -59,6 +59,9 @@ for (const viaTicket of [false, true]) test(`all keyed rounds and input failures
     const oldKey = store.saveTaskKey('owner', 'old', 'old-request', 'historical');
     const key = store.saveTaskKey('owner', 'old', 'current-request', 'current');
     const submissionKey = store.saveTaskKey('owner', 'old', 'submission-request', 'submission-round');
+    const noProof = store.saveTaskKey('owner', 'old', 'no-proof', 'unconfirmed-round');
+    store.appendHistory('old', { taskId: 'unconfirmed-round', reports: [{ id: 'stale', final: true, delivery: { state: 'delivered' } }] });
+    store.appendHistory('old', { taskId: 'unconfirmed-round', reports: [] });
     store.enqueueSubmission({ id: 'delivered-old', ownerId: 'owner', agentId: 'old', taskId: 'submission-round', kind: 'report', message: 'private', final: true, created: '2026-01-01T00:00:00.000Z' });
     store.saveSubmissionDelivery('delivered-old', { state: 'delivered', deliveredAt: '2026-01-02T00:00:00.000Z' });
     store.appendHistory('old', { taskId: 'historical', reports: [{ id: 'older', final: true, delivery: { state: 'delivered' } }] });
@@ -76,6 +79,7 @@ for (const viaTicket of [false, true]) test(`all keyed rounds and input failures
     assert.equal(store.resolveTaskKey('owner', oldKey).receipt.finalSubmissionId, 'latest');
     assert.equal(store.resolveTaskKey('owner', key).receipt.finalSubmissionId, 'current-final');
     assert.equal(store.resolveTaskKey('owner', submissionKey).receipt.finalSubmissionId, 'delivered-old');
+    assert.equal(store.resolveTaskKey('owner', noProof), null);
     assert.equal(store.resolveTaskKey('owner', blocked).failureReason, 'dispatch-expired');
     assert.equal(store.resolveTaskKey('owner', blocked).receipt, null);
     assert.equal(store.resolveTaskKey('other', oldKey), null);

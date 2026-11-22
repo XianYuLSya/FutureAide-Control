@@ -2412,3 +2412,30 @@ test('unlocked DSH effort-only steer resolves against the active provider and ke
     assert.equal(row.actualEffort, 'xhigh');
   } finally { f.service.close(); }
 });
+test('locked DSH receipt reflects reselected provider capability after default changes before delivery', async () => {
+  let catalogCalls = 0, f;
+  const catalog = provider => ({ default: { provider, model: 'test' }, routableProviders: ['fixture', 'new-route'],
+    groups: [
+      { id: 'fixture', models: [{ id: 'test', reasoningEfforts: ['high', 'max'] }] },
+      { id: 'new-route', models: [{ id: 'test', reasoningEfforts: ['medium'] }] },
+    ] });
+  f = await fixture({ config: { dshDefaultModelOnly: true }, beforeModels: () => {
+    if (++catalogCalls === 5) f.catalog(catalog('new-route'));
+  } });
+  try {
+    f.catalog(catalog('fixture'));
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'initial', effort: 'high' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'switch', effort: 'max' }, extra(A));
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === receipt.requestId);
+    assert.equal(receipt.accepted, true);
+    assert.deepEqual([receipt.requestedEffort, receipt.selectedEffort, receipt.actualEffort], ['max', 'medium', 'medium']);
+    assert.equal(receipt.effortAdjustment.reason, 'nearest-supported-effort');
+    assert.deepEqual([dispatch.model.provider, dispatch.model.selectedEffort], ['new-route', 'medium']);
+    assert.equal(f.sends.filter(item => item.requestId === receipt.requestId).length, 1);
+    const list = (await f.service.list(extra(A))).items[0];
+    assert.deepEqual([list.selectedEffort, list.actualEffort], ['medium', 'medium']);
+    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === receipt.requestId);
+    assert.deepEqual([row.selectedEffort, row.actualEffort], ['medium', 'medium']);
+  } finally { f.service.close(); }
+});

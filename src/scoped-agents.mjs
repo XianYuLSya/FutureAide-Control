@@ -1630,7 +1630,7 @@ export function createScopedAgents(config, {
       ...(reason ? { error: { code: reason, message: reason === 'dispatch-expired'
         ? 'This input passed its six hours before it could be sent.'
         : 'This input could not be delivered; its body is kept.' } } : {}),
-      ...effortReceipt((dispatch?.accepted ? dispatch.deliverySelection : undefined) ?? item?.selection ?? fallback.pin, dispatch?.actualEffort ?? stored.actualEffort ?? null, dispatch?.effortAdjustment ?? stored.effortAdjustment, dispatch?.actualEffortSource ?? stored.actualEffortSource),
+      ...effortReceipt((dispatch?.accepted ? dispatch.deliverySelection ?? dispatch.model : undefined) ?? item?.selection ?? fallback.pin, dispatch?.actualEffort ?? stored.actualEffort ?? null, dispatch?.effortAdjustment ?? stored.effortAdjustment, dispatch?.actualEffortSource ?? stored.actualEffortSource),
       actualModel: dispatch && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel)
         : actualModelName(item?.selection) ?? actualModelName(fallback.pin)
           ?? actualModelName(current.model) ?? actualModelName(current.modelPin),

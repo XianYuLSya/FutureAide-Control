@@ -235,7 +235,7 @@ function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
   const lastDispatch = task?.dispatches?.at(-1);
   const activeDispatch = [...(task?.dispatches ?? [])].reverse().find(item => item.accepted === true);
-  const visibleSelection = activeDispatch?.model ?? (!task ? record.creationSelection : task.modelSelection);
+  const visibleSelection = activeDispatch?.deliverySelection ?? activeDispatch?.model ?? (!task ? record.creationSelection : task.modelSelection);
   const error = record.error ?? task?.cancelError ?? (lastDispatch?.state === 'failed' ? lastDispatch.failure : undefined)
     ?? (!['completed', 'cancelled'].includes(lastDispatch?.state) ? lastDispatch?.error : undefined);
   const view = record.observation ?? {};
@@ -361,7 +361,7 @@ function taskInputs(store, record) {
     const status = lifecycle(delivery) ?? dispatch.state;
     put(dispatch.requestId, {
       requestId: dispatch.requestId,
-      ...inputEffort(dispatch.model, dispatch.accepted ? dispatch.actualEffort ?? null : null, dispatch.effortAdjustment, dispatch.actualEffortSource),
+      ...inputEffort(dispatch.accepted ? dispatch.deliverySelection ?? dispatch.model : dispatch.model, dispatch.accepted ? dispatch.actualEffort ?? null : null, dispatch.effortAdjustment, dispatch.actualEffortSource),
       actualModel: dispatch.accepted && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel) : null,
       ...(dispatch.mode ? { mode: dispatch.mode } : {}),
       ...(delivery ? { delivery } : {}),
@@ -1577,7 +1577,7 @@ export function createScopedAgents(config, {
       ...(dispatch.deliveryIntent?.expectedTurnId ? { expectedTurnId: dispatch.deliveryIntent.expectedTurnId } : {}),
       ...(dispatch.mode ? { mode: dispatch.mode } : {}),
       selectionExplicit: dispatch.selectionExplicit === true,
-      ...effortReceipt(dispatch.model, dispatch.actualEffort, dispatch.effortAdjustment, dispatch.actualEffortSource),
+      ...effortReceipt(dispatch.accepted ? dispatch.deliverySelection ?? dispatch.model : dispatch.model, dispatch.actualEffort, dispatch.effortAdjustment, dispatch.actualEffortSource),
     };
   }
 
@@ -1630,7 +1630,7 @@ export function createScopedAgents(config, {
       ...(reason ? { error: { code: reason, message: reason === 'dispatch-expired'
         ? 'This input passed its six hours before it could be sent.'
         : 'This input could not be delivered; its body is kept.' } } : {}),
-      ...effortReceipt(item?.selection ?? fallback.pin, dispatch?.actualEffort ?? stored.actualEffort ?? null, dispatch?.effortAdjustment ?? stored.effortAdjustment, dispatch?.actualEffortSource ?? stored.actualEffortSource),
+      ...effortReceipt((dispatch?.accepted ? dispatch.deliverySelection : undefined) ?? item?.selection ?? fallback.pin, dispatch?.actualEffort ?? stored.actualEffort ?? null, dispatch?.effortAdjustment ?? stored.effortAdjustment, dispatch?.actualEffortSource ?? stored.actualEffortSource),
       actualModel: dispatch && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel)
         : actualModelName(item?.selection) ?? actualModelName(fallback.pin)
           ?? actualModelName(current.model) ?? actualModelName(current.modelPin),
@@ -1710,29 +1710,15 @@ export function createScopedAgents(config, {
     }
     const explicit = dispatch.selectionExplicit === true && dispatch.model !== undefined;
     if (target === 'dsh') {
-      if (dispatch.kind !== 'task' && observed?.running === true && !dispatch.deliveryIntent) {
-        const current = observed.modelSelectionObserved !== false && observed.currentModel
-          ? observed.currentModel : await backend.model();
-        const fields = dispatch.model?.explicitFields;
-        if (!current?.model || (fields?.effort && !current.reasoningEffort)) {
-          throw Object.assign(new Error('The running DSH turn selection could not be confirmed.'), { code: 'model-selection-unconfirmed', terminal: true, notSent: true });
-        }
-        const changesModel = fields?.model && (current.model !== dispatch.model.model || (current.provider ?? '') !== (dispatch.model.provider ?? ''));
-        const changesEffort = fields?.effort && current.reasoningEffort !== dispatch.model.reasoningEffort;
-        if (!changesModel && !changesEffort) {
-          dispatch.deliveryModel = { ...current };
-          dispatch.modelReady = true;
-          saveDispatch(record);
-          return;
-        }
-        // DSH supports a session-local selection for the next model step of an
-        // active turn. Apply an explicit change through its normal host check.
-      }
+      let lockedDefault;
       if (dshDefaultOnly(record) && !dispatch.deliveryIntent && dispatch.model) {
         const catalog = await backend.models();
+        lockedDefault = catalog?.default;
         if (catalog?.default?.model && (catalog.default.model !== dispatch.model.model
             || (catalog.default.provider ?? '') !== (dispatch.model.provider ?? ''))) {
           const before = dispatch.model;
+          delete dispatch.deliveryModel;
+          delete dispatch.deliverySelection;
           const input = { ...(before.explicitInput?.effort !== undefined ? { effort: before.explicitInput.effort } : {}) };
           const frozenConfig = before.effortConfig ?? config.behavior ?? config;
           dispatch.model = { ...resolveDispatchSelection(catalog, input, { current: catalog.default, config: frozenConfig }),
@@ -1742,6 +1728,49 @@ export function createScopedAgents(config, {
             after: { provider: dispatch.model.provider, model: dispatch.model.model }, reason: 'locked-default-changed-before-write' };
           saveDispatch(record);
         }
+      }
+      if (dispatch.kind !== 'task' && observed?.running === true && !dispatch.deliveryIntent) {
+        const current = observed.modelSelectionObserved !== false && observed.currentModel
+          ? observed.currentModel : await backend.model();
+        const fields = dispatch.model?.explicitFields;
+        if (!current?.model || (fields?.effort && !current.reasoningEffort)) {
+          throw Object.assign(new Error('The running DSH turn selection could not be confirmed.'), { code: 'model-selection-unconfirmed', terminal: true, notSent: true });
+        }
+        let stepSelection;
+        if (!dshDefaultOnly(record) && !fields?.model && fields?.effort) {
+          // An effort-only steer belongs to the active provider even when the host
+          // default now names a different provider with the same model ID. Resolve
+          // against that provider's own capabilities; preserve model as start(B).
+          const catalog = await backend.models();
+          const groups = (catalog?.groups ?? []).filter(group => (group.id ?? group.provider) === current.provider);
+          const activeCatalog = { ...catalog, groups, routableProviders: [current.provider] };
+          stepSelection = resolveDispatchSelection(activeCatalog,
+            { model: current.model, effort: dispatch.model.explicitInput?.effort },
+            { current, config: dispatch.model.effortConfig ?? config.behavior ?? config });
+          dispatch.deliverySelection = stepSelection;
+        }
+        const changesModel = fields?.model && (current.model !== dispatch.model.model || (current.provider ?? '') !== (dispatch.model.provider ?? ''));
+        const changesEffort = fields?.effort && current.reasoningEffort !== (stepSelection ?? dispatch.model).reasoningEffort;
+        const currentMatchesLock = !dshDefaultOnly(record) || !lockedDefault?.model
+          || (current.model === lockedDefault.model && (current.provider ?? '') === (lockedDefault.provider ?? ''));
+        if (!changesModel && !changesEffort && currentMatchesLock) {
+          dispatch.deliveryModel = { ...current };
+          dispatch.modelReady = true;
+          saveDispatch(record);
+          return;
+        }
+        delete dispatch.deliveryModel;
+        if (stepSelection) {
+          await confirmDshSelection(record, backend, target, dispatch, stepSelection, observed, { sessionOnly: true });
+          dispatch.deliveryModel = { ...stepSelection };
+          record.model = { ...stepSelection };
+          dispatch.modelReady = true;
+          saveDispatch(record);
+          return;
+        }
+        delete dispatch.deliverySelection;
+        // DSH supports a session-local selection for the next model step of an
+        // active turn. Apply an explicit change through its normal host check.
       }
       if (!dispatch.model) {
         // DSH default-follow keeps the old resolveModel and its catalog validation.

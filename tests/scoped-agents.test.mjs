@@ -2302,24 +2302,32 @@ test('a locked DSH supplement with uncertain write is never resent after default
     assert.equal(dispatch.delivery, 'unknown');
   } finally { f.service.close(); }
 });
-test('a locked DSH supplement retries its original ID and keeps the active selection', async () => {
-  let attempts = 0;
-  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
-    if (++attempts === 2) throw Object.assign(new Error('default changed'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
+test('locked DSH steers on the new host default after its provider changes', async () => {
+  let lockedProvider = 'fixture';
+  const attempts = [];
+  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async input => {
+    attempts.push({ requestId: input.requestId, provider: input.selection?.provider, effort: input.selection?.reasoningEffort });
+    if (input.selection?.provider !== lockedProvider) throw Object.assign(new Error('host rejects stale locked provider'),
+      { code: 'managed-model-changed', notSent: true, retryableRead: true });
   } });
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'supplement', effort: 'high' }, extra(A));
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    const record = f.record();
-    record.task.dispatches.find(item => item.requestId === receipt.requestId).nextAttemptAt = 0;
-    f.store.save(record);
-    await f.service.poll(record.agentId);
-    assert.equal(attempts, 3);
-    assert.equal(f.sends.length, 2);
-    assert.equal(f.sends[1].requestId, receipt.requestId);
-    assert.equal(f.record().task.dispatches.find(item => item.requestId === receipt.requestId).deliveryModel.provider, 'fixture');
+    const first = await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
+    assert.equal(first.actualEffort, 'high');
+    const adjustment = await f.service.send({ name: 'artist', message: 'adjust', effort: 'max' }, extra(A));
+    assert.equal(adjustment.actualEffort, 'max');
+    lockedProvider = 'new-route';
+    f.defaultModel({ provider: lockedProvider, model: 'test' });
+    const next = await f.service.send({ name: 'artist', message: 'new provider', effort: 'max' }, extra(A));
+    assert.equal(next.accepted, true);
+    assert.equal(next.actualEffort, 'max');
+    assert.deepEqual(attempts.map(item => [item.provider, item.effort]),
+      [['fixture', 'high'], ['fixture', 'max'], ['new-route', 'max']]);
+    assert.equal(f.sends.filter(item => item.requestId === next.requestId).length, 1);
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === next.requestId);
+    assert.equal(dispatch.model.provider, 'new-route');
+    assert.equal(dispatch.deliveryModel, undefined, 'a stale live selection cannot override the newly locked model');
+    assert.equal(f.selections.at(-1).provider, 'new-route');
   } finally { f.service.close(); }
 });
 test('locked DSH reselects A then B then A with fresh selection steps and one business input', async () => {
@@ -2370,5 +2378,37 @@ test('DSH accepted receipt with unknown actual effort never falls back to select
     const item = (await f.service.list(extra(A))).items[0];
     assert.equal(item.actualEffort, null);
     assert.equal(item.actualModel, null);
+  } finally { f.service.close(); }
+});
+test('unlocked DSH effort-only steer resolves against the active provider and keeps the new default for start', async () => {
+  const f = await fixture();
+  const catalog = provider => ({ default: { provider, model: 'test' }, routableProviders: ['fixture', 'new-route'],
+    groups: [
+      { id: 'fixture', models: [{ id: 'test', reasoningEfforts: ['high', 'xhigh'] }] },
+      { id: 'new-route', models: [{ id: 'test', reasoningEfforts: ['high', 'max'] }] },
+    ] });
+  try {
+    f.catalog(catalog('fixture'));
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const first = await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
+    assert.equal(first.actualEffort, 'high');
+    f.catalog(catalog('new-route'));
+    const second = await f.service.send({ name: 'artist', message: 'adjust current', effort: 'max' }, extra(A));
+    assert.equal(second.accepted, true);
+    assert.equal(second.requestedEffort, 'max');
+    assert.equal(second.selectedEffort, 'xhigh');
+    assert.equal(second.actualEffort, 'xhigh');
+    assert.equal(second.effortAdjustment.reason, 'nearest-supported-effort');
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === second.requestId);
+    assert.deepEqual([dispatch.model.provider, dispatch.model.selectedEffort], ['new-route', 'max']);
+    assert.deepEqual([dispatch.deliveryModel.provider, dispatch.deliveryModel.reasoningEffort], ['fixture', 'xhigh']);
+    assert.deepEqual([f.selections.at(-1).provider, f.selections.at(-1).reasoningEffort], ['fixture', 'xhigh']);
+    assert.equal(f.sends.filter(item => item.requestId === second.requestId).length, 1);
+    const view = (await f.service.list(extra(A))).items[0];
+    assert.equal(view.selectedEffort, 'xhigh');
+    assert.equal(view.actualEffort, 'xhigh');
+    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === second.requestId);
+    assert.equal(row.selectedEffort, 'xhigh');
+    assert.equal(row.actualEffort, 'xhigh');
   } finally { f.service.close(); }
 });

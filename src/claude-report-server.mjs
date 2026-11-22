@@ -43,7 +43,7 @@ export const DEFAULT_KEEP_ALIVE_MS = 600000;
 
 export const INSTRUCTIONS = `FutureAide Control management tools.
 
-These tools manage named subagents in this project. Run, create and send accept model and effort. Check status for the target's IDs. The calling chat is identified from this connection itself. For caller identity, no session id, chat id, name or route is accepted as an argument, so never look for one. Explicit questions and reports reach the caller.`;
+The caller is identified from the connection: no session id, chat id, name or route is accepted as an argument. After dispatch, call futureaide_wait_agents once with taskKeys and omit timeout_seconds. Handle the event and use nextCursor when waiting for a later one. Host time limits apply. A timeout leaves the original task running.`;
 
 /**
  * The trusted caller record the shared service reads from `calling-context`
@@ -80,11 +80,11 @@ export function trustedContextOf(caller) {
  *   `{ server, caller, trusted }`. The caller is the verified one above.
  */
 export function createClaudeReportServer({ resolveCaller, management,
-  instructions = INSTRUCTIONS, version = SERVER_VERSION } = {}) {
+  instructions = INSTRUCTIONS, version = SERVER_VERSION, waitSignal } = {}) {
   if (typeof resolveCaller !== 'function') throw new TypeError('createClaudeReportServer requires resolveCaller');
   const server = new McpServer({ name: SERVER_NAME, version }, { instructions });
   if (typeof management === 'function') {
-    management({ server, caller: async () => resolveCaller(),
+    management({ server, waitSignal, caller: async () => resolveCaller(),
       trusted: async () => trustedContextOf(await resolveCaller()) });
   }
   return server;
@@ -242,12 +242,14 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     let body;
     try { body = await readBody(req); }
     catch (error) { sendJson(res, 400, { error: { code: error.code ?? 'invalid-request', message: error.message } }); return; }
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+    const isWait = body?.method === 'tools/call' && body?.params?.name === 'futureaide_wait_agents';
+    const waitController = new AbortController();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: !isWait });
     // Only a verified caller gets a surface; an unidentified peer gets nothing.
     const mcp = caller
-      ? createClaudeReportServer({ resolveCaller: async () => caller, instructions, management })
+      ? createClaudeReportServer({ resolveCaller: async () => caller, instructions, management, waitSignal: waitController.signal })
       : createUnavailableReportServer();
-    const close = () => { void transport.close().catch(() => {}); void mcp.close().catch(() => {}); };
+    const close = () => { if (!res.writableFinished) waitController.abort(); void transport.close().catch(() => {}); void mcp.close().catch(() => {}); };
     res.once('close', close);
     try {
       await mcp.connect(transport);

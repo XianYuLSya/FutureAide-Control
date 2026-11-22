@@ -408,6 +408,10 @@ compactList.reduced = (result = {}) => {
 /** Wait keeps its own receipt fields: notListed and timedOut are why the caller asked. */
 export function compactWait(result = {}) {
   return { items: (result.items ?? []).map(compactAgent), notListed: result.notListed ?? [],
+    ...(result.reason ? { reason: result.reason } : {}),
+    ...(result.events ? { events: result.events } : {}),
+    ...(result.nextCursor ? { nextCursor: result.nextCursor } : {}),
+    ...(result.error ? { error: result.error } : {}),
     ...(result.note ? { note: result.note } : {}), timedOut: result.timedOut === true };
 }
 

@@ -34,6 +34,32 @@ const mode = z.enum(['steer', 'queue']).optional().describe('Where this input go
 // A view may offer a smaller answer still (a roster reduced to its size), which beats
 // collapsing every entry into one unreadable preview.
 const COMPACT_MAXIMUM = 40000;
+
+async function waitForAgents(service, args, extra) {
+  const options = { names: args.names, taskKeys: args.taskKeys, after: args.after, timeoutSeconds: args.timeout_seconds };
+  const token = extra?._meta?.progressToken;
+  if (args.timeout_seconds !== undefined || token == null || !extra.sendNotification) return service.wait(options, extra);
+
+  const started = performance.now();
+  let pending = false;
+  const heartbeat = () => {
+    if (pending || extra.signal?.aborted) return;
+    pending = true;
+    const elapsed = (performance.now() - started) / 1000;
+    void extra.sendNotification({ method: 'notifications/progress', params: {
+      progressToken: token, progress: elapsed, message: 'Waiting for a subagent report or question.',
+    } }).catch(() => {}).finally(() => { pending = false; });
+  };
+  heartbeat();
+  const idleMs = Number(process.env.CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT);
+  const intervalMs = Number.isFinite(idleMs) && idleMs > 0
+    ? Math.max(1, Math.min(30000, Math.floor(idleMs / 2))) : 30000;
+  const timer = setInterval(heartbeat, intervalMs);
+  timer.unref();
+  try { return await service.wait(options, extra); }
+  finally { clearInterval(timer); }
+}
+
 function compactOutput(value, smaller) {
   const json = JSON.stringify(value);
   if (json.length <= COMPACT_MAXIMUM) return json;
@@ -62,7 +88,12 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
       // isError is read from the full result: a compact view must never hide a real failure.
       // A view may also shape the detail answer (inspect's node filter lives there),
       // so both paths receive the arguments.
-      const text = view === undefined ? boundedOutput(result)
+      const text = view === compactWait && result.nextCursor
+        ? compactOutput(args.detail === true ? result : compactWait(result), () => ({
+          ...compactWait(result), items: [], itemCount: result.items?.length ?? 0,
+          note: 'The roster details exceeded the output budget. Events and the cursor are included.',
+        }))
+        : view === undefined ? boundedOutput(result)
         : args?.detail === true
           ? (view.detail ? boundedOutput(view.detail(result, args)) : boundedOutput(result))
           : compactOutput(view(result, args), view.reduced ? () => view.reduced(result, args) : undefined);
@@ -104,9 +135,12 @@ export function registerScopedTools(server, options = {}) {
   register('futureaide_send_agent', 'Assign work or supplement a named subagent. You can select its model and effort here. To switch a running Codex turn, wait until it ends and send the new selection. mode decides a busy name: omit it for the target’s native default, steer to insert into the active turn, or queue to wait for the current turn to end and then start the next turn with this input alone. DSH reads a supplement on the model’s next step and refuses explicit queue, even when a question is pending; Claude CLI has no native steer and refuses explicit steer. A refused mode returns mode-unsupported with target and supportedModes, and nothing is stored. When no turn is running, both modes start a turn. A waiting subagent treats an ordinary send as its answer; explicit queue never answers a pending question. Supplement receipts carry requestId, mode, delivery and, once proven, turnId or afterTurnId; accepted alone never proves which turn received it. Managed dispatch and monitoring read only the session this name is bound to (DSH, Codex Desktop or Claude CLI), not the full session list. queued:true means locally saved; do not resend. retrying:true means the original request awaits background recovery; the caller need not resend. unknown means inspect the original receipt and recipient before any retry; never blindly repeat. accepted:true means the target accepted the request, not that work is complete. Use list for queue status or changes/inspect for details. Only explicit questions and reports return to this chat; ordinary replies and idle trees never notify it.', { name, message, ...modelOptions, mode }, (s, a, e) => s.send(a, e));
   register('futureaide_answer_agent', 'Answer the named subagent’s pending question directly. The plugin continues its original task once; no exchange ID, command, or text file is needed.', { name, message }, (s, a, e) => s.answer(a, e));
   registerView('futureaide_list_agents', 'Show only this chat’s subagents: name, state, lifetime, actualModel, current task, pending questions, the latest report, the changed-file count and a team roster. A name that has descendants answers with team: one line per member carrying its relative path, state, activity while running and file count, capped at 30 rows and summarised by {more:n} beyond that. The default view is compact; coverage, timestamps, per-node details and the full result text are omitted. The file count includes unconfirmed paths and is paired with their own total, so the two are never added together. Pass detail: true for the complete structure when those fields are needed. Deep history is unnecessary for ordinary supervision.', { detail }, (s, _a, e) => s.list(e), compactList);
-  registerView('futureaide_wait_agents', 'Wait briefly for any selected subagent to ask a question, submit a report, await a report, or need attention. Other work may proceed concurrently; a timeout does not cancel a task. Entries include actualModel. Pass detail: true for the complete structure.', {
-    names: z.array(name).min(1).max(50).optional(), timeout_seconds: z.number().int().min(0).max(45).optional(), detail,
-  }, (s, a, e) => s.wait({ names: a.names, timeoutSeconds: a.timeout_seconds ?? 0 }, e), compactWait);
+  registerView('futureaide_wait_agents', 'After dispatch, wait once using the taskKeys from run/send. Omit timeout_seconds to wait for a report, question or terminal state. Use nextCursor as after when waiting for the next event. An explicit 0 takes a snapshot and 1–45 bounds the query. Codex has a configured 60-second tool budget that progress cannot extend. Claude interactive main sessions may background a call after two minutes. A host timeout or disconnect leaves the original task and its delivery intact. Do not poll or dispatch again.', {
+    names: z.array(name).min(1).max(50).optional(),
+    taskKeys: z.array(z.string().min(1).max(512)).min(1).max(50).optional().describe('Copy taskKey from each original dispatch receipt.'),
+    after: z.string().min(1).optional().describe('Copy nextCursor from the preceding event for the same selection.'),
+    timeout_seconds: z.number().int().min(0).max(45).optional(), detail,
+  }, waitForAgents, compactWait);
   registerView('futureaide_agent_changes', 'Read observed file changes across a named subagent’s tree, attributed by agentPath, without reading conversations. Each path keeps only its operation, plus agentPath below the root and attribution when a before/after comparison found it; pass detail: true for the complete entries, including any before/after content. Coverage is stated as one sentence, and unconfirmed paths are called out. task=0 selects the current/latest task; 1 selects the preceding task, and its task text is kept so the answer says which task it is.', {
     name, task: z.number().int().min(0).optional(), detail,
   }, (s, a, e) => s.changes(a, e), compactChanges);
@@ -193,9 +227,13 @@ export async function claudeTrustedCaller({ trusted, caller, extra } = {}) {
  * @param {{service: object}} options The monitor's existing service instance.
  */
 export function scopedManagement({ service } = {}) {
-  return ({ server, caller, trusted } = {}) => registerScopedTools(server, {
+  return ({ server, caller, trusted, waitSignal } = {}) => registerScopedTools(server, {
     service,
-    extraFor: async extra => ({ [TRUSTED_CALLER]: await claudeTrustedCaller({ trusted, caller, extra }) }),
+    extraFor: async extra => ({
+      [TRUSTED_CALLER]: await claudeTrustedCaller({ trusted, caller, extra }),
+      signal: waitSignal && extra.signal ? AbortSignal.any([extra.signal, waitSignal]) : waitSignal ?? extra.signal,
+      _meta: { progressToken: extra._meta?.progressToken }, sendNotification: extra.sendNotification,
+    }),
   });
 }
 

@@ -1580,7 +1580,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   ];
   f.store.save(record);
   const result = await f.service.send({ name: 'artist', message: 'private supplement' }, extra(A));
-  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'delivery', 'mode', 'name', 'queued', 'requestId', 'state']);
+  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'delivery', 'mode', 'name', 'queued', 'requestId', 'state', 'taskKey']);
   assert.equal(result.accepted, true);
   assert.equal(result.callbackError.code, 'native-callback-unavailable');
   assert.doesNotMatch(JSON.stringify(result), /private|deep child|coverage/);
@@ -2178,5 +2178,70 @@ test('a reminder that did arrive keeps the task running while the model works', 
     const working = await f.service.poll(record.agentId);
     assert.equal(working.state, 'running', 'the reminder turn is work in progress, not a finished task');
     assert.equal(f.record().task.state, 'running');
+  } finally { f.service.close(); }
+});
+
+
+test('task-key wait replays reports, isolates owners and respects cursors and cancellation', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
+    assert.ok(sent.taskKey);
+    const r = f.record();
+    const controller = new AbortController();
+    const pending = f.service.wait({ taskKeys: [sent.taskKey] }, { ...extra(A), signal: controller.signal });
+    f.store.enqueueSubmission({ id: 'wait-stage', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId,
+      kind: 'report', message: 'stage ready', final: false });
+    const first = await pending;
+    assert.equal(first.events[0].type, 'report');
+    assert.equal(first.events[0].message, 'stage ready');
+    const replay = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.equal(replay.events[0].id, first.events[0].id);
+    const next = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(next.events.length, 0);
+    f.store.enqueueSubmission({ id: 'wait-skew', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId,
+      kind: 'report', message: 'later insert', created: '2000-01-01T00:00:00.000Z' });
+    const skew = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(skew.events[0].message, 'later insert');
+    await assert.rejects(f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(B)), { code: 'task-receipt-unavailable' });
+    const cancel = new AbortController();
+    const blocked = f.service.wait({ taskKeys: [sent.taskKey], after: skew.nextCursor }, { ...extra(A), signal: cancel.signal });
+    cancel.abort();
+    await assert.rejects(blocked, { name: 'AbortError' });
+  } finally { f.service.close(); }
+});
+
+
+test('task-key wait reads the original archived round after a new round', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'old', lifetime: 'persistent' }, extra(A));
+    const previous = f.record();
+    previous.state = 'failed'; previous.task.state = 'failed';
+    previous.task.error = { code: 'old-failure' };
+    f.store.save(previous);
+    const replacement = { ...previous, state: 'running', error: undefined,
+      task: { taskId: 'new-task', requestId: 'new-request', message: 'new', state: 'running', dispatches: [] } };
+    assert.equal(f.store.replaceTask(replacement, previous, { ...previous.task }), true);
+    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.equal(result.items[0].task.text, 'old');
+    assert.equal(result.events[0].type, 'failed');
+    assert.equal(result.events[0].reason.code, 'old-failure');
+  } finally { f.service.close(); }
+});
+
+
+test('task-key wait returns native questions and task reports once', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
+    const record = f.record();
+    record.task.reports = [{ id: 'native-report', message: 'checkpoint', final: false, delivery: { state: 'pending' } }];
+    record.observation = { questions: [{ id: 'native-question', state: 'pending', message: 'Which option?' }] };
+    f.store.save(record);
+    const first = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.deepEqual(first.events.map(event => event.type), ['report', 'question']);
+    const next = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(next.events.length, 0);
   } finally { f.service.close(); }
 });

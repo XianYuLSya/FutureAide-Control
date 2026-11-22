@@ -1580,7 +1580,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   ];
   f.store.save(record);
   const result = await f.service.send({ name: 'artist', message: 'private supplement' }, extra(A));
-  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'delivery', 'mode', 'name', 'queued', 'requestId', 'state']);
+  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualEffort', 'actualModel', 'callbackError', 'delivery', 'effortSource', 'mode', 'name', 'queued', 'requestId', 'requestedEffort', 'selectedEffort', 'state']);
   assert.equal(result.accepted, true);
   assert.equal(result.callbackError.code, 'native-callback-unavailable');
   assert.doesNotMatch(JSON.stringify(result), /private|deep child|coverage/);
@@ -1968,21 +1968,20 @@ test('create resolves a model substring and keeps it across sends, effort change
     assert.equal(created.actualModel, 'alpha-pro');
     assert.equal(f.sends.length, 0, 'creation starts no model turn');
     assert.deepEqual(f.record().modelPin,
-      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
+      { provider: 'fixture', model: 'alpha-pro' });
     assert.deepEqual(f.selections.map(item => [item.model, item.reasoningEffort, item.sessionOnly]),
-      [['alpha-pro', 'low', true]], 'an explicit DSH pin is session-only');
+      [['alpha-pro', undefined, true]], 'an explicit DSH pin is session-only');
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'alpha-pro');
 
     const first = await f.service.send({ name: 'artist', message: 'go' }, extra(A));
     assert.equal(first.actualModel, 'alpha-pro');
-    assert.equal(f.selections.length, 1, 'the same live selection is not selected again');
-    assert.deepEqual(f.record().task.modelSelection,
-      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
+    assert.equal(f.selections.at(-1).reasoningEffort, 'max');
+    assert.equal(f.record().task.modelSelection.reasoningEffort, 'max');
 
     const second = await f.service.send({ name: 'artist', message: 'more', effort: 'max' }, extra(A));
     assert.equal(second.actualModel, 'alpha-pro');
     assert.deepEqual(f.record().modelPin,
-      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'max' });
+      { provider: 'fixture', model: 'alpha-pro' });
     const lastSelection = f.selections.at(-1);
     assert.equal(lastSelection.provider, 'fixture');
     assert.equal(lastSelection.model, 'alpha-pro');
@@ -1993,21 +1992,22 @@ test('create resolves a model substring and keeps it across sends, effort change
   } finally { f.service.close(); }
 });
 
-test('effort alone without a pin is refused without touching the name or sending', async () => {
+test('effort alone uses the host default without pinning the model', async () => {
   const f = await fixture();
   try {
     f.catalog(MULTI_MODEL_CATALOG);
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await assert.rejects(f.service.send({ name: 'artist', message: 'work', effort: 'high' }, extra(A)),
-      error => error.code === 'model-required-for-effort' && /host default/.test(error.message));
+    const receipt = await f.service.send({ name: 'artist', message: 'work', effort: 'high' }, extra(A));
+    assert.equal(receipt.actualModel, 'base');
+    assert.equal(receipt.actualEffort, 'high');
     assert.equal(f.record().modelPin, undefined);
-    assert.equal(f.sends.length, 0);
+    assert.equal(f.sends.length, 1);
   } finally { f.service.close(); }
 });
 
 const LOCKED = { config: { dshDefaultModelOnly: true } };
 
-test('locked to the DSH default, a caller model and effort never select anything', async () => {
+test('locked to the DSH default, a caller model is ignored and effort is adapted', async () => {
   const f = await fixture(LOCKED);
   try {
     f.catalog(MULTI_MODEL_CATALOG);
@@ -2020,13 +2020,13 @@ test('locked to the DSH default, a caller model and effort never select anything
     assert.equal(sent.accepted, true);
     assert.equal(sent.actualModel, 'base', 'the task runs on the host default');
     assert.equal(f.record().modelPin, undefined);
-    assert.notEqual(f.record().task.dispatches.at(-1).explicitModel, true);
-    assert.equal(f.selections.some(item => item.sessionOnly === true || item.model !== 'base'), false,
-      'only the host default was ever selected');
+    assert.equal(f.record().task.dispatches.at(-1).model.explicitFields.model, false);
+    assert.equal(f.selections.some(item => item.model !== 'base'), false);
+    assert.equal(sent.actualEffort, 'high');
   } finally { f.service.close(); }
 });
 
-test('locked to the DSH default, an effort alone is ignored instead of refused', async () => {
+test('locked to the DSH default, an unsupported requested effort is adapted', async () => {
   const f = await fixture(LOCKED);
   try {
     f.catalog(MULTI_MODEL_CATALOG);
@@ -2104,7 +2104,7 @@ test('a busy lock freezes the current pin for queued input and a later pin chang
     assert.equal(newer.queued, true);
     assert.equal(newer.actualModel, 'beta-mini', 'the queued receipt reports this input’s resolved full ID');
     assert.deepEqual(f.record().modelPin,
-      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
+      { provider: 'fixture', model: 'beta-mini' });
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'alpha-pro',
       'list keeps the observed model separate from the queued new pin');
     assert.equal(f.store.supplements(record.agentId).length, 2);
@@ -2133,8 +2133,8 @@ test('a pending question freezes the answer selection before its continuation di
     assert.equal(answered.answered, true);
     assert.equal(answered.actualModel, 'beta-mini');
     const answer = f.record().task.answers[0];
-    assert.deepEqual(answer.modelSelection,
-      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
+    assert.equal(answer.modelSelection.model, 'beta-mini');
+    assert.equal(answer.modelSelection.reasoningEffort, 'medium');
     // The continuation waits for the live turn to end; a later pin change must not
     // rewrite the answer intent already accepted.
     f.finish();
@@ -2143,8 +2143,8 @@ test('a pending question freezes the answer selection before its continuation di
     f.store.save(later);
     await f.service.poll(record.agentId);
     const dispatch = f.record().task.dispatches.find(item => item.kind === 'answer');
-    assert.deepEqual(dispatch.model,
-      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
+    assert.equal(dispatch.model.model, 'beta-mini');
+    assert.equal(dispatch.model.reasoningEffort, 'medium');
   } finally { f.service.close(); }
 });
 
@@ -2158,8 +2158,8 @@ test('a reminder keeps the name’s explicit selection', async () => {
     await f.service.poll(f.record().agentId);
     const reminder = f.record().task.dispatches.find(item => item.reminder === true);
     assert.ok(reminder);
-    assert.deepEqual(reminder.model,
-      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
+    assert.equal(reminder.model.model, 'alpha-pro');
+    assert.equal(reminder.model.reasoningEffort, 'max');
   } finally { f.service.close(); }
 });
 

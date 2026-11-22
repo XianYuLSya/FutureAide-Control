@@ -1760,8 +1760,9 @@ export function createScopedAgents(config, {
     // is already queued or being recovered. `freezeModel` on a queued supplement
     // records that it had no pin when it was accepted, so a later pin cannot leak in.
     const { model: frozenModel, freezeModel, mode, selectionExplicit, ...dispatchExtra } = extra;
-    const selected = frozenModel !== undefined ? frozenModel
+    let selected = frozenModel !== undefined ? frozenModel
       : freezeModel === true ? undefined : record.modelPin;
+    if (dispatchExtra.reminder === true) selected = await resolveRequestedPin(record, {});
     const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now(),
       mode: mode === 'queue' ? 'queue' : mode === 'steer' ? 'steer' : record.task?.mode ?? 'steer',
       ...(selected ? { model: { ...selected } } : {}),

@@ -1334,7 +1334,14 @@ test('busy supplements persist independently and are dispatched in order to the 
   const record = f.record(); let release;
   const held = f.store.locked(record.agentId, () => new Promise(resolve => { release = resolve; }));
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(await f.service.send({ name: 'artist', message: 'first' }, extra(A)), { name: 'artist', accepted: false, queued: true, state: 'running', actualModel: 'test' });
+  const firstQueued = await f.service.send({ name: 'artist', message: 'first' }, extra(A));
+  assert.equal(firstQueued.accepted, false);
+  assert.equal(firstQueued.queued, true);
+  assert.equal(firstQueued.state, 'running');
+  assert.equal(firstQueued.actualModel, 'test');
+  assert.equal(firstQueued.delivery, 'local-pending');
+  assert.equal(firstQueued.mode, 'steer');
+  assert.match(firstQueued.requestId, /^request-/);
   const flagged = f.record(); flagged.callbackBlocked = true; f.store.save(flagged);
   const second = await f.service.send({ name: 'artist', message: 'second' }, extra(A));
   assert.equal(second.queued, true);
@@ -1348,6 +1355,39 @@ test('busy supplements persist independently and are dispatched in order to the 
   assert.equal(new Set(f.sends.map(item => item.requestId)).size, 3);
   assert.equal(f.store.supplements(record.agentId).length, 0);
   f.service.close();
+});
+
+test('an answer older than six hours is never written and does not hold the final', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'ask first' }, extra(A));
+    const record = f.record();
+    f.sessions.get(record.sessionId).questions = [{ id: 'old-question', state: 'pending', message: 'Decide?' }];
+    await f.service.poll(record.agentId);
+    const receipt = await f.service.send({ name: 'artist', message: 'the answer' }, extra(A));
+    assert.equal(receipt.delivery, 'answer-pending');
+    const aged = f.record();
+    const answer = aged.task.answers.find(entry => entry.answerId === receipt.requestId);
+    answer.created = '2020-01-01T00:00:00.000Z';
+    // The asking turn has ended; only the answer continuation is left.
+    aged.task.dispatches[0].state = 'completed';
+    f.store.save(aged);
+    f.sessions.get(aged.sessionId).running = false;
+    const sends = f.sends.length;
+    await f.service.poll(aged.agentId);
+    const latest = f.record();
+    assert.equal(f.sends.slice(sends).filter(item => item.message.includes('the answer')).length, 0,
+      'the expired answer is never written');
+    const settled = latest.task.answers.find(entry => entry.answerId === receipt.requestId);
+    assert.equal(settled.undelivered, 'dispatch-expired');
+    assert.equal(settled.delivery, 'unknown');
+    assert.deepEqual(f.store.openQuestions(latest), { unanswered: 0, undelivered: 0 },
+      'the expired answer cannot hold the final report');
+    const inspected = await f.service.inspect({ name: 'artist' }, extra(A));
+    const input = inspected.inputs?.find(entry => entry.requestId === receipt.requestId);
+    assert.equal(input?.reason, 'dispatch-expired');
+  } finally { f.service.close(); }
 });
 
 test('a supplement sent while the task runs is steered into the running turn', async () => {
@@ -1365,6 +1405,26 @@ test('a supplement sent while the task runs is steered into the running turn', a
     assert.equal(dispatch.kind, 'supplement');
     assert.equal(dispatch.accepted, true);
     assert.equal(dispatch.state, 'running');
+  } finally { f.service.close(); }
+});
+
+test('DSH explicit queue is refused after ask_parent ended the turn while its question is pending', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'ask me first' }, extra(A));
+    const record = f.record();
+    const session = f.sessions.get(record.sessionId);
+    // ask_parent returns without a running native turn, but the question is still open.
+    session.running = false;
+    session.questions = [{ id: 'dsh-open-question', state: 'pending', message: 'Which one?' }];
+    const sends = f.sends.length;
+    const receipt = await f.service.send({ name: 'artist', message: 'queue this', mode: 'queue' }, extra(A));
+    assert.equal(receipt.accepted, false);
+    assert.deepEqual(receipt.error, { code: 'mode-unsupported', target: 'dsh', supportedModes: ['steer'] });
+    assert.equal(f.sends.length, sends, 'nothing is written');
+    assert.equal(f.store.supplements(record.agentId).length, 0, 'nothing enters the queue');
+    assert.equal(f.record().task.answers?.length ?? 0, 0, 'the question is not answered');
   } finally { f.service.close(); }
 });
 
@@ -1521,8 +1581,14 @@ test('send returns a compact receipt for a rich active task and preserves errors
   const f = await fixture({ beforeSend: async () => { if (failure) throw failure; } });
   try {
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-  assert.deepEqual(await f.service.send({ name: 'artist', message: 'private initial task' }, extra(A)),
-    { name: 'artist', accepted: true, state: 'running', actualModel: 'test' });
+  const initial = await f.service.send({ name: 'artist', message: 'private initial task' }, extra(A));
+  assert.equal(initial.name, 'artist');
+  assert.equal(initial.accepted, true);
+  assert.equal(initial.state, 'running');
+  assert.equal(initial.actualModel, 'test');
+  assert.equal(initial.delivery, 'new-turn');
+  assert.equal(initial.mode, 'steer');
+  assert.match(initial.requestId, /^request-/);
   const record = f.record();
   record.callbackBlocked = true;
   record.task.reports = [{ id: 'old-report', message: 'private report', final: false, delivery: { state: 'blocked' } }];
@@ -1535,7 +1601,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   ];
   f.store.save(record);
   const result = await f.service.send({ name: 'artist', message: 'private supplement' }, extra(A));
-  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'name', 'state']);
+  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'delivery', 'mode', 'name', 'queued', 'requestId', 'state']);
   assert.equal(result.accepted, true);
   assert.equal(result.callbackError.code, 'native-callback-unavailable');
   assert.doesNotMatch(JSON.stringify(result), /private|deep child|coverage/);
@@ -1554,7 +1620,16 @@ test('send returns a compact receipt for a rich active task and preserves errors
   assert.equal(unknown.error.code, 'send-unknown');
   failure = undefined;
   f.sessions.get(f.record().sessionId).questions = [{ id: 'q', message: 'question', state: 'pending' }];
-  assert.deepEqual(await f.service.send({ name: 'artist', message: 'answer' }, extra(A)), { name: 'artist', answered: true, state: 'resuming', actualModel: 'test' });
+  const answerReceipt = await f.service.send({ name: 'artist', message: 'answer' }, extra(A));
+  assert.equal(answerReceipt.name, 'artist');
+  assert.equal(answerReceipt.answered, true);
+  assert.equal(answerReceipt.state, 'resuming');
+  assert.equal(answerReceipt.actualModel, 'test');
+  assert.equal(answerReceipt.delivery, 'answer-pending');
+  assert.equal(answerReceipt.accepted, false);
+  assert.equal(answerReceipt.queued, true);
+  assert.equal(answerReceipt.mode, 'steer');
+  assert.match(answerReceipt.requestId, /^request-/);
   } finally { f.service.close(); }
 });
 

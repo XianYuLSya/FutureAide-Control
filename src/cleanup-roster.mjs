@@ -1,3 +1,4 @@
+import { answerOutcome, unsentExpiredAnswer } from './cleanup-input-receipts.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { forgetUnsentStep,markRosterRestored } from './cleanup-roster-transaction.mjs';
 import { createHash } from 'node:crypto';
@@ -84,6 +85,27 @@ function nativeToken(ticketId, agentId) {
 }
 
 const time = value => { const n = typeof value === 'number' ? (value > 0 && value < 1e12 ? value * 1000 : value) : Date.parse(value ?? ''); return Number.isFinite(n) && n > 0 ? n : null; };
+// A durable local queue is not a native acceptance, even when the enclosing
+// task has already reached a terminal state.
+const unsettledDispatch = d => !unsentExpiredAnswer(d) && (['sending','unknown','retrying','queued'].includes(d.state)
+  || ['local-pending','after-current','answer-pending','unknown'].includes(d.delivery)
+  || (d.attempted && !d.accepted && !d.rejected));
+const unsettledAnswer = (task, answer) => answerOutcome(task, answer) === 'unknown';
+function laterAnswerSettled(tree, row, data) {
+  const record = tree.find(item => item.agentId === row.agent);
+  if (!record) return false;
+  const history = data.agent_history.filter(item => item.agent === row.agent).map(item => {
+    try { return parse(item.body); } catch { return undefined; }
+  });
+  const rounds = [record.task, ...(Array.isArray(record.history) ? record.history : []), ...history]
+    .filter(task => task?.taskId === row.task);
+  if (!rounds.length) return false;
+  // A conflicting copy of a round is never enough evidence to discard text.
+  return rounds.every(task => {
+    const answers = (task.answers ?? []).filter(item => item.answerId === row.requestId && item.message === row.message);
+    return answers.length === 1 && ['accepted','blocked'].includes(answerOutcome(task, answers[0]));
+  });
+}
 function assess(tree, data, ownerDeleted, now, config, natives, states) {
   const ids = new Set(tree.map(row => row.agentId));
   let uncertainClock = false;
@@ -113,6 +135,12 @@ function assess(tree, data, ownerDeleted, now, config, natives, states) {
   const submissions = data.submissions.filter(row => ids.has(row.agent));
   const supplements = data.supplements.filter(row => ids.has(row.agent));
   if (supplements.some(row => ['sending','unknown'].includes(row.status))) return { safe:false, reason:'input-outcome-unknown' };
+  if (supplements.some(row => {
+    let receipt; try { receipt=parse(row.receipt); } catch { return true; }
+    if (row.status === 'accepted' && receipt?.delivery === 'answer-pending' && laterAnswerSettled(tree,row,data)) return false;
+    return row.status !== 'blocked' && (receipt?.delivery === 'unknown'
+      || (!ownerDeleted && ['local-pending','after-current','answer-pending'].includes(receipt?.delivery)));
+  })) return {safe:false,reason:'input-outcome-unknown'};
   if (!ownerDeleted && supplements.some(row => row.status === 'queued')) return { safe:false, reason:'pending-supplement' };
   if (supplements.length) uncertainClock = true; // the legacy queue has no completion time
   for (const row of submissions) {
@@ -128,8 +156,8 @@ function assess(tree, data, ownerDeleted, now, config, natives, states) {
     if (!['idle','failed','cancelled','completed'].includes(record.state) && !archivedSupplement && !(ownerDeleted && task?.finishedAt)) return {safe:false,reason:'roster-state-not-settled'};
     if (record.closed || record.cleanupRosterTicket) return {safe:false,reason:'roster-already-closed'};
     if ((task?.cancelRequested || record.state === 'cancelled' || task?.state === 'cancelled') && !(task?.cancelVerified && task?.cancelTreeSettled)) return {safe:false,reason:'cancellation-not-verified'};
-    if ((task?.dispatches ?? []).some(d => ['sending','unknown','retrying'].includes(d.state) || (d.attempted && !d.accepted && !d.rejected))) return {safe:false,reason:'dispatch-outcome-unknown'};
-    if ((task?.answers ?? []).some(a => !a.dispatched)) return {safe:false,reason:'answer-in-flight'};
+    if ((task?.dispatches ?? []).some(unsettledDispatch)) return {safe:false,reason:'dispatch-outcome-unknown'};
+    if ((task?.answers ?? []).some(answer => unsettledAnswer(task,answer))) return {safe:false,reason:'answer-in-flight'};
     if (!ownerDeleted && (record.observation?.questions ?? []).some(q => q.state === 'pending')) return {safe:false,reason:'question-pending'};
     if (!ownerDeleted && Object.values(task?.questionNotices ?? {}).some(notice => !['delivered','blocked'].includes(notice?.state))) return {safe:false,reason:'question-notice-pending'};
     for (const notice of Object.values(task?.questionNotices ?? {})) {
@@ -162,7 +190,8 @@ function assess(tree, data, ownerDeleted, now, config, natives, states) {
       if (!ownerDeleted && !['delivered','blocked'].includes(state)) return {safe:false,reason:'historical-report-pending'};
       if (['delivered','blocked'].includes(state) && time(report.delivery?.deliveredAt ?? report.delivery?.blockedAt) === null) uncertainClock = true;
     }
-    if ((past.answers ?? []).some(answer => !answer.dispatched)) return {safe:false,reason:'historical-answer-in-flight'};
+    if ((past.dispatches ?? []).some(unsettledDispatch)) return {safe:false,reason:'historical-dispatch-outcome-unknown'};
+    if ((past.answers ?? []).some(answer => unsettledAnswer(past,answer))) return {safe:false,reason:'historical-answer-in-flight'};
     if (!ownerDeleted && Object.values(past.questionNotices ?? {}).some(notice => !['delivered','blocked'].includes(notice?.state))) return {safe:false,reason:'historical-question-pending'};
     collectDates(past);
   }
@@ -185,7 +214,8 @@ function assess(tree, data, ownerDeleted, now, config, natives, states) {
     ];
     const finalDelivered=finalStates.length>0 && finalStates.every(s=>s==='delivered');
     if(task.state==='completed' && finalDelivered && (task.autoCleanupHeld===true || root.state==='supplement_blocked'
-      || (task.reports??[]).some(r=>r.delivery?.state==='blocked')))return {safe:true,reason:'delivered-once-with-sealed-body',since:null,immediate:true};
+      || (task.reports??[]).some(r=>r.delivery?.state==='blocked')
+      || (task.answers??[]).some(answer=>answerOutcome(task,answer)==='blocked')))return {safe:true,reason:'delivered-once-with-sealed-body',since:null,immediate:true};
     if (!failed && !blocked) return {safe:false,reason:'once-terminal-not-proven'};
     const finished=time(task.finishedAt);
     const blockedTimes=(task.reports ?? []).filter(r => r.final && r.delivery?.state === 'blocked').map(r => time(r.delivery.blockedAt ?? r.delivery.finishedAt));

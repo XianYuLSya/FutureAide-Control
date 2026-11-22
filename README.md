@@ -108,6 +108,40 @@ futureaide_delete_agent({name: "架构图助手"})
 
 长期助手保留上下文，不再需要时按名字删除。
 
+### 忙时插话与排队
+
+助手正在干活时，`futureaide_send_agent` 和同名 `futureaide_run_agent` 可以带 `mode`：
+
+| `mode` | 效果 |
+|---|---|
+| 省略 | 跟随目标原有习惯：Codex / DSH 有活动轮时插进当前轮，下一步读到；Claude CLI 留到当前轮结束后的同一会话下一轮 |
+| `steer` | 明确插进当前轮，活动轮下一次模型动作读到；没有活动轮时直接开新一轮 |
+| `queue` | 明确排在当前轮之后：当前轮自然结束后，单独作为下一轮的第一条输入，不并入当前轮 |
+
+目标做不到的组合会直接拒绝，返回 `error.code: "mode-unsupported"`、`error.target`、`error.supportedModes`，同时 `accepted: false`；不入队、不调后端、不改模型：
+
+| 目标 | 忙时省略 | 显式 `steer` | 显式 `queue` |
+|---|---|---|---|
+| Codex Desktop | 插入当前轮 | 插入当前轮 | 等当前轮结束后开新轮 |
+| DSH | 下一步读到 | 下一步读到 | 拒绝，`supportedModes: ["steer"]` |
+| Claude CLI | 排到轮间，下一轮开始 | 拒绝，`supportedModes: ["queue"]` | 排到轮间，下一轮开始 |
+
+没有活动轮时，两种模式都直接开新一轮。有待答问题时，省略 mode 或显式 `steer` 的普通 send 作为回答；显式 `queue` 只排补充，不代答。DSH 忙时显式 `queue` 一律拒绝，即使有待答问题。
+
+补充回执会带 `requestId`、`mode`、`delivery`，有原生证据时带 `turnId`，已知所排轮次时带 `afterTurnId`：
+
+| `delivery` | 意思 |
+|---|---|
+| `local-pending` | 只在本地存下，尚未核实根轮；`accepted: false, queued: true` |
+| `after-current` | 已登记在活动轮 A 之后；`afterTurnId: A`，`accepted: false, queued: true` |
+| `current-turn` | 原生 steer 已受理，进入活动轮 A；`accepted: true, turnId: A` |
+| `new-turn` | 原生 start 已受理，作为新轮 B 的第一条输入；`accepted: true, turnId: B` |
+| `answer-pending` / `answered` | 已作为回答登记 / 回答已实际送达 |
+| `accepted-route-unknown` | 原生记录可证已写入，但去向无法确认；`accepted: true, queued: false` |
+| `unknown` / `blocked` | 写入结果未知，不自动重发 / 明确拒绝、取消或过期，附真实原因 |
+
+`accepted` 本身不能推断是当前轮还是新轮，必须看 `delivery` 和 `turnId`。`futureaide_inspect_agent({name})` 的 `inputs` 会列出本任务每条输入的同组字段和原因，用回执里的 `requestId` 对应；`list` 只保留计数摘要。
+
 ### 派给后台的 Claude
 
 先登录一次 CLI。在安装目录运行下面两条，找到 Claude Desktop 自带的 CLI 并登录它自己的账号：
@@ -131,9 +165,9 @@ futureaide_send_agent({name: "审稿", message: "接着检查刚才提到的第�
 | 工具 | 用途 |
 |---|---|
 | `futureaide_status` | 看当前聊天、项目、各目标的就绪状态和可选模型 |
-| `futureaide_run_agent` | 一步创建并派单，名字已存在时直接派给它 |
+| `futureaide_run_agent` | 一步创建并派单，名字已存在时直接派给它；`mode` 可选插话或排队 |
 | `futureaide_create_agent` | 预留名字，可选 `target`、`model`、`effort` |
-| `futureaide_send_agent` | 派单或补充，也可以更新模型和强度 |
+| `futureaide_send_agent` | 派单或补充，也可以更新模型和强度；`mode` 可选插话或排队 |
 | `futureaide_answer_agent` | 回答助手的问题 |
 | `futureaide_list_agents` | 看本聊天的名单，有下属时一人一行列出整棵树 |
 | `futureaide_wait_agents` | 等一个或多个名字，单次最多 45 秒 |

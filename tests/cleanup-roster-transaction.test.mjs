@@ -51,6 +51,37 @@ test('claim archives exact text, closes all members, survives stale save and res
   } finally { f.close(); }
 });
 
+test('a direct answer and frozen supplement receipts remain searchable by the original id', () => {
+  const f = fixture();
+  try {
+    const root = f.store.get('a');
+    const answer = { answerId: 'answer-direct', message: '原始回答\n第二行', dispatched: true, undelivered: 'final-submitted' };
+    root.state = root.task.state = 'running';
+    root.task.reports = [];
+    root.task.answers = [answer];
+    f.store.save(root);
+    f.store.enqueueSupplement(root, 'queued-input', '原始排队正文', { model: 'frozen-model' },
+      { mode: 'queue', selectionExplicit: true, receipt: { delivery: 'local-pending' } });
+    const claim = id => claimRosterTree(f.file, { rootId: 'a', fingerprint: readRosterTree(f.file, 'a').fingerprint, ticketId: id });
+    claim('before');
+    assert.deepEqual(readRosterArchives(f.file, { originalId: answer.answerId })[0].payload, answer);
+    const receipts = () => readRosterArchives(f.file, { originalId: 'queued-input' }).filter(row => row.source === 'supplement-receipt');
+    const before = receipts()[0];
+    assert.equal(before.payload.status, 'queued');
+    assert.equal(before.payload.mode, 'queue');
+    assert.equal(before.payload.selectionExplicit, 1);
+    assert.equal(JSON.parse(before.payload.selection).model, 'frozen-model');
+    assert.equal(JSON.parse(before.payload.receipt).delivery, 'local-pending');
+    releaseRosterTicket(f.file, 'before');
+    f.store.setSupplement('queued-input', 'blocked', 'final-submitted', { delivery: 'blocked' });
+    claim('after');
+    assert.equal(receipts().length, 2);
+    assert.ok(receipts().some(row => row.sha256 === before.sha256));
+    assert.ok(receipts().some(row => row.payload.reason === 'final-submitted' && row.payload.message === '原始排队正文'));
+    assert.equal(verifyRosterTicket(f.file, 'after').valid, true);
+  } finally { f.close(); }
+});
+
 test('a live name lease prevents the tree claim', () => {
   const f=fixture();
   try {

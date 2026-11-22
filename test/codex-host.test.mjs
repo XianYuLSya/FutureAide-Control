@@ -156,7 +156,7 @@ test('a missing debug port is reported with the FAswitch instruction', async () 
 test('schema-shaped turns project marker, messages and file changes incrementally', () => {
   const marker = markerLine('r', 'nonce');
   const turns = [{ id: 'turn-1', status: 'inProgress', startedAt: 1, items: [
-    { id: 'u1', type: 'userMessage', content: [{ type: 'text', text: `${marker}\nwork` }] },
+    { id: 'u1', type: 'userMessage', content: [{ type: 'text', text: `work\n\n${marker}` }] },
   ] }];
   const first = projectCodexTurns(emptyProjection(), turns, { r: { marker } });
   assert.equal(first.deliveries.r.turnId, 'turn-1');
@@ -167,7 +167,7 @@ test('schema-shaped turns project marker, messages and file changes incrementall
     changes: [{ path: 'D:/work/a.txt', kind: { type: 'add' } }] });
   const next = projectCodexTurns(first, turns, { r: { marker } });
   assert.equal(next.running, false);
-  assert.deepEqual(next.messages.map(message => [message.role, message.text]), [['user', `${marker}\nwork`], ['assistant', 'done']]);
+  assert.deepEqual(next.messages.map(message => [message.role, message.text]), [['user', `work\n\n${marker}`], ['assistant', 'done']]);
   assert.equal(next.changes[0].kind, 'add');
   const again = projectCodexTurns(next, turns, { r: { marker } });
   assert.equal(again.messages.length, 2);
@@ -437,7 +437,7 @@ test('findCreatedSession is read-only, skips an unreadable candidate and confirm
     ]);
     if (method === 'thread/turns/list' && params.threadId === 'someone-else') throw new Error('not readable in this store');
     if (method === 'thread/turns/list') return livePage([liveTurn({ id: 'turn-1', startedAt: createdAt, items: [
-      { clientId: 'u1', type: 'userMessage', content: [{ type: 'text', text: `${marker}\nwork` }] },
+      { clientId: 'u1', type: 'userMessage', content: [{ type: 'text', text: `work\n\n${marker}` }] },
     ] })]);
     if (method === 'thread/read') throw new Error('recovery must not hydrate a thread');
     throw new Error('unexpected ' + method);

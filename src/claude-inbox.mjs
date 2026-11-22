@@ -180,6 +180,19 @@ function toolMetadata(value) {
   return Object.keys(picked).length ? picked : undefined;
 }
 
+// Claude Desktop gives an absorbed peer message its own native queue UUID, so
+// source_uuid/commandUuid no longer identify our request. The fixed transport
+// envelope does; outside an identified FutureAide peer only that envelope counts,
+// never a bare marker someone typed or quoted.
+function envelopeRequestId(value) {
+  if (typeof value !== 'string') return undefined;
+  return /^<cross-session-message from-name="FutureAide Control">\r?\n\[FutureAide request ([A-Za-z0-9-]{1,100})\]\r?\n/.exec(value)?.[1];
+}
+function bodyRequestId(value) {
+  if (typeof value !== 'string') return undefined;
+  return /^\[FutureAide request ([A-Za-z0-9-]{1,100})\]\r?\n/.exec(value)?.[1];
+}
+
 export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576, sidechain = false } = {}) {
   if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('invalid-transcript-offset');
   if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new Error('invalid-transcript-page-size');
@@ -221,18 +234,44 @@ export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576
       const enqueued = event.type === 'queue-operation' && event.operation === 'enqueue'
         && typeof event.content === 'string'
         ? /^<cross-session-message from-name="FutureAide Control">\r?\n\[FutureAide request ([A-Za-z0-9-]{1,100})\]\r?\n/.exec(event.content) : null;
+      const queued = event.type === 'attachment' && attachment?.type === 'queued_command'
+        && attachment.origin?.kind === 'peer';
+      // origin.from/name is the Desktop-declared peer identity. Without it, only
+      // a complete envelope identifies a sender. An explicit FutureAide peer may
+      // also use its raw body, which starts with the bare marker.
+      const senderNames = [attachment?.origin?.from, attachment?.origin?.name]
+        .filter(value => typeof value === 'string');
+      const senderKnown = senderNames.length > 0;
+      const fromFutureAide = senderKnown && senderNames.every(value => value === 'FutureAide Control');
+      let queuedRequestId;
+      if (!queued) queuedRequestId = undefined;
+      else if (fromFutureAide) {
+        queuedRequestId = envelopeRequestId(attachment.origin?.body) ?? bodyRequestId(attachment.origin?.body)
+          ?? envelopeRequestId(attachment.prompt) ?? bodyRequestId(attachment.prompt);
+      } else if (!senderKnown) {
+        queuedRequestId = envelopeRequestId(attachment.origin?.body) ?? envelopeRequestId(attachment.prompt);
+      }
+      // A declared foreign peer gets no text id at all, even if its prompt looks
+      // like our envelope; only the old native source_uuid fallback remains.
       if (enqueued) {
         // This is our fixed transport envelope at the start of a native queue
         // record, not an id quoted by the model. The observer still intersects
         // it with persisted request ids; insertion remains a separate receipt.
         deliveries.push({ requestId: enqueued[1], stage: 'accepted', timestamp: event.timestamp, seq });
-      } else if (event.type === 'attachment' && attachment?.type === 'queued_command'
-          && attachment.origin?.kind === 'peer' && typeof attachment.source_uuid === 'string') {
-        deliveries.push({ requestId: attachment.source_uuid, deliveryId: attachment.delivery_id,
+      } else if (queued && (queuedRequestId || typeof attachment.source_uuid === 'string')) {
+        // A Desktop-absorbed queue command uses its own UUID for source_uuid. The
+        // request marker in the body/prompt survives, so prefer it and keep the
+        // native id only for older records that still carried ours.
+        deliveries.push({ requestId: queuedRequestId ?? attachment.source_uuid, deliveryId: attachment.delivery_id,
           stage: 'accepted', timestamp: event.timestamp, seq });
       } else if (event.type === 'queue-operation' && event.operation === 'remove'
-          && event.reason === 'absorbed_mid_turn' && typeof event.commandUuid === 'string') {
-        deliveries.push({ requestId: event.commandUuid, deliveryId: event.deliveryId,
+          && event.reason === 'absorbed_mid_turn') {
+        // Same rewrite on removal: commandUuid is Desktop's, while content keeps
+        // the complete envelope. A bare marker here is not a receipt. Fall back
+        // to commandUuid only for older records that still carried our id.
+        const removedRequestId = envelopeRequestId(event.content)
+          ?? (typeof event.commandUuid === 'string' ? event.commandUuid : undefined);
+        if (removedRequestId) deliveries.push({ requestId: removedRequestId, deliveryId: event.deliveryId,
           stage: 'inserted', timestamp: event.timestamp, seq });
       } else if (event.type === 'user' && typeof event.uuid === 'string'
           && typeof event.message?.content === 'string') {

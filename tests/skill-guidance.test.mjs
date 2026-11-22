@@ -16,6 +16,23 @@ test('the default skill uses named subagents and keeps legacy dispatch in its re
   assert.match(legacy, /codex_thread_id/);
 });
 
+test('the skill and README explain busy-time mode and delivery by target', async () => {
+  const skill = await read('../skills/futureaide-control/SKILL.md');
+  for (const word of ['mode', 'steer', 'queue', 'mode-unsupported', 'supportedModes', 'delivery',
+    'after-current', 'new-turn', 'accepted-route-unknown', 'answer-pending', 'inputs']) {
+    assert.ok(skill.includes(word), `skill is missing ${word}`);
+  }
+  assert.match(skill, /explicit `queue` never answers/i);
+  assert.match(skill, /DSH refuses explicit `queue` while busy/i);
+  assert.match(skill, /Claude CLI refuses explicit `steer` while busy/i);
+  const readme = await read('../README.md');
+  for (const word of ['mode', 'mode-unsupported', 'supportedModes', 'delivery', 'accepted-route-unknown', 'inputs']) {
+    assert.ok(readme.includes(word), `README is missing ${word}`);
+  }
+  assert.match(readme, /DSH.*supportedModes/s);
+  assert.match(readme, /Claude CLI.*supportedModes/s);
+});
+
 test('public README links resolve inside the distributable package', async () => {
   const readme = await read('../README.md');
   const root = new URL('../', import.meta.url);

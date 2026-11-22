@@ -368,10 +368,10 @@ test('a final report attempted while the question is unanswered waits for the an
   } finally { f.service.close(); }
 });
 
-test('answering a task that was already sealed says the answer was not delivered', async () => {
+for (const lifetime of ['persistent', 'once']) test(`a sealed ${lifetime} round keeps the only copy of a direct answer`, async () => {
   const f = await fixture();
   try {
-    const lead = await f.start('lead', 'Fix the ten places.');
+    const lead = await f.start('lead', 'Fix the ten places.', { lifetime });
     await f.ask(lead, 'Which contract applies?');
     await f.poll(lead);
     // A task left in this state by a version that still accepted the early final.
@@ -384,7 +384,11 @@ test('answering a task that was already sealed says the answer was not delivered
     const receipt = await f.answer(lead, 'Contract B.');
     assert.equal(receipt.answered, false, 'the caller is not told the task resumes');
     assert.equal(receipt.error.code, 'answer-not-delivered');
+    const answerId = f.record('lead').task.answers.at(-1).answerId;
     await f.poll(lead); await f.poll(lead);
+    const retained = f.record('lead').task.answers.find(answer => answer.answerId === answerId);
+    assert.equal(retained.message, 'Contract B.');
+    assert.equal(retained.undelivered, 'final-submitted');
 
     assert.equal(f.codex.inputs().some(input => input.text.includes('Contract B.')), false, 'nothing is written into the finished conversation');
     assert.equal(f.record('lead').task.state, 'completed', 'the held final report is released');

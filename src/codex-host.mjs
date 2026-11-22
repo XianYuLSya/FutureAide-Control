@@ -11,7 +11,8 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import {
   requestCodexNative, readCodexThreadNative, ensureCodexThreadNative, listCodexTurnsNative,
   listCodexItemsNative, listCodexModelsNative, sendCodexTextNative, releaseCodexThreadNative,
-  readCodexUserInput, replyCodexUserInput, RELEASE_STATUSES,
+  readCodexUserInput, replyCodexUserInput, findCodexDispatchInput, hasExactDispatchMarker,
+  RELEASE_STATUSES,
 } from './codex-ipc.mjs';
 
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
@@ -65,6 +66,7 @@ export function projectCodexTurns(previous, turns, requests = {}) {
   const ordered = [...(turns ?? [])].sort((a, b) => (a?.startedAt ?? 0) - (b?.startedAt ?? 0));
   for (const turn of ordered) {
     if (typeof turn?.id !== 'string') continue;
+    let userInputs = 0;
     const state = turn.status === 'inProgress' ? 'running' : 'ended';
     p.turns[turn.id] = { ...(p.turns[turn.id] ?? {}), state };
     if (state === 'running') {
@@ -85,6 +87,7 @@ export function projectCodexTurns(previous, turns, requests = {}) {
       if (kind === 'usermessage' || kind === 'agentmessage') {
         const role = kind === 'usermessage' ? 'user' : 'assistant';
         const text = itemText(item);
+        if (role === 'user') userInputs++;
         const index = p.messageIds[itemId];
         if (index !== undefined) p.messages[index] = { ...p.messages[index], text };
         else {
@@ -99,9 +102,13 @@ export function projectCodexTurns(previous, turns, requests = {}) {
             for (const [position, message] of p.messages.entries()) if (message?.id) p.messageIds[message.id] = position;
           }
         }
+        // A marker proves this input only when it is the message's exact last line;
+        // a body reference to the same text is not delivery evidence. `firstUser`
+        // tells recovery whether a turn/start marker is really the turn's first input.
         if (role === 'user') for (const [id, request] of Object.entries(requests)) {
-          if (typeof request?.marker === 'string' && text.includes(request.marker) && !p.deliveries[id]) {
-            p.deliveries[id] = { seq, turnId: turn.id };
+          if (typeof request?.marker === 'string' && hasExactDispatchMarker(text, request.marker)
+              && !p.deliveries[id]) {
+            p.deliveries[id] = { seq, turnId: turn.id, firstUser: userInputs === 1 };
           }
         }
       } else if (kind === 'filechange' && item.status === 'completed' && !p.changeSeen[itemId]) {
@@ -520,6 +527,59 @@ export function createCodexHost(options = {}) {
       if (!model?.model) return undefined;
       return { ...model, verified: true, resolved: true };
     },
+    /**
+     * The root thread's own turn, independent of every native descendant. `running`
+     * is true when the root thread is active, even if the turn page has not named the
+     * turn yet; `confirmed` says whether that state is backed by a visible turn row.
+     * `selection` is present only when a recorded turn/start for this exact turn
+     * proves the wire selection, never from a name pin or a child.
+     */
+    async rootTurn({ nativeSessionId, requests = {}, startRequestIds = new Set() } = {}) {
+      if (typeof nativeSessionId !== 'string' || !nativeSessionId) {
+        throw fail('codex-root-turn-unconfirmed', 'The managed root thread is unknown; nothing was read.', { uncertain: true });
+      }
+      let thread;
+      try {
+        // A metadata read, never a resume: asking whether the root is busy must not
+        // subscribe a thread the desktop already released.
+        thread = await readThreadForStatus(nativeSessionId);
+      } catch (error) {
+        if (error.code === 'codex-empty-rollout') {
+          return { running: true, confirmed: false, reason: 'empty-rollout' };
+        }
+        throw error;
+      }
+      const page = await listCodexTurnsNative(nativeSessionId, { limit: 10, itemsView: 'notLoaded', request: nativeRequest });
+      const active = (page.data ?? []).find(turn => turn?.status === 'inProgress' && typeof turn.id === 'string');
+      const threadActive = thread?.status?.type === 'active';
+      if (!active) {
+        return { running: threadActive, confirmed: !threadActive,
+          ...(threadActive ? { reason: 'active-turn-not-visible' } : {}) };
+      }
+      // Only a request that actually started this turn proves its selection. A steer
+      // that carried an inherited pin has the same turnId and delivery but says
+      // nothing about how the turn was started. Legacy task rows without a recorded
+      // method are the one historical form that still counts as first-dispatch
+      // evidence; an old steer row never does.
+      const start = Object.values(requests ?? {}).find(request => request?.status === 'accepted'
+        && request.turnId === active.id && typeof request.delivery?.model === 'string'
+        && (request.route === 'new-turn' || request.kind === 'task'
+          || startRequestIds.has(request.requestId)));
+      // `selection` is the catalog identity the caller used (preset-a);
+      // `wireSelection` is the actual native slug the turn was started with
+      // (wire-a). They are different coordinate systems and must never be compared
+      // directly. Thread metadata can supply only the wire side.
+      const selection = start?.model?.model ? { provider: start.model.provider ?? 'openai',
+        model: start.model.model, ...(start.model.reasoningEffort ? { reasoningEffort: start.model.reasoningEffort } : {}) } : undefined;
+      const reported = start ? { model: start.delivery.model,
+        ...(start.delivery.effort ? { reasoningEffort: start.delivery.effort } : {}) }
+        : (() => { const value = currentModelFromThread(thread);
+          return value ? { model: value.model, ...(value.reasoningEffort ? { reasoningEffort: value.reasoningEffort } : {}) } : undefined; })();
+      return { running: true, confirmed: true, turnId: active.id,
+        ...(selection ? { selection } : {}),
+        ...(reported ? { wireSelection: reported } : {}),
+        ...(selection || reported ? { selectionSource: start ? 'turn-start' : 'thread-metadata' } : {}) };
+    },
     async createFirstTurn(input) {
       // thread/start is the same entry the UI uses. Omitting model, effort,
       // approval, reviewer, sandbox, permissions and config leaves every one of
@@ -537,6 +597,17 @@ export function createCodexHost(options = {}) {
       const refused = typeof input.blockReason === 'function' ? input.blockReason() : undefined;
       if (refused) {
         throw fail(refused, 'The round ended before this input was written; the thread was created, no turn was started.',
+          { terminal: true, notSent: true, nativeSessionId: threadId });
+      }
+      // The caller persists the intended method and target here, after the thread exists
+      // and immediately before turn/start. A process that dies after this point leaves a
+      // write-ahead record that recovery can verify without replaying the message.
+      if (typeof input.onIntent === 'function') {
+        await input.onIntent({ method: 'turn/start', threadId, priorTurnId: null });
+      }
+      const late = typeof input.blockReason === 'function' ? input.blockReason() : undefined;
+      if (late) {
+        throw fail(late, 'The round ended before this input was written; the thread was created, no turn was started.',
           { terminal: true, notSent: true, nativeSessionId: threadId });
       }
       let turn;
@@ -570,7 +641,8 @@ export function createCodexHost(options = {}) {
       await nativeRequest('thread/name/set', { threadId: nativeSessionId, name });
       return { renamed: true };
     },
-    async send({ nativeSessionId, message, model, effort, resubscribe = false, blockReason }) {
+    async send({ nativeSessionId, message, model, effort, mode, selection, selectionExplicit,
+      legacySelection = false, knownSelections, onIntent, allowStart = true, resubscribe = false, blockReason }) {
       // A thread whose release we already asked for may still read as idle while this
       // connection holds no subscription: the request was acknowledged, the idle grace
       // is running. Only a resume puts the subscription back before a turn rides it, so
@@ -579,10 +651,26 @@ export function createCodexHost(options = {}) {
         try { await nativeRequest('thread/resume', { threadId: nativeSessionId, excludeTurns: true }); }
         catch { /* the write below reports the real reason, missing thread included */ }
       }
-      const result = await sendCodexTextNative(nativeSessionId, message,
-        { request: nativeRequest, ...(blockReason === undefined ? {} : { blockReason }),
-          ...(model === undefined ? {} : { model }), ...(effort === undefined ? {} : { effort }) });
-      return { sent: true, turnId: result?.turn?.id ?? result?.turnId };
+      const result = await sendCodexTextNative(nativeSessionId, message, {
+        request: nativeRequest,
+        ...(blockReason === undefined ? {} : { blockReason }),
+        ...(model === undefined ? {} : { model }),
+        ...(effort === undefined ? {} : { effort }),
+        ...(mode === undefined ? {} : { mode }),
+        ...(selection === undefined ? {} : { selection }),
+        ...(selectionExplicit === undefined ? {} : { selectionExplicit }),
+        ...(legacySelection ? { legacySelection: true } : {}),
+        ...(knownSelections === undefined ? {} : { knownSelections }),
+        ...(onIntent === undefined ? {} : { onIntent }),
+        ...(allowStart === false ? { allowStart: false } : {}),
+      });
+      // A queue that met an active root turn is a durable "after A" answer, not a send.
+      if (result?.waiting === true) return result;
+      return { ...result, sent: true, turnId: result?.turn?.id ?? result?.turnId };
+    },
+    /** Read-only marker recovery for one dispatch; never writes or resumes. */
+    async findDispatchInput({ nativeSessionId, marker }) {
+      return findCodexDispatchInput(nativeSessionId, marker, { request: nativeRequest });
     },
     /** The native user-input cards of one managed thread. Read-only; an unverifiable read
      * stays `unverified` and is never turned into "there is nothing pending". */

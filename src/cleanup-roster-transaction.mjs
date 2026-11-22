@@ -80,6 +80,8 @@ function archiveEntries(tree, now, externalArchives = []) {
     if (typeof value.id === 'string' && typeof value.message === 'string')
       add('embedded-message', value.id, agentId, { id: value.id, message: value.message }, false, agentId,
         typeof value.createdAt === 'string' ? value.createdAt : undefined);
+    if (typeof value.answerId === 'string' && typeof value.message === 'string')
+      add('answer', value.answerId, agentId, value, true, agentId, value.created);
     for (const child of Object.values(value)) embedded(agentId, child);
   }
   for (const row of tree.records.agents) {
@@ -95,6 +97,12 @@ function archiveEntries(tree, now, externalArchives = []) {
     { id: row.id, owner: row.owner, agent: row.agent, task: row.task, kind: row.kind, message: row.message, final: row.final, created: row.created });
   for (const row of tree.records.supplements) add('supplement', row.requestId, row.agent,
     { requestId: row.requestId, owner: row.owner, agent: row.agent, session: row.session, task: row.task, message: row.message, created: row.created });
+  // The original immutable keys above also occur in already-issued tickets.
+  // A separate versioned row preserves the exact delivery evidence at claim time.
+  for (const row of tree.records.submissions)
+    add('submission-receipt', row.id, row.agent, row, true);
+  for (const row of tree.records.supplements)
+    add('supplement-receipt', row.requestId, row.agent, row, true);
   for (const item of externalArchives) {
     if (!lookup.has(item.agentId) || typeof item.sourceId !== 'string' || !item.sourceId || typeof item.sessionId !== 'string' || !item.sessionId || !Object.hasOwn(item,'event')) throw new Error('native-history-invalid');
     add(item.sourceType?'dsh-'+item.sourceType:'dsh-history', item.sourceId, item.agentId, {sourceId:item.sourceId,sessionId:item.sessionId,event:item.event}, false, item.sessionId,

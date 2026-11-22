@@ -26,6 +26,39 @@ function fixture({lifetime='once', state='failed', task, ownerStatus, desktopOve
   return {dir,store,engine,record,privatePath,nativePath,close(){store.close();rmSync(dir,{recursive:true,force:true});}};
 }
 
+test('queued and unknown dispatches and answers prevent terminal cleanup across rounds', async()=>{
+  for (const delivery of ['local-pending','after-current','answer-pending','unknown']) {
+    for (const historical of [false,true]) {
+      const f=fixture();
+      try {
+        const record=f.store.get('agent');
+        const pending={taskId:'old',dispatches:[{requestId:'r',mode:'queue',state:'queued',accepted:false,delivery}]};
+        if (historical) f.store.appendHistory('agent',pending);
+        else { record.task.dispatches=pending.dispatches; f.store.save(record); }
+        assert.equal((await f.engine.inventory()).items[0].firstEligible,false,`${delivery} historical=${historical}`);
+      } finally { f.close(); }
+    }
+  }
+  const f=fixture();
+  try {
+    const record=f.store.get('agent'); record.task.answers=[{dispatched:true,delivery:'unknown'}]; f.store.save(record);
+    assert.equal((await f.engine.inventory()).items[0].reason,'answer-in-flight');
+  } finally { f.close(); }
+});
+
+test('new supplement fields retain original message by request ID in archive', async()=>{
+  const f=fixture();
+  try {
+    f.store.db.prepare(`INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created,mode,selectionExplicit,receipt)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run('input-id','owner','agent','session','old','原始输入\n第二行','accepted','2020-01-01T00:00:00Z','steer',1,JSON.stringify({delivery:'current-turn',accepted:true}));
+    const item=(await f.engine.inventory()).items[0];
+    assert.equal(item.firstEligible,true,item.reason);
+    const result=await f.engine.remove(item,{mode:'first',revalidate:async()=>true});
+    assert.equal(result.removed,true,JSON.stringify(result));
+    assert.equal((await f.engine.archives({originalId:'input-id'}))[0].payload.message,'原始输入\n第二行');
+  } finally { f.close(); }
+});
+
 test('R02 a second final that was just sealed still needs the whole retention period',async()=>{
   const stamp=new Date().toISOString(),now=Date.parse(stamp);
   const f=fixture({state:'idle',retention:86400000,cleanupNow:()=>now,task:{taskId:'round',state:'completed',finishedAt:stamp,autoCleanupHeld:true,reports:[

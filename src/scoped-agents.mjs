@@ -3931,6 +3931,7 @@ export function createScopedAgents(config, {
         // The receipt reports the full ID resolved for this input, not a stale
         // display value from before the pin changed.
         ...effortReceipt(pin),
+        ...(dshDefaultOnly(record) ? { modelLocked: true } : {}),
         actualModel: actualModelName(pin) ?? actualModelName(record.model),
         ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
       });
@@ -4263,6 +4264,7 @@ export function createScopedAgents(config, {
           ...(dispatch?.turnId ? { turnId: dispatch.turnId } : {}),
           ...(dispatch?.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
           ...effortReceipt(dispatch?.model, dispatch?.actualEffort),
+          ...(dshDefaultOnly(record) ? { modelLocked: true } : {}),
           actualModel: actualModelName(current.model) ?? actualModelName(current.modelPin),
           ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
           ...(previousReport ? { previousReport } : {}),
@@ -4346,6 +4348,7 @@ export function createScopedAgents(config, {
         ...(result.afterTurnId ? { afterTurnId: result.afterTurnId } : {}),
         actualModel: result.actualModel ?? null,
         ...effortReceipt(result, result.actualEffort ?? null),
+        ...(result.modelLocked ? { modelLocked: true } : {}),
         ...(result.queued !== undefined ? { queued: result.queued === true } : {}), ...(result.retrying ? { retrying: true } : {}),
         ...(result.callbackError ? { callbackError: result.callbackError } : {}), ...(result.error ? { error: result.error } : {}) });
       const existing = name === undefined ? undefined : store.named(owner.ownerId, assertName(name));

@@ -10,7 +10,26 @@ const transportFields = ['dataRoot', 'dshDataRoot', 'target', 'baseUrl', 'instan
 // Behaviour switches a named profile may set for itself. They are deliberately not
 // transport fields: creating a profile copies only the connection, and a profile that
 // says nothing inherits the base configuration.
-const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs', 'dshDefaultModelOnly'];
+const cleanupDefaults = {
+  agentAutoCleanup: false,
+  codexAutoCleanup: true,
+  onceTerminalRetentionMs: 86400000,
+  agentIdleRetentionMs: 43200000,
+  diagnosticRetentionMs: 604800000,
+  agentCleanupIntervalMs: 900000,
+  cleanupGraceMs: 86400000,
+};
+const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs', 'dshDefaultModelOnly', ...Object.keys(cleanupDefaults)];
+
+function cleanupSettings(base, overrides = {}) {
+  const result = { ...cleanupDefaults, ...pick(base, Object.keys(cleanupDefaults)), ...pick(overrides, Object.keys(cleanupDefaults)) };
+  for (const [key, value] of Object.entries(result)) {
+    if (typeof cleanupDefaults[key] === 'boolean' ? typeof value !== 'boolean' : !(Number.isSafeInteger(value) && value > 0)) {
+      return { ...cleanupDefaults, cleanupConfigurationError: key };
+    }
+  }
+  return result;
+}
 const targetFields = ['futureaideSessionId', 'codexThreadId'];
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -132,6 +151,7 @@ export async function loadConfig(filename, profile) {
       hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
       ...pick(supplied, transportFields),
       ...selected,
+      ...cleanupSettings(supplied, selectedValue), profile,
       // A selected profile overrides the base value it inherits; the switch is on by
       // default so an older configuration keeps releasing.
       idleSessionCleanup: idleSessionCleanup(selected.idleSessionCleanup, idleSessionCleanup(supplied.idleSessionCleanup)),
@@ -148,6 +168,7 @@ export async function loadConfig(filename, profile) {
     hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
     workspace: process.cwd(),
     ...supplied,
+    ...cleanupSettings(supplied), profile: null,
     idleSessionCleanup: idleSessionCleanup(supplied.idleSessionCleanup),
     teamBoard: teamBoard(supplied.teamBoard),
     claudeCallbackReminderMs: claudeCallbackReminderMs(supplied.claudeCallbackReminderMs),

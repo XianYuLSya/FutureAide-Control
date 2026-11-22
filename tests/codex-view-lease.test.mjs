@@ -1,4 +1,4 @@
-﻿// The release guard in front of `thread/unsubscribe`.
+// The release guard in front of `thread/unsubscribe`.
 //
 // One renderer subscription per thread is all the desktop has, so a plugin release that is
 // not gated on the desktop's own view state would drop the user's open thread. Three layers
@@ -9,7 +9,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  pageMcpRequest, pageThreadUnsubscribeGuard, pageDropReleaseHandoff,
+  pageMcpRequest, pageThreadUnsubscribeGuard, pageDropReleaseHandoff, pageCleanupCommit,
   threadUnsubscribePrepareExpression, threadUnsubscribeSendExpression, threadViewProbeExpression,
   releaseCodexThreadNative, createCodexNativeRpc, nativeRpcExpression, appPageTargets,
   RELEASE_STATUSES, RELEASE_GUARD_INTERNALS, RELEASE_CLOCK_TOLERANCE_MS,
@@ -1482,4 +1482,34 @@ test('a card whose questions or options were replaced is not answered', async ()
   assert.deepEqual(await pageReplyUserInput(page.win, page.load, RELEASE_GUARD_INTERNALS, card,
     { q1: { answers: ['先跑通'] } }), { status: 'unknown', reason: 'questions-changed' });
   assert.equal(page.writes.length, 0);
+});
+
+
+test('cleanup delete uses window guard and refuses occupied, unknown, or closed gate', async () => {
+  const params={threadId:THREAD,treeIds:[THREAD],activity:[]};
+  const clear=pageTransport({commit:{status:'deleted',dispatched:true}});
+  assert.equal((await clear.rpc.request('futureaide/cleanup/delete',params,{canRelease:()=>true})).status,'deleted');
+  const sent=clear.main().sent.find(message=>String(message.params?.expression??'').includes('skipRoleRead:true'));
+  assert.ok(sent.params.expression.includes('futureaide/cleanup/delete'));clear.rpc.close();
+  for (const [extra,expected] of [['inUse','inUse'],['no-entry','unverified']]) {
+    const fixture=pageTransport({extra});
+    assert.equal((await fixture.rpc.request('futureaide/cleanup/delete',params,{canRelease:()=>true})).status,expected);
+    fixture.rpc.close();
+  }
+  const closed=pageTransport();
+  assert.equal((await closed.rpc.request('futureaide/cleanup/delete',params,{canRelease:()=>false})).status,'notSent');
+  assert.equal(closed.sockets.length,0);closed.rpc.close();
+});
+
+test('cleanup renderer checks full tree and reads root immediately before delete', async () => {
+  const thread={id:THREAD,status:{type:'idle'},updatedAt:4};
+  const request={id:'x',params:{threadId:THREAD,treeIds:[THREAD],activity:[{id:THREAD,parent:null,updatedAt:4,turns:[]}]}};
+  const methods=[];
+  const call=async(_win,r)=>{methods.push(r.method);if(r.method==='thread/list'||r.method==='thread/turns/list')return {result:{data:[]}};
+    if(r.method==='thread/read')return {result:{thread}};if(r.method==='thread/delete')return {result:{}};throw Error('unexpected')};
+  assert.deepEqual(await pageCleanupCommit({},request,1000,call),{result:{deleted:true}});
+  assert.deepEqual(methods.slice(-2),['thread/read','thread/delete']);
+  thread.status={type:'active'};methods.length=0;
+  assert.equal((await pageCleanupCommit({},request,1000,call)).result?.notSent,true);
+  assert.ok(!methods.includes('thread/delete'));
 });

@@ -364,11 +364,14 @@ export async function monitorAlive(store, now = Date.now(), options = {}) {
 }
 
 /** Spawn the single detached monitor. A PID alone never confirms a successful spawn. */
-export function monitorSpawn(configFile, lease, spawnProcess = spawn) {
+export function monitorSpawn(configFile, lease, spawnProcess = spawn, config) {
   if (!configFile) throw new Error('The installed plugin has no private configuration path for recovery.');
   if (!/^monitor-[0-9a-f-]{36}$/.test(lease ?? '')) throw new Error('Invalid shared monitor lease.');
   const script = fileURLToPath(new URL('./scoped-worker.mjs', import.meta.url));
-  const child = spawnProcess(process.execPath, [script, '--config', configFile, '--lease', lease], {
+  const args = [script, '--config', configFile, '--lease', lease];
+  if (config?.profile) args.push('--profile', config.profile);
+  if (config?.stateDirectory && config?.dshDataRoot) args.push('--state', path.resolve(config.stateDirectory), '--root', path.resolve(config.dshDataRoot));
+  const child = spawnProcess(process.execPath, args, {
     detached: true, stdio: 'ignore', windowsHide: true,
   });
   return new Promise((resolve, reject) => {
@@ -437,7 +440,7 @@ export async function ensureSharedMonitor(config, store, { spawnProcess = spawn,
     if (owner && owner.holder === state.holder && unknownIdentity) return false;
     return true;
   }
-  try { await monitorSpawn(config.configFile, holder, spawnProcess); }
+  try { await monitorSpawn(config.configFile, holder, spawnProcess, config); }
   catch (error) { store.releaseLease(MONITOR_LEASE, holder); throw error; }
   return true;
 }

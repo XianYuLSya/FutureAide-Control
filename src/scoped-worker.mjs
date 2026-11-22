@@ -45,7 +45,9 @@ const values = Object.fromEntries(process.argv.slice(2).reduce((pairs, value, in
   return pairs;
 }, []));
 if (!values['--config'] || !/^monitor-[0-9a-f-]{36}$/.test(values['--lease'] ?? '')) throw new Error('Invalid shared monitor identity.');
-const config = await loadConfig(values['--config']);
+const config = await loadConfig(values['--config'], values['--profile']);
+if ((values['--state'] && values['--state'] !== path.resolve(config.stateDirectory))
+  || (values['--root'] && values['--root'] !== path.resolve(config.dshDataRoot))) throw new Error('Monitor configuration identity changed.');
 const hostDirectory = config.managedStateDirectory ?? path.join(path.dirname(config.hostBridgeFile), 'managed-host');
 
 // Hints the next round acts on: a managed-host file event names one record, anything
@@ -92,6 +94,14 @@ const failures = new Map();
 // file is not read again. It only ever skips a read of identical bytes.
 const sleepCache = new Map();
 const ownsLease = () => { const lease = store.lease(MONITOR_LEASE); return running && lease?.holder === holder && lease.expires > Date.now(); };
+let cleanup;
+async function loadCleanupMonitor() {
+  if(!cleanup) {
+    const {cleanupMonitor}=await import('./cleanup-command.mjs');
+    cleanup=cleanupMonitor(config,ownsLease);
+  }
+}
+if(config.agentAutoCleanup) await loadCleanupMonitor();
 const deliveries = backgroundBatch(() => pollSleeping(store, agentId => service.poll(agentId),
   (agentId, taskId) => service.wake(agentId, taskId), ownsLease), signal);
 function signal() { if (wake) wake(); else signalled = true; }
@@ -130,6 +140,7 @@ async function waitForWork(timeoutMs, floor) {
   signalled = false;
   trace(`wait= ${outcome.reason}`);
   if (outcome.reason === 'commit') {
+    if(!cleanup && store.lease('cleanup:reload')?.expires>Date.now()) await loadCleanupMonitor();
     lastVersion = outcome.version;
     hints.commit();
     idleSince = undefined;
@@ -188,6 +199,7 @@ try {
   // expired still stops the loop on the next read.
   while (running && store.leaseHeld(MONITOR_LEASE, holder)) {
     if (!store.leaseHeld(MONITOR_READY_LEASE, holder)) break;
+    const cleanupWaiting = cleanup?.tick() === true;
     const roundStarted = Date.now();
     const { taken, only, sweepDue } = planMonitorRound(hints, service, lastSweepAt, { sweepMs: SWEEP_MS });
     attach(monitorDirectories(config));
@@ -224,6 +236,7 @@ try {
     if (hints.defer(deferred)) { trace(`wake= deferred ${deferred.join(",")}`); signalled = true; }
     const version = store.dataVersion();
     const external = version !== lastVersion;
+    if(external && !cleanup && store.lease('cleanup:reload')?.expires>Date.now()) await loadCleanupMonitor();
     lastVersion = version;
     // A commit nobody told us about is news: the next round sweeps for it instead of
     // waiting out the five-second ceiling.
@@ -238,7 +251,7 @@ try {
     else idleSince ??= Date.now();
     rounds += 1;
     trace(`round=${rounds} busy=${busy} external=${external} sweep=${sweepDue ? 1 : 0} idleMs=${idleSince === undefined ? 0 : Date.now() - idleSince} watched=${watchers.size}`);
-    const quiet = !busy && !external && !store.hasSleeping() && releaseAt === undefined;
+    const quiet = !busy && !external && !store.hasSleeping() && releaseAt === undefined && !cleanupWaiting;
     if (quiet && Date.now() - idleSince >= IDLE_EXIT_MS) {
       store.releaseLease(MONITOR_READY_LEASE, holder);
       const stillQuiet = !store.hasSleeping() && store.dataVersion() === lastVersion;
@@ -260,6 +273,8 @@ try {
     else await waitForWork(waitMs, floor);
   }
 } finally {
+  running=false;
+  await cleanup?.drain();
   await deliveries.drain();
   await service.drainPolls();
   pollSignal.close();

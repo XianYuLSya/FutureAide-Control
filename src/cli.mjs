@@ -31,6 +31,9 @@ const { values, positionals } = parseArgs({
     'timeout-minutes': { type: 'string' },
     id: { type: 'string' }, through: { type: 'string' }, todo: { type: 'string' },
     help: { type: 'boolean', short: 'h' },
+    output: {type:'string'}, manifest: {type:'string'}, decisions: {type:'string'}, approval: {type:'string'}, ticket:{type:'string'}, 'original-id':{type:'string'},
+    scopes: {type:'string'}, key: {type:'string'}, name: {type:'string'}, owner: {type:'string'}, from: {type:'string'},
+    to: {type:'string'}, 'worktree-review': {type:'string'},
   },
 });
 
@@ -71,6 +74,14 @@ const usage = `futureaide-control <connect|status|sessions|read|send|wait|watch|
   --profile NAME            Named connection for this call; omission keeps the default
   --session-id ID           Default: configured execution mother session
   connect --request-id ID   Prepare the bridge without starting a model or restarting the app
+  cleanup preview --output FILE [--scopes roster,dsh,files]
+  cleanup approve --manifest FILE --decisions FILE
+  cleanup enable|disable|status
+  cleanup apply --manifest FILE --approval DIGEST [--worktree-review FILE] [--output FILE]
+  cleanup archive [--name NAME] [--owner ID] [--original-id ID] [--from UTC] [--to UTC] [--output FILE]
+  cleanup restore --ticket STAGING_TICKET
+  cleanup revoke --key INVENTORY_KEY
+  cleanup vacuum --decisions FILE --approval DIGEST --output BACKUP_PATH
   profiles [--profile NAME]
   profile-create --profile NAME --workspace ABSOLUTE_PATH [--session-id ID] [--codex-thread-id ID]
   sessions --query TEXT --limit 20
@@ -97,7 +108,8 @@ if (values.help || !positionals.length) {
     const command = positionals[0];
     const feedback = command.startsWith('feedback-') ? await import('./feedback-inbox.mjs') : null;
     values.config = await maintenanceConfigPath(values.config, path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
-    const control = ['profiles', 'profile-create', 'feedback-pending', 'feedback-organize', 'feedback-todos'].includes(command) ? undefined : createControl(await loadConfig(values.config, values.profile));
+    const control = feedback || ['profiles', 'profile-create', 'cleanup'].includes(command)
+      ? undefined : createControl(await loadConfig(values.config, values.profile));
     const sessionId = values['session-id'];
     const number = name => {
       if (values[name] === undefined) return undefined;
@@ -205,6 +217,7 @@ if (values.help || !positionals.length) {
       case 'feedback-todos':
         result = feedback.feedbackTodos((await loadConfig(values.config)).configFile);
         break;
+      case 'cleanup': result = await (await import('./cleanup-command.mjs')).cleanupCommand(positionals[1],values); break;
       case 'register-peer': result = await (await peers()).register({ peerId: values['peer-id'], kind: values.kind, workspace: values.workspace, threadId: values['codex-thread-id'], agentId: values['agent-id'], label: values.label }); break;
       case 'list-peers': result = await (await peers()).list({ workspace: values.workspace }); break;
       case 'inbox': result = await (await peers()).inbox({ peerId: values['peer-id'], state: values.state }); break;

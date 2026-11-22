@@ -91,7 +91,10 @@ export async function installDesktopHostBridge(config, profileDirectory, { refre
   const discoveryConfig = discoveryFile ? `        discoveryFile: ${JSON.stringify(discoveryFile)}\n        dataRoot: ${JSON.stringify(config.dshDataRoot ?? config.dataRoot)}\n` : '';
   const stateConfig = config.managedStateDirectory ? `        managedStateDirectory: ${JSON.stringify(config.managedStateDirectory)}\n` : '';
   // The bridge enforces the same lock as the plugin, for callers still on an older one.
-  const policyConfig = config.dshDefaultModelOnly === true ? '        defaultModelOnly: true\n' : '';
+  const grace = config.cleanupGraceMs ?? 86400000;
+  if (!Number.isSafeInteger(grace) || grace <= 0) throw new Error('The staging grace period must be a positive integer.');
+  const policyConfig = (config.dshDefaultModelOnly === true ? '        defaultModelOnly: true\n' : '')
+    + (grace === 86400000 ? '' : `        cleanupGraceMs: ${grace}\n`);
   const feedbackConfig = path.isAbsolute(config.configFile || '') ? `        feedbackNode: ${JSON.stringify(process.execPath)}\n        feedbackConfigFile: ${JSON.stringify(config.configFile)}\n` : '';
   const registration = createHash('sha256').update(JSON.stringify([module.href, credentialFile, discoveryConfig, stateConfig, feedbackConfig])).digest('hex').slice(0, 16);
   const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${registration}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${stateConfig}${discoveryConfig}${policyConfig}${feedbackConfig}${end}\n`;
@@ -137,6 +140,8 @@ export async function installHostBridge(config) {
   const revision = await hostBridgeRevision();
   await writeFile(marker, JSON.stringify({ owner: 'futureaide-control', version: 1 }) + '\n');
   await writeFile(path.join(root, 'preset.yml'), 'name: Codex Control Bridge\ndescription: Local control transport bootstrap. No model prompt is submitted.\norder: 999\n');
-  await writeFile(path.join(root, 'agent.cordis.yml'), JSON.stringify([{ id: 'codex-control-host', name: pathToFileURL(plugin).href + '?v=' + revision, config: { credentialFile, ...(path.isAbsolute(config.configFile || '') ? { feedbackNode: process.execPath, feedbackConfigFile: config.configFile } : {}) } }], null, 2) + '\n');
+  const presetConfig = { credentialFile, ...(path.isAbsolute(config.configFile || '')
+    ? { feedbackNode: process.execPath, feedbackConfigFile: config.configFile } : {}) };
+  await writeFile(path.join(root, 'agent.cordis.yml'), JSON.stringify([{ id: 'codex-control-host', name: pathToFileURL(plugin).href + '?v=' + revision, config: presetConfig }], null, 2) + '\n');
   return { installed: true, preset: HOST_PRESET, presetDirectory: root, revision, requiresBootstrapSession: true };
 }

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { answerOutcome } from './cleanup-input-receipts.mjs';
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
@@ -637,24 +638,25 @@ export class RosterStore {
       const body = "CASE WHEN json_type(body,'$.release')='object' "
         + "THEN json_set(json_remove(?1,'$.release'),'$.release',json_extract(body,'$.release')) "
         + "ELSE json_remove(?1,'$.release') END";
-      const changed = this.db.prepare(`UPDATE backend_state SET body=${body} WHERE agent=?2 AND body IS NOT ${body}`)
+      const changed = this.db.prepare(`UPDATE backend_state SET body=${body} WHERE agent=?2 AND body IS NOT ${body}
+        AND EXISTS (SELECT 1 FROM agents WHERE id=?2 AND json_type(body,'$.cleanupRosterTicket') IS NULL)`)
         .run(incoming, agentId).changes === 1;
       if (changed) { this.dropProjections(); return true; }
       const inserted = this.db.prepare(`INSERT INTO backend_state(agent,body)
-        SELECT id,json_remove(?1,'$.release') FROM agents WHERE id=?2
+        SELECT id,json_remove(?1,'$.release') FROM agents WHERE id=?2 AND json_type(body,'$.cleanupRosterTicket') IS NULL
         ON CONFLICT(agent) DO NOTHING`).run(incoming, agentId).changes === 1;
       if (inserted) { this.dropProjections(); return true; }
-      return this.db.prepare('SELECT 1 AS found FROM agents WHERE id=?').get(agentId) !== undefined;
+      return this.db.prepare("SELECT 1 AS found FROM agents WHERE id=? AND json_type(body,'$.cleanupRosterTicket') IS NULL").get(agentId) !== undefined;
     }
     // An identical document is not rewritten. A Codex poll saves its state on every
     // refresh, and rewriting an unchanged 100+ KB row (zero-filling the old pages under
     // secure_delete) was most of the monitor's disk writes.
-    const changed = this.db.prepare(`INSERT INTO backend_state(agent,body) SELECT id,? FROM agents WHERE id=?
+    const changed = this.db.prepare(`INSERT INTO backend_state(agent,body) SELECT id,? FROM agents WHERE id=? AND json_type(body,'$.cleanupRosterTicket') IS NULL
       ON CONFLICT(agent) DO UPDATE SET body=excluded.body WHERE backend_state.body IS NOT excluded.body`)
       .run(JSON.stringify(value), agentId).changes === 1;
     if (changed) { this.dropProjections(); return true; }
     // Nothing written: either the document was identical, or the name is gone.
-    return this.db.prepare('SELECT 1 AS found FROM agents WHERE id=?').get(agentId) !== undefined;
+    return this.db.prepare("SELECT 1 AS found FROM agents WHERE id=? AND json_type(body,'$.cleanupRosterTicket') IS NULL").get(agentId) !== undefined;
   }
 
   /**
@@ -672,7 +674,8 @@ export class RosterStore {
     if (typeof taskId !== 'string' || !taskId) return false;
     const attempt = typeof ticket === 'string' && ticket;
     const statement = `UPDATE backend_state SET body=json_set(body,'$.release',json(?1))
-      WHERE agent=?2 AND json_extract((SELECT body FROM agents WHERE id=?2),'$.task.taskId')=?3`
+      WHERE agent=?2 AND json_extract((SELECT body FROM agents WHERE id=?2),'$.task.taskId')=?3
+      AND json_type((SELECT body FROM agents WHERE id=?2),'$.cleanupRosterTicket') IS NULL`
       + (attempt ? " AND json_extract((SELECT body FROM agents WHERE id=?2),'$.releaseState.ticket')=?4" : '');
     const parameters = attempt ? [JSON.stringify(release), agentId, taskId, attempt]
       : [JSON.stringify(release), agentId, taskId];
@@ -938,9 +941,11 @@ export class RosterStore {
       WHEN coalesce(json_extract(body,'$.autoCleanupClosed'),0)=1
       THEN json_set(${merged},'$.closed',json('true'),'$.autoCleanupClosed',json('true'))
       ELSE ${merged} END
-      WHERE id=?2 AND owner=?3 AND name=?4 ${fence} RETURNING body`)
+      WHERE id=?2 AND owner=?3 AND name=?4 AND json_type(body,'$.cleanupRosterTicket') IS NULL ${fence} RETURNING body`)
       .get(body, record.agentId, record.ownerId, record.name, ...(dispatch ? [record.task?.taskId ?? null] : []));
     if (dispatch && !result) return false;
+    if (!result && this.db.prepare("SELECT 1 FROM agents WHERE id=? AND json_type(body,'$.cleanupRosterTicket') IS NOT NULL").get(record.agentId))
+      throw Object.assign(new Error('This subagent is closed by a roster cleanup ticket.'), { code: 'cleanup-claimed' });
     if (!result) throw new Error('This subagent instance has already been removed.');
     this.woken.delete(record.agentId);
     // The SQL may deliberately preserve an atomic wake or child snapshot that the
@@ -965,7 +970,7 @@ export class RosterStore {
   }
   requestCleanup(record) {
     const changed = this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.state','cleaning','$.closed',json('true')),'$.sleep','$.error','$.nextAttemptAt')
-      WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=?`)
+      WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=? AND json_type(body,'$.cleanupRosterTicket') IS NULL`)
       .run(record.agentId, record.ownerId, record.sessionId).changes === 1;
     if (changed) this.touched(record.agentId);
     return changed;
@@ -1005,8 +1010,30 @@ export class RosterStore {
       )
       SELECT count(*) AS blocked FROM tree JOIN agents ON agents.id=tree.id
       WHERE json_extract(agents.body,'$.expired.retainBody')=1`).get(agentId);
-    return { pending: (row?.pending ?? 0) + (supplements?.pending ?? 0),
-      blocked: (row?.blocked ?? 0) + (supplements?.blocked ?? 0) + (expired?.blocked ?? 0) };
+    // An answer entered directly can have no supplement row. A final can seal
+    // it before its native write, including on a child or an older round.
+    const rounds = this.db.prepare(`WITH RECURSIVE tree(id) AS (
+        SELECT id FROM agents WHERE id=?1
+        UNION
+        SELECT child.id FROM agents AS child JOIN tree ON json_extract(child.body,'$.parentAgentId')=tree.id
+      ), rounds(agent, task) AS (
+        SELECT a.id,json_extract(a.body,'$.task') FROM agents AS a JOIN tree ON a.id=tree.id
+        UNION ALL SELECT h.agent,h.body FROM agent_history AS h JOIN tree ON h.agent=tree.id
+      ) SELECT rounds.task, backend_state.body AS backend FROM rounds
+        LEFT JOIN backend_state ON backend_state.agent=rounds.agent
+        WHERE json_array_length(rounds.task,'$.answers')>0`).all(agentId);
+    let pending = row.pending + supplements.pending;
+    let blocked = row.blocked + supplements.blocked + expired.blocked;
+    for (const round of rounds) {
+      const task = JSON.parse(round.task);
+      const backend = round.backend ? JSON.parse(round.backend) : undefined;
+      for (const answer of task.answers) {
+        const outcome = answerOutcome(task, answer, backend);
+        if (outcome === 'blocked') blocked++;
+        else if (outcome !== 'accepted') pending++;
+      }
+    }
+    return { pending, blocked };
   }
   claimAutoCleanup(record) {
     // One transaction for the check and the claim: a child that accepts a message while

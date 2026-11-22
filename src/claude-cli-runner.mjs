@@ -44,12 +44,13 @@
 //   by an interpreter. The real caller always passes the path string probeClaudeCli
 //   returned.
 import { execFile, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { createInterface } from 'node:readline';
 import { replaceStateFile } from './replace-state-file.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -212,6 +213,57 @@ export function claudeTurnArguments({ sessionId, resume = false, model, effort, 
   }
   if (name) args.push('--name', String(name));
   return args;
+}
+
+/** Read a CLI's own model catalog without sending a user message. */
+export async function discoverClaudeModels({ cli, workspace, timeoutMs = PROBE_TIMEOUT_MS } = {}) {
+  const command = cliCommand(cli);
+  const child = spawn(command.command, [...command.prefixArgs, '-p', '--input-format', 'stream-json',
+    '--output-format', 'stream-json', '--verbose'], { cwd: workspace, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+  const lines = createInterface({ input: child.stdout });
+  const pending = new Map();
+  let seq = 0;
+  const failure = error => { for (const { reject } of pending.values()) reject(error); pending.clear(); };
+  child.on('error', failure);
+  child.stdin.on('error', failure);
+  child.on('exit', () => failure(fail('claude-control-exited', 'Claude exited before its model capabilities were read.')));
+  lines.on('line', line => {
+    let value; try { value = JSON.parse(line); } catch { return; }
+    if (value.type !== 'control_response') return;
+    const response = value.response, waiter = pending.get(response?.request_id);
+    if (!waiter) return;
+    pending.delete(response.request_id);
+    if (response.subtype !== 'success') waiter.reject(fail('claude-control-refused', String(response.error ?? 'Control request refused.')));
+    else waiter.resolve(response.response ?? {});
+  });
+  async function request(subtype) {
+    const id = `catalog-${++seq}`;
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { pending.delete(id); reject(fail('claude-control-timeout', `Claude did not answer ${subtype}.`)); }, timeoutMs);
+      pending.set(id, { resolve: value => { clearTimeout(timer); resolve(value); }, reject: error => { clearTimeout(timer); reject(error); } });
+      child.stdin.write(JSON.stringify({ type: 'control_request', request_id: id, request: { subtype } }) + '\n');
+    });
+  }
+  try {
+    await request('initialize');
+    const catalog = await request('list_models');
+    const settings = await request('get_settings');
+    return claudeCatalog(catalog, settings);
+  } finally { child.stdin.destroy(); child.kill(); lines.close(); }
+}
+
+export function claudeCatalog(catalog, settings) {
+  if (!Array.isArray(catalog?.models) || typeof settings?.applied?.model !== 'string') {
+    throw fail('claude-capabilities-unavailable', 'Claude did not report model capabilities and applied model.');
+  }
+  const entries = catalog.models.filter(row => !row.disabled && typeof row.resolvedModel === 'string')
+    .map(row => ({ id: row.resolvedModel, name: row.displayName ?? row.value ?? row.resolvedModel,
+      reasoning: Array.isArray(row.supportedEffortLevels) ? { efforts: row.supportedEffortLevels.map(id => ({ id })) }
+        : row.supportsEffort === false ? { efforts: [] } : {},
+      effortCapabilityKnown: Array.isArray(row.supportedEffortLevels) || row.supportsEffort === false }));
+  return { default: { provider: 'claude-cli', model: settings.applied.model,
+    ...(settings.applied.effort ? { reasoningEffort: settings.applied.effort } : {}) },
+  routableProviders: ['claude-cli'], groups: [{ id: 'claude-cli', models: entries }] };
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +458,7 @@ function applySystemEvent(state, value) {
   state.sessionStarted = true;
   if (state.phase === 'starting') state.phase = 'streaming';
   if (typeof value.session_id === 'string' && value.session_id) state.cliSessionId = value.session_id;
+  if (typeof value.claude_code_version === 'string') state.cliVersion = value.claude_code_version;
   if (typeof value.model === 'string' && value.model) state.model = value.model;
   // Some hosts publish the effective next-message effort in init. Absence is
   // unknown, not confirmation that the requested command-line value applied.
@@ -538,6 +591,8 @@ export function applyClaudeLine(state, line) {
   }
   state.updatedAt = new Date().toISOString();
   if (value.type === 'system') { applySystemEvent(state, value); return { kind: 'system' }; }
+  if (value.type === 'user' && state.businessSubmitted === true && state.inputUuid
+      && value.uuid === state.inputUuid && value.session_id === state.sessionId) state.businessAccepted = true;
   if (value.type === 'assistant') { applyAssistantEvent(state, value); return { kind: 'assistant' }; }
   if (value.type === 'user') { applyUserEvent(state, value); return { kind: 'user' }; }
   if (value.type === 'result') { applyResultEvent(state, value); return { kind: 'result' }; }
@@ -743,6 +798,9 @@ export async function startClaudeTurn(input = {}, deps = {}) {
         mcpFile, allowedTools: mcpFile ? allowedCallbackTools(serverName) : undefined,
         name: nameValue,
       }),
+      selectedModel: modelValue ?? null, selectedEffort: effortValue ?? null,
+      stagedControl: input.stagedControl === true,
+      inputUuid: input.stagedControl === true ? randomUUID() : null,
       mcpServer: serverName ?? null, startedAt, workerPid: null,
       files: { prompt: CLAUDE_TURN_FILES.prompt, mcp: mcpFile ? CLAUDE_TURN_FILES.mcp : null,
         stdout: CLAUDE_TURN_FILES.stdout, stderr: CLAUDE_TURN_FILES.stderr },
@@ -909,8 +967,14 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
     requestId: state.requestId ?? null,
     sessionId: state.sessionId ?? null,
     cliSessionId: state.cliSessionId ?? null,
+    cliVersion: state.cliVersion ?? null,
     model: state.model ?? null,
     actualEffort: state.actualEffort ?? null,
+    ...(state.capabilities ? { capabilities: state.capabilities } : {}),
+    ...(state.applied ? { applied: state.applied } : {}),
+    ...(state.effortAdjustment ? { effortAdjustment: state.effortAdjustment } : {}),
+    businessAccepted: state.businessAccepted === true,
+    ...(state.businessAccepted === true && state.inputUuid ? { inputUuid: state.inputUuid } : {}),
     messages: state.messages ?? [],
     ...(error ? { error } : {}),
     sessionStarted: state.sessionStarted === true,

@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import path from 'node:path';
-import { createClaudeCliBackend, CLAUDE_CLI_MODELS, CLAUDE_CLI_EFFORTS } from '../src/claude-cli-backend.mjs';
+import { createClaudeCliBackend } from '../src/claude-cli-backend.mjs';
+import { CLI_MODELS as CLAUDE_CLI_MODELS } from '../fixtures/fake-claude-workflow.mjs';
+import { CLAUDE_EFFORTS as CLAUDE_CLI_EFFORTS } from '../src/claude-cli-runner.mjs';
 import { endedState, modelTurnError } from '../src/control.mjs';
 import { modelCatalogSummary, resolveModelSelection } from '../src/model-selection.mjs';
 
@@ -17,8 +19,11 @@ function fakeRunner({ probe, turns = {}, failFor = [] } = {}) {
   return {
     calls,
     live,
-    setTurn(directory, turn) { live.set(directory, turn); },
+    setTurn(directory, turn) { live.set(directory, { ...(turn.sessionStarted ? { businessAccepted: true } : {}), ...turn }); },
     async probeClaudeCli() { calls.probes += 1; return probe ?? { cli: CLI }; },
+    async discoverClaudeModels() { return { default: { provider: 'claude-cli', model: 'claude-sonnet-5-5' },
+      groups: [{ id: 'claude-cli', models: CLAUDE_CLI_MODELS.map(id => ({ id,
+        reasoning: { efforts: CLAUDE_CLI_EFFORTS.map(id => ({ id })) } })) }] }; },
     async startClaudeTurn(input) {
       const failing = [...failures].find(requestId => input.directory.includes(requestId));
       if (failing) {
@@ -26,7 +31,7 @@ function fakeRunner({ probe, turns = {}, failFor = [] } = {}) {
         throw Object.assign(new Error('The claude process could not be spawned.'), { code: 'claude-cli-spawn-failed', retryable: true });
       }
       calls.starts.push(input);
-      live.set(input.directory, { state: 'running',
+      live.set(input.directory, { state: 'running', businessAccepted: true,
         messages: [{ role: 'assistant', text: 'working' }] });
       return { accepted: true };
     },
@@ -112,7 +117,7 @@ test('a dispatch refused by the runner lands rejected and clears active', async 
   assert.equal(typeof forwarded[0], 'function', 'the gate is handed to the runner');
   assert.equal(state().active, undefined, 'the adapter clears its active request');
   assert.equal(state().requests['r-runner'].status, 'rejected', 'the claim lands terminal');
-  assert.deepEqual(await backend.receipt({ requestId: 'r-runner' }), { status: 'rejected', afterSeq: 0 });
+  assert.equal((await backend.receipt({ requestId: 'r-runner' })).notSent, true);
 });
 
 // The window this closes: the runner wrote its terminal refusal, then the adapter process
@@ -134,8 +139,7 @@ test('a runner refusal already on disk is never upgraded to accepted by a later 
   assert.equal(state().requests['r-crash'].status, 'rejected', 'the refusal on disk wins over accepted');
   assert.equal(state().requests['r-crash'].terminal.failure.code, 'round-finished');
   assert.equal(observed.running, false);
-  assert.deepEqual(await backend.receipt({ requestId: 'r-crash' }), { status: 'rejected',
-    afterSeq: state().requests['r-crash'].afterSeq });
+  assert.equal((await backend.receipt({ requestId: 'r-crash' })).notSent, true);
 });
 
 test('create reserves the name with zero model turns and confirms a logged-in CLI', async () => {
@@ -172,7 +176,7 @@ test('one turn per request, and every later turn resumes the same session uuid',
   const { backend, record } = await setup({ runner });
   assert.deepEqual(await backend.beginTask({}), { treeProtocol: 1, reportProtocol: 1, throughSeq: 0 });
   const first = await backend.deliver({ requestId: 'request-1', message: 'Do the work', kind: 'task' });
-  assert.equal(first.accepted, true);
+  assert.equal(first.status, 'unknown');
   assert.equal(runner.calls.starts.length, 1);
   const [started] = runner.calls.starts;
   assert.equal(started.directory, turnDirectory('request-1'));
@@ -209,7 +213,7 @@ test('a live turn makes the next input retryable instead of starting a second pr
   runner.setTurn(turnDirectory('request-1'), { state: 'ended', sessionStarted: true, messages: [] });
   await backend.turn({ requestId: 'request-1' });
   const retried = await backend.deliver({ requestId: 'request-2', message: 'Second', kind: 'supplement' });
-  assert.equal(retried.accepted, true);
+  assert.equal(retried.status, 'unknown');
   assert.equal(runner.calls.starts.length, 2);
 });
 
@@ -222,12 +226,27 @@ test('delivery is idempotent per request id and refuses a reuse with another mes
   assert.equal(again.afterSeq, first.afterSeq);
   assert.equal(runner.calls.starts.length, 1, 'the same request never starts twice');
   assert.deepEqual(await backend.receipt({ requestId: 'request-1' }),
-    { status: 'accepted', afterSeq: first.afterSeq, result: { accepted: true, requestId: 'request-1' } });
+    { status: 'accepted', afterSeq: first.afterSeq, actualEffort: null, result: { accepted: true, requestId: 'request-1' } });
   await assert.rejects(() => backend.deliver({ requestId: 'request-1', message: 'Something else' }),
     error => error.code === 'request-id-conflict');
   assert.equal(await backend.receipt({ requestId: 'request-unknown' }), undefined,
     'no write was ever attempted');
   assert.equal(state().requests['request-1'].messageHash.length, 64);
+});
+
+test('worker startup stays unknown until the matching business input is observed', async () => {
+  const runner = fakeRunner();
+  const { backend } = await setup({ runner });
+  const first = await backend.deliver({ requestId: 'pending', message: 'task' });
+  assert.equal(first.status, 'unknown');
+  const dir = runner.calls.starts[0].directory;
+  runner.setTurn(dir, { state: 'running', messages: [] });
+  assert.equal((await backend.receipt({ requestId: 'pending' })).status, 'unknown');
+  assert.equal((await backend.deliver({ requestId: 'pending', message: 'task' })).status, 'unknown');
+  assert.equal(runner.calls.starts.length, 1);
+  runner.setTurn(dir, { state: 'running', businessAccepted: true,
+    applied: { model: 'claude-test', effort: 'high' }, messages: [] });
+  assert.equal((await backend.receipt({ requestId: 'pending' })).actualEffort, 'high');
 });
 
 test('a failed turn keeps both the shared completion reason and the runner error', async () => {
@@ -312,16 +331,15 @@ test('answer consumes the pending question once and continues the same task', as
     error => error.code === 'question-not-pending');
 });
 
-test('the catalog lists the four CLI models, no invented default, and pass-through efforts', async () => {
+test('the catalog uses the discovered CLI models and default', async () => {
   const { backend } = await setup({ runner: fakeRunner() });
   const catalog = await backend.models();
   const summary = modelCatalogSummary(catalog);
   assert.deepEqual(summary.models, [...CLAUDE_CLI_MODELS]);
-  assert.equal(summary.defaultModel, null, 'an unknown default stays empty');
+  assert.equal(summary.defaultModel, 'claude-sonnet-5-5');
   assert.deepEqual(catalog.groups[0].models[0].reasoning.efforts.map(effort => effort.id),
     [...CLAUDE_CLI_EFFORTS]);
   assert.equal(catalog.groups[0].models[0].reasoning.defaultEffort, undefined);
-  assert.match(catalog.note, /verbatim/);
   assert.deepEqual(resolveModelSelection(catalog, { model: 'sonnet' }),
     { provider: 'claude-cli', model: 'claude-sonnet-5-5' });
   assert.equal(resolveModelSelection(catalog, { model: 'opus', effort: 'xhigh' }).reasoningEffort, 'xhigh');
@@ -341,23 +359,24 @@ test('model() only claims what the CLI really reported', async () => {
   assert.equal(started.model, 'claude-sonnet-5-5');
   assert.equal(started.effort, 'high');
   runner.setTurn(started.directory, { state: 'ended', sessionStarted: true, model: 'claude-sonnet-5-5', actualEffort: 'medium',
+    businessAccepted: true, applied: { model: 'claude-sonnet-5-5', effort: 'medium' },
     messages: [{ role: 'assistant', text: 'done' }] });
   await backend.turn({ requestId: 'request-1' });
   const observed = await backend.model();
   assert.equal(observed.model, 'claude-sonnet-5-5');
   assert.equal(observed.provider, 'claude-cli');
   assert.equal(observed.reasoningEffort, 'medium', 'observed effort comes from the CLI, not the requested high');
+  assert.deepEqual((await backend.observe()).modelEvidence,
+    { requestId: 'request-1', model: 'claude-sonnet-5-5', actualEffort: 'medium', businessAccepted: true });
   const begin = await backend.beginTask({});
   assert.equal(begin.currentModel.model, 'claude-sonnet-5-5');
 });
 
-test('an explicit selection is frozen with its request, and an unflagged one is refused', async () => {
+test('a selection is frozen with its request whether selected explicitly or by defaults', async () => {
   const runner = fakeRunner({ failFor: ['request-2'] });
   const { backend } = await setup({ runner });
-  await assert.rejects(() => backend.deliver({ requestId: 'request-1', message: 'x',
-    model: { model: 'claude-opus-5-5' } }), error => error.code === 'invalid-dispatch');
   const selection = { provider: 'claude-cli', model: 'claude-opus-5-5', reasoningEffort: 'max' };
-  await backend.deliver({ requestId: 'request-1', message: 'x', explicitModel: true, model: selection });
+  await backend.deliver({ requestId: 'request-1', message: 'x', model: selection });
   assert.equal(runner.calls.starts[0].effort, 'max');
   assert.equal(runner.calls.starts[0].model, 'claude-opus-5-5');
   // Replaying the same request id with the same selection is a no-op.
@@ -374,7 +393,7 @@ test('an explicit selection is frozen with its request, and an unflagged one is 
     model: { provider: 'claude-cli', model: 'claude-fable-5-1' } }), error => error.code === 'request-id-conflict');
   const retried = await backend.deliver({ requestId: 'request-2', message: 'y', explicitModel: true,
     model: { provider: 'claude-cli', model: 'claude-haiku-5-5' } });
-  assert.equal(retried.accepted, true);
+  assert.equal(retried.status, 'unknown');
   assert.equal(runner.calls.starts[1].model, 'claude-haiku-5-5');
 });
 

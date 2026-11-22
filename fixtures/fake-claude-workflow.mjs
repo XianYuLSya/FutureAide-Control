@@ -99,7 +99,7 @@ function parseArgs(argv) {
   const options = { argv: [...argv], flags: {}, positional: [] };
   const valueFlags = new Set(['--output-format', '--permission-mode', '--permission-prompts',
     '--session-id', '--resume', '--model', '--effort', '--append-system-prompt', '--mcp-config',
-    '--allowedTools', '--name']);
+    '--allowedTools', '--name', '--input-format']);
   for (let index = 0; index < argv.length; index++) {
     const token = argv[index];
     if (valueFlags.has(token)) { options.flags[token.slice(2)] = argv[++index]; continue; }
@@ -152,7 +152,26 @@ async function runPrint(options) {
     logInvocation({ command: 'print', argv: options.argv, exitCode: 1, refused: 'auth-required' });
     return 1;
   }
-  const prompt = (options.positional[0] ?? readStdin()).trim();
+  let prompt;
+  if (options.flags['input-format'] === 'stream-json') {
+    const { createInterface } = await import('node:readline');
+    for await (const line of createInterface({ input: process.stdin })) {
+      let event; try { event = JSON.parse(line); } catch { continue; }
+      if (event.type === 'control_request') {
+        const subtype = event.request?.subtype;
+        const model = options.flags.model ?? CLI_MODELS[0];
+        const response = subtype === 'list_models' ? { models: CLI_MODELS.map(id => ({ value: id,
+          resolvedModel: id, supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] })) }
+          : subtype === 'get_settings' ? { applied: { model, effort: options.flags.effort ?? 'high' } } : {};
+        out(JSON.stringify({ type: 'control_response', response: { subtype: 'success', request_id: event.request_id, response } }) + '\n');
+      } else if (event.type === 'user') {
+        prompt = String(event.message?.content ?? '').trim();
+        out(JSON.stringify(event) + '\n');
+        break;
+      }
+    }
+    if (prompt === undefined) return 0;
+  } else prompt = (options.positional[0] ?? readStdin()).trim();
   const requestedSession = options.flags.resume ?? options.flags['session-id'];
   if (requestedSession && !/^[0-9a-f-]{36}$/i.test(requestedSession)) {
     err(`Invalid session id: ${requestedSession}\n`);

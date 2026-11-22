@@ -425,7 +425,7 @@ function taskInputs(store, record) {
     }
     put(answer.answerId, {
       requestId: answer.answerId,
-      ...inputEffort(dispatch?.model ?? answer.modelSelection, dispatch?.accepted ? dispatch.actualEffort ?? null : answer.actualEffort ?? null, dispatch?.effortAdjustment, dispatch?.actualEffortSource ?? answer.actualEffortSource),
+      ...inputEffort((dispatch?.accepted ? dispatch.deliverySelection : undefined) ?? dispatch?.model ?? answer.modelSelection, dispatch?.accepted ? dispatch.actualEffort ?? null : answer.actualEffort ?? null, dispatch?.effortAdjustment, dispatch?.actualEffortSource ?? answer.actualEffortSource),
       actualModel: dispatch?.accepted && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel) : null,
       mode: 'steer',
       delivery,

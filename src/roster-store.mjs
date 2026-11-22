@@ -1016,17 +1016,19 @@ export class RosterStore {
         SELECT id FROM agents WHERE id=?1
         UNION
         SELECT child.id FROM agents AS child JOIN tree ON json_extract(child.body,'$.parentAgentId')=tree.id
-      ), rounds(task) AS (
-        SELECT json_extract(a.body,'$.task') FROM agents AS a JOIN tree ON a.id=tree.id
-        UNION ALL SELECT h.body FROM agent_history AS h JOIN tree ON h.agent=tree.id
-      ) SELECT json_extract(task,'$.answers') AS answers, json_extract(task,'$.dispatches') AS dispatches
-        FROM rounds WHERE json_array_length(task,'$.answers')>0`).all(agentId);
+      ), rounds(agent, task) AS (
+        SELECT a.id,json_extract(a.body,'$.task') FROM agents AS a JOIN tree ON a.id=tree.id
+        UNION ALL SELECT h.agent,h.body FROM agent_history AS h JOIN tree ON h.agent=tree.id
+      ) SELECT rounds.task, backend_state.body AS backend FROM rounds
+        LEFT JOIN backend_state ON backend_state.agent=rounds.agent
+        WHERE json_array_length(rounds.task,'$.answers')>0`).all(agentId);
     let pending = row.pending + supplements.pending;
     let blocked = row.blocked + supplements.blocked + expired.blocked;
     for (const round of rounds) {
-      const task = { dispatches: JSON.parse(round.dispatches ?? '[]') };
-      for (const answer of JSON.parse(round.answers)) {
-        const outcome = answerOutcome(task, answer);
+      const task = JSON.parse(round.task);
+      const backend = round.backend ? JSON.parse(round.backend) : undefined;
+      for (const answer of task.answers) {
+        const outcome = answerOutcome(task, answer, backend);
         if (outcome === 'blocked') blocked++;
         else if (outcome !== 'accepted') pending++;
       }

@@ -222,7 +222,7 @@ async function answerCleanupFixture({answer, dispatch, rowTask='round', rowMessa
   store.db.prepare('INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created,receipt) VALUES(?,?,?,?,?,?,?,?,?)')
     .run('r','owner','answer-agent','session',rowTask,rowMessage,'accepted','2020-01-01T00:00:00Z',JSON.stringify({delivery:'answer-pending'}));
   const engine=createRosterCleanup({stateDirectory,agentIdleRetentionMs:0,onceTerminalRetentionMs:0},
-    {desktop:{inspect:async()=>({running:false,treeIds:['session'],activityVersion:'v',historyPresent:false}),ownerStatus:async()=>({state:'unknown'})}});
+    {desktop:{inspect:async()=>({running:false,treeIds:['session'],activityVersion:'v',historyPresent:false}),ownerStatus:async()=>({state:'unknown'}),remove:async()=>({removed:true})}});
   return {store,engine,record,async close(){store.close();await rm(stateDirectory,{recursive:true,force:true});}};
 }
 
@@ -317,4 +317,100 @@ test('old queued answer uses its own persisted round, including legacy history',
       assert.equal((await f.engine.inventory()).items[0].firstEligible,false,storage);
     } finally {await f.close();}
   }
+});
+
+test('verified cancellation archives only the same native request proven unsent', async () => {
+  const message='取消前尚未送达的回答\n原文';
+  const answer={answerId:'r',message,dispatched:true,accepted:false,delivery:'answer-pending'};
+  const dispatch={kind:'answer',requestId:'r',state:'cancelled',accepted:false,delivery:'local-pending',deliveryIntent:{method:'steer',expectedTurnId:'turn-a'}};
+  const request={requestId:'r',taskId:'round',kind:'answer',status:'retryable',attempted:false,route:'local-pending',
+    reschedule:{notSent:true},intent:{outcome:'not-sent',method:'turn/steer',threadId:'thread',expectedTurnId:'turn-a'}};
+  const backend={taskId:'round',binding:{owned:true,sessionId:'thread'},requests:{r:request}};
+  const cases=[
+    ['proven',{},true],
+    ['no evidence',{backend:undefined},false],
+    ['unverified cancellation',{task:{cancelVerified:false}},false],
+    ['tree not settled',{task:{cancelTreeSettled:false}},false],
+    ['different request',{request:{requestId:'other'}},false],
+    ['different round',{request:{taskId:'other'}},false],
+    ['different session',{request:{intent:{...request.intent,threadId:'other'}}},false],
+    ['different turn',{request:{intent:{...request.intent,expectedTurnId:'turn-b'}}},false],
+    ['latest status unknown',{request:{status:'unknown'}},false],
+    ['attempted again',{request:{attempted:true}},false],
+    ['latest intent unknown',{request:{intent:{...request.intent,outcome:'unknown'}}},false],
+    ['native accepted',{request:{status:'accepted'}},false],
+    ['native not-sent flag absent',{request:{reschedule:{}}},false],
+  ];
+  for (const [label,change,expected] of cases) {
+    const f=await answerCleanupFixture({answer,dispatch,rowMessage:message});
+    try {
+      Object.assign(f.record,{state:'cancelled'});
+      Object.assign(f.record.task,{state:'cancelled',cancelRequested:true,cancelVerified:true,cancelTreeSettled:true,...change.task});
+      f.record.task.reports=[];
+      f.store.save(f.record);
+      if (!Object.hasOwn(change,'backend') || change.backend) {
+        const value=structuredClone(backend); Object.assign(value.requests.r,change.request);
+        f.store.saveBackendState(f.record.agentId,value);
+      }
+      const hold=f.store.autoCleanupHold(f.record.agentId);
+      assert.equal(hold.pending,expected?0:1,`${label}: ${JSON.stringify(hold)}`);
+      assert.equal(hold.blocked,expected?1:0,`${label}: ${JSON.stringify(hold)}`);
+      const item=(await f.engine.inventory()).items[0];
+      assert.equal(item.firstEligible,expected,`${label}: ${JSON.stringify(item)}`);
+      if (expected) {
+        const result=await f.engine.remove(item,{mode:'first',revalidate:async()=>true});
+        assert.equal(result.removed,true,JSON.stringify(result));
+        const archived=await f.engine.archives({originalId:'r'});
+        assert.ok(archived.some(entry=>entry.payload.message===message),'original answer was archived');
+      }
+    } finally {await f.close();}
+  }
+});
+
+test('verified cancelled answer uses its own native request after a new round starts', async () => {
+  const message='旧轮取消前的回答';
+  const answer={answerId:'r',message,dispatched:true,accepted:false,delivery:'answer-pending'};
+  const dispatch={kind:'answer',requestId:'r',state:'cancelled',accepted:false,delivery:'local-pending',deliveryIntent:{method:'steer',expectedTurnId:'turn-a'}};
+  const request={requestId:'r',taskId:'round',kind:'answer',status:'retryable',attempted:false,route:'local-pending',
+    reschedule:{notSent:true},intent:{outcome:'not-sent',method:'turn/steer',threadId:'thread',expectedTurnId:'turn-a'}};
+  const f=await answerCleanupFixture({answer,dispatch,rowMessage:message});
+  try {
+    Object.assign(f.record.task,{state:'cancelled',cancelRequested:true,cancelVerified:true,cancelTreeSettled:true,reports:[]});
+    f.store.appendHistory(f.record.agentId,structuredClone(f.record.task));
+    f.record.state='idle'; f.record.task={taskId:'new-round',state:'completed',finishedAt:'2020-01-02T00:00:00Z',answers:[],dispatches:[],reports:[]};
+    f.store.save(f.record);
+    const backend={taskId:'new-round',binding:{owned:true,sessionId:'thread'},requests:{r:request}};
+    f.store.saveBackendState(f.record.agentId,backend);
+    assert.deepEqual(f.store.autoCleanupHold(f.record.agentId),{pending:0,blocked:1});
+    assert.equal((await f.engine.inventory()).items[0].firstEligible,true);
+    backend.requests.r.taskId='unrelated-round'; f.store.saveBackendState(f.record.agentId,backend);
+    assert.deepEqual(f.store.autoCleanupHold(f.record.agentId),{pending:1,blocked:0});
+    assert.equal((await f.engine.inventory()).items[0].firstEligible,false);
+    backend.requests.r.taskId='round'; backend.requests.r.intent.outcome='unknown'; f.store.saveBackendState(f.record.agentId,backend);
+    assert.deepEqual(f.store.autoCleanupHold(f.record.agentId),{pending:1,blocked:0});
+    assert.equal((await f.engine.inventory()).items[0].firstEligible,false);
+  } finally {await f.close();}
+});
+
+test('verified cancellation recognises a rejected external-race start without trusting stale not-sent evidence', async () => {
+  const {cancelledUnsentAnswer}=await import('../src/cleanup-input-receipts.mjs');
+  const task={taskId:'old',state:'cancelled',cancelVerified:true,cancelTreeSettled:true};
+  const dispatch={requestId:'r',kind:'answer',state:'cancelled',accepted:false,delivery:'after-current',deliveryIntent:{method:'start'}};
+  const request={requestId:'r',taskId:'old',kind:'answer',status:'waiting',attempted:false,route:'after-current',afterTurnId:'external',
+    reschedule:{notSent:true,reason:'turn-started-before-write',afterTurnId:'external'},
+    intent:{outcome:'not-sent',method:'turn/start',threadId:'thread',priorTurnId:'prior'}};
+  const backend={taskId:'new',binding:{owned:true,sessionId:'thread'},requests:{r:request}};
+  assert.equal(cancelledUnsentAnswer(task,dispatch,backend),true);
+  for (const change of [
+    {status:'unknown'}, {attempted:true}, {status:'accepted'},
+    {intent:{...request.intent,outcome:'unknown'}},
+    {intent:{...request.intent,threadId:'other'}},
+    {reschedule:{...request.reschedule,afterTurnId:'other'}},
+    {requestId:'other'}, {taskId:'new'},
+  ]) {
+    const copy=structuredClone(backend); Object.assign(copy.requests.r,change);
+    assert.equal(cancelledUnsentAnswer(task,dispatch,copy),false,JSON.stringify(change));
+  }
+  assert.equal(cancelledUnsentAnswer({...task,cancelVerified:false},dispatch,backend),false);
+  assert.equal(cancelledUnsentAnswer({...task,cancelTreeSettled:false},dispatch,backend),false);
 });

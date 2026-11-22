@@ -1191,6 +1191,13 @@ export function createScopedAgents(config, {
     };
   }
 
+  /**
+   * An installation can run DSH on its own default model only (dshDefaultModelOnly).
+   * Then a caller's model and effort are ignored for DSH names, a pin saved before the
+   * switch is never applied, and every DSH input follows the host default.
+   */
+  const dshDefaultOnly = record => config.dshDefaultModelOnly === true && targetOf(record) === 'dsh';
+
   // A Codex turn cannot change model or effort while it is running: turn/steer
   // only adds input to the live turn. This checks the shared state as well as the
   // last observation, so an async queue cannot slip a rejected selection through.
@@ -1261,6 +1268,11 @@ export function createScopedAgents(config, {
     // dispatch belongs to: a stale copy must never overwrite a round that has moved on.
     const backend = await backendFor(record);
     const target = targetOf(record);
+    if (dshDefaultOnly(record) && dispatch.explicitModel === true) {
+      // Frozen before the installation locked DSH to its default: never applied.
+      delete dispatch.model;
+      dispatch.explicitModel = false;
+    }
     const explicit = dispatch.explicitModel === true && dispatch.model !== undefined;
     if (explicit) {
       if (target === 'dsh') {
@@ -1316,7 +1328,8 @@ export function createScopedAgents(config, {
     // is already queued or being recovered. `freezeModel` on a queued supplement
     // records that it had no pin when it was accepted, so a later pin cannot leak in.
     const { model: frozenModel, freezeModel, ...dispatchExtra } = extra;
-    const selected = frozenModel !== undefined ? frozenModel
+    const selected = dshDefaultOnly(record) ? undefined
+      : frozenModel !== undefined ? frozenModel
       : freezeModel === true ? undefined : record.modelPin;
     const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now(),
       ...(selected ? { model: { ...selected }, explicitModel: true } : {}), ...dispatchExtra };
@@ -1900,7 +1913,7 @@ export function createScopedAgents(config, {
     // DSH records it on the session; `sessionOnly` keeps it out of the user's global
     // default. Codex has no session-only select API: its adapter applies the pin on
     // the first turn/start, so the resolved ID is the display value until then.
-    if (record.modelPin) {
+    if (record.modelPin && !dshDefaultOnly(record)) {
       if (targetOf(record) === 'dsh') {
         if (!sameModelSelection(created.model, record.modelPin)) {
           const selected = await backend.selectModel({ ...record.modelPin,
@@ -3031,8 +3044,11 @@ export function createScopedAgents(config, {
       const emptyCatalog = { models: [], defaultModel: null };
       const probeAdapter = record => diagnoseTarget(record.target, { adapters: backendAdapters,
         ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}), record, deps: adapterDeps(record) });
+      // Locked to the host default, DSH offers callers that one model and nothing else.
+      const dshChoices = summary => config.dshDefaultModelOnly !== true ? summary
+        : { ...summary, models: summary.defaultModel ? [summary.defaultModel] : [], modelLocked: true };
       const [dshModels, codexEntry, claudeEntry] = await Promise.all([
-        host ? readStatusModels(() => controlFactory(config, { client }).models()) : emptyCatalog,
+        host ? readStatusModels(() => controlFactory(config, { client }).models()).then(dshChoices) : emptyCatalog,
         probeAdapter(codexProbe),
         probeAdapter({ ...codexProbe, target: 'claude-cli' }),
       ]);
@@ -3057,7 +3073,7 @@ export function createScopedAgents(config, {
         target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
         ...(parent ? { parentAgentId: parent.agentId } : {}) };
       await ensureTargetBackend(record);
-      if (hasModelRequest({ model, effort })) {
+      if (hasModelRequest({ model, effort }) && !dshDefaultOnly(record)) {
         // Resolve against the live target catalog before the name exists, so a typo
         // creates nothing and a valid pin is part of the first durable record.
         record.modelPin = await resolveRequestedPin(record, { model, effort });
@@ -3080,8 +3096,13 @@ export function createScopedAgents(config, {
     },
     async send({ name, message, model, effort }, extra) {
       textMessage(message);
-      const request = { model, effort };
-      const wantsSelection = hasModelRequest(request);
+      let request = { model, effort };
+      let wantsSelection = hasModelRequest(request);
+      // A DSH name of an installation locked to the host default takes no selection:
+      // the input is sent as if the caller had named no model and no effort.
+      const ignoreSelectionFor = record => {
+        if (dshDefaultOnly(record)) { request = {}; wantsSelection = false; }
+      };
       const supplementStates = new Set(['running', 'awaiting_input', 'awaiting_report', 'reconnecting']);
       let enteredOperation = false;
       const queued = (record, pin) => ({
@@ -3132,6 +3153,7 @@ export function createScopedAgents(config, {
       const operation = async record => {
         enteredOperation = true;
         requireWritableTarget(record);
+        ignoreSelectionFor(record);
         const closing = ['cleaning', 'cleanup_failed', 'creating', 'supplement_blocked'];
         if (record.closed || closing.includes(record.state)) throw new Error('This subagent is closing, has blocked supplements, or is not yet ready.');
         retainMissingTreeFailure(record);
@@ -3190,7 +3212,7 @@ export function createScopedAgents(config, {
         // requested substring to its real ID first, so an unknown model still lists
         // the catalog; only then decide whether a running Codex turn forbids a change.
         const resolvePin = async () => {
-          if (!wantsSelection) return record.modelPin;
+          if (!wantsSelection) return dshDefaultOnly(record) ? undefined : record.modelPin;
           const pin = await resolveRequestedPin(record, request);
           if (targetOf(record) === 'codex-desktop' && codexTurnRunning(record)
               && (!record.modelPin || !sameModelSelection(pin, record.modelPin))) {
@@ -3244,6 +3266,8 @@ export function createScopedAgents(config, {
           const next = { ...record, state: 'running', observation: undefined, error: undefined,
             nextAttemptAt: undefined, retryAttempts: 0, sleep: undefined,
             ...(wantsSelection ? { modelPin: { ...pin } } : {}),
+            // A pin saved before the lock was turned on goes with the next task.
+            ...(dshDefaultOnly(record) ? { modelPin: undefined } : {}),
             task: { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [],
               modelSelection: pin ? { ...pin } : null, finalReminder: 'armed' } };
           // A task assignment ends the previous round for good: its release attempt loses
@@ -3284,6 +3308,7 @@ export function createScopedAgents(config, {
         if (enteredOperation || error.code !== 'agent-busy') throw error;
         const owner = await context(extra);
         const record = requireWritableTarget(named(owner, name));
+        ignoreSelectionFor(record);
         if (wantsSelection) {
           // Resolve first: a missing ID must report the catalog, not a busy state.
           const pin = await resolveRequestedPin(record, request);

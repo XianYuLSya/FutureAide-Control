@@ -19,3 +19,16 @@ test('tree barrier rechecks the root after descendant results arrive', async () 
   assert.equal(await waitManagedTree(subagents,new Map([['root',root]]),root,()=>true),2);
   assert.equal(checks,2);
 });
+
+test('tree barrier uses DSH 0.2.2-rc.3 waitForTreeWork as a method of the service', async () => {
+  const root = {id:'root',status:'idle',session:{seq:1},whenIdle:async () => {}};
+  // The real method reads this.manager, so an unbound call would lose the service.
+  const subagents = {manager:{checks:0}, async waitForTreeWork(target) {
+    assert.equal(target, root);
+    if (++this.manager.checks === 1) { root.session.seq++; return true; }
+    return false;
+  }};
+  assert.equal(await waitManagedTree(subagents,new Map([['root',root]]),root,()=>true),2);
+  assert.equal(subagents.manager.checks,2);
+  await assert.rejects(waitManagedTree({},new Map([['root',root]]),root,()=>true), /managed-tree-unavailable/);
+});

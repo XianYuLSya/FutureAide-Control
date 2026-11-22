@@ -745,6 +745,24 @@ test('legacy unknown answer with a native not-sent receipt retries the original 
   } finally { f.service.close(); }
 });
 
+test('legacy unknown answer with a proven pre-write read failure resumes once', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    delete request.intent; delete request.route; delete request.reschedule; delete request.afterTurnId;
+    request.attempted = false; request.status = 'retryable';
+    f.store.saveBackendState(seed.agentId, state);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).accepted, true);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start']);
+    assert.ok(answerWrites(f).every(input => input.text.includes(seed.requestId)));
+  } finally { f.service.close(); }
+});
+
 test('legacy unknown answer with no proof of non-write is not replayed', async () => {
   const seed = await answerRaceSeed();
   const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });

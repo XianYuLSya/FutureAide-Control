@@ -484,12 +484,21 @@ export async function createCodexBackend(record, deps = {}) {
    * (`current-turn` / `new-turn` / `after-current` / `accepted-route-unknown`);
    * the stored wire selection stays on `request.delivery` for old readers.
    */
+  function verifiedNotSent(request) {
+    if (request.status !== 'retryable' || request.native || request.turnId) return false;
+    if (request.intent) return request.intent.outcome === 'not-sent';
+    if (request.attempted === true) return false;
+    if (request.reschedule) return request.reschedule.notSent === true;
+    // Older requests record a pre-write read failure without an intent or route.
+    return request.attempted === false && !request.route;
+  }
   function receiptFrom(value, id) {
     const request = value.requests[id];
     if (!request) return undefined;
     return {
       accepted: request.status === 'accepted',
       status: request.status,
+      ...(verifiedNotSent(request) ? { verifiedNotSent: true } : {}),
       ...(Number.isSafeInteger(request.afterSeq) ? { afterSeq: request.afterSeq } : {}),
       ...(request.route ? { delivery: request.route } : {}),
       ...(request.turnId ? { turnId: request.turnId } : {}),

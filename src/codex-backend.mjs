@@ -485,7 +485,12 @@ export async function createCodexBackend(record, deps = {}) {
    * the stored wire selection stays on `request.delivery` for old readers.
    */
   function verifiedNotSent(request) {
-    if (request.status !== 'retryable' || request.native || request.turnId) return false;
+    if (request.native || request.turnId) return false;
+    if (request.status === 'waiting') {
+      return request.attempted === false && request.reschedule?.notSent === true
+        && (!request.intent || request.intent.outcome === 'not-sent');
+    }
+    if (request.status !== 'retryable') return false;
     if (request.intent) return request.intent.outcome === 'not-sent';
     if (request.attempted === true) return false;
     if (request.reschedule) return request.reschedule.notSent === true;
@@ -998,10 +1003,11 @@ export async function createCodexBackend(record, deps = {}) {
       }
       return receiptFrom(state(), requestId);
     },
-    async receipt({ requestId }) {
+    async receipt({ requestId, reconcile = true }) {
       const value = state();
       const request = value.requests[requestId];
       if (!request) return undefined;
+      if (!reconcile) return receiptFrom(value, requestId);
       await reconcileRequest(value, request);
       return receiptFrom(state(), requestId);
     },

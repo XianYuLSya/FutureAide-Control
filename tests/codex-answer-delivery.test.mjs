@@ -844,6 +844,28 @@ test('legacy unknown answer does not reuse old not-sent evidence over a newer in
   } finally { f.service.close(); }
 });
 
+test('a legacy unknown answer with a proven pre-write read failure takes the turn before the queued input', async () => {
+  const seed = await answerRaceSeed({ queuedInput: true });
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    delete request.intent; delete request.route; delete request.reschedule; delete request.afterTurnId;
+    request.attempted = false; request.status = 'retryable';
+    f.store.saveBackendState(seed.agentId, state);
+
+    await pollTimes(f, seed, 2);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start'],
+      'the proven-unwritten answer resumes as one turn under the original request');
+    assert.ok(answerWrites(f).every(input => input.text.includes(seed.requestId)));
+    assert.deepEqual(queueWrites(f), [], 'the queued input waits behind the recovered answer turn');
+    const recovered = answerDispatch(f, seed.requestId);
+    assert.deepEqual([recovered.accepted, recovered.delivery], [true, 'new-turn']);
+  } finally { f.service.close(); }
+});
+
 test('a temporary registration probe keeps the answer recoverable and ahead of the queued input', async () => {
   const seed = await answerRaceSeed({ queuedInput: true });
   const registration = { ready: false };
@@ -872,6 +894,39 @@ test('a temporary registration probe keeps the answer recoverable and ahead of t
     const before = f.codex.inputs().length;
     await f.poll(seed);
     assert.equal(f.codex.inputs().length, before, 'the recovered answer is never written twice');
+  } finally { f.service.close(); }
+});
+
+test('a legacy unknown answer survives a temporary registration loss and recovers as a new turn', async () => {
+  const seed = await answerRaceSeed();
+  const registration = { ready: false };
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop, registration });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    delete request.intent; delete request.route; delete request.reschedule; delete request.afterTurnId;
+    request.attempted = false; request.status = 'retryable';
+    f.store.saveBackendState(seed.agentId, state);
+
+    await f.poll(seed);
+    const waiting = answerDispatch(f, seed.requestId);
+    assert.equal(waiting.state, 'retrying', 'a read-only registration refusal does not seal the answer as failed');
+    assert.equal(waiting.error.code, 'codex-report-not-ready');
+    const row = (await f.service.inspect({ name: 'lead' }, extra(BOSS))).inputs
+      .find(entry => entry.requestId === seed.requestId);
+    assert.equal(row.delivery, 'answer-pending');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer'], 'the original steer is kept');
+
+    registration.ready = true;
+    await delay(Math.max(0, waiting.nextAttemptAt - Date.now()) + 50);
+    await f.poll(seed);
+    const recovered = answerDispatch(f, seed.requestId);
+    assert.deepEqual([recovered.accepted, recovered.delivery], [true, 'new-turn']);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start'],
+      'after A ended, the recovered answer keeps its original steer and opens one new turn');
+    assert.ok(answerWrites(f).every(input => input.text.includes(seed.requestId)));
   } finally { f.service.close(); }
 });
 
@@ -923,6 +978,29 @@ test('a legacy failed answer without native proof is never resent', async () => 
       assert.equal(answerDispatch(f, seed.requestId).state, 'failed', 'an unproven or terminal receipt keeps its failed evidence');
     } finally { f.service.close(); }
   }
+});
+
+test('a legacy failed answer with a newer unproven start is never replayed', async () => {
+  const seed = await answerRaceSeed({ queuedInput: true });
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    Object.assign(dispatch, { state: 'failed', delivery: 'local-pending',
+      error: { code: 'codex-report-not-ready', message: 'The explicit Codex parent-report tools have not been connected.' } });
+    f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    // The old no-write receipt belonged to the rejected steer. This later start
+    // has no not-sent outcome, so it proves nothing about the answer write.
+    request.intent = { method: 'turn/start', threadId: seed.threadId, at: new Date().toISOString() };
+    request.attempted = true; request.status = 'retryable';
+    f.store.saveBackendState(seed.agentId, state);
+
+    await pollTimes(f, seed, 3);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer'],
+      'a failed answer without current not-sent proof is never written again');
+    assert.equal(answerDispatch(f, seed.requestId).accepted, false, 'the unproven failed answer is never accepted');
+  } finally { f.service.close(); }
 });
 
 test('an expired waiting answer shows dispatch-expired while the external turn is still active', async () => {

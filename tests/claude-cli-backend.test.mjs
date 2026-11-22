@@ -340,12 +340,13 @@ test('model() only claims what the CLI really reported', async () => {
   const [started] = runner.calls.starts;
   assert.equal(started.model, 'claude-sonnet-5-5');
   assert.equal(started.effort, 'high');
-  runner.setTurn(started.directory, { state: 'ended', sessionStarted: true, model: 'claude-sonnet-5-5',
+  runner.setTurn(started.directory, { state: 'ended', sessionStarted: true, model: 'claude-sonnet-5-5', actualEffort: 'medium',
     messages: [{ role: 'assistant', text: 'done' }] });
   await backend.turn({ requestId: 'request-1' });
   const observed = await backend.model();
   assert.equal(observed.model, 'claude-sonnet-5-5');
   assert.equal(observed.provider, 'claude-cli');
+  assert.equal(observed.reasoningEffort, 'medium', 'observed effort comes from the CLI, not the requested high');
   const begin = await backend.beginTask({});
   assert.equal(begin.currentModel.model, 'claude-sonnet-5-5');
 });

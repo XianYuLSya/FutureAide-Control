@@ -64,8 +64,10 @@ export function createClaudeCliBackend(record, deps = {}) {
     const next = refused ? 'rejected' : 'accepted';
     let changed = request.status !== next;
     request.status = next;
-    if (native.model && native.model !== value.currentModel?.model) {
-      value.currentModel = { provider: 'claude-cli', model: native.model };
+    if (native.model && (native.model !== value.currentModel?.model
+        || (native.actualEffort ?? undefined) !== value.currentModel?.reasoningEffort)) {
+      value.currentModel = { provider: 'claude-cli', model: native.model,
+        ...(native.actualEffort == null ? {} : { reasoningEffort: native.actualEffort }) };
       changed = true;
     }
     if ((native.sessionStarted || native.state === 'ended') && !value.started) {

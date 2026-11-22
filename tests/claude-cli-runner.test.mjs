@@ -250,6 +250,15 @@ function stateOf() {
     message: 'task', mcpRequired: 'futureaide' });
 }
 
+test('init effort is observed only when the CLI reports a recognized value', () => {
+  const state = stateOf();
+  applyClaudeLine(state, JSON.stringify({ type: 'system', subtype: 'init', model: 'm', effort: 'high' }));
+  assert.equal(state.actualEffort, 'high');
+  const unknown = stateOf();
+  applyClaudeLine(unknown, JSON.stringify({ type: 'system', subtype: 'init', model: 'm' }));
+  assert.equal(unknown.actualEffort, undefined);
+});
+
 test('normalization keeps the real model, the MCP status and the tool trail', () => {
   const state = stateOf();
   applyClaudeLine(state, JSON.stringify({ type: 'system', subtype: 'init', session_id: SESSION,

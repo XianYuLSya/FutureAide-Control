@@ -407,6 +407,11 @@ function applySystemEvent(state, value) {
   if (state.phase === 'starting') state.phase = 'streaming';
   if (typeof value.session_id === 'string' && value.session_id) state.cliSessionId = value.session_id;
   if (typeof value.model === 'string' && value.model) state.model = value.model;
+  // Some hosts publish the effective next-message effort in init. Absence is
+  // unknown, not confirmation that the requested command-line value applied.
+  if (Object.hasOwn(value, 'effort') && (value.effort === null || CLAUDE_EFFORTS.includes(value.effort))) {
+    state.actualEffort = value.effort;
+  }
   if (typeof value.permissionMode === 'string' && value.permissionMode) state.permissionMode = value.permissionMode;
   const servers = Array.isArray(value.mcp_servers)
     ? value.mcp_servers.map(entry => ({ name: String(entry?.name ?? ''), status: String(entry?.status ?? 'unknown') }))
@@ -905,6 +910,7 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
     sessionId: state.sessionId ?? null,
     cliSessionId: state.cliSessionId ?? null,
     model: state.model ?? null,
+    actualEffort: state.actualEffort ?? null,
     messages: state.messages ?? [],
     ...(error ? { error } : {}),
     sessionStarted: state.sessionStarted === true,

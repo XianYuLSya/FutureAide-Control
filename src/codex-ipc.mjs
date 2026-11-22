@@ -1321,9 +1321,10 @@ function threadSelection(thread) {
 
 /** True when the wire selection proves the same model and effort, false when it
  * proves a different one, and undefined when a requested effort is not visible. */
-function sameWireSelection(actual, wanted) {
+export function sameWireSelection(actual, wanted, fields) {
   if (!actual?.model || !wanted?.model) return undefined;
-  if (actual.model !== wanted.model) return false;
+  if ((fields === undefined || fields.model) && actual.model !== wanted.model) return false;
+  if (fields && !fields.effort) return true;
   if (wanted.reasoningEffort === undefined || wanted.reasoningEffort === '') return true;
   if (actual.reasoningEffort === undefined) return undefined;
   return actual.reasoningEffort === wanted.reasoningEffort;
@@ -1357,7 +1358,7 @@ function activeSelectionEvidence(thread, active, knownSelections) {
  */
 export async function sendCodexTextNative(threadId, text, {
   request = requestCodexNative, model, effort, blockReason, mode, selection,
-  selectionExplicit, legacySelection = false, knownSelections, onIntent, allowStart = true,
+  selectionExplicit, explicitFields, legacySelection = false, knownSelections, onIntent, allowStart = true,
 } = {}) {
   const intendedMode = mode === undefined ? 'steer' : mode;
   if (!['steer', 'queue'].includes(intendedMode)) {
@@ -1403,7 +1404,7 @@ export async function sendCodexTextNative(threadId, text, {
         { terminal: true, notSent: true, threadId, ...(active ? { turnId: active.id } : {}) });
     }
     const evidence = activeSelectionEvidence(thread, active, knownSelections);
-    const same = evidence ? sameWireSelection(evidence.selection, wantedSelection) : undefined;
+    const same = evidence ? sameWireSelection(evidence.selection, wantedSelection, explicitFields) : undefined;
     if (same === false) {
       throw fail('codex-model-change-while-running',
         'Codex Desktop cannot change model or effort while a turn is running. This input was not sent; wait for the current turn to end, then send the new selection.',
@@ -1440,7 +1441,8 @@ export async function sendCodexTextNative(threadId, text, {
   const priorTurnId = method === 'turn/start' ? ((page.data ?? []).find(turn => typeof turn?.id === 'string')?.id ?? null) : undefined;
   if (typeof onIntent === 'function') {
     await onIntent({ method, threadId,
-      ...(method === 'turn/steer' ? { expectedTurnId: active.id } : { priorTurnId }),
+      ...(method === 'turn/steer' ? { expectedTurnId: active.id,
+        actualEffort: activeSelectionEvidence(thread, active, knownSelections)?.selection.reasoningEffort ?? null } : { priorTurnId }),
       mode: intendedMode });
   }
   refuse();

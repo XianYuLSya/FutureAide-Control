@@ -215,6 +215,43 @@ test('explicit same selection is proven from the turn start, not from a name pin
   assert.deepEqual([threadMatch.status, threadMatch.source], ['same', 'thread-metadata']);
 });
 
+test('Codex compares only explicit fields on active A and uses the frozen effort to start B', async () => {
+  const high = { ...selection(SOL), reasoningEffort: 'high' };
+  const f = await fixture({ omitModel: true,
+    thread: { active: true, turns: [{ id: 'turn-a', status: 'inProgress', startedAt: 1,
+      items: [{ id: 'u1', type: 'userMessage', content: [{ type: 'text', text: markerLine('r1', 'n') }] }] }] },
+    saved: { binding: { sessionId: 'native-1', owned: true }, projections: {}, nonce: 'n',
+      requests: { r1: requestState({ model: high, delivery: { model: SOL.model, effort: 'high' } }) } } });
+  const startSelection = selection(SOL); // The default changed to max after A started.
+  const modelOnly = { model: true, effort: false };
+  const effortOnly = { model: false, effort: true };
+  assert.equal((await f.backend.matchRootSelection({ selection: startSelection, explicitFields: modelOnly })).status, 'same');
+  for (const [requestId, explicitFields, model] of [
+    ['model-only', modelOnly, startSelection], ['match-effort', effortOnly, high],
+    ['plain', { model: false, effort: false }, startSelection], ['answer', { model: false, effort: false }, startSelection],
+  ]) {
+    const receipt = await f.backend.deliver({ requestId, message: requestId, mode: 'steer',
+      kind: requestId === 'answer' ? 'answer' : 'supplement',
+      model, explicitFields, selectionExplicit: explicitFields.model || explicitFields.effort });
+    assert.deepEqual([receipt.turnId, receipt.actualEffort], ['turn-a', 'high']);
+  }
+  for (const mode of ['steer', 'queue']) {
+    await assert.rejects(f.backend.deliver({ requestId: 'change-' + mode, message: 'change effort',
+      mode, selectionExplicit: true, explicitFields: effortOnly, model: startSelection }),
+    { code: 'codex-model-change-while-running' });
+  }
+  const thread = f.native.threads.get('native-1');
+  thread.active = false;
+  thread.turns[0].status = 'completed';
+  const receipt = await f.backend.deliver({ requestId: 'answer-b', message: 'answer after A',
+    kind: 'answer', mode: 'steer', selectionExplicit: false, explicitFields: { model: false, effort: false },
+    model: startSelection });
+  assert.deepEqual([receipt.delivery, receipt.actualEffort], ['new-turn', 'max']);
+  assert.equal(f.native.paramsOf('turn/start')[0].effort, 'max');
+  assert.equal((await f.backend.receipt({ requestId: 'answer-b' })).actualEffort, 'max');
+  assert.equal(f.native.count('turn/start'), 1);
+});
+
 test('explicit different and unprovable selections never write', async () => {
   const activeTurn = { active: true, turns: [{ id: 'turn-a', status: 'inProgress', startedAt: 1,
     items: [{ id: 'u1', type: 'userMessage', content: [{ type: 'text', text: 'first task' }] }] }] };

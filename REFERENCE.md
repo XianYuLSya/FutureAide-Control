@@ -6,7 +6,7 @@
 
 `model` 忽略大小写，先找完全相同的 ID，再选包含该片段的第一项。回执、`list` 和 `wait` 的 `actualModel` 显示解析出的完整 ID。找不到时，错误会列出可选 ID。
 
-`effort` 必须是所选模型支持的档位。每次显式指定 `model` 时省略它，会采用该模型的默认档位。已选模型的名字可以单传 `effort` 调整档位。后续任务、补充、回答和提醒都沿用这个名字的选择。
+`effort` 可单传。每个新轮次先用显式强度，再查 `modelDefaultEfforts` 中完整模型 ID，最后取 `defaultEffort`。出厂 6.2 Astra 为 high，其余 max。create 指定的档位留给首次输入。运行中的 Codex 轮次沿用实际档，明确改档须等该轮结束。模型缺档取最近支持档，同距取低。
 
 从未指定模型的名字，在下一次输入派出时读取目标应用的默认模型。正在执行的模型请求继续完成，失败任务不会自动重放。同一输入的后台恢复保留最初确定的模型和请求身份。DSH 原生下属的新建与复用仍按它自己的继承和显式选择规则。
 
@@ -32,7 +32,7 @@ DSH 通过本版宿主桥把显式选择应用到该会话。工具提示更新�
 - **登录：** 只用 CLI 自己的登录，用 `claude auth status` 判断是否就绪。插件不读凭据文件，也不提取 Claude Desktop 的登录缓存。
 - **代理：** 插件不设置、不清除任何代理变量。FAswitch 把当前档案的代理写进 Claude 用户设置，CLI 自己加载。
 - **权限：** 固定用 `--permission-mode auto --permission-prompts none`。这两个参数不可用时报错，不会自动放宽。
-- **模型：** 省略 `model` 时由 CLI 选默认模型，`list`、`wait` 在 CLI 发出 `system/init` 后显示实际模型。强度接受 `low`、`medium`、`high`、`xhigh`、`max`。
+- **模型：** 省略 `model` 时由 CLI 选默认模型，`list`、`wait` 在 CLI 发出 `system/init` 后显示实际模型。支持档位按该模型的 CLI 能力目录确定，`actualEffort` 取执行业务输入的 worker 回读值。
 - **清理：** `once` 收尾和按名字 `delete` 都会停止受管进程、清理插件私有记录。Claude 自己保存的会话历史留在用户目录，删除回执标明 `nativeHistoryPolicy: "retain"`。
 
 ## 回报

@@ -13,7 +13,7 @@ QQ 交流群：259109974
 ## 能做什么
 
 - **按名字派活**：一句话创建并派单。名字跟着当前聊天走，别的聊天里的同名助手互不相干。
-- **派单时选模型**：`model` 和 `effort` 传一次，这个名字后面一直沿用。
+- **派单时选模型**：名字可以固定模型；`effort` 可单传，每个新轮次按当前模型选默认档。
 - **直接问答**：助手用 `ask_parent` 提问，你按名字回答，原任务接着跑。
 - **只收明确的回报**：助手用 `report_parent` 交的内容才会回到聊天，普通回复不打扰你。
 - **多层分工**：助手可以再派下属。最终报告要等整棵任务树收尾才交。
@@ -83,7 +83,20 @@ futureaide_answer_agent({name: "画图助手", message: "包含入口、主要�
 futureaide_run_agent({name: "审阅搭档", target: "codex-desktop", model: "astra", effort: "high", message: "检查当前修改并报告发现。"})
 ```
 
-`model` 可以写完整 ID，也可以写其中一段，回执里的 `actualModel` 是最终解析出的模型。写错会报错并列出可选项，不会退回默认。不传 `model` 的名字跟随目标应用的默认设置。
+`model` 可以写完整 ID，也可以写其中一段，回执里的 `actualModel` 是最终解析出的模型。写错会报错并列出可选项，不会退回默认。省略 `model` 时，在当前会话模型或目标默认模型上选档。
+
+```text
+futureaide_create_agent({name: "校对", lifetime: "persistent", effort: "medium"})
+futureaide_send_agent({name: "校对", message: "校对这份说明"})
+```
+
+首次 send 使用 create 指定的 medium。后续新轮省略 effort 时，插件按完整模型 ID 查 `modelDefaultEfforts`，未命中则取 `defaultEffort`。出厂配置如下。
+
+```json
+{ "defaultEffort": "max", "modelDefaultEfforts": { "gpt-6.2-astra": "high" } }
+```
+
+在当前安装使用的 `config.json` 修改这两项；命名 profile 可覆盖全局值和单个模型。重载插件连接和监工后，新收件按新配置选档，已收件保留快照。模型缺档时取最接近的支持档，同距取低。例如请求 max 而模型最高支持 high，`requestedEffort` 为 max、`selectedEffort` 为 high，`effortAdjustment` 给出原因，确认执行后 `actualEffort` 为 high。排队尚未执行时实际档为空。Codex 插话沿用当前轮的档位。`dshDefaultModelOnly` 开启时只锁 DSH 默认模型，仍可单传 effort。
 
 ### 并行分工
 

@@ -125,6 +125,11 @@ const errorFields = value => ({
   ...(value.error ? { error: value.error } : {}),
 });
 
+const effortFields = value => Object.fromEntries(
+  ['requestedEffort', 'effortSource', 'selectedEffort', 'actualEffort', 'effortAdjustment']
+    .filter(key => value[key] !== undefined).map(key => [key, value[key]]),
+);
+
 /**
  * One list or wait entry. Report text appears exactly once here: the service echoes
  * the same reply in task.result, reports.latest and delivery, so only the latest
@@ -136,6 +141,7 @@ export function compactAgent(item = {}) {
   return {
     name: item.name,
     ...(item.actualModel === undefined ? {} : { actualModel: item.actualModel }),
+    ...effortFields(item),
     ...targetOfView(item.target),
     state: item.state,
     lifetime: item.lifetime,
@@ -162,6 +168,7 @@ export function compactCreate(result = {}) {
   return {
     name: result.name,
     ...(result.actualModel === undefined ? {} : { actualModel: result.actualModel }),
+    ...effortFields(result),
     ...targetOfView(result.target),
     lifetime: result.lifetime,
     state: result.state,
@@ -255,6 +262,7 @@ const INPUT_REASON_LIMIT = 200;
  */
 const compactInput = input => ({
   requestId: input.requestId,
+  ...effortFields(input),
   mode: input.mode ?? null,
   delivery: input.delivery ?? null,
   accepted: input.accepted === true,
@@ -325,6 +333,7 @@ export function compactInspect(result = {}, { node } = {}) {
   return {
     name: result.name,
     ...targetOfView(result.target),
+    ...effortFields(result),
     lifetime: result.lifetime,
     state: result.state,
     ...(result.state === REPORTED_ACTIVITY_STATE && result.activity ? { activity: result.activity } : {}),

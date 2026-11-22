@@ -638,7 +638,7 @@ export function createCodexHost(options = {}) {
       await nativeRequest('thread/name/set', { threadId: nativeSessionId, name });
       return { renamed: true };
     },
-    async send({ nativeSessionId, message, model, effort, mode, selection, selectionExplicit,
+    async send({ nativeSessionId, message, model, effort, mode, selection, selectionExplicit, explicitFields,
       legacySelection = false, knownSelections, onIntent, allowStart = true, resubscribe = false, blockReason }) {
       // A thread whose release we already asked for may still read as idle while this
       // connection holds no subscription: the request was acknowledged, the idle grace
@@ -656,6 +656,7 @@ export function createCodexHost(options = {}) {
         ...(mode === undefined ? {} : { mode }),
         ...(selection === undefined ? {} : { selection }),
         ...(selectionExplicit === undefined ? {} : { selectionExplicit }),
+        ...(explicitFields === undefined ? {} : { explicitFields }),
         ...(legacySelection ? { legacySelection: true } : {}),
         ...(knownSelections === undefined ? {} : { knownSelections }),
         ...(onIntent === undefined ? {} : { onIntent }),

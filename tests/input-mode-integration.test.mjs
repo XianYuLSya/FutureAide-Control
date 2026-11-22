@@ -443,6 +443,10 @@ function fakeCodex() {
     },
     deliver: async input => {
       calls.deliver.push({ ...input });
+      if (state.rejectNext) {
+        state.rejectNext = false; receipts.set(input.requestId, { status: 'rejected', notSent: true });
+        throw Object.assign(new Error('lost response to pre-write rejection'), { uncertain: true });
+      }
       const delivery = state.running ? 'current-turn' : 'new-turn';
       if (!state.running) { state.running = true; state.turnId = `turn-${++state.turnSeq}`; state.actualEffort = input.model?.reasoningEffort ?? null; }
       const receipt = { status: 'accepted', accepted: true, delivery, turnId: state.turnId, actualEffort: state.actualEffort };
@@ -712,5 +716,24 @@ test('Codex explicit selection is not queued if active observation fails', async
       error => error.code === 'model-selection-unconfirmed' && error.notSent === true);
     assert.equal(f.store.supplementInputs(helper.agentId).length, before);
     assert.equal(f.codex.calls.deliver.length, 1);
+  } finally { f.service.close(); }
+});
+
+test('a recovered not-sent rejection stays failed even if the turn ends', async () => {
+  const f = await codexFixture();
+  try {
+    const helper = await startCodex(f);
+    f.codex.state.question = { id: 'q-rejected', state: 'pending', message: 'Continue?' };
+    const answer = await f.service.send({ name: helper.name, message: 'not written' }, extra(THREAD));
+    f.codex.state.rejectNext = true;
+    await f.service.poll(helper.agentId);
+    f.codex.state.running = false;
+    const restarted = f.reopen();
+    await restarted.poll(helper.agentId);
+    const row = inputFor(await restarted.inspect({ name: helper.name }, extra(THREAD)), answer.requestId);
+    assert.equal(row.accepted, false);
+    assert.equal(row.status, 'blocked');
+    assert.equal(row.actualEffort, null);
+    assert.equal(f.codex.calls.deliver.filter(item => item.kind === 'answer').length, 1);
   } finally { f.service.close(); }
 });

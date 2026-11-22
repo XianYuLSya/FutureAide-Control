@@ -1502,16 +1502,16 @@ export function createScopedAgents(config, {
 
   /** The selection the active root turn was started with, from native or saved evidence. */
   function activeTurnSelection(record, root) {
-    if (root?.selection) return root.selection;
     // A saved task dispatch is evidence only for the exact turn the root reports. A
     // later turn B in the same task must not borrow the first dispatch's selection.
     const turnId = root?.turnId;
-    if (!turnId) return undefined;
-    const started = (record.task?.dispatches ?? []).find(dispatch => dispatch.kind === 'task'
-      && dispatch.accepted === true && dispatch.model
-      && dispatch.turnId === turnId);
-    return started?.model ? { ...started.model,
+    if (!turnId) return root?.selection;
+    const started = (record.task?.dispatches ?? []).find(dispatch => dispatch.accepted === true
+      && dispatch.delivery === 'new-turn' && dispatch.model && dispatch.turnId === turnId);
+    const evidence = started?.model ? { ...started.model,
       ...(started.actualEffort !== undefined ? { reasoningEffort: started.actualEffort } : {}) } : undefined;
+    return root?.selection ? { ...evidence, ...root.selection,
+      reasoningEffort: root.selection.reasoningEffort ?? evidence?.reasoningEffort } : evidence;
   }
 
   /**

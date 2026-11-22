@@ -2267,3 +2267,18 @@ test('create previews the default effort without claiming it is actual', async (
     assert.equal(f.sends.length, 0);
   } finally { f.service.close(); }
 });
+test('locked DSH accepted request stays on original receipt after default change', async () => {
+  const f = await fixture({ config: { dshDefaultModelOnly: true } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const first = await f.service.send({ name: 'artist', message: 'accepted once', effort: 'high' }, extra(A));
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    await f.service.poll(f.record().agentId);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.selections.length, 1);
+    const dispatch = f.record().task.dispatches[0];
+    assert.equal(dispatch.requestId, first.requestId);
+    assert.equal(dispatch.actualEffort, 'high');
+    assert.equal(dispatch.model.provider, 'fixture');
+  } finally { f.service.close(); }
+});

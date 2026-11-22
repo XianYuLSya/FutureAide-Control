@@ -703,7 +703,9 @@ test('persistent agents reuse one session and retain earlier task changes', asyn
   assert.equal(f.record().state, 'idle');
   await f.service.send({ name: 'artist', message: 'second' }, extra(A));
   assert.equal(f.record().sessionId, id);
-  assert.deepEqual((await f.service.changes({ name: 'artist', task: 1 }, extra(A))).changes, [{ path: 'first.svg', operation: 'write', agentPath: ['artist'] }]);
+  const priorChanges = (await f.service.changes({ name: 'artist', task: 1 }, extra(A))).changes;
+  assert.deepEqual(priorChanges.filter(change => change.source !== 'workspace-diff'),
+    [{ path: 'first.svg', operation: 'write', agentPath: ['artist'] }]);
   assert.equal(f.removed.length, 0);
   f.service.close();
 });

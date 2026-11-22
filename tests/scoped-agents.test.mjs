@@ -11,6 +11,7 @@ import { monitorSpawn } from '../src/shared-monitor.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
 import { createAuthority, openAuthority } from '../src/cleanup-authority.mjs';
+import { readRosterTree, claimRosterTree, recordRosterStep, completeRosterTicket } from '../src/cleanup-roster-transaction.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const A = '11111111-1111-4111-8111-111111111111';
@@ -2296,6 +2297,30 @@ test('supplement key begins after existing reports and does not duplicate submis
     const latest = f.record(); latest.task.reports = [{ id: 'submission:new', message: 'new', final: false, delivery: { state: 'pending' } }]; f.store.save(latest);
     const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
     assert.deepEqual(result.events.map(event => event.message), ['new']);
+  } finally { f.service.close(); }
+});
+
+test('cleanup ticket preserves the old wait receipt across same-name replacement', async () => {
+  const dir = await mkdtemp(path.join(workspace, 'clean', 'scoped-tests', 'ticket-wait-'));
+  const file = path.join(dir, 'roster.sqlite');
+  const store = new RosterStore(file); const f = await fixture({ store });
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'old', lifetime: 'once' }, extra(A));
+    const old = f.record();
+    old.task.reports = [{ id: 'submission:ticket-final', final: true, message: 'private', delivery: { state: 'delivered' } }];
+    store.save(old);
+    const tree = readRosterTree(file, old.agentId);
+    claimRosterTree(file, { rootId: old.agentId, fingerprint: tree.fingerprint, ticketId: 'ticket-wait' });
+    recordRosterStep(file, 'ticket-wait', old.agentId, 'native-complete', { removed: true });
+    recordRosterStep(file, 'ticket-wait', old.agentId, 'private-complete', { removed: true });
+    completeRosterTicket(file, 'ticket-wait');
+    const replacement = await f.service.run({ name: 'artist', message: 'new', lifetime: 'persistent' }, extra(A));
+    const oldWait = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    const newWait = await f.service.wait({ taskKeys: [replacement.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.notEqual(replacement.taskKey, sent.taskKey);
+    assert.equal(oldWait.events[0].type, 'delivered');
+    assert.equal(oldWait.events[0].id, `${sent.taskKey}:delivered:ticket-final`);
+    assert.equal(newWait.events.some(event => event.type === 'delivered'), false);
   } finally { f.service.close(); }
 });
 

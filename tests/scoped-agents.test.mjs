@@ -2620,3 +2620,22 @@ test('DSH recovery of a persisted pre-write refusal uses the frozen start select
     assert.equal(dispatch.delivery, 'new-turn');
   } finally { f.service.close(); }
 });
+test('DSH reports a native new turn when the bridge safely writes after A ended', async () => {
+  let f;
+  f = await fixture({ beforeSend: input => {
+    if (input.message === 'same selection after A') f.sessions.get(f.record().sessionId).running = false;
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'start A', effort: 'high' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'same selection after A', effort: 'high' }, extra(A));
+    assert.equal(receipt.accepted, true);
+    assert.equal(receipt.mode, 'steer');
+    assert.equal(receipt.delivery, 'new-turn');
+    assert.equal(receipt.actualEffort, 'high');
+    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, 'new-turn');
+    const inspect = await f.service.inspect({ name: 'artist' }, extra(A));
+    assert.equal(inspect.inputs.find(item => item.requestId === receipt.requestId).delivery, 'new-turn');
+    assert.equal(f.sends.filter(item => item.requestId === receipt.requestId).length, 1);
+  } finally { f.service.close(); }
+});

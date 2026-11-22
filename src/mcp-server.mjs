@@ -9,7 +9,8 @@ import { createPeers } from './peers.mjs';
 import { CODEX_THREAD_ID } from './codex-target.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
 import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
-import { TRUSTED_CALLER } from './calling-context.mjs';
+import { TRUSTED_CALLER, trustedCaller, callingThread } from './calling-context.mjs';
+import { submitFeedback } from './feedback-client.mjs';
 import { monitorAlive } from './shared-monitor.mjs';
 import { exitWhenInputCloses } from './stdio-exit.mjs';
 import { compactChanges, compactCreate, compactInspect, compactList, compactStatus, compactWait } from './tool-view.mjs';
@@ -17,6 +18,11 @@ import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT 
 import { TARGETS } from './agent-backend.mjs';
 import { RosterStore } from './roster-store.mjs';
 
+const recentErrors = new Map();
+const feedbackSchema = { kind: z.enum(['problem', 'friction']), message: z.string().min(1).max(1200), severity: z.enum(['low', 'medium', 'high']).optional() };
+function errorScope(extra, name) { const c = trustedCaller(extra); return (c ? c.source + ':' + c.nativeSessionId : 'codex:' + callingThread(extra)) + ':' + (name ?? ''); }
+function rememberError(extra, name, tool, error) { if (typeof error?.code !== 'string') return; try { const key = errorScope(extra, name); recentErrors.delete(key); recentErrors.set(key, { tool, code: error.code, ...(Number.isInteger(error.httpStatus) ? { httpStatus: error.httpStatus } : {}), at: new Date().toISOString() }); while (recentErrors.size > 500) recentErrors.delete(recentErrors.keys().next().value); } catch {} }
+function recentError(extra, name) { try { const v = recentErrors.get(errorScope(extra, name)); return v && Date.now() - Date.parse(v.at) <= 900000 ? v : null; } catch { return null; } }
 const name = z.string().min(1).max(80).describe('Subagent name in this chat. Names in other chats are unrelated.');
 const message = z.string().min(1).max(100000).describe('Task, update, or answer text. Pass it directly; do not create a communication file.');
 const modelOptions = {
@@ -56,9 +62,24 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
     annotations: { readOnlyHint: readOnly, destructiveHint: destructive, idempotentHint: readOnly, openWorldHint: !readOnly },
   }, async (args, extra) => {
     const finished = diagnostics?.tool(tool, extra);
+    const deadline = Date.now() + 2000;
+    let trusted;
     try {
-      const trusted = (await extraFor(extra)) ?? extra;
-      const result = await action(await resolve(), args, trusted);
+      if (tool === 'feedback' || tool === 'futureaide_feedback') {
+        let timer;
+        const identity = await Promise.race([Promise.resolve().then(() => extraFor(extra)), new Promise(resolve => { timer = setTimeout(() => resolve(null), Math.max(0, deadline - Date.now())); })]);
+        clearTimeout(timer);
+        if (!identity || Date.now() >= deadline) return { content: [{ type: 'text', text: JSON.stringify({ saved: false, code: 'feedback-unavailable' }) }] };
+        trusted = { ...identity, feedbackDeadline: deadline };
+      } else trusted = { ...((await extraFor(extra)) ?? extra), feedbackDeadline: deadline };
+      let result;
+      if (tool === 'feedback' || tool === 'futureaide_feedback') {
+        let timer, started = false;
+        const work = (async () => { const resolved = await resolve(); if (Date.now() >= deadline) return { saved: false, code: 'feedback-unavailable' }; started = true; return action(resolved, args, trusted); })();
+        result = await Promise.race([work, new Promise(done => { timer = setTimeout(() => done(started ? { saved: null, code: 'feedback-outcome-unknown' } : { saved: false, code: 'feedback-unavailable' }), Math.max(0, deadline - Date.now())); })]);
+        clearTimeout(timer);
+      } else result = await action(await resolve(), args, trusted);
+      if (!['feedback', 'futureaide_feedback'].includes(tool) && result?.error) rememberError(trusted, args?.name, tool, result.error);
       // isError is read from the full result: a compact view must never hide a real failure.
       // A view may also shape the detail answer (inspect's node filter lives there),
       // so both paths receive the arguments.
@@ -69,6 +90,7 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
       return { content: [{ type: 'text', text }],
         ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
+      if (trusted && !['feedback', 'futureaide_feedback'].includes(tool)) rememberError(trusted, args?.name, tool, error);
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
     } finally { finished?.(); }
   });
@@ -89,6 +111,7 @@ export function registerScopedTools(server, options = {}) {
   // own annotations, or a host might auto-approve a write as a read.
   const registerView = (tool, description, inputSchema, action, view) =>
     register(tool, description, inputSchema, action, true, false, view);
+  register('futureaide_feedback', 'Record a plugin problem or friction in the local feedback inbox.', { ...feedbackSchema, name: name.optional() }, (s, a, e) => s.submitCallerFeedback(a, e, recentError(e, a.name), e.feedbackDeadline));
   registerView('futureaide_status', 'Check this chat context and target readiness. Each backend lists its available model IDs in catalog order and its defaultModel. An unavailable backend or catalog includes the reason. Pass detail: true for the full diagnostics.', { detail }, (s, _a, e) => s.status(e), compactStatus);
   register('futureaide_run_agent', 'Start a subagent’s work in one call: create the name if it does not exist, then send the task; an existing name simply receives the message. Use model and effort to select what runs this and later inputs for the name. The receipt gives the resolved ID as actualModel. Omit name to have one generated. Results return to this chat through the subagent’s own ask_parent questions and report_parent reports, so do not poll; accepted or queued is a receipt, not completion. lifetime is once (the default) or persistent, and target picks the application for a new name: dsh (the default), codex-desktop or claude-cli. An existing name keeps its own target and lifetime; a conflicting explicit value is refused rather than running on another application. mode applies to an existing working name: omit it for the target’s native behavior, steer to insert into its active turn, or queue to start the next turn after the current one ends. A new name starts its first turn either way. DSH refuses explicit queue while busy; Claude CLI refuses explicit steer while busy. An explicit mode the target cannot honor returns mode-unsupported with target and supportedModes, and stores nothing. A supplement receipt carries requestId, mode, delivery and, once proven, turnId or afterTurnId; accepted alone never proves which turn received it. A new name whose first send fails still returns created:true with that name and its error: the name exists, so call list before deciding whether to send again, and never rename and rerun the task. queued:true means locally saved — do not resend; retrying:true means the original request awaits background recovery, so the caller need not resend; unknown means inspect the original receipt and recipient before deciding whether a retry is safe.', {
     name: name.optional(), message, ...modelOptions, lifetime: z.enum(['once', 'persistent']).optional()
@@ -161,6 +184,7 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
 function registerParentTools(server, options) {
   const register = toolRegistrar(server, options);
   const parentMessage = z.string().min(1).max(100000).describe('Message for the managed parent of this chat. Pass it directly; never a chat id, path, or internal number.');
+  register('feedback', 'Record a plugin problem or friction in the local feedback inbox.', feedbackSchema, (s, a, e) => s.submitManagedFeedback(a, e, recentError(e), e.feedbackDeadline));
   register('ask_parent', 'Ask the parent of this managed subagent a question. The caller is identified by the managed connection, so no chat or agent id is accepted. The question joins the subagent’s current task and is delivered to its parent; the task keeps waiting for the answer. You may go on with whatever does not depend on it: the answer arrives in this conversation as a message beginning "Parent answer:", and a final report is not accepted before then. ' + QUESTION_CONTRACT + ' ' + CODEX_ASK_PARENT_INSTRUCTION, { message: parentMessage }, (s, a, e) => s.submitToParent({ kind: 'ask', message: a.message }, e));
   register('report_parent', 'Submit an explicit report from this managed subagent to its parent. The caller is identified by the managed connection. Ordinary final text from a native turn never completes a task; only this tool does, and only with final:true. ' + FINAL_REPORT_CONTRACT, {
     message: parentMessage,
@@ -354,12 +378,17 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (process.argv[2] === '--claude-cli-reports') {
     // This server belongs to a single claude -p process. The runner sets the
     // route in its MCP config, outside the prompt and tool argument schemas.
-    const [roster, agentId, taskId, requestId, mode] = process.argv.slice(3);
+    const [roster, agentId, taskId, requestId, configFile, mode] = process.argv.slice(3);
     if (!roster || !agentId || !taskId || !requestId) throw new Error('Missing managed Claude CLI dispatch.');
     const store = new RosterStore(roster);
     const server = new McpServer({ name: 'futureaide', version: '1.0.0' });
-    registerParentTools(server, { service: {
+    registerParentTools(server, { extraFor: extra => ({ ...extra, [TRUSTED_CALLER]: { source: 'claude-cli', nativeSessionId: agentId + ':' + taskId + ':' + requestId } }), service: {
       submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId }),
+      submitManagedFeedback: (input, _extra, error, deadline) => {
+        const record = store.get(agentId);
+        if (!record || record.closed || record.target !== 'claude-cli' || record.task?.taskId !== taskId || record.task?.dispatches?.at(-1)?.requestId !== requestId || ['idle', 'failed'].includes(record.state)) throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
+        return submitFeedback(input, { source: 'claude-cli', caller: store.owner(record.ownerId)?.source ?? null, target: 'claude-cli', name: record.name ?? null, error }, { configFile, deadline });
+      },
     } });
     const transport = new StdioServerTransport();
     if (mode !== '--no-idle-session-cleanup') {

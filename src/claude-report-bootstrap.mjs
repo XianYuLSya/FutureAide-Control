@@ -167,6 +167,12 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     }
   };
   const callTool = async (name, args) => {
+    if (name === 'futureaide_feedback') {
+      let sent = false, expired = false, timer;
+      const timeout = new Promise(resolve => { timer = setTimeout(() => { expired = true; if (sent) void discardClient(); resolve(sent ? failure('write-outcome-unknown', 'This feedback may already have been saved. Ask the secretary to check the local feedback inbox; do not resend.', { operation: name }) : { content: [{ type: 'text', text: JSON.stringify({ saved: false, code: 'feedback-unavailable' }) }] }); }, 2000); });
+      const work = (async () => { try { await prepare(); if (expired) return; sent = true; return await state.client.callTool({ name, arguments: args }); } catch { if (sent) { void discardClient(); return failure('write-outcome-unknown', 'This feedback may already have been saved. Ask the secretary to check the local feedback inbox; do not resend.', { operation: name }); } return { content: [{ type: 'text', text: JSON.stringify({ saved: false, code: 'feedback-unavailable' }) }] }; } })();
+      const result = await Promise.race([work, timeout]); clearTimeout(timer); return result;
+    }
     try { await prepare(); }
     catch (error) { return failure(error?.code ?? 'report-service-unavailable', error?.message ?? String(error)); }
     try {

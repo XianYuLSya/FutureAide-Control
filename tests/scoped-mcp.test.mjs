@@ -36,7 +36,7 @@ test('installed MCP exposes only name-addressed tools and forwards trusted reque
   await server.connect(b); await client.connect(a);
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 13, 'eleven name-addressed tools plus the Codex-side ask_parent/report_parent');
+    assert.equal(tools.length, 15, 'management and managed feedback tools are registered');
     assert.ok(tools.findIndex(tool => tool.name === 'futureaide_run_agent') < tools.findIndex(tool => tool.name === 'futureaide_create_agent'),
       'the one-call run tool is offered before the two-call pair');
     assert.ok(!tools.some(tool => /spawn_agent|register_peer|create_session|profile_create/.test(tool.name)));
@@ -294,7 +294,7 @@ test('every tool keeps its own annotations: a write is never advertised as a rea
     const expected = { futureaide_status: true, futureaide_run_agent: false, futureaide_create_agent: false,
       futureaide_send_agent: false, futureaide_answer_agent: false, futureaide_list_agents: true,
       futureaide_wait_agents: true, futureaide_agent_changes: true, futureaide_inspect_agent: true,
-      futureaide_cancel_agent: false, futureaide_delete_agent: false, ask_parent: false, report_parent: false };
+      futureaide_cancel_agent: false, futureaide_delete_agent: false, futureaide_feedback: false, feedback: false, ask_parent: false, report_parent: false };
     assert.deepEqual(tools.map(tool => tool.name).sort(), Object.keys(expected).sort());
     for (const [tool, readOnly] of Object.entries(expected)) {
       const annotations = tools.find(entry => entry.name === tool).annotations;

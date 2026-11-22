@@ -162,7 +162,7 @@ export const mcpToolName = (server, tool) => 'mcp__' + server + '__' + tool;
  */
 export function allowedCallbackTools(server = DEFAULT_MCP_SERVER_NAME) {
   const name = String(server || DEFAULT_MCP_SERVER_NAME);
-  return REQUIRED_MCP_TOOLS.map(tool => mcpToolName(name, tool));
+  return [...REQUIRED_MCP_TOOLS, 'feedback'].map(tool => mcpToolName(name, tool));
 }
 
 /** The one MCP server name a config may declare, so no other server gets a say. */
@@ -186,6 +186,7 @@ export function claudeSystemPrompt({ serverName = DEFAULT_MCP_SERVER_NAME, name 
     'Another agent assigned this task and is waiting for you.',
     `If you need a decision from your parent, call the MCP tool ${mcpToolName(server, 'ask_parent')}.`,
     `Deliver your final result with ${mcpToolName(server, 'report_parent')}(message, final=true).`,
+    `Record plugin problems or friction with ${mcpToolName(server, 'feedback')}; this does not notify your parent.`,
     'Ordinary replies do not reach your parent; only those two calls do.',
   ].join('\n');
 }

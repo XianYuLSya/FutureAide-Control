@@ -1,3 +1,4 @@
+import { submitFeedback } from './feedback-client.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
@@ -773,7 +774,7 @@ export function createScopedAgents(config, {
   const settings = record => ({ ...config, target: targetOf(record), workspace: record.workspace,
     stateDirectory: agentDirectory(record), codexThreadId: undefined, futureaideSessionId: undefined });
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
-    sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
+    sessionId: record.sessionId, workspace: record.workspace, feedbackAgentName: record.name ?? null, feedbackCallerHost: store.owner(record.ownerId)?.source ?? null, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
     ...(record.task ? { taskId: record.task.taskId } : {}) });
   // Handles an adapter needs on the shared side: the target's own state in its own
   // row (never inside the record the shared layer will save again) and one host
@@ -4480,6 +4481,18 @@ export function createScopedAgents(config, {
      * argument) through the binding its backend recorded, and the submission joins
      * the same task so the one state machine delivers it to the parent.
      */
+    async submitCallerFeedback({ name, ...input }, extra, error, deadline) {
+      const caller = trustedCaller(extra);
+      const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+      const record = name ? store.named(ownerId, name) : null;
+      return submitFeedback(input, { source: caller?.source ?? 'codex-desktop', caller: caller?.source ?? 'codex-desktop', target: name ? (record ? targetOf(record) : null) : 'plugin', name: record?.name ?? null, error }, { configFile: config.configFile, deadline });
+    },
+    async submitManagedFeedback(input, extra, error, deadline) {
+      const bound = store.agentForCodexThread(callingThread(extra));
+      const record = bound && store.get(bound.agentId);
+      if (!record || record.closed || !record.task) throw Object.assign(new Error('This caller has no active managed task.'), { code: 'submission-not-owned' });
+      return submitFeedback(input, { source: 'codex-desktop', caller: store.owner(record.ownerId)?.source ?? null, target: 'codex-desktop', name: record.name ?? null, error: error && record.task.startedAt && Date.parse(error.at) >= Date.parse(record.task.startedAt) ? error : null }, { configFile: config.configFile, deadline });
+    },
     async submitToParent({ kind, message, final = false }, extra) {
       textMessage(message);
       if (!['ask', 'report'].includes(kind)) throw new Error('kind must be ask or report.');

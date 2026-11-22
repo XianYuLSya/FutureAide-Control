@@ -317,3 +317,15 @@ test('a bridge without configuration reports that instead of serving silence', a
     assert.equal(JSON.parse(result.content[0].text).error.code, 'configuration-unavailable');
   } finally { await close(); await bridge.close(); }
 });
+
+test('feedback lost reply is never replayed and tells secretary to check inbox', async () => {
+  const dead = remote({ tools: [{ name: 'futureaide_feedback', inputSchema: { type: 'object' } }], onCall: async () => { throw Error('lost after write'); } });
+  const { bridge } = await bridgeWith({ remotes: [dead] });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    const result = await client.callTool({ name: 'futureaide_feedback', arguments: { kind: 'problem', message: 'lost receipt' } });
+    assert.equal(dead.calls.length, 1);
+    assert.match(result.content[0].text, /write-outcome-unknown/);
+    assert.match(result.content[0].text, /secretary.*inbox.*do not resend/i);
+  } finally { await close(); await bridge.close(); }
+});

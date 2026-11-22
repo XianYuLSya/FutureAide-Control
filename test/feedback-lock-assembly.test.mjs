@@ -93,23 +93,40 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
   const metrics = {
     configPath, root, reportPort, dshBaseUrl: dsh.baseUrl, codexHome,
     monitorPid: worker.child.pid,
-    baseline: { dispatch: [], report: [] },
+    baseline: { dispatch: [], report: [], feedback: [] },
     locked: { dispatch: [], report: [], feedback: [] },
     lock: [], monitorProgress: [],
   };
-  for (let i = 0; i < 10; i++) {
-    const sent = await measure(mcp.client, 'futureaide_send_agent', {
-      name: `baseline-${i}`, message: `baseline ${i}`,
-    });
-    assert.equal(sent.value.accepted, true, JSON.stringify(sent.value));
-    metrics.baseline.dispatch.push(sent.ms);
-    const report = await measure(reports, 'report_parent', { message: `baseline ${i}`, final: false });
-    assert.equal(report.value.accepted, true);
-    metrics.baseline.report.push(report.ms);
-  }
-
   let iteration = 0;
+  let baselineIteration = 0;
   while (iteration < 10) {
+    // Alternate batches to balance roster growth and machine load. Both arms
+    // submit feedback and run dispatch/report concurrently, with equal timing.
+    const batchEnd = Math.min(10, iteration + 5);
+    while (baselineIteration < batchEnd) {
+      const n = baselineIteration++;
+      const feedbackStart = performance.now();
+      let baselineFinished = false;
+      const feedback = callTool(mcp.client, 'futureaide_feedback', {
+        kind: 'problem', message: `baseline sample ${n}`,
+      }).then(result => {
+        baselineFinished = true;
+        return { ms: performance.now() - feedbackStart, finishedAt: Date.now(),
+          value: result.value, isError: result.isError };
+      });
+      await tick();
+      assert.equal(baselineFinished, false, 'baseline feedback must overlap the operations');
+      const [dispatch, report, fb] = await Promise.all([
+        measure(mcp.client, 'futureaide_send_agent', { name: `baseline-${n}`, message: `baseline ${n}` }),
+        measure(reports, 'report_parent', { message: `baseline ${n}`, final: false }),
+        feedback,
+      ]);
+      assert.equal(dispatch.value.accepted, true, JSON.stringify(dispatch.value));
+      assert.equal(report.value.accepted, true);
+      metrics.baseline.dispatch.push(dispatch.ms);
+      metrics.baseline.report.push(report.ms);
+      metrics.baseline.feedback.push(fb);
+    }
     const lock = spawn(process.execPath, ['-e', workerScript, inboxPath(configPath)], {
       stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
     });
@@ -125,7 +142,7 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
     const lockInfo = { lockedAt, releasedAt: null };
     metrics.lock.push(lockInfo);
     const watchedReports = [];
-    while (iteration < 10 && Date.now() - lockedAt < 3000) {
+    while (iteration < batchEnd && Date.now() - lockedAt < 3000) {
       const n = iteration++;
       const start = performance.now();
       let finished = false;
@@ -170,12 +187,8 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
   for (const item of [...metrics.locked.dispatch, ...metrics.locked.report]) {
     assert.ok(metrics.lock.some(lock => item.finishedAt >= lock.lockedAt && item.finishedAt < lock.releasedAt));
   }
-  for (const item of metrics.locked.feedback) {
-    assert.ok(item.ms <= 2100, JSON.stringify(item));
-    assert.equal(item.value?.saved, false, JSON.stringify(item));
-    assert.equal(item.value?.code, 'feedback-busy', JSON.stringify(item));
-  }
-  assert.equal(pendingFeedback(configPath).length, 0);
+  const pending = pendingFeedback(configPath);
+  metrics.savedCount = pending.reduce((sum, item) => sum + item.count, 0);
   metrics.p95 = {
     baselineDispatch: p95(metrics.baseline.dispatch),
     lockedDispatch: p95(metrics.locked.dispatch.map(item => item.ms)),
@@ -186,6 +199,18 @@ test('isolated monitor continues dispatch and report while feedback SQLite is lo
   metrics.p95.reportIncrease = metrics.p95.lockedReport - metrics.p95.baselineReport;
   await writeFile(path.join(root, 'feedback-lock-results.json'), JSON.stringify(metrics, null, 2));
   console.log(`feedback lock evidence: ${path.join(root, 'feedback-lock-results.json')}`);
+  assert.equal(metrics.savedCount, 10);
+  assert.equal(metrics.baseline.feedback.length, 10);
+  assert.equal(metrics.locked.feedback.length, 10);
+  for (const item of metrics.baseline.feedback) {
+    assert.equal(item.value?.saved, true, JSON.stringify(item));
+    assert.ok(item.ms <= 2100, JSON.stringify(item));
+  }
+  for (const item of metrics.locked.feedback) {
+    assert.ok(item.ms <= 2100, JSON.stringify(item));
+    assert.equal(item.value?.saved, false, JSON.stringify(item));
+    assert.equal(item.value?.code, 'feedback-busy', JSON.stringify(item));
+  }
   assert.ok(metrics.monitorProgress.some(item => metrics.lock.some(lock =>
     item.lockedAt === lock.lockedAt && Date.parse(item.consumed) >= lock.lockedAt
       && Date.parse(item.consumed) < lock.releasedAt && item.observedAt < lock.releasedAt)),

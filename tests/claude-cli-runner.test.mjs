@@ -82,10 +82,14 @@ test('staged protocol reads capabilities and applied before one input for new an
   assert.deepEqual(inputs.map(item => item.text), ['one task', 'one task']);
 });
 
-test('staged protocol refuses a mismatched applied model before the business input', async () => {
+for (const [scenario, settings] of [
+  ['different model', '{model:"other",effort}'],
+  ['unconfirmed effort', '{model}'],
+  ['unknown applied effort', '{model,effort:"unlisted"}'],
+]) test('staged protocol refuses ' + scenario + ' before the business input', async () => {
   const workspace = await scratch('protocol-refusal');
   const script = path.join(workspace, 'protocol.mjs');
-  await writeFile(script, protocolFixture.replace("const model = args.includes('--model') ? value('--model') : 'claude-test';", "const model = 'different-model';"));
+  await writeFile(script, protocolFixture.replace('applied:{model,effort}', 'applied:' + settings));
   const cli = { command: process.execPath, prefixArgs: [script] };
   const directory = path.join(workspace, 'turn');
   await startClaudeTurn({ directory, workspace, cli, sessionId: SESSION, message: 'must not arrive',

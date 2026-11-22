@@ -188,6 +188,7 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
       const row = catalog.models?.find(item => !item.disabled && item.resolvedModel === applied?.model);
       if (!row || (!Array.isArray(row.supportedEffortLevels) && row.supportsEffort !== false) || !applied?.model
           || (turn.selectedModel && applied.model !== turn.selectedModel)
+          || (turn.selectedEffort && !applied.effort)
           || (applied.effort && !row.supportedEffortLevels?.includes(applied.effort))) {
         throw new Error('CLI did not confirm the selected model, supported efforts and applied effort');
       }

@@ -147,13 +147,13 @@ futureaide_delete_agent({name: "架构图助手"})
 |---|---|
 | `local-pending` | 只在本地存下，尚未核实根轮；`accepted: false, queued: true` |
 | `after-current` | 已登记在活动轮 A 之后；`afterTurnId: A`，`accepted: false, queued: true` |
-| `current-turn` | 原生 steer 已受理，进入活动轮 A；`accepted: true, turnId: A` |
-| `new-turn` | 原生 start 已受理，作为新轮 B 的第一条输入；`accepted: true, turnId: B` |
+| `current-turn` | 输入已进入活动轮。Codex 的回执给出 `turnId: A`。 |
+| `new-turn` | 输入已开启新轮。Codex 的回执给出 `turnId: B`。 |
 | `answer-pending` / `answered` | 已作为回答登记 / 回答已实际送达 |
 | `accepted-route-unknown` | 原生记录可证已写入，但去向无法确认；`accepted: true, queued: false` |
 | `unknown` / `blocked` | 写入结果未知，不自动重发 / 明确拒绝、取消或过期，附真实原因 |
 
-`accepted` 本身不能推断是当前轮还是新轮，必须看 `delivery` 和 `turnId`。`futureaide_inspect_agent({name})` 的 `inputs` 会列出本任务每条输入的同组字段和原因，用回执里的 `requestId` 对应；`list` 只保留计数摘要。
+DSH 由宿主在写入时确认去向。若补充写入前活动轮已结束，新轮按收件时冻结的档位执行，回执显示 `new-turn` 和确认的 `actualEffort`。按 `requestId` 可在 `futureaide_inspect_agent({name})` 的 `inputs` 查到对应输入。`list` 的 `inputDelivery` 显示最近一次已确认的输入去向，`delivery` 显示报告送达状态。
 
 ### 派给后台的 Claude
 

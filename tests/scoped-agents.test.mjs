@@ -19,7 +19,7 @@ const extra = threadId => ({ _meta: { threadId } });
 const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
 async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles,
-  callCodex: callCodexOverride, config: extraConfig = {}, reportedEffort } = {}) {
+  callCodex: callCodexOverride, config: extraConfig = {}, reportedEffort, reportedDelivery } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -32,7 +32,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
   const selections = [];
   const api = {
     async connectionIdentity() { if (offline) throw new Error('DSH offline'); return { application: 'dsh', dataRoot: path.join(stateDirectory, 'native') }; },
-    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPrompt', 'managedPromptReceipt'] }; },
+    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPromptV2', 'managedPromptReceipt'] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId, { ...input, model: { provider: 'fixture', model: 'test' }, running: false, seq: 0, questions: [], changes: [], turns: new Map() });
       return { ...sessions.get(input.sessionId), modelRequestsStarted: 0 };
@@ -113,10 +113,11 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
       if (beforeSend) await beforeSend(input);
       const s = sessions.get(input.sessionId);
       const afterSeq = s.seq;
+      const delivery = s.running ? 'current-turn' : 'new-turn';
       s.running = true; s.seq += 1;
       s.turns.set(input.requestId, { afterSeq, state: 'running' });
       sends.push(input);
-      return { accepted: true, afterSeq, actualEffort: reportedEffort === null ? null : s.model.reasoningEffort ?? null, actualEffortSource: reportedEffort === null ? null : 'host-readback', ...(reportedEffort === null ? { actualModel: null } : {}) };
+      return { accepted: true, delivery: reportedDelivery === null ? null : delivery, afterSeq, actualEffort: reportedEffort === null ? null : s.model.reasoningEffort ?? null, actualEffortSource: reportedEffort === null ? null : 'host-readback', ...(reportedEffort === null ? { actualModel: null } : {}) };
     },
     async wait(input) {
       const s = sessions.get(input.sessionId);
@@ -2437,5 +2438,185 @@ test('locked DSH receipt reflects reselected provider capability after default c
     assert.deepEqual([list.selectedEffort, list.actualEffort], ['medium', 'medium']);
     const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === receipt.requestId);
     assert.deepEqual([row.selectedEffort, row.actualEffort], ['medium', 'medium']);
+  } finally { f.service.close(); }
+});
+test('DSH steer rejected before write after A ends starts the frozen B selection once', async () => {
+  let f, attempts = 0;
+  const offered = [];
+  f = await fixture({ beforeSend: async input => {
+    if (input.message !== 'after boundary') return;
+    offered.push({ requestId: input.requestId, selection: input.selection, startSelection: input.startSelection,
+      expectedTurn: input.expectedTurn, mode: input.mode });
+    if (attempts++ === 0) {
+      f.sessions.get(f.record().sessionId).running = false;
+      throw Object.assign(new Error('A ended before write'), { code: 'managed-turn-ended', notSent: true, retryableRead: true });
+    }
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const first = await f.service.send({ name: 'artist', message: 'start A', effort: 'high' }, extra(A));
+    assert.equal(first.delivery, 'new-turn');
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    const pending = await f.service.send({ name: 'artist', message: 'after boundary' }, extra(A));
+    assert.equal(f.sends.length, 1, 'the bridge refused before the business write');
+    assert.equal(offered[0].selection.reasoningEffort, 'high');
+    assert.deepEqual([offered[0].startSelection.provider, offered[0].startSelection.reasoningEffort], ['new-route', 'max']);
+    assert.ok(Number.isSafeInteger(offered[0].expectedTurn.throughSeq));
+    const record = f.record(); const saved = record.task.dispatches.find(item => item.requestId === pending.requestId);
+    saved.nextAttemptAt = 0; f.store.save(record);
+    await f.service.poll(record.agentId);
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === pending.requestId);
+    assert.equal(offered.length, 2);
+    assert.equal(offered[1].requestId, pending.requestId);
+    assert.deepEqual([offered[1].selection.provider, offered[1].selection.reasoningEffort], ['new-route', 'max']);
+    assert.equal(offered[1].expectedTurn, undefined);
+    assert.equal(f.sends.filter(input => input.requestId === pending.requestId).length, 1);
+    assert.equal(dispatch.delivery, 'new-turn');
+    assert.equal(dispatch.actualEffort, 'max');
+    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, 'new-turn');
+    assert.equal((await f.service.wait({ names: ['artist'], timeoutSeconds: 0 }, extra(A))).items[0].inputDelivery, 'new-turn');
+    const inspected = await f.service.inspect({ name: 'artist' }, extra(A));
+    assert.equal(inspected.inputDelivery, 'new-turn');
+    assert.equal(inspected.inputs.find(input => input.requestId === pending.requestId).delivery, 'new-turn');
+  } finally { f.service.close(); }
+});
+test('DSH accepted receipt with unknown route never reports an inferred delivery', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    // Simulate a bridge that confirms acceptance but cannot recover its route.
+    const original = f.controlFactory;
+    // The fixture opts out of route evidence at the control response boundary.
+    f.api.managedPromptReceipt = async () => ({ status: 'unknown' });
+    assert.equal(typeof original, 'function');
+    const receipt = await f.service.send({ name: 'artist', message: 'normal' }, extra(A));
+    assert.equal(receipt.delivery, 'new-turn');
+    // Historical accepted receipt without delivery must not borrow its intent.
+    const record = f.record();
+    const dispatch = record.task.dispatches[0];
+    dispatch.accepted = false; dispatch.state = 'unknown'; dispatch.delivery = 'unknown';
+    const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
+    await mkdir(directory, { recursive: true });
+    const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, dispatch.requestId])).digest('hex');
+    await writeFile(path.join(directory, key + '.json'), JSON.stringify({ status: 'accepted', result: { actualEffort: 'max', delivery: null } }));
+    f.store.save(record);
+    await f.service.poll(record.agentId);
+    const recovered = f.record().task.dispatches[0];
+    assert.equal(recovered.accepted, true);
+    assert.equal(recovered.delivery, null);
+    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, undefined);
+    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === dispatch.requestId);
+    assert.equal(row.delivery, null);
+  } finally { f.service.close(); }
+});
+
+test('DSH lost acknowledgement recovers actual route without resending the input', async () => {
+  let f, attempts = 0;
+  f = await fixture({ beforeSend: async input => {
+    if (input.message !== 'lost steer') return;
+    attempts++;
+    const record = f.record();
+    const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
+    await mkdir(directory, { recursive: true });
+    const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, input.requestId])).digest('hex');
+    await writeFile(path.join(directory, key + '.json'), JSON.stringify({ status: 'unknown', instance: await f.api.connectionIdentity() }));
+    f.sends.push(input); // The native fixture recorded the one successful write.
+    throw Object.assign(new Error('acknowledgement lost'), { uncertain: true });
+  } });
+  f.api.managedPromptReceipt = async () => ({ status: 'accepted', delivery: 'current-turn',
+    selected: { provider: 'fixture', model: 'test', reasoningEffort: 'high' } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'start', effort: 'high' }, extra(A));
+    const pending = await f.service.send({ name: 'artist', message: 'lost steer' }, extra(A));
+    await f.service.poll(f.record().agentId);
+    await f.service.poll(f.record().agentId);
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === pending.requestId);
+    assert.equal(attempts, 1);
+    assert.equal(f.sends.filter(item => item.requestId === pending.requestId).length, 1);
+    assert.equal(dispatch.accepted, true);
+    assert.equal(dispatch.delivery, 'current-turn');
+    assert.equal(dispatch.actualEffort, 'high');
+    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, 'current-turn');
+    const inspect = await f.service.inspect({ name: 'artist' }, extra(A));
+    assert.equal(inspect.inputs.find(item => item.requestId === pending.requestId).delivery, 'current-turn');
+  } finally { f.service.close(); }
+});
+
+test('DSH accepted response explicitly lacking a route stays null in send, list and inspect', async () => {
+  const f = await fixture({ reportedDelivery: null });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const first = await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
+    assert.equal(first.accepted, true);
+    assert.equal(first.delivery, null);
+    const second = await f.service.send({ name: 'artist', message: 'second' }, extra(A));
+    assert.equal(second.accepted, true);
+    assert.equal(second.delivery, null);
+    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, undefined);
+    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === second.requestId);
+    assert.equal(row.delivery, null);
+  } finally { f.service.close(); }
+});
+test('DSH changed activity is re-observed and the native boundary chooses the current turn', async () => {
+  let f, attempts = 0;
+  const offered = [];
+  f = await fixture({ beforeSend: async input => {
+    if (input.message !== 'new activity') return;
+    offered.push({ selection: input.selection, startSelection: input.startSelection, expectedTurn: input.expectedTurn });
+    if (attempts++ === 0) {
+      const session = f.sessions.get(f.record().sessionId);
+      session.running = true; session.seq += 2;
+      session.model = { provider: 'new-route', model: 'test', reasoningEffort: 'max' };
+      throw Object.assign(new Error('turn changed before write'), { code: 'managed-turn-changed', notSent: true, retryableRead: true });
+    }
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'start A', effort: 'high' }, extra(A));
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    const pending = await f.service.send({ name: 'artist', message: 'new activity' }, extra(A));
+    const record = f.record(); const saved = record.task.dispatches.find(item => item.requestId === pending.requestId);
+    saved.nextAttemptAt = 0; f.store.save(record);
+    await f.service.poll(record.agentId);
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === pending.requestId);
+    assert.equal(attempts, 2);
+    assert.equal(f.sends.filter(input => input.requestId === pending.requestId).length, 1);
+    assert.equal(offered[0].selection.provider, 'fixture');
+    assert.equal(offered[1].selection.provider, 'new-route');
+    assert.ok(offered[1].expectedTurn.throughSeq > offered[0].expectedTurn.throughSeq);
+    assert.equal(dispatch.delivery, 'current-turn');
+    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, 'current-turn');
+  } finally { f.service.close(); }
+});
+test('DSH recovery of a persisted pre-write refusal uses the frozen start selection', async () => {
+  let f, attempts = 0;
+  const offered = [];
+  f = await fixture({ beforeSend: async input => {
+    if (input.message !== 'recover refusal') return;
+    offered.push(input);
+    if (attempts++ === 0) {
+      const record = f.record(); f.sessions.get(record.sessionId).running = false;
+      const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
+      await mkdir(directory, { recursive: true });
+      const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, input.requestId])).digest('hex');
+      await writeFile(path.join(directory, key + '.json'), JSON.stringify({ status: 'retryable', code: 'managed-turn-ended', notSent: true }));
+      throw Object.assign(new Error('worker stopped after bridge refusal'), { uncertain: true });
+    }
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'start A', effort: 'high' }, extra(A));
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    const pending = await f.service.send({ name: 'artist', message: 'recover refusal' }, extra(A));
+    const record = f.record();
+    assert.equal(record.task.dispatches.find(item => item.requestId === pending.requestId).state, 'unknown');
+    await f.service.poll(record.agentId);
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === pending.requestId);
+    assert.equal(attempts, 2);
+    assert.equal(f.sends.filter(input => input.requestId === pending.requestId).length, 1);
+    assert.deepEqual([offered[1].selection.provider, offered[1].selection.reasoningEffort], ['new-route', 'max']);
+    assert.equal(offered[1].expectedTurn, undefined);
+    assert.equal(dispatch.delivery, 'new-turn');
   } finally { f.service.close(); }
 });

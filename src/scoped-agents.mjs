@@ -248,6 +248,7 @@ function publicResult(record, { fullResult = false } = {}) {
     selectedEffort: visibleSelection?.selectedEffort ?? null,
     actualEffort: activeDispatch?.actualEffort ?? null,
     actualEffortSource: activeDispatch?.actualEffort != null ? activeDispatch.actualEffortSource ?? null : null,
+    ...(['current-turn', 'new-turn'].includes(activeDispatch?.delivery) ? { inputDelivery: activeDispatch.delivery } : {}),
     ...((activeDispatch?.effortAdjustment ?? visibleSelection?.effortAdjustment) ? { effortAdjustment: activeDispatch?.effortAdjustment ?? visibleSelection.effortAdjustment } : {}),
     // The full ID the target actually uses, never the caller's substring. The
     // explicit pin is a separate value and is only reported by a dispatch receipt;
@@ -355,16 +356,16 @@ function taskInputs(store, record) {
     if (dispatch.kind === 'answer') continue;
     if (blockedInputs.has(dispatch.requestId)) continue;
     const existing = rows.get(dispatch.requestId);
-    const delivery = dispatch.delivery
-      ?? (dispatch.state === 'blocked' || (dispatch.state === 'failed' && dispatch.error) ? 'blocked'
+    const delivery = dispatch.accepted === true && Object.hasOwn(dispatch, 'delivery') && dispatch.delivery === null
+      ? null : dispatch.delivery ?? (dispatch.state === 'blocked' || (dispatch.state === 'failed' && dispatch.error) ? 'blocked'
         : ['sending', 'queued', 'retrying'].includes(dispatch.state) ? 'local-pending' : undefined);
-    const status = lifecycle(delivery) ?? dispatch.state;
+    const status = lifecycle(delivery) ?? (dispatch.accepted ? 'accepted' : dispatch.state);
     put(dispatch.requestId, {
       requestId: dispatch.requestId,
       ...inputEffort(dispatch.accepted ? dispatch.deliverySelection ?? dispatch.model : dispatch.model, dispatch.accepted ? dispatch.actualEffort ?? null : null, dispatch.effortAdjustment, dispatch.actualEffortSource),
       actualModel: dispatch.accepted && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel) : null,
       ...(dispatch.mode ? { mode: dispatch.mode } : {}),
-      ...(delivery ? { delivery } : {}),
+      ...(delivery === null ? { delivery: null } : delivery ? { delivery } : {}),
       accepted: dispatch.accepted === true,
       queued: dispatch.accepted !== true && (waitingRoute(delivery) || ['sending', 'queued', 'retrying'].includes(dispatch.state)),
       ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
@@ -408,7 +409,7 @@ function taskInputs(store, record) {
           && (waitingRoute(route) || ['sending', 'queued', 'retrying'].includes(dispatch.state))) {
         delivery = 'answer-pending'; queued = true;
       } else if (dispatch.accepted === true) {
-        delivery = 'accepted-route-unknown'; accepted = true;
+        delivery = dispatch.delivery === null ? null : 'accepted-route-unknown'; accepted = true;
       } else if (route === 'blocked' || dispatch.state === 'blocked'
           || (dispatch.state === 'failed' && dispatch.error)) {
         delivery = 'blocked'; reason = dispatch.error?.code ?? 'send-failed';
@@ -434,7 +435,7 @@ function taskInputs(store, record) {
       ...(dispatch?.turnId ?? answer.turnId ? { turnId: dispatch?.turnId ?? answer.turnId } : {}),
       ...(dispatch?.afterTurnId ?? answer.afterTurnId ? { afterTurnId: dispatch?.afterTurnId ?? answer.afterTurnId } : {}),
       ...(reason ? { reason } : {}),
-      status: lifecycle(delivery) ?? 'unknown',
+      status: lifecycle(delivery) ?? (accepted ? 'accepted' : 'unknown'),
       ...(existing?.createdAt ? {} : dispatch?.startedAt ? { createdAt: dispatch.startedAt } : {}),
     });
   }
@@ -1570,7 +1571,7 @@ export function createScopedAgents(config, {
   function dispatchReceipt(dispatch) {
     if (!dispatch) return {};
     return {
-      ...(dispatch.delivery ? { delivery: dispatch.delivery } : {}),
+      ...(dispatch.delivery === null && dispatch.accepted ? { delivery: null } : dispatch.delivery ? { delivery: dispatch.delivery } : {}),
       ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
       ...(dispatch.delivery !== 'current-turn' && dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
       ...(dispatch.deliveryIntent?.method ? { method: dispatch.deliveryIntent.method } : {}),
@@ -1608,8 +1609,8 @@ export function createScopedAgents(config, {
     const terminalDelivery = item?.status === 'blocked' ? 'blocked'
       : item?.status === 'accepted' ? (stored.delivery ?? dispatch?.delivery ?? 'accepted-route-unknown')
         : item?.status === 'unknown' ? 'unknown' : undefined;
-    const delivery = terminalDelivery ?? stored.delivery ?? dispatch?.delivery ?? fallback.delivery
-      ?? 'local-pending';
+    const delivery = dispatch?.accepted === true && Object.hasOwn(dispatch, 'delivery') && dispatch.delivery === null
+      ? null : terminalDelivery ?? stored.delivery ?? dispatch?.delivery ?? fallback.delivery ?? 'local-pending';
     const accepted = item?.status === 'blocked' ? false
       : item?.status === 'accepted' || dispatch?.accepted === true || deliveryAccepted(delivery);
     const queued = !accepted && item?.status !== 'blocked' && (deliveryQueued(delivery)
@@ -1952,6 +1953,7 @@ export function createScopedAgents(config, {
         : (observed?.running === true && dispatch.mode !== 'queue' ? 'steer' : 'start');
       dispatch.deliveryIntent = { method, mode: dispatch.mode,
         ...(method === 'steer' && root?.turnId ? { expectedTurnId: root.turnId } : {}),
+        ...(target === 'dsh' && method === 'steer' ? { expectedThroughSeq: Number.isSafeInteger(observed?.throughSeq) ? observed.throughSeq : null } : {}),
         ...(method === 'start' && root?.turnId ? { afterTurnId: root.turnId } : {}) };
       saveDispatch(record);
       // The adapter has its own asynchronous preparation (host lock, state reads, preflight,
@@ -1977,14 +1979,17 @@ export function createScopedAgents(config, {
         ...(dispatch.selectionExplicit === undefined ? {}
           : { selectionExplicit: dispatch.selectionExplicit === true }),
         ...(dispatch.model?.explicitFields ? { explicitFields: dispatch.model.explicitFields } : {}),
+        ...(target === 'dsh' && dispatch.model ? { startModel: dispatch.model } : {}),
+        ...(target === 'dsh' && method === 'steer' ? { expectedTurn: { throughSeq: dispatch.deliveryIntent.expectedThroughSeq } } : {}),
         ...(modern || target === 'claude-cli' || target === 'dsh'
           ? (dispatch.model ? { model: target === 'dsh' ? dispatch.deliveryModel ?? dispatch.model : dispatch.model } : {})
           : (explicit ? { model: dispatch.model, explicitModel: true } : { explicitModel: false })) });
       // A native receipt names the actual route. When it does not, a Codex write is
       // never reported as current or new from `accepted` alone.
-      const delivery = typeof sent.delivery === 'string' ? sent.delivery
+      const delivery = target === 'dsh' && sent.accepted === true && Object.hasOwn(sent, 'delivery') && sent.delivery === null
+        ? null : typeof sent.delivery === 'string' ? sent.delivery
         : (sent.reschedule === true || sent.waiting === true || sent.status === 'waiting') ? 'local-pending'
-          : target === 'codex-desktop' ? (sent.accepted === true ? 'accepted-route-unknown' : sent.status ?? 'unknown')
+          : ['codex-desktop', 'dsh'].includes(target) ? (sent.accepted === true ? 'accepted-route-unknown' : sent.status ?? 'unknown')
             : sent.accepted !== true ? (['retryable', 'retrying'].includes(sent.status) ? 'local-pending' : sent.status ?? 'unknown')
               : dispatch.kind === 'answer' ? 'answered'
                 : method === 'steer' ? 'current-turn' : 'new-turn';
@@ -2008,6 +2013,7 @@ export function createScopedAgents(config, {
       // the queued-wait route it never took. A queue row that opened B keeps its
       // known A as history.
       if (delivery === 'current-turn') delete dispatch.afterTurnId;
+      if (target === 'dsh' && accepted && delivery === 'new-turn') { delete dispatch.deliverySelection; delete dispatch.deliveryModel; }
       if (accepted && explicit && target === 'codex-desktop') {
         // The native turn now runs with the pinned model; record the real display value
         // and only now make it the name's intended selection. A refused or still
@@ -2021,7 +2027,9 @@ export function createScopedAgents(config, {
         accepted ? null : dispatch.error?.code ?? sent.reason ?? null, dispatchReceipt(dispatch));
       }
       if (!accepted && (['retryable', 'retrying'].includes(dispatch.state) || sent.status === 'retryable')) {
-        if (dshDefaultOnly(record) && sent.notSent === true) { delete dispatch.deliveryIntent; dispatch.modelReady = false; }
+        if (target === 'dsh' && sent.notSent === true && (['managed-turn-ended', 'managed-turn-changed', 'managed-turn-unknown'].includes(sent.code) || dshDefaultOnly(record))) {
+          delete dispatch.deliveryIntent; delete dispatch.deliveryModel; delete dispatch.deliverySelection; dispatch.modelReady = false;
+        }
         dispatch.state = 'retrying'; deferRetry(dispatch);
       }
     } catch (error) {
@@ -2044,8 +2052,9 @@ export function createScopedAgents(config, {
       // transient transport failure: retrying it would loop forever and hide the typo.
       const modelError = ['model-required', 'model-required-for-effort', 'model-not-found',
         'effort-not-supported', 'model-default-invalid', 'codex-model-change-while-running'].includes(error.code);
-      if (dshDefaultOnly(record) && error?.notSent === true && error?.terminal !== true) {
-        delete dispatch.deliveryIntent;
+      if (targetOf(record) === 'dsh' && error?.notSent === true && error?.terminal !== true
+          && (['managed-turn-ended', 'managed-turn-changed', 'managed-turn-unknown'].includes(error.code) || dshDefaultOnly(record))) {
+        delete dispatch.deliveryIntent; delete dispatch.deliveryModel; delete dispatch.deliverySelection;
         dispatch.modelReady = false;
       }
       const retryable = !modelError && (error.notSent === true || error.retryableRead === true
@@ -3220,7 +3229,7 @@ export function createScopedAgents(config, {
       return;
     }
     if (receipt.status === 'accepted') Object.assign(dispatch, { accepted: true, state: 'running', error: undefined, failure: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
-      delivery: receipt.delivery ?? dispatch.delivery ?? 'accepted-route-unknown',
+      delivery: Object.hasOwn(receipt, 'delivery') ? receipt.delivery : 'accepted-route-unknown',
       ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
       ...(Object.hasOwn(receipt, 'actualEffort') ? { actualEffort: receipt.actualEffort } : {}),
       ...(receipt.actualEffort != null && receipt.actualEffortSource ? { actualEffortSource: receipt.actualEffortSource } : {}),
@@ -3228,12 +3237,17 @@ export function createScopedAgents(config, {
       ...(Object.hasOwn(receipt, 'actualModel') ? { actualModel: receipt.actualModel } : {}),
       ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}) });
     if (receipt.status === 'accepted' && receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
+    if (receipt.status === 'accepted' && receipt.delivery === 'new-turn' && targetOf(record) === 'dsh') {
+      delete dispatch.deliverySelection; delete dispatch.deliveryModel;
+    }
     if (receipt.status === 'rejected' || receipt.status === 'failed') {
       dispatch.state = 'failed'; dispatch.accepted = false;
       dispatch.error = receipt.error ?? { code: receipt.code ?? 'send-rejected', message: receipt.message ?? 'The input was not accepted.' };
     }
     if (receipt.status === 'retryable') {
-      if (dshDefaultOnly(record)) { delete dispatch.deliveryIntent; dispatch.modelReady = false; }
+      if (targetOf(record) === 'dsh' && (['managed-turn-ended', 'managed-turn-changed', 'managed-turn-unknown'].includes(receipt.code) || dshDefaultOnly(record))) {
+        delete dispatch.deliveryIntent; delete dispatch.deliveryModel; delete dispatch.deliverySelection; dispatch.modelReady = false;
+      }
       if (!allowResend) return 'not-sent';
       await dispatchOnce(record, dispatch);
     }
@@ -3257,6 +3271,7 @@ export function createScopedAgents(config, {
           ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}),
           nextAttemptAt: undefined, retryAttempts: undefined });
         if (receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
+        if (receipt.delivery === 'new-turn' && targetOf(record) === 'dsh') { delete dispatch.deliverySelection; delete dispatch.deliveryModel; }
         return 'accepted';
       }
       if (['rejected', 'retryable', 'failed'].includes(receipt?.status)

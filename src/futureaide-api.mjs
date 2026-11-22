@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { open } from 'node:fs/promises';
+import { open, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { discoveryCandidates, isProcessAlive } from './discovery.mjs';
@@ -642,10 +642,29 @@ export class FutureAideClient {
     try { credential = JSON.parse(await readBoundedFile(this.#hostBridgeFile, 2048)); }
     catch { fail('host-bridge-required', 'The local host bridge credential is unavailable.'); }
     if (credential.version !== 1 || !/^[a-f0-9]{64}$/.test(credential.token ?? '')) fail('host-bridge-required', 'The local host bridge credential is invalid.');
+    if (/^(?:cleanup|managedCleanup)/.test(endpoint)) {
+      try {
+        const canonical = await realpath(this.#dataHome);
+        const info = await stat(canonical, { bigint: true });
+        if (!info.isDirectory() || !info.ino) throw new Error();
+        args = { ...args, cleanupRoot: { path: canonical, dev: String(info.dev), ino: String(info.ino) } };
+      } catch {
+        fail('cleanup-root-unverified', 'The configured DSH cleanup directory could not be identified.');
+      }
+    }
     return (await this.#rpc(endpoint, { ...args, token: credential.token }, { write, expectedInstance, channel: 'futureaide-control' })).value;
   }
 
   async hostStatus() { return this.#hostCall('ping', {}); }
+  async cleanupInventory() { return this.#hostCall('cleanupInventory', {}); }
+  async cleanupHistory(item) { return this.#hostCall('cleanupHistory', {item}); }
+  async cleanupInspect(item) { return this.#hostCall('cleanupInspect', { item }); }
+  async cleanupRemove(item, context) { const expectedInstance = await this.#discover(); return this.#hostCall('cleanupRemove', { item, context }, { write: true, expectedInstance }); }
+  async cleanupResidualInspect(input) { return this.#hostCall('cleanupResidualInspect', input); }
+  async cleanupResidualRemove(input) { const expectedInstance=await this.#discover(); return this.#hostCall('cleanupResidualRemove', input, {write:true,expectedInstance}); }
+  async cleanupFinalize(ticket) { const expectedInstance = await this.#discover(); return this.#hostCall('cleanupFinalize', {ticket}, {write:true, expectedInstance}); }
+  async cleanupRestore(ticket) { const expectedInstance = await this.#discover(); return this.#hostCall('cleanupRestore', {ticket}, {write:true, expectedInstance}); }
+  async cleanupTempUsage(path) { return this.#hostCall('cleanupTempUsage', { path }); }
 
   async #managedCall(method, input, write) {
     validId(input?.ownerId, 'ownerId');
@@ -729,6 +748,10 @@ export class FutureAideClient {
     if (!Array.isArray(value?.events)) fail('invalid-response', 'DSH returned invalid managed session history.');
     return value;
   }
+  async managedCleanupInspect(input) { return this.#managedCall('managedCleanupInspect', input, false); }
+  async managedCleanupStage(input) { return this.#managedCall('managedCleanupStage', input, true); }
+  async managedCleanupFinalize(input) { return this.#managedCall('managedCleanupFinalize', input, true); }
+  async managedCleanupRestore(input) { return this.#managedCall('managedCleanupRestore', input, true); }
   async managedAnswer(input) { return this.#managedCall('managedAnswer', input, true); }
   async managedCancel(input) { return this.#managedCall('managedCancel', input, true); }
   async managedDestroy(input) { return this.#managedCall('managedDestroy', input, true); }

@@ -1,4 +1,4 @@
-﻿// Codex Desktop native RPC over the running renderer's local debug endpoint.
+// Codex Desktop native RPC over the running renderer's local debug endpoint.
 // Nothing here starts an app-server, a CLI, a window, or a model turn by itself.
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -294,8 +294,11 @@ export async function pageThreadUnsubscribeGuard(win, call, load, internals, thr
       if (!Number.isSafeInteger(options.checkedAt) || age < 0 || age > internals.commitWindowMs) {
         return answer('unverified', { reason: 'window-check-stale' });
       }
+      if (request?.method === 'futureaide/cleanup/check') return answer('checked');
       const message = await call(win, request, timeoutMs);
-      if (message?.error) return answer('unverified', { reason: 'rpc-rejected' });
+      if (request?.method==='futureaide/cleanup/delete' && message?.result?.notSent) return answer('notSent',{reason:message.result.reason});
+      if (message?.error) return answer('unverified', { reason: 'rpc-rejected', ...(request?.method==='futureaide/cleanup/delete'?{dispatched:true}:{}) });
+      if (request?.method === 'futureaide/cleanup/delete' && message?.result?.deleted === true) return answer('deleted', {dispatched:true});
       const status = message?.result?.status;
       return answer(typeof status === 'string' && status ? status : 'unverified', { dispatched: true });
     }
@@ -479,10 +482,67 @@ export async function pageThreadUnsubscribeGuard(win, call, load, internals, thr
   }
 }
 
+// Called inside the guarded renderer commit. Every native read is metadata-only;
+// the last operation before delete is the root's final activity read.
+export async function pageCleanupCommit(win, request, timeoutMs, call) {
+  const p = request.params, root = p.threadId;
+  let submitted=false;
+  const sourceKinds = ['cli','vscode','exec','appServer','subAgent','subAgentReview','subAgentCompact','subAgentThreadSpawn','subAgentOther','unknown'];
+  const rpc = async (method,params) => {
+    const reply = await call(win,{id:'cleanup-read-'+Math.random(),method,params},timeoutMs);
+    if (reply?.error || !reply?.result) throw new Error('read-unverified');
+    return reply.result;
+  };
+  const pages = async (method,params) => {
+    let cursor;const seen=new Set(), rows=[];
+    do {
+      const page=await rpc(method,{...params,limit:100,...(cursor?{cursor}:{})});
+      if(!Array.isArray(page.data)) throw new Error('page-unverified');
+      rows.push(...page.data);
+      if(rows.length>1000) throw new Error('page-too-large');
+      const next=page.nextCursor;
+      if(next!=null && (typeof next!=='string'||!next||!page.data.length||seen.has(next))) throw new Error('page-incomplete');
+      if(next)seen.add(next);cursor=next;
+    }while(cursor);
+    return rows;
+  };
+  try {
+    if(!Array.isArray(p.activity) || !Array.isArray(p.treeIds) || !p.treeIds.includes(root)) throw new Error('proof-missing');
+  const nodes=[{id:root,parent:null}], found=new Set(), observed=[];
+    for(const node of nodes) {
+      if(found.has(node.id)||!p.treeIds.includes(node.id)) throw new Error('tree-changed');
+      found.add(node.id);
+      for(const archived of [false,true]) {
+        const children=await pages('thread/list',{parentThreadId:node.id,archived,useStateDbOnly:true,sourceKinds});
+        for(const child of children) {
+          if(typeof child?.id!=='string'||nodes.some(x=>x.id===child.id)) throw new Error('tree-ambiguous');
+          nodes.push({id:child.id,parent:node.id});
+        }
+      }
+      const turns=await pages('thread/turns/list',{threadId:node.id,itemsView:'summary'});
+      if(turns.some(t=>!['completed','failed','interrupted'].includes(t.status))) throw new Error('turn-active');
+      const thread=(await rpc('thread/read',{threadId:node.id,includeTurns:false})).thread;
+      if(thread?.id!==node.id || !(['idle','notLoaded'].includes(thread.status?.type) || (thread.status?.type==='systemError' && turns.some(turn=>turn.status==='failed')))) throw new Error('thread-active');
+      observed.push({id:node.id,parent:node.parent,cwd:thread.cwd,path:thread.path,updatedAt:thread.updatedAt,turns});
+    }
+    if(found.size!==p.treeIds.length || JSON.stringify(observed)!==JSON.stringify(p.activity)) throw new Error('activity-or-tree-changed');
+    // No asynchronous work or extra native call between this read and delete.
+    const last=(await rpc('thread/read',{threadId:root,includeTurns:false})).thread;
+    const initial=observed.find(x=>x.id===root);
+    if(last?.id!==root || !(['idle','notLoaded'].includes(last.status?.type) || (last.status?.type==='systemError' && initial.turns.some(turn=>turn.status==='failed'))) || (last.cwd!==initial.cwd || last.path!==initial.path || last.updatedAt!==initial.updatedAt)) throw new Error('root-changed');
+    submitted=true;
+    const deleted=await call(win,{id:request.id,method:'thread/delete',params:{threadId:root}},timeoutMs);
+    if(deleted?.error || !deleted?.result) return {error:{message:'delete-unconfirmed'}};
+    return {result:{deleted:true}};
+  } catch(error) {
+    const reason=String(error?.message??error);
+    return submitted?{error:{message:reason}}:{result:{notSent:true,reason}};
+  }
+}
 function guardExpressionSource(threadId, requestLiteral, timeoutMs, options = {}) {
   // The version table, the request helper and the loader position are all passed in: the
   // page has no module scope, and nothing here may fall back to a window global.
-  return `(async()=>{const call=${pageMcpRequest.toString()};`
+  return `(async()=>{const baseCall=${pageMcpRequest.toString()};const cleanupCall=${pageCleanupCommit.toString()};const call=(w,r,t)=>r?.method==="futureaide/cleanup/delete"?cleanupCall(w,r,t,baseCall):baseCall(w,r,t);`
     + `const pageDropReleaseHandoff=${pageDropReleaseHandoff.toString()};const guard=${pageThreadUnsubscribeGuard.toString()};`
     + `return await guard(window, call, null, ${JSON.stringify(RELEASE_GUARD_INTERNALS)}, `
     + `${JSON.stringify(threadId)}, ${requestLiteral}, ${Number(timeoutMs) || 15000}, `
@@ -507,7 +567,7 @@ export function threadUnsubscribePrepareExpression({ threadId, token, timeoutMs 
 /** The commit half: no import, one role re-read on the module the prepare confirmed, then
  * everything else — route, lease and the snapshot's age — in the single synchronous step
  * that sends. Only the transport calls this. */
-export function threadUnsubscribeSendExpression({ threadId, token, checkedAt, timeoutMs = 15000 } = {}) {
+export function threadUnsubscribeSendExpression({ threadId, token, checkedAt, timeoutMs = 15000, cleanupRequest } = {}) {
   if (typeof threadId !== 'string' || !threadId) {
     throw fail('codex-native-rpc-unsupported', 'A release needs one threadId.');
   }
@@ -517,7 +577,7 @@ export function threadUnsubscribeSendExpression({ threadId, token, checkedAt, ti
   if (!Number.isSafeInteger(checkedAt)) {
     throw fail('codex-native-rpc-unsupported', 'A release commit needs a window check time.');
   }
-  const request = JSON.stringify({ id: `futureaide-release-${randomUUID()}`, method: 'thread/unsubscribe', params: { threadId } });
+  const request = JSON.stringify(cleanupRequest ?? { id: `futureaide-release-${randomUUID()}`, method: 'thread/unsubscribe', params: { threadId } });
   return guardExpressionSource(threadId, request, timeoutMs, { skipRoleRead: true, handoffToken: token, checkedAt });
 }
 
@@ -804,7 +864,8 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
   }
   return { close, async request(method, params, options = {}) {
     const { canRelease, signal } = options ?? {};
-    const release = method === 'thread/unsubscribe';
+    const cleanupDelete = method === 'futureaide/cleanup/delete';
+    const release = method === 'thread/unsubscribe' || cleanupDelete;
     const background = options?.background === true && (method === 'thread/read' || method === 'thread/list');
     const userInputRead = method === 'futureaide/userInput/read';
     const userInputReply = method === 'futureaide/userInput/reply';
@@ -850,7 +911,8 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       };
       if (!release) return await evaluate(expression);
 
-      const releaseOnce = async () => {
+      let cleanupCommitSent=false;
+      const releaseOnce = async (currentId = params?.threadId, cleanupRequest) => {
         // The watch is started before the first window snapshot, so a change that happens
         // while that snapshot is being read is still counted by the generation.
         const watch = await startReleaseWatch(target);
@@ -861,7 +923,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         if (target.pageGeneration !== generation) return { status: 'inUse', reason: 'window-check-changed' };
 
         const token = `release-${randomUUID()}`;
-        const probe = await evaluate(threadUnsubscribePrepareExpression({ threadId: params?.threadId, token, timeoutMs }));
+        const probe = await evaluate(threadUnsubscribePrepareExpression({ threadId: currentId, token, timeoutMs }));
         if (probe?.status !== 'observed') return probe;
 
         // Every other app page is probed in parallel, on its own short-lived socket, and each
@@ -869,7 +931,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         // in is the final snapshot requested, so no stale first evidence can hide behind a
         // later refresh.
         const extraResults = await Promise.all(began.others.map(page =>
-          probeExtraPage(target.found, page, params?.threadId, extraProbeTimeoutMs)));
+          probeExtraPage(target.found, page, currentId, extraProbeTimeoutMs)));
         for (const result of extraResults) {
           if (result.verdict) return result.verdict;
         }
@@ -902,16 +964,26 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         // The commit spends the credential, rechecks this window's route and view
         // lease, and sends on the same renderer tick. A different window can still
         // open after this final snapshot but before the queued evaluation starts.
+        if(cleanupRequest?.method==='futureaide/cleanup/delete')cleanupCommitSent=true;
         return await evaluate(threadUnsubscribeSendExpression({
-          threadId: params?.threadId, token, checkedAt, timeoutMs,
+          threadId: currentId, token, checkedAt, timeoutMs, cleanupRequest,
         }));
       };
       try {
-        return await releaseOnce();
+        if (!cleanupDelete) return await releaseOnce();
+        const ids = params?.treeIds;
+        if (!Array.isArray(ids) || !ids.length || new Set(ids).size !== ids.length || !ids.includes(params.threadId)) return {status:'unverified',reason:'cleanup-invalid-tree'};
+        for (const id of ids.filter(id => id !== params.threadId)) {
+          const checked = await releaseOnce(id, {method:'futureaide/cleanup/check',params:{threadId:id}});
+          if (checked?.status !== 'checked') return {...checked,notSent:true};
+        }
+        const verdict=await releaseOnce(params.threadId, {id:'cleanup-' + randomUUID(),method:'futureaide/cleanup/delete',params});
+        return !cleanupCommitSent || verdict?.status==='unverified' && !verdict?.dispatched && verdict?.reason!=='rpc-rejected'
+          ?{...verdict,notSent:true}:verdict;
       } catch (error) {
         // A release failure is this call's own; it never invalidates the shared socket and
         // never rejects a turn/start running beside it.
-        return { status: 'unverified', reason: `release-failed:${error?.code ?? 'unknown'}` };
+        return { status: 'unverified', reason: `release-failed:${error?.code ?? 'unknown'}`, ...(cleanupDelete && !cleanupCommitSent?{notSent:true}:{}) };
       }
     } catch (error) {
       // This socket is shared by every managed name in the monitor process. A

@@ -3536,7 +3536,8 @@ export function createScopedAgents(config, {
       }
       const queued = store.requestCleanup(record);
       if (queued) await ensureWorker(store.get(record.agentId), { wake: true });
-      return { name, deleted: false, queued, state: queued ? 'cleaning' : 'removed',
+      const current = queued ? undefined : store.get(record.agentId);
+      return { name, deleted: false, queued, state: queued ? 'cleaning' : current?.cleanupRosterTicket ? 'cleanup-claimed' : 'removed',
         ...(targetOf(record) === 'claude-cli' ? { nativeHistoryPolicy: 'retain' } : {}) };
     },
     /**

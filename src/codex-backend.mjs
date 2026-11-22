@@ -432,9 +432,10 @@ export async function createCodexBackend(record, deps = {}) {
     if (!value.binding) return { value, tree: { nodes: [], running: false,
       settled: !Object.values(value.requests).some(r => r.attempted) }, histories: {} };
     const observed = await host.observe({ nativeSessionId: value.binding.sessionId, workspace: load().workspace,
-      projections: value.projections, requests: value.requests });
+      projections: value.projections, requests: value.requests, ...(!value.binding.codexDomain && value.binding.rolloutPath ? {rolloutPath:value.binding.rolloutPath} : {}) });
     value.projections = observed.projections;
     value.tree = observed.tree;
+    if (!value.binding.codexDomain && observed.codexDomain) value.binding.codexDomain = observed.codexDomain;
     for (const [id, delivery] of Object.entries(value.projections[value.binding.sessionId]?.deliveries ?? {})) {
       if (value.requests[id]) Object.assign(value.requests[id], { status: 'accepted', turnId: delivery.turnId, deliverySeq: delivery.seq });
     }
@@ -662,7 +663,7 @@ export async function createCodexBackend(record, deps = {}) {
             turnId = first?.turnId;
             acceptedWrite = first?.created === true || Boolean(turnId);
             if (first?.nativeSessionId) {
-              value.binding = { sessionId: first.nativeSessionId, owned: true };
+              value.binding = { sessionId: first.nativeSessionId, owned: true, ...(first.codexDomain ? {codexDomain:first.codexDomain} : {}), ...(first.rolloutPath ? {rolloutPath:first.rolloutPath} : {}) };
               value.pendingTitle ??= { name: load().name, attempts: 0 };
               save(value);
             }

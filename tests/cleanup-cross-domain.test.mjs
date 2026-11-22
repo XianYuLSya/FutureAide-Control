@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import os from 'node:os';
+import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
+import {createCleanupService} from '../src/cleanup-service.mjs';
+test('D08/D11 a roster tree cannot remove a protected native child, including after its row vanishes from the listing',async t=>{
+  const root=await mkdtemp(path.join(os.tmpdir(),'fa-cross-domain-'));t.after(()=>rm(root,{recursive:true,force:true}));
+  const stateDirectory=path.join(root,'state'),configFile=path.join(root,'config.json');
+  await mkdir(stateDirectory);await writeFile(configFile,'{}');
+  const c={stateDirectory,configFile,dshDataRoot:root,agentAutoCleanup:true};
+  let removed=0;
+  const adapter=i=>({inventory:async()=>({complete:true,items:[i]}),inspect:async()=>i,remove:async()=>{removed++;return {removed:true}}});
+  const native={id:'native-parent',kind:'dsh-session',root,treeIds:['native-parent','native-child'],activityVersion:'raw',running:false,eligible:false,ownership:'managed'};
+  const roster={id:'roster-parent',kind:'managed-agent',root:stateDirectory,target:'dsh',treeIds:['roster-parent','native-parent','native-child'],activityVersion:'named',running:false,eligible:true,firstEligible:true};
+  const service=createCleanupService(c,{dsh:adapter(native),roster:adapter(roster)});
+  const snapshot=await service.preview(['dsh','roster']);
+  await service.approve(snapshot,{snapshot:snapshot.hash,remaining:'B',keep:[snapshot.items[0].memberKeys.find(k=>JSON.parse(k).at(-1)==='native-child')]});
+  await service.switchEnabled(true);await service.execute('rules');assert.equal(removed,0);
+});

@@ -238,7 +238,11 @@ test('the monitor retries a first turn held before transport admission on the ex
     codexProbeRegistration: async () => ({ ready: true, registered: true, tools: ['ask_parent', 'report_parent'] }),
     startSharedMonitor: () => true,
   });
-  t.after(async () => { service.close(); await rm(stateDirectory, { recursive: true, force: true }); });
+  t.after(async () => {
+    await service.drainPolls();
+    service.close();
+    await rm(stateDirectory, { recursive: true, force: true });
+  });
   let beforeRecovery = true;
   native.hooks.beforeThreadRead = thread => {
     if (!thread.turns.length) {

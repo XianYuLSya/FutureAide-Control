@@ -724,3 +724,72 @@ test('a read-only retryable answer is retried after restart instead of becoming 
     assert.equal(row.delivery, 'answered');
   } finally { f.service.close(); }
 });
+
+test('legacy unknown answer with a native not-sent receipt retries the original request once', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown';
+    f.store.save(record);
+    const request = f.store.backendState(seed.agentId).requests[seed.requestId];
+    assert.equal(request.status, 'retryable');
+    assert.equal(request.reschedule.notSent, true);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).accepted, true);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start']);
+    assert.ok(answerWrites(f).every(input => input.text.includes(seed.requestId)));
+    await pollTimes(f, seed);
+    assert.equal(answerWrites(f).length, 2);
+  } finally { f.service.close(); }
+});
+
+test('legacy unknown answer with no proof of non-write is not replayed', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    request.status = 'retryable'; delete request.reschedule;
+    if (request.intent) delete request.intent.outcome;
+    f.store.saveBackendState(seed.agentId, state);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).accepted, false);
+    assert.equal(answerDispatch(f, seed.requestId).state, 'unknown');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+  } finally { f.service.close(); }
+});
+
+test('expired legacy unknown answer with a not-sent receipt is not replayed', async () => {
+  const seed = await answerRaceSeed({ ageMs: 7 * 60 * 60 * 1000 });
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).accepted, false);
+    assert.equal(answerDispatch(f, seed.requestId).expired, 'dispatch-expired');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+  } finally { f.service.close(); }
+});
+
+test('legacy unknown answer does not reuse old not-sent evidence over a newer intent', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    assert.equal(request.reschedule.notSent, true);
+    request.status = 'retryable'; request.intent.outcome = 'pending';
+    f.store.saveBackendState(seed.agentId, state);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).state, 'unknown');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+  } finally { f.service.close(); }
+});

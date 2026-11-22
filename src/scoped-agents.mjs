@@ -3193,7 +3193,11 @@ export function createScopedAgents(config, {
         message: 'The native side rejected this answer; it was not written.' };
     }
     if (receipt.status === 'retryable') {
-      if (dispatch.state === 'unknown') return;
+      // Older answer rows can say unknown even though the native retryable
+      // receipt proves that this exact attempt never wrote. Other unknowns
+      // remain read-only; a retryable label alone is not that proof.
+      if (dispatch.state === 'unknown' && !(answer &&
+          (receipt.intent ? receipt.intent.outcome === 'not-sent' : receipt.reschedule?.notSent === true))) return;
       if (!allowResend) return 'not-sent';
       await dispatchOnce(record, dispatch);
     }

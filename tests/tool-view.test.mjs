@@ -210,6 +210,32 @@ test('an inspection shows each message list once and clips only long text', () =
   assert.equal('updatedAt' in compact, false);
 });
 
+test('inspect lists every input with its own receipt fields, including accepted ones', () => {
+  const created = '2026-11-22T20:00:00.000Z';
+  const inputs = [
+    { requestId: 'request-a', mode: 'steer', delivery: 'current-turn', accepted: true, queued: false,
+      turnId: 'turn-A', status: 'accepted', createdAt: created },
+    { requestId: 'request-b', mode: 'queue', delivery: 'after-current', accepted: false, queued: true,
+      afterTurnId: 'turn-A', reason: 'r'.repeat(260), status: 'queued', createdAt: created },
+    { requestId: 'request-c', mode: 'queue', delivery: 'new-turn', accepted: true, queued: false, turnId: 'turn-B' },
+  ];
+  const result = { name: 'artist', lifetime: 'persistent', target: 'dsh', state: 'running', activity: 'writing',
+    changes: { count: 0, files: [], coverage: {} }, questions: [],
+    tree: { settled: false, running: true, nodes: [member('artist', 0, [], { status: 'running', activity: 'writing' })] },
+    history: [], historyCount: 0, inputs };
+  const compact = compactInspect(result);
+  assert.deepEqual(compact.inputs, [
+    { requestId: 'request-a', mode: 'steer', delivery: 'current-turn', accepted: true, queued: false,
+      turnId: 'turn-A', status: 'accepted', createdAt: created },
+    { requestId: 'request-b', mode: 'queue', delivery: 'after-current', accepted: false, queued: true,
+      afterTurnId: 'turn-A', reason: truncated('r'.repeat(260), 200), status: 'queued', createdAt: created },
+    { requestId: 'request-c', mode: 'queue', delivery: 'new-turn', accepted: true, queued: false, turnId: 'turn-B' },
+  ], 'every input survives, not only the pending ones, and a long reason is clipped');
+  assert.equal('inputs' in compactAgent({ name: 'artist', state: 'idle', supplements: { queued: 1 } }), false,
+    'list keeps its counts instead of carrying every row');
+  assert.deepEqual(compactInspect.detail(result).inputs, inputs, 'detail is the unchanged service structure');
+});
+
 test('status keeps every readiness field and drops only the method lists', () => {
   const status = { ready: true, contextVerified: true, workspace: 'D:\\project',
     backends: { dsh: { ready: true, connected: true },

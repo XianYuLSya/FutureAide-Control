@@ -19,7 +19,7 @@ DSH 通过本版宿主桥把显式选择应用到该会话。工具提示更新�
 插件经主渲染进程的本地调试端口发 `thread/start`、`turn/start`，和界面新建对话走同一个入口。后续发送、补充、打断、删除和观察也走这条 app-server RPC。插件不读 Codex 的数据库、thread history 或 rollout 文件，不读账号凭据，也不启动独立 CLI 或第二个 app-server。
 
 - 已选模型的名字在 `turn/start` 传入完整模型和推理档位，其余名字由 Codex 决定。
-- `turn/steer` 只补充当前轮次。运行中换模型或档位会报错，等该轮结束后再发送。
+- `turn/steer` 只补充当前轮次。运行中换模型或档位会报错，等该轮结束后再发送。显式 `mode: "queue"` 不走 steer：当前轮结束后用 `turn/start` 单独开下一轮，第一条输入只有这一条。
 - 权限沿用 Codex 设置。
 - 标题等会话有内容后再用 `thread/name/set` 补上，失败最多重试 5 次，不影响任务。
 - 没有调试端口时，`status` 的 `codex-desktop` 项报 `codex-native-rpc-unavailable`。这时普通 Codex 对话调用 DSH 不受影响。

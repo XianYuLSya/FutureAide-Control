@@ -1,4 +1,4 @@
-﻿// Codex Desktop native RPC over the running renderer's local debug endpoint.
+// Codex Desktop native RPC over the running renderer's local debug endpoint.
 // Nothing here starts an app-server, a CLI, a window, or a model turn by itself.
 import { randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -1304,12 +1304,75 @@ export async function listCodexModelsNative({ request = requestCodexNative, incl
   return { data, nextCursor: null };
 }
 
-/** Send text to an idle thread with turn/start, or add input to the active turn.
- * `model` and `effort` are the already-resolved native values: they are only
- * legal on a new turn. A steer has no such fields, so a running turn can only
- * receive the same selection it already runs with; anything else is refused
- * before a write instead of being silently dropped. */
-export async function sendCodexTextNative(threadId, text, { request = requestCodexNative, model, effort, blockReason } = {}) {
+function nativeItemText(item) {
+  if (typeof item?.text === 'string') return item.text;
+  if (Array.isArray(item?.content)) return item.content
+    .filter(part => typeof part?.text === 'string').map(part => part.text).join('\n');
+  return '';
+}
+
+/** The selection a thread reports. It is a trusted native field only when present;
+ * a missing model or effort is unknown, never a default. */
+function threadSelection(thread) {
+  if (!thread?.model) return undefined;
+  return { provider: thread.modelProvider ?? 'openai', model: thread.model,
+    ...(thread.reasoningEffort ? { reasoningEffort: thread.reasoningEffort } : {}) };
+}
+
+/** True when the wire selection proves the same model and effort, false when it
+ * proves a different one, and undefined when a requested effort is not visible. */
+function sameWireSelection(actual, wanted) {
+  if (!actual?.model || !wanted?.model) return undefined;
+  if (actual.model !== wanted.model) return false;
+  if (wanted.reasoningEffort === undefined || wanted.reasoningEffort === '') return true;
+  if (actual.reasoningEffort === undefined) return undefined;
+  return actual.reasoningEffort === wanted.reasoningEffort;
+}
+
+/** The best evidence for the active turn's own start selection: a recorded
+ * turn/start for that exact turn first, then the thread's native fields. */
+function activeSelectionEvidence(thread, active, knownSelections) {
+  const known = (Array.isArray(knownSelections) ? knownSelections : [])
+    .find(entry => entry?.turnId === active.id && entry?.model);
+  if (known) return { selection: known, source: 'turn-start' };
+  const reported = threadSelection(thread);
+  return reported ? { selection: reported, source: 'thread-metadata' } : undefined;
+}
+
+/**
+ * Send text to a Codex thread.
+ *
+ * `mode` is `steer` (the default) or `queue`. Queue never steers: while the root
+ * turn is active it returns `waiting` and writes nothing; when the root is idle it
+ * starts a new turn. `selectionExplicit` is the caller's tri-state intent:
+ *   true  - this call explicitly selects a model/effort; an active turn is
+ *           verified against its own start evidence, and a difference is refused;
+ *   false - this call made no selection; a frozen selection is only used by a new
+ *           turn, never compared with or sent to an active turn;
+ *   undefined - a legacy call/record. When it carries an old frozen selection,
+ *           an active turn must still prove that selection; without proof nothing
+ *           is written and `codex-model-selection-unconfirmed` is returned.
+ * `onIntent` runs after the final read and before the native write, so the caller
+ * can persist the intended method and target before the RPC leaves.
+ */
+export async function sendCodexTextNative(threadId, text, {
+  request = requestCodexNative, model, effort, blockReason, mode, selection,
+  selectionExplicit, legacySelection = false, knownSelections, onIntent, allowStart = true,
+} = {}) {
+  const intendedMode = mode === undefined ? 'steer' : mode;
+  if (!['steer', 'queue'].includes(intendedMode)) {
+    throw fail('invalid-mode', 'mode must be steer or queue; nothing was sent.', { terminal: true });
+  }
+  const wantedSelection = selection ?? ((model === undefined && effort === undefined) ? undefined : {
+    ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { reasoningEffort: effort }),
+  });
+  // Old direct callers had no tri-state; a model/effort argument then meant an
+  // explicit selection. New callers say `selectionExplicit:false` when the value is
+  // only a frozen pin, and that suppresses this legacy interpretation.
+  const verifySelection = selectionExplicit === true || legacySelection === true
+    || (selectionExplicit === undefined && (wantedSelection?.model !== undefined
+      || wantedSelection?.reasoningEffort !== undefined));
   let thread;
   try {
     thread = await ensureCodexThreadNative(threadId, { request });
@@ -1334,22 +1397,184 @@ export async function sendCodexTextNative(threadId, text, { request = requestCod
   // The same fence travels with the request itself, so it is asked a last time after the
   // connection is live and immediately before the page commits the write.
   const fence = typeof blockReason === 'function' ? { blockReason } : undefined;
-  if (active) {
-    // Without thread metadata the active turn's selection cannot be proven
-    // unchanged, so only an option-free steer is safe.
-    const sameModel = model === undefined || thread?.model === model;
-    const sameEffort = effort === undefined || (thread?.reasoningEffort ?? undefined) === effort;
-    if (!sameModel || !sameEffort) {
+  const requireSameSelection = () => {
+    if (!wantedSelection?.model) {
+      throw fail('model-required', 'An explicit model selection requires a model id; nothing was sent.',
+        { terminal: true, notSent: true, threadId, ...(active ? { turnId: active.id } : {}) });
+    }
+    const evidence = activeSelectionEvidence(thread, active, knownSelections);
+    const same = evidence ? sameWireSelection(evidence.selection, wantedSelection) : undefined;
+    if (same === false) {
       throw fail('codex-model-change-while-running',
         'Codex Desktop cannot change model or effort while a turn is running. This input was not sent; wait for the current turn to end, then send the new selection.',
         { terminal: true, threadId, turnId: active.id });
     }
-    refuse();
-    const result = await request('turn/steer', { threadId, expectedTurnId: active.id, clientUserMessageId: randomUUID(), input }, fence);
-    return { ...(result ?? {}), turnId: result?.turnId ?? active.id };
+    if (same !== true) {
+      throw fail('codex-model-selection-unconfirmed',
+        'The running turn\'s model and effort could not be proven from its own start evidence; nothing was sent.',
+        { terminal: true, notSent: true, threadId, turnId: active.id,
+          ...(evidence ? { evidenceSource: evidence.source } : {}) });
+    }
+  };
+  if (intendedMode === 'queue' && active) {
+    // Queue only opens a new turn. A selection may not be changed through it.
+    if (verifySelection) requireSameSelection();
+    return { waiting: true, delivery: 'after-current', afterTurnId: active.id };
+  }
+  if (!active && thread?.status?.type === 'active') {
+    // The thread claims to be running but the turn page cannot name the turn. Starting
+    // another turn or steering an unknown one would both be a guess.
+    throw fail('codex-root-turn-unconfirmed',
+      'Codex reports the root thread active but no running turn is visible; nothing was sent.',
+      { uncertain: true, threadId });
+  }
+  if (!active && allowStart === false) {
+    // An older queued input is the FIFO head. This ordinary steer may only join an
+    // active root turn; with the root already idle it must return to the scheduler
+    // as a definitely-not-written local-pending item instead of starting a turn.
+    return { reschedule: true, notSent: true, delivery: 'local-pending',
+      reason: 'queue-head-pending' };
+  }
+  const method = active ? 'turn/steer' : 'turn/start';
+  if (method === 'turn/steer' && verifySelection) requireSameSelection();
+  const priorTurnId = method === 'turn/start' ? ((page.data ?? []).find(turn => typeof turn?.id === 'string')?.id ?? null) : undefined;
+  if (typeof onIntent === 'function') {
+    await onIntent({ method, threadId,
+      ...(method === 'turn/steer' ? { expectedTurnId: active.id } : { priorTurnId }),
+      mode: intendedMode });
   }
   refuse();
-  return request('turn/start', { threadId, clientUserMessageId: randomUUID(), input,
-    ...(model === undefined ? {} : { model }),
-    ...(effort === undefined ? {} : { effort }) }, fence);
+  if (method === 'turn/steer') {
+    const steer = { threadId, expectedTurnId: active.id, clientUserMessageId: randomUUID(), input };
+    try {
+      const result = await request('turn/steer', steer, fence);
+      return { ...(result ?? {}), method: 'turn/steer', delivery: 'current-turn',
+        turnId: result?.turnId ?? active.id };
+    } catch (error) {
+      // A native rejection of expectedTurnId proves the steer was not written. Re-read
+      // the root thread itself; the pre-steer metadata may be stale in either direction.
+      // This method never starts a replacement turn here: an answer or an older queued
+      // input may be ahead of this message, so the shared scheduler gets a definite
+      // "not written, reschedule" receipt instead of a guessed start.
+      if (error?.code !== 'codex-native-rpc-rejected'
+          || !/no active turn|not running|expectedTurnId|no turn/i.test(String(error?.rpcMessage ?? error?.message ?? ''))) {
+        throw error;
+      }
+      let afterThread;
+      try { afterThread = await readCodexThreadNative(threadId, { request }); }
+      catch { afterThread = undefined; }
+      const after = await listCodexTurnsNative(threadId, { limit: 10, itemsView: 'notLoaded', request });
+      const still = (after.data ?? []).find(turn => turn?.status === 'inProgress' && typeof turn.id === 'string');
+      if (still || afterThread?.status?.type === 'active') {
+        throw fail('codex-turn-changed',
+          'The running turn changed before this input was written; nothing was sent.',
+          { terminal: true, notSent: true, threadId, turnId: still?.id });
+      }
+      return { reschedule: true, notSent: true, reason: 'steer-turn-ended',
+        afterTurnId: active.id, previousTurnId: (after.data ?? []).find(turn => typeof turn?.id === 'string')?.id ?? null };
+    }
+  }
+  try {
+    const started = await request('turn/start', { threadId, clientUserMessageId: randomUUID(), input,
+      ...(wantedSelection?.model === undefined ? {} : { model: wantedSelection.model }),
+      ...(wantedSelection?.reasoningEffort === undefined ? {} : { effort: wantedSelection.reasoningEffort }) }, fence);
+    return { ...(started ?? {}), method: 'turn/start', delivery: 'new-turn', priorTurnId,
+      turnId: started?.turn?.id };
+  } catch (error) {
+    // Another turn can start between our idle read and this write. The native
+    // rejection proves nothing was written; re-read the root and wait behind that
+    // turn instead of turning a definite rejection into an unknown write.
+    if (error?.code === 'codex-native-rpc-rejected'
+        && /already running|a turn is running|turn.*in progress/i.test(String(error?.rpcMessage ?? error?.message ?? ''))) {
+      let active;
+      try {
+        const after = await listCodexTurnsNative(threadId, { limit: 10, itemsView: 'notLoaded', request });
+        active = (after.data ?? []).find(turn => turn?.status === 'inProgress' && typeof turn.id === 'string');
+      } catch { active = undefined; }
+      if (active) {
+        return { reschedule: true, notSent: true, delivery: 'after-current',
+          afterTurnId: active.id, reason: 'turn-started-before-write' };
+      }
+      return { reschedule: true, notSent: true, delivery: 'local-pending',
+        reason: 'turn-start-rejected' };
+    }
+    throw error;
+  }
+}
+
+/** The dispatch marker is appended as the message's last non-empty line. A body
+ * reference to the same text is not proof that this input was delivered. */
+export function hasExactDispatchMarker(text, marker) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  let last = lines.length - 1;
+  while (last >= 0 && lines[last].trim() === '') last--;
+  return last >= 0 && lines[last].trim() === marker;
+}
+
+/**
+ * Read-only recovery for one dispatch whose RPC outcome was lost. It scans the
+ * bound thread's own user messages for the exact final-line marker; a body
+ * reference never counts. It pages through turns and items so an old request is
+ * either found or reported as having no proof, and it never writes or resumes.
+ * `firstUser` is true only when the marker is the first user input of its turn,
+ * which is what lets a turn/start recovery avoid claiming a steer as a new turn.
+ */
+export async function findCodexDispatchInput(threadId, marker, {
+  request = requestCodexNative, pageLimit = 40, maxPages = 10, maxItemPages = 20,
+} = {}) {
+  if (typeof marker !== 'string' || !marker) {
+    throw fail('invalid-dispatch', 'A dispatch marker is required.');
+  }
+  const matches = [];
+  const seenTurnCursors = new Set();
+  let cursor, pages = 0;
+  do {
+    const page = await listCodexTurnsNative(threadId, {
+      limit: Math.min(Math.max(pageLimit, 1), 100), itemsView: 'summary',
+      sortDirection: 'desc', ...(cursor ? { cursor } : {}), request,
+    });
+    for (const turn of page.data ?? []) {
+      if (typeof turn?.id !== 'string' || !turn.id) continue;
+      let found = false, firstUser = false;
+      // A summary page carries only the turn's first user message (and last agent
+      // message); finding the marker there already proves it is the first input.
+      const summaryUsers = (turn.items ?? []).filter(item => String(item?.type).toLowerCase() === 'usermessage');
+      for (const [index, item] of summaryUsers.entries()) {
+        if (!hasExactDispatchMarker(nativeItemText(item), marker)) continue;
+        found = true; firstUser = index === 0; break;
+      }
+      if (!found) {
+        // A steered input is not on the summary page, so read the turn's items in
+        // pages and remember whether any user input preceded the match.
+        const seenItemCursors = new Set();
+        let itemCursor, itemPages = 0, userInputs = 0;
+        do {
+          const items = await listCodexItemsNative(threadId, turn.id, {
+            limit: 100, sortDirection: 'asc', ...(itemCursor ? { cursor: itemCursor } : {}), request,
+          });
+          for (const entry of items.data ?? []) {
+            const item = entry?.item ?? entry;
+            if (String(item?.type).toLowerCase() !== 'usermessage') continue;
+            userInputs++;
+            if (hasExactDispatchMarker(nativeItemText(item), marker)) {
+              found = true; firstUser = userInputs === 1; break;
+            }
+          }
+          itemCursor = typeof items.nextCursor === 'string' && items.nextCursor
+            && !seenItemCursors.has(items.nextCursor) ? items.nextCursor : undefined;
+          if (itemCursor) seenItemCursors.add(itemCursor);
+          itemPages++;
+        } while (!found && itemCursor && itemPages < maxItemPages);
+      }
+      if (found) matches.push({ turnId: turn.id, firstUser,
+        ...(turn.startedAt === undefined ? {} : { startedAt: turn.startedAt }) });
+    }
+    cursor = typeof page.nextCursor === 'string' && page.nextCursor
+      && !seenTurnCursors.has(page.nextCursor) ? page.nextCursor : undefined;
+    if (cursor) seenTurnCursors.add(cursor);
+    pages++;
+  } while (cursor && pages < maxPages);
+  if (matches.length === 1) return { status: 'found', ...matches[0] };
+  if (matches.length > 1) return { status: 'ambiguous', turns: matches };
+  return { status: 'not-found' };
 }

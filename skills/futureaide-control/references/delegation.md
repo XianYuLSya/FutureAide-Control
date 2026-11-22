@@ -28,7 +28,7 @@ profile / workspace / sessionId:
 
 ## 跟进与验收
 
-使用稳定 request_id，默认 queue。授权纠偏才使用 steer，并明确被替代版本和停止动作。未知发送结果先查原回执，不能换 ID 重发。
+以下只适用于旧版普通会话入口 `futureaide_send`：使用稳定 request_id，默认 queue。授权纠偏才使用 steer，并明确被替代版本和停止动作。未知发送结果先查原回执，不能换 ID 重发。按名字派给受管子代理时，`futureaide_send_agent` / `futureaide_run_agent` 的 `mode` 以 SKILL.md 的“Interrupting and queueing”为准，省略 mode 不等于显式 steer。
 
 执行者返回文件、命令、退出码、证据、未验证项和剩余问题。只读工作说明无修改；模拟模型与真实服务验证分别记录。
 

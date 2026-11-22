@@ -26,7 +26,12 @@ test('default loader connects the real Codex adapter without an injected factory
   } });
   assert.equal(backend.target, 'codex-desktop');
   const probe = await backend.probe();
-  assert.deepEqual(probe.methods, BACKEND_METHODS);
+  // The real adapter extends the minimum shared contract with the two root-turn
+  // reads. Their order is part of the adapter menu, not an accident of this test.
+  const expectedMethods = [...BACKEND_METHODS];
+  expectedMethods.splice(expectedMethods.indexOf('receipt') + 1, 0, 'rootTurn', 'matchRootSelection');
+  assert.deepEqual(probe.methods, expectedMethods);
+  assert.equal(probe.methods.length, BACKEND_METHODS.length + 2);
   assert.equal(probe.reportProtocol, 1);
 });
 
@@ -152,6 +157,94 @@ function desktopAdapter(events, { omit = [] } = {}) {
     async cursor() { events.push('desktop:cursor'); return { throughSeq: 0 }; },
   };
   for (const name of omit) delete backend[name];
+  return backend;
+}
+
+function sameCatalogSelection(left, right) {
+  if (!left?.model || !right?.model) return false;
+  if (left.model !== right.model) return false;
+  if ((left.reasoningEffort ?? undefined) !== (right.reasoningEffort ?? undefined)) return false;
+  return !left.provider || !right.provider || left.provider === right.provider;
+}
+
+// A desktop adapter with a real, stateful root turn. Its rootTurn() reports only
+// what the fixture actually knows; matchRootSelection() derives idle, unknown and
+// same/different from that same state instead of echoing the requested answer.
+// deliver() advances the root exactly like a native start/steer would.
+function rootState() {
+  return { running: false, turnId: undefined, selection: undefined, turnSeq: 0 };
+}
+
+function selectionDesktopAdapter(events, { catalog, deliveries, currentModel = true, root = rootState() } = {}) {
+  const backend = desktopAdapter(events);
+  backend.models = async () => { events.push('desktop:models'); return catalog; };
+  backend.beginTask = async () => ({ treeProtocol: 1, reportProtocol: 1, throughSeq: 0,
+    ...(currentModel ? { currentModel: { ...DESKTOP_MODEL } } : {}) });
+  backend.observe = async () => ({
+    sessionId: backend.record.sessionId, taskId: backend.record.task?.taskId,
+    running: root.running, questions: [], reports: [], changes: [], throughSeq: 1,
+    ...(currentModel ? { currentModel: root.running && root.selection
+      ? { ...root.selection } : { ...DESKTOP_MODEL } } : {}),
+    tree: { settled: !root.running, running: root.running, nodes: [] },
+  });
+  backend.model = async () => {
+    events.push('desktop:model');
+    return currentModel ? { ...DESKTOP_MODEL } : undefined;
+  };
+  backend.rootTurn = async () => {
+    events.push('desktop:rootTurn');
+    return { confirmed: true, running: root.running,
+      ...(root.turnId ? { turnId: root.turnId } : {}),
+      ...(root.running && root.selection ? { selection: { ...root.selection } } : {}) };
+  };
+  backend.matchRootSelection = async ({ selection, turnId } = {}) => {
+    events.push('desktop:matchRootSelection');
+    if (!selection?.model) throw Object.assign(new Error('a model id is required'),
+      { code: 'model-required', terminal: true });
+    if (!root.running) return { status: 'idle', running: false, resolved: { ...selection } };
+    if (turnId && root.turnId !== turnId) {
+      return { status: 'unknown', reason: 'turn-changed', running: true,
+        ...(root.turnId ? { turnId: root.turnId } : {}) };
+    }
+    if (!root.selection?.model) {
+      return { status: 'unknown', reason: 'no-wire-selection', running: true,
+        ...(root.turnId ? { turnId: root.turnId } : {}) };
+    }
+    return { status: sameCatalogSelection(selection, root.selection) ? 'same' : 'different',
+      running: true, ...(root.turnId ? { turnId: root.turnId } : {}),
+      resolved: { ...selection }, actual: { ...root.selection } };
+  };
+  backend.deliver = async input => {
+    deliveries.push({ ...input });
+    events.push(['desktop:deliver', input.requestId]);
+    if (input.mode === 'queue' && root.running) {
+      return { accepted: false, status: 'waiting', waiting: true,
+        delivery: 'after-current', afterTurnId: root.turnId };
+    }
+    if (root.running) {
+      if (input.selectionExplicit === true && !root.selection?.model) {
+        throw Object.assign(new Error('the running turn selection could not be confirmed'),
+          { code: 'codex-model-selection-unconfirmed', terminal: true, notSent: true });
+      }
+      if (input.selectionExplicit === true && input.model && !sameCatalogSelection(input.model, root.selection)) {
+        throw Object.assign(new Error('the running turn uses another selection'),
+          { code: 'codex-model-change-while-running', terminal: true, notSent: true });
+      }
+      return { accepted: true, sent: true, delivery: 'current-turn', turnId: root.turnId };
+    }
+    root.turnSeq += 1;
+    root.turnId = `turn-${root.turnSeq}`;
+    root.running = true;
+    root.selection = input.model ? { ...input.model } : undefined;
+    return { accepted: true, sent: true, delivery: 'new-turn', turnId: root.turnId };
+  };
+  backend.endRootTurn = () => {
+    root.running = false;
+    root.turnId = undefined;
+    root.selection = undefined;
+  };
+  backend.forgetRootSelection = () => { root.selection = undefined; };
+  backend.root = root;
   return backend;
 }
 
@@ -309,7 +402,7 @@ test('an unpinned Codex name reports actualModel from the live observation, neve
   } finally { f.service.close(); }
 });
 
-test('Codex receives an explicit model on deliver and never selects one; a running turn refuses a pin change', async () => {
+test('Codex first dispatch uses the frozen pin while a running turn only accepts an explicit selection it can prove', async () => {
   const deliveries = [];
   const events = [];
   const catalog = { default: { ...DESKTOP_MODEL }, routableProviders: [DESKTOP_MODEL.provider],
@@ -317,14 +410,19 @@ test('Codex receives an explicit model on deliver and never selects one; a runni
       { id: DESKTOP_MODEL.model, reasoning: { efforts: [{ id: 'max' }], defaultEffort: 'max' } },
       { id: 'desktop-pro', reasoning: { efforts: [{ id: 'high' }], defaultEffort: 'high' } },
     ] }] };
+  const DEFAULT_SELECTION = { provider: 'fixture', model: 'desktop-model', reasoningEffort: 'max' };
+  const PRO_SELECTION = { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' };
+  const roots = new Map();
+  const rootFor = record => {
+    if (!roots.has(record.name)) roots.set(record.name, rootState());
+    return roots.get(record.name);
+  };
+  let adapter;
   const f = await fixture({ adapters: { 'codex-desktop': record => {
-    const backend = desktopAdapter(events); backend.record = record;
-    backend.models = async () => { events.push('desktop:models'); return catalog; };
-    backend.deliver = async input => {
-      deliveries.push(input); events.push(['desktop:deliver', input.requestId]);
-      return { accepted: true, status: 'written', afterSeq: 1 };
-    };
-    return backend;
+    adapter = selectionDesktopAdapter(events, { catalog, deliveries,
+      currentModel: record.name !== 'unpinned', root: rootFor(record) });
+    adapter.record = record;
+    return adapter;
   } } });
   try {
     const created = await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop', model: 'PRO' }, extra(A));
@@ -332,96 +430,168 @@ test('Codex receives an explicit model on deliver and never selects one; a runni
     assert.equal(f.record('partner').model, undefined, 'no session-only model write exists for Codex');
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, null,
       'list waits for a real observation instead of presenting the pin as actual');
-    assert.deepEqual(f.record('partner').modelPin,
-      { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' });
+    assert.deepEqual(f.record('partner').modelPin, PRO_SELECTION);
     await f.service.send({ name: 'partner', message: 'work' }, extra(A));
     await f.service.poll(f.record('partner').agentId);
     assert.equal(deliveries.length, 1);
-    assert.equal(deliveries[0].explicitModel, true);
-    assert.deepEqual(deliveries[0].model,
-      { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' });
+    assert.deepEqual(deliveries[0].model, PRO_SELECTION,
+      'the first dispatch uses the selection frozen when the name was created');
+    assert.equal(deliveries[0].selectionExplicit, false,
+      'this send did not explicitly select the inherited pin');
+    assert.equal('explicitModel' in deliveries[0], false,
+      'the modern adapter receives selectionExplicit, not the legacy explicitModel flag');
+    assert.equal(deliveries[0].mode, 'steer');
     assert.equal(events.includes('desktop:selectModel'), false,
       'the shared layer never calls Codex selectModel');
+    assert.deepEqual([adapter.root.running, adapter.root.turnId], [true, 'turn-1']);
+    assert.deepEqual((await adapter.rootTurn()).selection, PRO_SELECTION);
+    assert.equal((await adapter.matchRootSelection({ selection: PRO_SELECTION, turnId: 'turn-1' })).status, 'same');
+    assert.equal((await adapter.matchRootSelection({ selection: DEFAULT_SELECTION, turnId: 'turn-1' })).status, 'different');
+    assert.equal((await adapter.matchRootSelection({ selection: PRO_SELECTION, turnId: 'turn-old' })).status, 'unknown',
+      'a selection cannot be matched against a turn that is not the active one');
 
-    const error = await rejection(f.service.send({ name: 'partner', message: 'change', model: 'desktop-model' }, extra(A)));
-    assert.equal(error.code, 'codex-model-change-while-running');
-    assert.deepEqual(f.record('partner').modelPin,
-      { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' },
+    const same = await f.service.send({ name: 'partner', message: 'same pin', model: 'PRO', effort: 'high' }, extra(A));
+    assert.equal(same.accepted, true, 'the exact active selection is proven by the root turn start');
+    assert.equal(same.delivery, 'current-turn');
+    assert.equal(same.turnId, 'turn-1');
+    assert.equal(same.actualModel, 'desktop-pro');
+    assert.equal(deliveries.length, 2);
+    assert.deepEqual([deliveries[1].mode, deliveries[1].selectionExplicit, deliveries[1].model],
+      ['steer', true, PRO_SELECTION]);
+    const sameRow = f.store.supplementInputs(f.record('partner').agentId)
+      .find(row => row.requestId === same.requestId);
+    assert.deepEqual([sameRow.delivery, sameRow.turnId], ['current-turn', 'turn-1']);
+    assert.deepEqual(f.record('partner').modelPin, PRO_SELECTION);
+
+    const beforeRefusals = f.store.supplementInputs(f.record('partner').agentId).length;
+    const beforeDispatches = f.record('partner').task.dispatches.length;
+    for (const mode of ['steer', 'queue']) {
+      const error = await rejection(f.service.send({ name: 'partner', message: `change ${mode}`,
+        model: 'desktop-model', mode }, extra(A)));
+      assert.equal(error.code, 'codex-model-change-while-running',
+        `${mode}: a real model change is refused even when it asks to queue`);
+    }
+    assert.deepEqual(f.record('partner').modelPin, PRO_SELECTION,
       'the refused selection is not persisted');
-    assert.equal(f.store.supplements(f.record('partner').agentId).length, 0);
-    assert.equal(f.record('partner').task.dispatches.length, 1, 'the refused change created no dispatch');
+    assert.equal(f.store.supplementInputs(f.record('partner').agentId).length, beforeRefusals,
+      'the refused changes queued nothing');
+    assert.equal(f.store.supplements(f.record('partner').agentId).length, 0,
+      'the refused changes left no pending queue row');
+    assert.equal(f.record('partner').task.dispatches.length, beforeDispatches,
+      'the refused changes created no dispatch');
+    assert.equal(deliveries.length, 2, 'the refused changes made no native write');
     const unknown = await rejection(f.service.send({ name: 'partner', message: 'typo', model: 'not-in-catalog' }, extra(A)));
     assert.equal(unknown.code, 'model-not-found', 'a missing ID is reported before the running check');
     assert.match(unknown.message, /desktop-pro/);
-    const same = await f.service.send({ name: 'partner', message: 'same pin', model: 'PRO', effort: 'high' }, extra(A));
-    assert.equal(same.queued, true, 'the exact active pin is an ordinary supplement');
-    assert.equal(same.actualModel, 'desktop-pro');
-    assert.equal(f.store.supplements(f.record('partner').agentId).length, 1);
-    assert.deepEqual(f.record('partner').modelPin,
-      { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' });
 
     await f.service.create({ name: 'unpinned', lifetime: 'persistent', target: 'codex-desktop' }, extra(A));
     await f.service.send({ name: 'unpinned', message: 'inherit' }, extra(A));
     await f.service.poll(f.record('unpinned').agentId);
-    assert.equal(deliveries.length, 2);
-    assert.equal(deliveries[1].explicitModel, false);
-    assert.equal('model' in deliveries[1], false, 'native inheritance sends no model field');
+    assert.equal(deliveries.length, 3);
+    const inherited = deliveries.at(-1);
+    assert.equal(inherited.selectionExplicit, false);
+    assert.equal('model' in inherited, false, 'native inheritance sends no model field');
   } finally { f.service.close(); }
 });
 
-test('an earlier queued selection is delivered even after a later pin change; the live turn decides compatibility', async () => {
+test('an explicit same selection on a running Codex turn needs the turn’s own start evidence', async () => {
+  const deliveries = [];
+  const events = [];
+  const catalog = { default: { ...DESKTOP_MODEL }, routableProviders: [DESKTOP_MODEL.provider],
+    groups: [{ id: DESKTOP_MODEL.provider, models: [
+      { id: 'desktop-pro', reasoning: { efforts: [{ id: 'high' }], defaultEffort: 'high' } },
+    ] }] };
+  const PRO_SELECTION = { provider: 'fixture', model: 'desktop-pro', reasoningEffort: 'high' };
+  const roots = new Map();
+  const rootFor = record => {
+    if (!roots.has(record.name)) roots.set(record.name, rootState());
+    return roots.get(record.name);
+  };
+  let adapter;
+  const f = await fixture({ adapters: { 'codex-desktop': record => {
+    adapter = selectionDesktopAdapter(events, { catalog, deliveries, root: rootFor(record) });
+    adapter.record = record;
+    return adapter;
+  } } });
+  try {
+    await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop', model: 'PRO' }, extra(A));
+    await f.service.send({ name: 'partner', message: 'work' }, extra(A));
+    await f.service.poll(f.record('partner').agentId);
+    const beforePin = structuredClone(f.record('partner').modelPin);
+    const beforeInputs = f.store.supplementInputs(f.record('partner').agentId).length;
+    // The root is running, but the fixture has no recorded start selection for it.
+    adapter.forgetRootSelection();
+    const error = await rejection(f.service.send({ name: 'partner', message: 'same but unproven',
+      model: 'PRO', effort: 'high' }, extra(A)));
+    assert.equal(error.code, 'model-selection-unconfirmed');
+    assert.equal(error.uncertain, true);
+    assert.deepEqual(f.record('partner').modelPin, beforePin, 'an unproven selection does not change the pin');
+    assert.equal(f.store.supplementInputs(f.record('partner').agentId).length, beforeInputs,
+      'an unproven selection queues nothing');
+    assert.equal(deliveries.length, 1, 'an unproven selection never reaches the adapter');
+    const match = await adapter.matchRootSelection({ selection: PRO_SELECTION, turnId: adapter.root.turnId });
+    assert.equal(match.status, 'unknown');
+    assert.equal(match.reason, 'no-wire-selection');
+  } finally { f.service.close(); }
+});
+
+test('an earlier queued input keeps its frozen selection when the name pin changes later', async () => {
   const catalog = { default: { provider: 'fixture', model: 'a-model' }, routableProviders: ['fixture'],
     groups: [{ id: 'fixture', models: [
       { id: 'a-model', reasoning: { efforts: [{ id: 'low' }], defaultEffort: 'low' } },
       { id: 'b-model', reasoning: { efforts: [{ id: 'high' }], defaultEffort: 'high' } },
     ] }] };
+  const A_SELECTION = { provider: 'fixture', model: 'a-model', reasoningEffort: 'low' };
+  const B_SELECTION = { provider: 'fixture', model: 'b-model', reasoningEffort: 'high' };
   const deliveries = [];
+  const events = [];
+  const roots = new Map();
+  const rootFor = record => {
+    if (!roots.has(record.name)) roots.set(record.name, rootState());
+    return roots.get(record.name);
+  };
+  let adapter;
   const f = await fixture({ adapters: { 'codex-desktop': record => {
-    const backend = desktopAdapter([]); backend.record = record;
-    backend.models = async () => catalog;
-    backend.deliver = async input => {
-      deliveries.push(input);
-      if (input.explicitModel && input.model?.model !== 'a-model') {
-        throw Object.assign(new Error('the running turn still uses a-model'), {
-          code: 'codex-model-change-while-running', terminal: true,
-        });
-      }
-      return { accepted: true, status: 'written', afterSeq: 1 };
-    };
-    return backend;
+    adapter = selectionDesktopAdapter(events, { catalog, deliveries, root: rootFor(record) });
+    adapter.record = record;
+    return adapter;
   } } });
   try {
     await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop', model: 'A' }, extra(A));
     await f.service.send({ name: 'partner', message: 'first' }, extra(A));
     await f.service.poll(f.record('partner').agentId);
-    const queuedA = f.record('partner');
-    // Simulate the between-turns window in which inputs are accepted while the
-    // running turn still uses a-model.
-    queuedA.state = queuedA.task.state = 'awaiting_report';
-    queuedA.observation = { ...(queuedA.observation ?? {}),
-      tree: { ...(queuedA.observation?.tree ?? {}), running: false } };
-    f.store.save(queuedA);
+    const queued = await f.service.send({ name: 'partner', message: 'old input', mode: 'queue' }, extra(A));
+    assert.equal(queued.accepted, false);
+    assert.equal(queued.delivery, 'after-current');
+    assert.equal(queued.afterTurnId, 'turn-1');
+    assert.equal(queued.actualModel, 'a-model');
+    const queuedRow = f.store.supplement(queued.requestId);
+    assert.deepEqual(queuedRow.selection, A_SELECTION);
+    assert.equal(queuedRow.selectionExplicit, false);
 
-    const first = await f.service.send({ name: 'partner', message: 'old input', model: 'A' }, extra(A));
-    const second = await f.service.send({ name: 'partner', message: 'new input', model: 'B' }, extra(A));
-    assert.equal(first.actualModel, 'a-model');
-    assert.equal(second.actualModel, 'b-model');
-    assert.deepEqual(f.record('partner').modelPin,
-      { provider: 'fixture', model: 'b-model', reasoningEffort: 'high' });
+    // A later pin write is for future turns only. The queued row already froze A.
+    const changed = f.store.get(f.record('partner').agentId);
+    changed.modelPin = { ...B_SELECTION };
+    f.store.save(changed);
+    adapter.endRootTurn();
+    await f.service.poll(f.record('partner').agentId);
 
-    const running = f.record('partner');
-    running.state = running.task.state = 'running';
-    running.observation = { ...(running.observation ?? {}),
-      tree: { ...(running.observation?.tree ?? {}), running: true, settled: false } };
-    f.store.save(running);
-    await f.service.poll(running.agentId);
+    const delivered = deliveries.find(item => item.message === 'old input');
+    assert.ok(delivered, 'the queued input was delivered when the root became idle');
+    assert.deepEqual(delivered.model, A_SELECTION, 'the earlier input is not rewritten by the later pin');
+    assert.equal(delivered.selectionExplicit, false);
+    assert.equal(delivered.mode, 'queue');
+    const deliveredRow = f.store.supplementInputs(f.record('partner').agentId)
+      .find(row => row.requestId === queued.requestId);
+    assert.deepEqual([deliveredRow.delivery, deliveredRow.turnId], ['new-turn', 'turn-2']);
 
-    assert.equal(deliveries[1].model.model, 'a-model', 'the earlier input is not discarded by the later pin');
-    assert.equal(deliveries[1].explicitModel, true);
-    const summary = f.store.supplementSummary(running.agentId, running.task.taskId);
-    assert.equal(summary.accepted, 1);
-    assert.equal(summary.blocked, 1, 'the incompatible later input is left visibly blocked');
-    assert.equal(summary.latest.reason, 'codex-model-change-while-running');
+    // The idle queue branch is not the old “store it and report queued” path: with
+    // no running root and no earlier row, the next queue request starts immediately.
+    adapter.endRootTurn();
+    const next = await f.service.send({ name: 'partner', message: 'next queue', mode: 'queue' }, extra(A));
+    assert.equal(next.accepted, true);
+    assert.equal(next.delivery, 'new-turn');
+    assert.equal(next.turnId, 'turn-3');
   } finally { f.service.close(); }
 });
 

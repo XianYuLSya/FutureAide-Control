@@ -244,6 +244,28 @@ const compactNode = node => {
   return { ...rest, ...(Array.isArray(rest.messages) ? { messages: rest.messages.map(compactMessage) } : {}) };
 };
 
+const INPUT_REASON_LIMIT = 200;
+
+/**
+ * One input row from inspect. These are the same fields the send or run receipt
+ * carried, so a caller can look up the requestId it kept and read that input's own
+ * outcome instead of inferring one from the name's state. `accepted` alone never
+ * says which turn received the text; only delivery and its turn IDs do.
+ * @param {object} input One service input record.
+ */
+const compactInput = input => ({
+  requestId: input.requestId,
+  mode: input.mode ?? null,
+  delivery: input.delivery ?? null,
+  accepted: input.accepted === true,
+  queued: input.queued === true,
+  ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
+  ...(input.afterTurnId === undefined ? {} : { afterTurnId: input.afterTurnId }),
+  ...(input.reason === undefined ? {} : { reason: truncate(String(input.reason), INPUT_REASON_LIMIT) }),
+  ...(input.status === undefined ? {} : { status: input.status }),
+  ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt }),
+});
+
 /** One node's messages, the rest as a name so the tree stays recognisable. */
 const narrowedNodes = (nodes, chosen) => nodes.map(node => node === chosen ? node : { name: node.name, status: node.status });
 
@@ -315,6 +337,9 @@ export function compactInspect(result = {}, { node } = {}) {
       ...(tree.observationError ? { observationError: tree.observationError } : {}), nodes: nodes.map(compactNode) },
     // latest.summary would repeat the item body that reports.items already carries.
     reports: { total: reports.total ?? 0, pending: reports.pending ?? 0, items: reports.items ?? [] },
+    // Every input of this task, including accepted ones: a request id is only
+    // useful if the row that owns it can still be found after the turn moved on.
+    ...(Array.isArray(result.inputs) && result.inputs.length ? { inputs: result.inputs.map(compactInput) } : {}),
     ...(hasMore ? { hasMore: true } : {}),
     ...(noteOwner?.note ? { note: noteOwner.note } : {}),
     ...(result.inspectionIncomplete === true ? { inspectionIncomplete: true } : {}),

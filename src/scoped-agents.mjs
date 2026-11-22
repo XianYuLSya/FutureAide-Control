@@ -280,6 +280,170 @@ function publicResult(record, { fullResult = false } = {}) {
 }
 
 /**
+ * Every input of the current task, including ones whose native receipt is already
+ * accepted. `inspect` returns these rows so one requestId can be followed from the
+ * local queue to its actual route. Fields absent from historical rows stay absent.
+ */
+function taskInputs(store, record) {
+  const task = record.task;
+  if (!task) return [];
+  // Delivery labels that prove a native write versus only a local wait. `answered` is
+  // the display label for an answer whose text actually reached the target; the raw
+  // route (turnId/afterTurnId) stays beside it. `accepted` alone never tells current
+  // from new, and `answer.dispatched` alone is not delivery proof.
+  const acceptedRoute = route => ['current-turn', 'new-turn', 'answered'].includes(route);
+  const waitingRoute = route => ['after-current', 'local-pending', 'answer-pending'].includes(route);
+  const rows = new Map();
+  const put = (requestId, row) => {
+    if (!requestId) return;
+    const prior = rows.get(requestId) ?? {};
+    const merged = { ...prior, ...row };
+    // A frozen older row never overrides a value another record already proved.
+    for (const [key, value] of Object.entries(row)) if (value === undefined && prior[key] !== undefined) merged[key] = prior[key];
+    rows.set(requestId, merged);
+  };
+  const lifecycle = delivery => delivery === 'blocked' ? 'blocked'
+    : delivery === 'unknown' ? 'unknown'
+      : waitingRoute(delivery) ? 'queued'
+        : acceptedRoute(delivery) || delivery === 'accepted-route-unknown' ? 'accepted'
+          : undefined;
+
+  // Durable queue rows: accepted inputs are hidden from the work queue but still belong
+  // to this task's inspect answer. The store derives blocked/local-pending for rows
+  // written before receipts existed instead of leaving those states absent.
+  let queued = [];
+  try { queued = store.supplementInputs(record.agentId, task.taskId) ?? []; } catch { queued = []; }
+  const blockedInputs = new Set();
+  for (const item of queued) {
+    if (item.delivery === 'blocked') blockedInputs.add(item.requestId);
+    const status = lifecycle(item.delivery) ?? item.status;
+    put(item.requestId, {
+      requestId: item.requestId,
+      ...(item.mode ? { mode: item.mode } : {}),
+      ...(item.delivery ? { delivery: item.delivery } : {}),
+      accepted: item.accepted === true,
+      queued: item.queued === true,
+      ...(item.turnId ? { turnId: item.turnId } : {}),
+      ...(item.afterTurnId ? { afterTurnId: item.afterTurnId } : {}),
+      ...(item.reason ? { reason: item.reason } : {}),
+      ...(status ? { status } : {}),
+      ...(item.createdAt ? { createdAt: item.createdAt } : {}),
+    });
+  }
+
+  // A dispatch is the actual write intent/evidence. Its route fills fields a queue row
+  // written before receipts existed could not have. A blocked queue row keeps its final
+  // reason: a stale intent must never turn "not sent" back into a pending input.
+  for (const dispatch of task.dispatches ?? []) {
+    if (dispatch.kind === 'answer') continue;
+    if (blockedInputs.has(dispatch.requestId)) continue;
+    const existing = rows.get(dispatch.requestId);
+    const delivery = dispatch.delivery
+      ?? (dispatch.state === 'blocked' || (dispatch.state === 'failed' && dispatch.error) ? 'blocked'
+        : ['sending', 'queued', 'retrying'].includes(dispatch.state) ? 'local-pending' : undefined);
+    const status = lifecycle(delivery) ?? dispatch.state;
+    put(dispatch.requestId, {
+      requestId: dispatch.requestId,
+      ...(dispatch.mode ? { mode: dispatch.mode } : {}),
+      ...(delivery ? { delivery } : {}),
+      accepted: dispatch.accepted === true,
+      queued: dispatch.accepted !== true && (waitingRoute(delivery) || ['sending', 'queued', 'retrying'].includes(dispatch.state)),
+      ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
+      ...(dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
+      ...(dispatch.error?.code ? { reason: dispatch.error.code } : {}),
+      ...(status ? { status } : {}),
+      ...(existing?.createdAt ? {} : dispatch.startedAt ? { createdAt: dispatch.startedAt } : {}),
+    });
+  }
+
+  // Answers keep the caller-visible request id the send/run receipt returned (the
+  // answerId), so the caller can find the row it was told about. The native text write
+  // is found through the dispatch's answerIds against the answer's questionIds. Only
+  // that write's receipt can say the text reached a turn; a failed write is blocked,
+  // and accepted-without-route is "accepted, route unknown" rather than answered.
+  const answerDispatches = (task.dispatches ?? []).filter(dispatch => dispatch.kind === 'answer');
+  const matchedDispatches = new Set();
+  for (const answer of task.answers ?? []) {
+    const questionIds = Array.isArray(answer.questionIds) ? answer.questionIds : [];
+    // A requestId match is the strongest link (a supplement used as the answer keeps
+    // its enqueue id). Otherwise the dispatch's answerIds carries the question ids the
+    // answer consumed. A retried answer prefers its accepted write over an older failure.
+    const candidates = answerDispatches.filter(entry => entry.requestId === answer.answerId)
+      .concat(questionIds.length ? answerDispatches.filter(entry =>
+        (entry.answerIds ?? []).some(id => questionIds.includes(id))) : []);
+    const dispatch = candidates.find(entry => entry.accepted === true) ?? candidates.at(-1);
+    for (const candidate of candidates) matchedDispatches.add(candidate);
+    const route = dispatch?.delivery;
+    const existing = rows.get(answer.answerId);
+    let delivery, accepted = false, queued = false, reason;
+    if (answer.undelivered) {
+      delivery = 'blocked'; reason = answer.undelivered;
+    } else if (answer.nativeAnswered === true) {
+      // The adapter answered the native question card itself; that is the delivery,
+      // not a text turn, so no turn id is invented for it.
+      delivery = 'answered'; accepted = true;
+    } else if (dispatch) {
+      if (dispatch.accepted === true && acceptedRoute(route)) {
+        delivery = 'answered'; accepted = true;
+      } else if (dispatch.accepted !== true
+          && (waitingRoute(route) || ['sending', 'queued', 'retrying'].includes(dispatch.state))) {
+        delivery = 'answer-pending'; queued = true;
+      } else if (dispatch.accepted === true) {
+        delivery = 'accepted-route-unknown'; accepted = true;
+      } else if (route === 'blocked' || dispatch.state === 'blocked'
+          || (dispatch.state === 'failed' && dispatch.error)) {
+        delivery = 'blocked'; reason = dispatch.error?.code ?? 'send-failed';
+      } else {
+        delivery = 'unknown'; reason = dispatch.error?.code ?? 'answer-outcome-unknown';
+      }
+    } else if (questionIds.length && answer.dispatched !== true) {
+      // Registered against a real question and waiting for its dispatch.
+      delivery = 'answer-pending'; queued = true;
+    } else {
+      // A row that claims it was dispatched with no dispatch record, or one that never
+      // matched a question, is not evidence that the answer was delivered.
+      delivery = 'unknown'; reason = answer.dispatched === true ? 'answer-dispatch-unconfirmed' : 'answer-question-unconfirmed';
+    }
+    put(answer.answerId, {
+      requestId: answer.answerId,
+      mode: 'steer',
+      delivery,
+      accepted,
+      queued,
+      ...(dispatch?.turnId ?? answer.turnId ? { turnId: dispatch?.turnId ?? answer.turnId } : {}),
+      ...(dispatch?.afterTurnId ?? answer.afterTurnId ? { afterTurnId: dispatch?.afterTurnId ?? answer.afterTurnId } : {}),
+      ...(reason ? { reason } : {}),
+      status: lifecycle(delivery) ?? 'unknown',
+      ...(existing?.createdAt ? {} : dispatch?.startedAt ? { createdAt: dispatch.startedAt } : {}),
+    });
+  }
+  // An answer dispatch with no surviving answer row is still a real input; keep it
+  // visible under its own request id instead of dropping the write from inspect.
+  for (const dispatch of answerDispatches) {
+    if (matchedDispatches.has(dispatch)) continue;
+    const route = dispatch.delivery;
+    const delivery = dispatch.accepted === true && acceptedRoute(route) ? 'answered'
+      : dispatch.accepted === true ? 'accepted-route-unknown'
+        : waitingRoute(route) ? route
+          : ['sending', 'queued', 'retrying'].includes(dispatch.state) ? 'answer-pending'
+            : route ?? (dispatch.state === 'failed' || dispatch.state === 'blocked' ? 'blocked' : 'unknown');
+    put(dispatch.requestId, {
+      requestId: dispatch.requestId,
+      ...(dispatch.mode ? { mode: dispatch.mode } : {}),
+      delivery,
+      accepted: dispatch.accepted === true,
+      queued: dispatch.accepted !== true && (waitingRoute(delivery) || ['sending', 'queued', 'retrying'].includes(dispatch.state)),
+      ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
+      ...(dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
+      ...(dispatch.error?.code ? { reason: dispatch.error.code } : {}),
+      status: lifecycle(delivery) ?? 'unknown',
+      ...(dispatch.startedAt ? { createdAt: dispatch.startedAt } : {}),
+    });
+  }
+  return [...rows.values()].sort((left, right) => String(left.createdAt ?? '').localeCompare(String(right.createdAt ?? '')));
+}
+
+/**
  * Native receipt for a Claude notice. Our request id survives as the queue,
  * attachment or user uuid, so the delivery record — not the transcript text — is
  * the evidence: the reader truncates text at 8k, which would drop the trailing
@@ -1256,6 +1420,179 @@ export function createScopedAgents(config, {
       { code: 'codex-model-change-while-running', terminal: true });
   }
 
+  function normalizeRequestedMode(mode) {
+    if (mode === undefined || mode === null) return undefined;
+    if (mode === 'steer' || mode === 'queue') return mode;
+    throw Object.assign(new Error('mode must be "steer" or "queue" when it is given.'),
+      { code: 'mode-invalid', terminal: true });
+  }
+
+  /**
+   * The live turn's own start selection is the only evidence that a running Codex
+   * root can accept an explicit selection. A provider is compared only when both
+   * sides name one: the native thread summary can omit it while the catalog id is
+   * already the resolved model.
+   */
+  function sameTurnSelection(left, right) {
+    if (!left || !right) return false;
+    const text = value => typeof value === 'string' ? value.trim().toLowerCase() : '';
+    const model = text(left.model);
+    if (!model || model !== text(right.model)) return false;
+    if ((text(left.reasoningEffort) || '') !== (text(right.reasoningEffort) || '')) return false;
+    return !text(left.provider) || !text(right.provider) || text(left.provider) === text(right.provider);
+  }
+
+  function deliveryAccepted(delivery) {
+    return ['current-turn', 'new-turn', 'answered', 'accepted-route-unknown'].includes(delivery);
+  }
+
+  function deliveryQueued(delivery) {
+    return ['after-current', 'local-pending', 'answer-pending'].includes(delivery);
+  }
+
+  /**
+   * What the target says about its root turn. Only a Codex adapter can answer this
+   * for the root alone; every other target uses its observed session state. A
+   * missing adapter method falls back to the saved observation, never to the whole
+   * tree's running flag for a scheduling decision when a fresh read is available.
+   */
+  async function rootTurnFor(record) {
+    const backend = await backendFor(record);
+    if (typeof backend.rootTurn === 'function') {
+      const root = await backend.rootTurn();
+      if (!root || typeof root !== 'object') return { known: false };
+      // A native root read that could not confirm its state is not an idle root: the
+      // scheduler must keep the input local rather than inventing an after-current.
+      if (root.confirmed === false) return { known: false, reason: root.reason };
+      return { known: true, running: root.running === true,
+        turnId: typeof root.turnId === 'string' ? root.turnId : undefined,
+        selection: root.selection && typeof root.selection === 'object' ? root.selection : undefined };
+    }
+    if (targetOf(record) === 'codex-desktop') {
+      return { known: true, running: codexTurnRunning(record), turnId: undefined, selection: undefined };
+    }
+    return { known: true, running: undefined, turnId: undefined, selection: undefined };
+  }
+
+  /** The selection the active root turn was started with, from native or saved evidence. */
+  function activeTurnSelection(record, root) {
+    if (root?.selection) return root.selection;
+    // A saved task dispatch is evidence only for the exact turn the root reports. A
+    // later turn B in the same task must not borrow the first dispatch's selection.
+    const turnId = root?.turnId;
+    if (!turnId) return undefined;
+    const started = (record.task?.dispatches ?? []).find(dispatch => dispatch.kind === 'task'
+      && dispatch.accepted === true && dispatch.selectionExplicit === true && dispatch.model
+      && dispatch.turnId === turnId);
+    return started?.model;
+  }
+
+  /**
+   * An explicit selection may join a running root only when the target's own
+   * comparison proves the same catalog selection. `matchRootSelection` resolves the
+   * catalog preset to its wire slug, so preset-a and wire-a are never compared
+   * directly. Different is a model change; unknown or idle is refused as unconfirmed.
+   */
+  async function rootSelectionMatch(record, selection, root) {
+    const backend = await backendFor(record);
+    if (typeof backend.matchRootSelection === 'function') {
+      const match = await backend.matchRootSelection({ selection,
+        ...(root?.turnId ? { turnId: root.turnId } : {}) });
+      return match?.status;
+    }
+    const active = activeTurnSelection(record, root);
+    return active ? (sameTurnSelection(selection, active) ? 'same' : 'different') : 'unknown';
+  }
+
+  async function assertExplicitSelectionForRunning(record, pin, root) {
+    const status = await rootSelectionMatch(record, pin, root);
+    if (status === 'same') return;
+    if (status === 'idle') {
+      throw Object.assign(new Error('The root turn already ended; this selection was not written into it.'),
+        { code: 'round-finished', terminal: true, notSent: true });
+    }
+    if (status === 'different') throw modelChangeRefused();
+    throw Object.assign(new Error('The running turn’s model and reasoning effort could not be confirmed, so this selection was not sent.'),
+      { code: 'model-selection-unconfirmed', uncertain: true, terminal: true });
+  }
+
+  function modeUnsupported(record, requested, supportedModes) {
+    const target = targetOf(record);
+    return {
+      name: record.name, accepted: false, queued: false, state: record.state,
+      mode: requested ?? supportedModes[0],
+      error: { code: 'mode-unsupported', target, supportedModes },
+      code: 'mode-unsupported', target, supportedModes,
+    };
+  }
+
+  function dispatchReceipt(dispatch) {
+    if (!dispatch) return {};
+    return {
+      ...(dispatch.delivery ? { delivery: dispatch.delivery } : {}),
+      ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
+      ...(dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
+      ...(dispatch.deliveryIntent?.method ? { method: dispatch.deliveryIntent.method } : {}),
+      ...(dispatch.deliveryIntent?.expectedTurnId ? { expectedTurnId: dispatch.deliveryIntent.expectedTurnId } : {}),
+      ...(dispatch.mode ? { mode: dispatch.mode } : {}),
+      selectionExplicit: dispatch.selectionExplicit === true,
+    };
+  }
+
+  /**
+   * Persist the native/scheduling receipt on the supplement row. The fourth
+   * argument is the new storage contract; an older store simply ignores it.
+   */
+  function saveSupplementReceipt(requestId, status, reason = null, receipt = undefined) {
+    if (!requestId) return;
+    try { store.setSupplement(requestId, status, reason, receipt); }
+    catch (error) {
+      if (arguments.length < 4 || error?.code !== 'ERR_INVALID_ARG_TYPE') throw error;
+      store.setSupplement(requestId, status, reason);
+    }
+  }
+
+  /** The caller-visible receipt for one supplement, from its row and its dispatch. */
+  function supplementReceipt(record, requestId, fallback = {}) {
+    const current = store.get(record.agentId) ?? record;
+    // An accepted row is no longer in the pending queue, but its stored receipt is
+    // the evidence this caller must get back. supplement() reads the row by id.
+    const item = store.supplement(requestId);
+    const dispatch = (current.task?.dispatches ?? []).find(entry => entry.requestId === requestId);
+    const stored = item?.receipt ?? {};
+    // A terminal row already recorded by the scheduler outranks any optimistic
+    // fallback the entry carried into this call: blocked stays blocked and accepted
+    // keeps the route the native receipt proved.
+    const terminalDelivery = item?.status === 'blocked' ? 'blocked'
+      : item?.status === 'accepted' ? (stored.delivery ?? dispatch?.delivery ?? 'accepted-route-unknown')
+        : item?.status === 'unknown' ? 'unknown' : undefined;
+    const delivery = terminalDelivery ?? stored.delivery ?? dispatch?.delivery ?? fallback.delivery
+      ?? 'local-pending';
+    const accepted = item?.status === 'blocked' ? false
+      : item?.status === 'accepted' || dispatch?.accepted === true || deliveryAccepted(delivery);
+    const queued = !accepted && item?.status !== 'blocked' && (deliveryQueued(delivery)
+      || ['queued', 'sending'].includes(item?.status ?? 'queued'));
+    const turnId = stored.turnId ?? dispatch?.turnId ?? fallback.turnId;
+    const afterTurnId = stored.afterTurnId ?? dispatch?.afterTurnId ?? fallback.afterTurnId;
+    const reason = item?.reason ?? dispatch?.error?.code ?? fallback.reason;
+    return {
+      name: current.name, state: current.state, accepted, queued,
+      requestId,
+      mode: item?.mode ?? stored.mode ?? fallback.mode ?? 'steer',
+      delivery,
+      ...(turnId ? { turnId } : {}),
+      ...(afterTurnId ? { afterTurnId } : {}),
+      ...(reason ? { error: { code: reason, message: reason === 'dispatch-expired'
+        ? 'This input passed its six hours before it could be sent.'
+        : 'This input could not be delivered; its body is kept.' } } : {}),
+      actualModel: actualModelName(item?.selection) ?? actualModelName(fallback.pin)
+        ?? actualModelName(current.model) ?? actualModelName(current.modelPin),
+      ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable',
+        message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
+      ...(fallback.previousReport ? { previousReport: fallback.previousReport } : {}),
+    };
+  }
+
   async function resolveRequestedPin(record, input) {
     const request = selectionRequest(input);
     if (request.model === undefined && !record.modelPin) {
@@ -1311,42 +1648,48 @@ export function createScopedAgents(config, {
     // dispatch belongs to: a stale copy must never overwrite a round that has moved on.
     const backend = await backendFor(record);
     const target = targetOf(record);
-    if (dshDefaultOnly(record) && dispatch.explicitModel === true) {
+    if (dshDefaultOnly(record)) {
       // Frozen before the installation locked DSH to its default: never applied.
       delete dispatch.model;
       dispatch.explicitModel = false;
+      dispatch.selectionExplicit = false;
     }
-    const explicit = dispatch.explicitModel === true && dispatch.model !== undefined;
-    if (explicit) {
-      if (target === 'dsh') {
-        await confirmDshSelection(backend, target, dispatch, dispatch.model, observed, { sessionOnly: true });
-        record.model = { ...dispatch.model };
+    const explicit = dispatch.selectionExplicit === true && dispatch.model !== undefined;
+    if (target === 'dsh') {
+      if (!dispatch.model) {
+        // DSH default-follow keeps the old resolveModel and its catalog validation.
+        dispatch.model = resolveModel(await backend.models(), {});
+        saveDispatch(record);
       }
+      await confirmDshSelection(backend, target, dispatch, dispatch.model, observed, { sessionOnly: explicit });
+      record.model = { ...dispatch.model };
+      dispatch.modelReady = true;
+      saveDispatch(record);
+      return;
+    }
+    if (explicit) {
       // Codex applies the model on its own turn/start. Calling its selectModel would
       // either fake a selection or touch the user's defaults, so it is never used.
       dispatch.modelReady = true;
       saveDispatch(record);
       return;
     }
-    if (target !== 'dsh') {
-      // Native inheritance: read the actual model for display, but never select or
-      // send one for a name that did not ask for an explicit selection.
-      const current = observed && observed.modelSelectionObserved !== false && observed.currentModel
-        ? observed.currentModel
-        : await backend.model();
-      dispatch.model = current ? { ...current } : undefined;
-      if (current) record.model = { ...current };
+    // An input accepted without a new selection carries the selection frozen when the
+    // caller wrote it. That value is for a future turn/start and is never compared with
+    // a running turn. Only a record without any frozen value reads the live value for
+    // display; a steer never sends either value.
+    if (dispatch.model) {
       dispatch.modelReady = true;
       saveDispatch(record);
       return;
     }
-    // DSH default-follow keeps the old resolveModel and its catalog validation.
-    if (!dispatch.model) {
-      dispatch.model = resolveModel(await backend.models(), {});
-      saveDispatch(record);
+    const current = observed && observed.modelSelectionObserved !== false && observed.currentModel
+      ? observed.currentModel
+      : await backend.model();
+    if (current) {
+      dispatch.model = { ...current };
+      record.model = { ...current };
     }
-    await confirmDshSelection(backend, target, dispatch, dispatch.model, observed);
-    record.model = { ...dispatch.model };
     dispatch.modelReady = true;
     saveDispatch(record);
   }
@@ -1370,12 +1713,16 @@ export function createScopedAgents(config, {
     // The selection is frozen here: later pin changes must not rewrite an input that
     // is already queued or being recovered. `freezeModel` on a queued supplement
     // records that it had no pin when it was accepted, so a later pin cannot leak in.
-    const { model: frozenModel, freezeModel, ...dispatchExtra } = extra;
+    const { model: frozenModel, freezeModel, mode, selectionExplicit, ...dispatchExtra } = extra;
     const selected = dshDefaultOnly(record) ? undefined
       : frozenModel !== undefined ? frozenModel
       : freezeModel === true ? undefined : record.modelPin;
     const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now(),
-      ...(selected ? { model: { ...selected }, explicitModel: true } : {}), ...dispatchExtra };
+      mode: mode === 'queue' ? 'queue' : mode === 'steer' ? 'steer' : record.task?.mode ?? 'steer',
+      ...(selected ? { model: { ...selected } } : {}),
+      ...(selectionExplicit === true && selected ? { explicitModel: true, selectionExplicit: true }
+        : selectionExplicit === false ? { selectionExplicit: false } : {}),
+      ...dispatchExtra };
     // A new round ends any release attempt at once: the ticket stops matching, the host's
     // own critical-point check refuses, and the subscription is restored by this write.
     invalidateRelease(record);
@@ -1410,7 +1757,7 @@ export function createScopedAgents(config, {
     const item = store.supplement(requestId);
     // A direct supplement of an active round has no queue row; its own persisted intent then
     // carries the original clock, so a retry never refreshes that either.
-    return dispatchExpired(item?.created ?? intent?.startedAt) ? 'dispatch-expired' : undefined;
+    return dispatchExpired(item?.created ?? intent?.requestedAt ?? intent?.startedAt) ? 'dispatch-expired' : undefined;
   }
 
   /**
@@ -1418,7 +1765,7 @@ export function createScopedAgents(config, {
    * its body and the running task is untouched; the task itself becomes failed only when
    * it is the task that expired.
    */
-  function sealBlockedInput(record, dispatch, reason) {
+  function sealBlockedInput(record, dispatch, reason, message) {
     const item = store.supplement(dispatch.requestId);
     if (reason === 'dispatch-expired') {
       expireInput(record, dispatch, item);
@@ -1426,8 +1773,10 @@ export function createScopedAgents(config, {
     }
     dispatch.state = 'blocked';
     dispatch.accepted = false;
-    dispatch.error = { code: reason, message: 'This round already ended; the input was not sent.' };
-    if (item) store.setSupplement(item.requestId, 'blocked', 'final-submitted');
+    dispatch.error = { code: reason, message: message
+      ?? (reason === 'round-finished' ? 'This round already ended; the input was not sent.' : 'This input was not sent.') };
+    if (item) store.setSupplement(item.requestId, 'blocked', reason,
+      { delivery: 'blocked', accepted: false, queued: false });
   }
 
   async function dispatchOnce(record, dispatch, observed) {
@@ -1456,23 +1805,96 @@ export function createScopedAgents(config, {
         throw dispatchRefused();
       }
       const explicit = dispatch.explicitModel === true && dispatch.model !== undefined;
+      const target = targetOf(record);
+      const modern = typeof backend.rootTurn === 'function';
+      // A queued input may only start a turn. Re-read the root right before the write:
+      // an active root keeps it in the durable queue with the turn it waits behind.
+      let root;
+      if (target === 'codex-desktop') {
+        try { root = await rootTurnFor(record); }
+        catch (error) { root = { known: false, error }; }
+        if (dispatch.mode === 'queue' && root?.known !== false && root.running) {
+          Object.assign(dispatch, { state: 'queued', accepted: false, delivery: 'after-current',
+            afterTurnId: root.turnId });
+          if (dispatch.kind === 'supplement') saveSupplementReceipt(dispatch.requestId, 'queued', null, dispatchReceipt(dispatch));
+          saveDispatch(record);
+          return;
+        }
+        if (root?.known === false) {
+          // No write happened. Keep the same request in the local queue; a later poll
+          // re-reads the root and starts it under this same request id.
+          Object.assign(dispatch, { state: 'queued', accepted: false, delivery: 'local-pending' });
+          if (dispatch.kind === 'supplement') saveSupplementReceipt(dispatch.requestId, 'queued', null, dispatchReceipt(dispatch));
+          saveDispatch(record);
+          return;
+        }
+      }
+      // Persist the intended native method and its target before the RPC: a process
+      // that dies after the write can only recover the route from this record.
+      const method = target === 'codex-desktop'
+        ? (root?.running ? 'steer' : 'start')
+        : (observed?.running === true && dispatch.mode !== 'queue' ? 'steer' : 'start');
+      dispatch.deliveryIntent = { method, mode: dispatch.mode,
+        ...(method === 'steer' && root?.turnId ? { expectedTurnId: root.turnId } : {}),
+        ...(method === 'start' && root?.turnId ? { afterTurnId: root.turnId } : {}) };
+      saveDispatch(record);
       // The adapter has its own asynchronous preparation (host lock, state reads, preflight,
       // writes), so it is given the same gate to consult immediately before it writes.
       const reasonFor = () => writeBlockReason(record.agentId,
         { taskId: dispatch.taskId ?? record.task?.taskId, requestId: dispatch.requestId, kind: dispatch.kind });
       const blocked = reasonFor();
       if (blocked) throw dispatchRefused(blocked);
+      // A normal steer may join a running root, but it must not open B while an earlier
+      // queue row is waiting: the scheduler owns FIFO. If the root went idle after this
+      // dispatch was prepared, the adapter hands it back without writing.
+      const waitingRows = store.supplements(record.agentId);
+      const position = waitingRows.findIndex(row => row.requestId === dispatch.requestId);
+      const earlierQueue = position > 0 && waitingRows.slice(0, position).some(row =>
+        row.task === record.task?.taskId && row.mode === 'queue' && row.status !== 'blocked');
+      const allowStart = !(target === 'codex-desktop' && dispatch.kind === 'supplement'
+        && dispatch.mode !== 'queue' && earlierQueue);
       const sent = await backend.deliver({ requestId: dispatch.requestId,
         message: dispatch.message, kind: dispatch.kind,
         writeBlockReason: reasonFor,
-        ...(explicit ? { model: dispatch.model, explicitModel: true } : { explicitModel: false }) });
-      Object.assign(dispatch, { state: sent.accepted ? 'running' : sent.status ?? 'unknown', accepted: sent.accepted === true,
-        afterSeq: sent.afterSeq ?? dispatch.afterSeq, ...(sent.accepted ? { error: undefined, nextAttemptAt: undefined } : {}) });
-      if (sent.accepted === true && explicit && targetOf(record) === 'codex-desktop') {
-        // The native turn now runs with the pinned model; record the real display value.
+        allowStart,
+        mode: dispatch.mode === 'queue' ? 'queue' : 'steer',
+        ...(dispatch.selectionExplicit === undefined ? {}
+          : { selectionExplicit: dispatch.selectionExplicit === true }),
+        ...(modern
+          ? (dispatch.model ? { model: dispatch.model } : {})
+          : (explicit ? { model: dispatch.model, explicitModel: true } : { explicitModel: false })) });
+      // A native receipt names the actual route. When it does not, a Codex write is
+      // never reported as current or new from `accepted` alone.
+      const delivery = typeof sent.delivery === 'string' ? sent.delivery
+        : (sent.reschedule === true || sent.waiting === true || sent.status === 'waiting') ? 'local-pending'
+          : target === 'codex-desktop' ? (sent.accepted === true ? 'accepted-route-unknown' : sent.status ?? 'unknown')
+            : sent.accepted !== true ? (['retryable', 'retrying'].includes(sent.status) ? 'local-pending' : sent.status ?? 'unknown')
+              : dispatch.kind === 'answer' ? 'answered'
+                : method === 'steer' ? 'current-turn' : 'new-turn';
+      const accepted = sent.accepted === true || deliveryAccepted(delivery);
+      const state = accepted ? 'running'
+        : ['after-current', 'local-pending', 'answer-pending'].includes(delivery) ? 'queued'
+          : delivery === 'blocked' ? 'blocked' : ['unknown', 'accepted-route-unknown'].includes(delivery) ? 'unknown'
+            : sent.status ?? 'failed';
+      Object.assign(dispatch, { delivery, state, accepted,
+        ...(sent.turnId ? { turnId: sent.turnId } : {}),
+        ...(sent.afterTurnId ?? (delivery === 'after-current' ? sent.turnId ?? root?.turnId : undefined)
+          ? { afterTurnId: sent.afterTurnId ?? sent.turnId ?? root?.turnId } : {}),
+        ...(sent.afterSeq !== undefined ? { afterSeq: sent.afterSeq } : {}),
+        ...(accepted ? { error: undefined, nextAttemptAt: undefined } : {}) });
+      if (accepted && explicit && target === 'codex-desktop') {
+        // The native turn now runs with the pinned model; record the real display value
+        // and only now make it the name's intended selection. A refused or still
+        // waiting input never changes the pin.
         record.model = { ...dispatch.model };
+        record.modelPin = { ...dispatch.model };
       }
-      if (!sent.accepted && ['retryable', 'retrying'].includes(dispatch.state)) {
+      if (dispatch.kind === 'supplement') {
+        saveSupplementReceipt(dispatch.requestId, accepted ? 'accepted'
+          : delivery === 'blocked' ? 'blocked' : delivery === 'unknown' ? 'unknown' : 'queued',
+        accepted ? null : dispatch.error?.code ?? sent.reason ?? null, dispatchReceipt(dispatch));
+      }
+      if (!accepted && ['retryable', 'retrying'].includes(dispatch.state)) {
         dispatch.state = 'retrying'; deferRetry(dispatch);
       }
     } catch (error) {
@@ -1480,10 +1902,13 @@ export function createScopedAgents(config, {
       // that moved on, closed or ended must not have this copy saved back over it; a round
       // that is merely too old seals this one input and keeps everything else.
       if (error?.notSent === true && error?.terminal === true) {
-        const reason = error.code === 'dispatch-expired' ? 'dispatch-expired' : 'round-finished';
+        const code = error.code;
+        const reason = code === 'dispatch-expired' ? 'dispatch-expired'
+          : ['round-finished', 'task-cancelled', 'final-submitted', 'task-changed'].includes(code) ? 'round-finished'
+            : code ?? 'send-blocked';
         const latest = store.get(record.agentId);
         if (!roundMovedOn(record, latest) && !latest.task?.cancelRequested) {
-          sealBlockedInput(record, dispatch, reason);
+          sealBlockedInput(record, dispatch, reason, error.message);
           saveDispatch(record);
         }
         throw error;
@@ -2050,8 +2475,9 @@ export function createScopedAgents(config, {
       // delayed through the worker queue, so reading the live pin here would let a
       // later change rewrite an input the caller had already accepted.
       const frozen = Object.prototype.hasOwnProperty.call(record.task, 'modelSelection')
-        ? { model: record.task.modelSelection, freezeModel: true } : {};
-      await sendDispatch(record, record.task.message, 'task', [], undefined, observed, frozen);
+        ? { model: record.task.modelSelection, freezeModel: true,
+          selectionExplicit: record.task.selectionExplicit === true } : {};
+      await sendDispatch(record, record.task.message, 'task', [], record.task.requestId, observed, frozen);
     } finally { trackWorkspaceBaseline(record, baseline); }
   }
 
@@ -2086,6 +2512,16 @@ export function createScopedAgents(config, {
     if (result.nativeAnswered === true) {
       answer.dispatched = true;
       answer.nativeAnswered = true;
+      answer.delivery = 'answered';
+      answer.accepted = true;
+      // A native card reply lands in the turn that asked. Read that exact root turn
+      // once so the receipt names it instead of leaving the caller to infer it.
+      if (targetOf(record) === 'codex-desktop') {
+        try {
+          const root = await rootTurnFor(record);
+          if (root.known && root.turnId) answer.turnId = root.turnId;
+        } catch { /* the answer already succeeded; its route stays as the card path */ }
+      }
       if (record.observation?.questions) record.observation.questions = record.observation.questions.map(question =>
         answer.questionIds.includes(question.id) ? { ...question, state: 'answered' } : question);
     } else {
@@ -2117,8 +2553,18 @@ export function createScopedAgents(config, {
     for (const answer of task.answers ?? []) {
       if (answer.dispatched || !answer.questionIds) continue;
       const item = store.supplement(answer.answerId);
-      if (item && dispatchExpired(item.created)) {
-        expireInput(record, undefined, item);
+      const created = item?.created ?? answer.created;
+      if (created && dispatchExpired(created)) {
+        // The original input is already six hours old. There is no native write for a
+        // never-dispatched continuation, so nothing can be accepted; record the age as
+        // a settled blocked input instead of writing it or holding the final forever.
+        const placeholder = { requestId: item?.requestId ?? answer.answerId, kind: 'answer',
+          answerIds: [...answer.questionIds], state: 'unknown', accepted: false,
+          startedAt: created, requestedAt: created };
+        task.dispatches.push(placeholder);
+        expireInput(record, placeholder, item);
+        placeholder.state = 'unknown';
+        Object.assign(answer, { dispatched: true, undelivered: 'dispatch-expired', delivery: 'unknown' });
         expired = true;
         continue;
       }
@@ -2135,9 +2581,24 @@ export function createScopedAgents(config, {
     for (const answer of ready) answer.dispatched = true;
     const last = ready.at(-1);
     const frozen = Object.prototype.hasOwnProperty.call(last, 'modelSelection')
-      ? { model: last.modelSelection, freezeModel: true } : {};
-    return sendDispatch(record, ready.map(answer => answer.continuation).join('\n\n'), 'answer',
-      ready.flatMap(answer => answer.questionIds), queuedAnswer?.requestId, view, frozen);
+      ? { model: last.modelSelection, freezeModel: true,
+        selectionExplicit: last.selectionExplicit === true,
+        ...(last.created ? { requestedAt: last.created } : {}) } : {};
+    const dispatch = await sendDispatch(record, ready.map(answer => answer.continuation).join('\n\n'), 'answer',
+      ready.flatMap(answer => answer.questionIds), queuedAnswer?.requestId ?? last.answerId, view, frozen);
+    // The answer's own inspect row must carry the route the native write actually took.
+    // A later poll cannot reconstruct which turn received the text from the name state.
+    for (const answer of ready) {
+      Object.assign(answer, {
+        delivery: dispatch.accepted ? 'answered'
+          : dispatch.delivery === 'unknown' ? 'unknown' : 'answer-pending',
+        ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
+        ...(dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
+        accepted: dispatch.accepted === true,
+      });
+    }
+    saveDispatch(record);
+    return dispatch;
   }
 
   /**
@@ -2597,21 +3058,31 @@ export function createScopedAgents(config, {
   }
 
   async function recoverDispatch(record, dispatch, { allowResend = true } = {}) {
-    if (dispatch.accepted || !['sending', 'retrying', 'unknown'].includes(dispatch.state)) return;
+    if (dispatch.accepted || !['sending', 'retrying', 'unknown', 'queued'].includes(dispatch.state)) return;
     if (dispatch.nextAttemptAt > Date.now()) return;
     // The backend owns its own receipt format; undefined means this saved intent
     // never reached a native write.
     const receipt = await (await backendFor(record)).receipt({ requestId: dispatch.requestId });
     if (!receipt) {
-      if (!['sending', 'retrying'].includes(dispatch.state)) return;
+      if (!['sending', 'retrying', 'queued'].includes(dispatch.state)) return;
       // The receipt is written before entering the native send. No receipt means
-      // this intent never reached that send; keep the exact request ID.
+      // this intent never reached that send; keep the exact request ID. A direct
+      // answer or a first task dispatch has no supplement row, so this loop is the
+      // only place that can retry it after a transient root read.
       if (!allowResend) return 'not-sent';
       await dispatchOnce(record, dispatch);
       return;
     }
     dispatch.afterSeq = receipt.afterSeq ?? dispatch.afterSeq;
-    if (receipt.status === 'accepted') Object.assign(dispatch, { accepted: true, state: 'running', error: undefined, failure: undefined, nextAttemptAt: undefined, retryAttempts: undefined });
+    if (receipt.delivery === 'after-current' || receipt.delivery === 'local-pending') {
+      Object.assign(dispatch, { state: 'queued', accepted: false, delivery: receipt.delivery,
+        ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}) });
+      return;
+    }
+    if (receipt.status === 'accepted') Object.assign(dispatch, { accepted: true, state: 'running', error: undefined, failure: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
+      delivery: receipt.delivery ?? dispatch.delivery ?? 'accepted-route-unknown',
+      ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
+      ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}) });
     if (receipt.status === 'rejected') dispatch.state = 'failed';
     if (receipt.status === 'retryable') {
       if (!allowResend) return 'not-sent';
@@ -2628,6 +3099,9 @@ export function createScopedAgents(config, {
       dispatch.afterSeq = receipt?.afterSeq ?? dispatch.afterSeq;
       if (receipt?.status === 'accepted') {
         Object.assign(dispatch, { accepted: true, state: 'running', error: undefined,
+          delivery: receipt.delivery ?? dispatch.delivery ?? 'accepted-route-unknown',
+          ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
+          ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}),
           nextAttemptAt: undefined, retryAttempts: undefined });
         return 'accepted';
       }
@@ -2646,28 +3120,132 @@ export function createScopedAgents(config, {
     return 'unknown';
   }
 
-  async function drainSupplements(record) {
-    if (record.task.cancelRequested) store.blockQueued(record.agentId, record.task.taskId, 'task-cancelled');
-    else if (record.task.reports?.some(report => report.final)) store.blockQueued(record.agentId, record.task.taskId, 'final-submitted');
-    const sealed = record.task.cancelRequested || record.task.reports?.some(report => report.final);
-    if (!sealed && (!(record.task.dispatches?.[0]?.accepted) || (record.task.answers ?? []).some(answer => !answer.dispatched))) return;
+  /**
+   * Deliver every supplement that is due, in rowid order, under the schedule the
+   * native root allows: an answer always takes the next turn; a steer joins the
+   * running root; a queue starts one turn of its own only after the root is idle.
+   * One call starts at most one new turn. Waiting is durable and never resent when
+   * the write outcome is unknown.
+   */
+  async function drainSupplements(record, { view: suppliedView } = {}) {
+    const task = record.task;
+    if (!task) return;
+    if (task.cancelRequested) store.blockQueued(record.agentId, task.taskId, 'task-cancelled');
+    else if ((task.reports ?? []).some(report => report.final)) store.blockQueued(record.agentId, task.taskId, 'final-submitted');
+    const sealed = task.cancelRequested || (task.reports ?? []).some(report => report.final);
+    // An answer that is ready — or whose continuation is still an unaccepted local
+    // intent — owns the next turn. Any queue behind it waits even when this same
+    // poll already sees an idle root; the dispatch loop retries the answer first.
+    const readyAnswers = (task.answers ?? []).some(answer => !answer.dispatched
+      || (task.dispatches ?? []).some(dispatch => dispatch.kind === 'answer'
+        && (dispatch.answerIds ?? []).includes(answer.answerId)
+        && dispatch.accepted !== true && !['blocked', 'failed', 'cancelled'].includes(dispatch.state)));
+    if (!sealed && (!(task.dispatches?.[0]?.accepted) || readyAnswers)) return;
+    const target = targetOf(record);
+    let view = suppliedView;
+    const loadView = async () => view ??= await observe(record);
+    let root;
+    if (!sealed && target === 'codex-desktop') {
+      try { root = await rootTurnFor(record); }
+      catch { root = { known: false }; }
+    }
+
+    /** Start or steer this one input under its own request id and persist its receipt. */
+    const startItem = async (item, mode) => {
+      const current = store.get(record.agentId);
+      if (!current || current.task?.taskId !== task.taskId) return undefined;
+      // The entry's observation can go stale while the name lock waits. Re-read the
+      // target's own state before a mode that only works while idle: a DSH queue and
+      // a CLI steer must be refused, never written as the other mode.
+      if ((target === 'dsh' && mode === 'queue') || (target === 'claude-cli' && mode === 'steer')) {
+        const latest = await observe(record);
+        if (latest.running === true) {
+          saveSupplementReceipt(item.requestId, 'blocked', 'mode-unsupported',
+            { delivery: 'blocked', mode, accepted: false, queued: false });
+          return undefined;
+        }
+        view = latest;
+      }
+      store.setSupplement(item.requestId, 'sending');
+      // Mutate the record this poll is saving, not a second copy: a later save of the
+      // poll's own record would otherwise erase the dispatch this start just wrote.
+      const targetRecord = record.task?.taskId === task.taskId ? record : current;
+      const dispatch = await sendDispatch(targetRecord, item.message, 'supplement', [], item.requestId, view,
+        { model: item.selection, freezeModel: true, mode,
+          ...(item.selectionExplicit === undefined ? {}
+            : { selectionExplicit: item.selectionExplicit === true }) });
+      const receipt = dispatchReceipt(dispatch);
+      if (dispatch.accepted) saveSupplementReceipt(item.requestId, 'accepted', null, receipt);
+      else if (dispatch.delivery === 'after-current' || dispatch.delivery === 'local-pending'
+        || dispatch.state === 'queued' || dispatch.state === 'retrying') saveSupplementReceipt(item.requestId, 'queued', null, receipt);
+      else saveSupplementReceipt(item.requestId, dispatch.state === 'failed' ? 'blocked' : 'unknown',
+        dispatch.error?.code ?? (dispatch.state === 'failed' ? 'send-failed' : 'acceptance-unknown'), receipt);
+      return dispatch;
+    };
+
+    /** Later queue rows wait behind the turn that just opened, not the earlier one. */
+    const retargetWaiting = (startedId, turnId) => {
+      if (typeof turnId !== 'string' || !turnId) return;
+      for (const other of store.supplements(record.agentId)) {
+        if (other.requestId === startedId || other.mode !== 'queue' || other.status !== 'queued') continue;
+        const prior = (task.dispatches ?? []).find(entry => entry.requestId === other.requestId);
+        if (prior?.accepted === true) continue;
+        saveSupplementReceipt(other.requestId, 'queued', null,
+          { delivery: 'after-current', afterTurnId: turnId, mode: 'queue', accepted: false, queued: true });
+      }
+    };
     for (const item of store.supplements(record.agentId)) {
-      if (item.task !== record.task?.taskId) { store.setSupplement(item.requestId, 'blocked', 'task-changed'); continue; }
+      // A blocked row keeps its original reason even when the task has since changed.
       if (item.status === 'blocked') continue;
+      if (item.task !== task.taskId) { store.setSupplement(item.requestId, 'blocked', 'task-changed'); continue; }
       // The age check runs again immediately before the send, from the moment the caller
       // wrote the supplement: waiting behind anything does not extend its six hours.
       const current = store.get(record.agentId);
       if (!current || current.ownerId !== item.owner || current.sessionId !== item.session || current.task?.taskId !== item.task) {
         store.setSupplement(item.requestId, 'blocked', current?.task?.taskId !== item.task ? 'task-changed' : current?.task?.cancelRequested ? 'task-cancelled' : 'task-closed'); return;
       }
-      const prior = record.task.dispatches.find(dispatch => dispatch.requestId === item.requestId);
+      if (dispatchExpired(item.created) && !(task.dispatches ?? []).some(dispatch => dispatch.requestId === item.requestId && dispatch.accepted === true)) {
+        const prior = (task.dispatches ?? []).find(dispatch => dispatch.requestId === item.requestId);
+        if (roundMovedOn(record)) throw dispatchRefused();
+        expireInput(record, prior, item);
+        saveDispatch(record);
+        continue;
+      }
+      const prior = (task.dispatches ?? []).find(dispatch => dispatch.requestId === item.requestId);
       if (prior) {
-        if (dispatchExpired(item.created) && prior.accepted !== true) {
-          const outcome = await expiredReceipt(record, prior);
-          if (roundMovedOn(record)) throw dispatchRefused();
-          if (outcome === 'accepted') store.setSupplement(item.requestId, 'accepted');
-          else expireInput(record, prior, item, outcome);
-          saveDispatch(record);
+        // A queue request that was never written waits under its original id. When the
+        // root is idle it starts; while the root runs it stays after the same turn.
+        if (prior.accepted !== true && (prior.state === 'queued' || prior.delivery === 'after-current' || prior.delivery === 'local-pending')) {
+          if (sealed) {
+            prior.state = 'blocked';
+            saveSupplementReceipt(item.requestId, 'blocked', record.task.cancelRequested ? 'task-cancelled' : 'final-submitted');
+            saveDispatch(record);
+            continue;
+          }
+          if (target === 'codex-desktop') {
+            if (!root || root.known === false) {
+              saveSupplementReceipt(item.requestId, 'queued', null, { ...dispatchReceipt(prior), delivery: 'local-pending' });
+              return;
+            }
+            if (root.running) {
+              if (prior.mode === 'queue') {
+                Object.assign(prior, { state: 'queued', delivery: 'after-current', afterTurnId: root.turnId });
+                saveSupplementReceipt(item.requestId, 'queued', null, dispatchReceipt(prior));
+                saveDispatch(record);
+                continue;
+              }
+              // A steer that was only queued locally still belongs in the running turn.
+            }
+          }
+          await dispatchOnce(record, prior, view);
+          if (prior.accepted) {
+            saveSupplementReceipt(item.requestId, 'accepted', null, dispatchReceipt(prior));
+            continue;
+          }
+          saveSupplementReceipt(item.requestId, prior.state === 'failed' ? 'blocked'
+            : prior.state === 'unknown' ? 'unknown' : 'queued',
+          prior.error?.code ?? null, dispatchReceipt(prior));
+          if (prior.state !== 'queued' && prior.state !== 'retrying') return;
           continue;
         }
         const recovered = await recoverDispatch(record, prior, { allowResend: false });
@@ -2676,14 +3254,14 @@ export function createScopedAgents(config, {
           continue;
         }
         if (recovered === 'not-sent') {
-          const view = sealed ? undefined : await observe(record);
-          if (sealed || (view.reports ?? []).some(report => report.final)) {
+          const latestView = sealed ? undefined : await loadView();
+          if (sealed || (latestView.reports ?? []).some(report => report.final)) {
             store.setSupplement(item.requestId, 'blocked', record.task.cancelRequested ? 'task-cancelled' : 'final-submitted');
             prior.state = 'blocked';
             store.save(record);
             continue;
           }
-          await dispatchOnce(record, prior);
+          await dispatchOnce(record, prior, latestView);
         }
         if (!prior.accepted && prior.state !== 'failed' && Number.isSafeInteger(prior.afterSeq)) {
           const observed = await (await backendFor(record)).turn({ requestId: prior.requestId,
@@ -2693,12 +3271,16 @@ export function createScopedAgents(config, {
               failure: observed.failure ?? modelTurnError(observed.completionReason) });
         }
         store.save(record);
-        if (prior.accepted) { store.setSupplement(item.requestId, 'accepted'); continue; }
-        store.setSupplement(item.requestId, prior.state === 'failed' ? 'blocked' : 'unknown', prior.error?.code ?? (prior.state === 'failed' ? 'send-failed' : 'acceptance-unknown')); return;
+        if (prior.accepted) { saveSupplementReceipt(item.requestId, 'accepted', null, dispatchReceipt(prior)); continue; }
+        saveSupplementReceipt(item.requestId, prior.state === 'failed' ? 'blocked' : 'unknown',
+          prior.error?.code ?? (prior.state === 'failed' ? 'send-failed' : 'acceptance-unknown'), dispatchReceipt(prior));
+        return;
       }
       const priorAnswer = (record.task.answers ?? []).find(answer => answer.answerId === item.requestId);
       if (priorAnswer && sealed) {
-        store.setSupplement(item.requestId, priorAnswer.questionIds ? 'accepted' : 'unknown', priorAnswer.questionIds ? null : 'answer-confirmation-unknown');
+        saveSupplementReceipt(item.requestId, priorAnswer.questionIds ? 'accepted' : 'unknown',
+          priorAnswer.questionIds ? null : 'answer-confirmation-unknown',
+          { delivery: priorAnswer.questionIds ? 'answer-pending' : 'unknown' });
         if (!priorAnswer.questionIds) return;
         continue;
       }
@@ -2707,41 +3289,102 @@ export function createScopedAgents(config, {
       }
       if (priorAnswer) {
         if (!priorAnswer.questionIds) await answerLocked(record, item.message, item.requestId,
-          { modelSelection: item.selection ?? null });
-        if (store.supplement(item.requestId)?.status !== 'blocked') store.setSupplement(item.requestId, 'accepted');
+          { modelSelection: item.selection ?? null, selectionExplicit: item.selectionExplicit === true,
+            created: item.created });
+        if (store.supplement(item.requestId)?.status !== 'blocked') {
+          saveSupplementReceipt(item.requestId, 'accepted', null,
+            { delivery: priorAnswer.nativeAnswered ? 'answered' : 'answer-pending', mode: 'steer' });
+        }
         if (!priorAnswer.dispatched) return;
         continue;
       }
-      const view = await observe(record);
-      if ((view.reports ?? []).some(report => report.final)) { store.blockQueued(record.agentId, record.task.taskId, 'final-submitted'); store.setSupplement(item.requestId, 'blocked', 'final-submitted'); return; }
-      if (dispatchExpired(item.created)) {
-        if (roundMovedOn(record)) throw dispatchRefused();
-        expireInput(record, undefined, item);
-        saveDispatch(record);
+      const scheduled = await loadView();
+      if ((scheduled.reports ?? []).some(report => report.final)) {
+        store.blockQueued(record.agentId, record.task.taskId, 'final-submitted');
+        store.setSupplement(item.requestId, 'blocked', 'final-submitted'); return;
+      }
+      const mode = item.mode === 'queue' ? 'queue' : 'steer';
+      const pendingQuestion = (scheduled.questions ?? []).some(question => question.state === 'pending');
+      if (pendingQuestion && mode !== 'queue') {
+        // An ordinary input to a waiting helper is its answer; explicit queue never is.
+        store.setSupplement(item.requestId, 'sending');
+        await answerLocked(record, item.message, item.requestId,
+          { modelSelection: item.selection ?? null, selectionExplicit: item.selectionExplicit === true,
+            created: item.created });
+        if (store.supplement(item.requestId)?.status !== 'blocked') {
+          const answer = (record.task.answers ?? []).find(entry => entry.answerId === item.requestId);
+          saveSupplementReceipt(item.requestId, 'accepted', null,
+            { delivery: answer?.nativeAnswered ? 'answered' : 'answer-pending', mode: 'steer' });
+        }
+        return;
+      }
+      if (pendingQuestion && mode === 'queue') {
+        // Explicit queue waits, and the question stays unanswered for a separate answer.
+        if (root?.running) saveSupplementReceipt(item.requestId, 'queued', null,
+          { delivery: 'after-current', afterTurnId: root.turnId, mode: 'queue' });
+        else saveSupplementReceipt(item.requestId, 'queued', null, { delivery: 'local-pending', mode: 'queue' });
         continue;
       }
-      // A headless CLI turn owns the session until it exits. Leave the input
-      // in the shared queue so the next process can resume that same session.
-      if (targetOf(record) === 'claude-cli' && view.running) return;
-      // A queued input keeps the selection frozen when it was accepted. Do not
-      // compare it with record.modelPin: that is the latest intended selection,
-      // not the model of the turn currently running, and a later pin change must
-      // not discard an earlier input. The Codex adapter checks the live thread's
-      // real model/effort and refuses an incompatible turn itself; send() rejects
-      // a new selection change while the turn is running at the entry.
-      store.setSupplement(item.requestId, 'sending');
-      if ((view.questions ?? []).some(question => question.state === 'pending')) {
-        await answerLocked(record, item.message, item.requestId, { modelSelection: item.selection ?? null });
-        if (store.supplement(item.requestId)?.status !== 'blocked') store.setSupplement(item.requestId, 'accepted');
+      if (target === 'claude-cli') {
+        // A headless CLI turn owns its session until the process exits. Every ordinary
+        // supplement waits between turns; an explicit steer was refused at the entry.
+        if (scheduled.running === true) {
+          saveSupplementReceipt(item.requestId, 'queued', null,
+            { delivery: 'after-current', mode: 'queue' });
+          return;
+        }
+        const started = await startItem(item, mode);
+        if (started?.delivery === 'new-turn') retargetWaiting(item.requestId, started.turnId);
         return;
-      } else {
-        const dispatch = await sendDispatch(record, item.message, 'supplement', [], item.requestId, view,
-          { model: item.selection, freezeModel: true });
-        store.setSupplement(item.requestId, dispatch.accepted ? 'accepted'
-          : dispatch.expired || dispatch.state === 'failed' ? 'blocked' : 'unknown',
-        dispatch.accepted ? null : dispatch.error?.code ?? (dispatch.state === 'failed' ? 'send-failed' : 'acceptance-unknown'));
-        if (!dispatch.accepted) return;
       }
+      if (target === 'dsh') {
+        if (scheduled.running === true && mode !== 'queue') {
+          await startItem(item, 'steer');
+          continue;
+        }
+        if (scheduled.running === true) {
+          saveSupplementReceipt(item.requestId, 'queued', null, { delivery: 'after-current', mode: 'queue' });
+          continue;
+        }
+        const started = await startItem(item, mode);
+        if (started?.delivery === 'new-turn') retargetWaiting(item.requestId, started.turnId);
+        return;
+      }
+      // Codex: only the root turn decides. An unreadable root leaves everything local.
+      if (!root || root.known === false) {
+        saveSupplementReceipt(item.requestId, 'queued', null, { delivery: 'local-pending', mode });
+        return;
+      }
+      if (root.running) {
+        // The write-time check uses the native catalog/wire comparison. A different
+        // selection is blocked with its own reason; an unprovable one stays local and
+        // is checked again on a later poll. Neither writes or changes the name pin.
+        if (item.selectionExplicit === true && item.selection) {
+          let status;
+          try { status = await rootSelectionMatch(record, item.selection, root); }
+          catch { status = 'unknown'; }
+          if (status === 'different') {
+            saveSupplementReceipt(item.requestId, 'blocked', 'codex-model-change-while-running',
+              { delivery: 'blocked', mode, accepted: false, queued: false });
+            continue;
+          }
+          if (status !== 'same') {
+            saveSupplementReceipt(item.requestId, 'queued', null,
+              { delivery: 'local-pending', mode, accepted: false, queued: true });
+            return;
+          }
+        }
+        if (mode === 'queue') {
+          saveSupplementReceipt(item.requestId, 'queued', null,
+            { delivery: 'after-current', afterTurnId: root.turnId, mode: 'queue' });
+          continue;
+        }
+        await startItem(item, 'steer');
+        continue;
+      }
+      const started = await startItem(item, mode);
+      if (started?.delivery === 'new-turn') retargetWaiting(item.requestId, started.turnId);
+      return;
     }
   }
 
@@ -2842,12 +3485,21 @@ export function createScopedAgents(config, {
 
   function expireInput(record, dispatch, item, outcome = 'not-sent') {
     const unconfirmed = outcome === 'unknown';
-    const createdAt = item?.created ?? (dispatch?.kind === 'task' ? record.task.startedAt : dispatch?.startedAt);
+    const createdAt = item?.created ?? (dispatch?.kind === 'task' ? record.task.startedAt
+      : dispatch?.requestedAt ?? dispatch?.startedAt);
     const reason = 'dispatch-expired';
-    if (dispatch) Object.assign(dispatch, { state: 'blocked', accepted: false, expired: reason,
+    if (dispatch) Object.assign(dispatch, { state: dispatch.kind === 'answer' ? 'unknown' : 'blocked',
+      accepted: false, expired: reason,
       nextAttemptAt: undefined, error: { code: reason, message: unconfirmed
         ? 'This input expired after six hours with no confirmed receipt. Its body is kept.'
         : 'This input expired after six hours without being sent. Its body is kept.' } });
+    if (dispatch?.kind === 'answer') {
+      for (const answer of record.task.answers ?? []) {
+        if ((dispatch.answerIds ?? []).includes(answer.answerId)) {
+          Object.assign(answer, { dispatched: true, undelivered: reason, delivery: 'unknown' });
+        }
+      }
+    }
     if (item) {
       store.setSupplement(item.requestId, 'blocked', reason);
       const answer = record.task.answers?.find(entry => entry.answerId === item.requestId);
@@ -3186,8 +3838,9 @@ export function createScopedAgents(config, {
         }
       });
     },
-    async send({ name, message, model, effort }, extra) {
+    async send({ name, message, model, effort, mode }, extra) {
       textMessage(message);
+      const requestedMode = normalizeRequestedMode(mode);
       let request = { model, effort };
       let wantsSelection = hasModelRequest(request);
       // A DSH name of an installation locked to the host default takes no selection:
@@ -3197,8 +3850,21 @@ export function createScopedAgents(config, {
       };
       const supplementStates = new Set(['running', 'awaiting_input', 'awaiting_report', 'reconnecting']);
       let enteredOperation = false;
-      const queued = (record, pin) => ({
+      // What this call means on this target when the caller did not name a mode.
+      // A headless CLI supplement is read between turns (= queue); Codex and DSH
+      // add an ordinary supplement to the live turn when one is running (= steer).
+      const effectiveMode = (record, { answer = false, start = false } = {}) => {
+        if (requestedMode) return requestedMode;
+        if (answer || start) return 'steer';
+        return targetOf(record) === 'claude-cli' ? 'queue' : 'steer';
+      };
+      const queued = (record, pin, extraReceipt = {}) => ({
         name: record.name, accepted: false, queued: true, state: record.state,
+        requestId: extraReceipt.requestId,
+        mode: extraReceipt.mode ?? 'steer',
+        delivery: extraReceipt.delivery ?? 'local-pending',
+        ...(extraReceipt.afterTurnId ? { afterTurnId: extraReceipt.afterTurnId } : {}),
+        ...(extraReceipt.turnId ? { turnId: extraReceipt.turnId } : {}),
         // The receipt reports the full ID resolved for this input, not a stale
         // display value from before the pin changed.
         actualModel: actualModelName(pin) ?? actualModelName(record.model),
@@ -3209,8 +3875,8 @@ export function createScopedAgents(config, {
         record.modelPin = { ...pin };
         store.save(record);
       };
-      const queue = async (record, pin, { usePinnedModel = false, savePin = false } = {}) => {
-        const requestId = uid('request');
+      const queue = async (record, pin, { usePinnedModel = false, savePin = false,
+        requestId = uid('request'), mode, selectionExplicit = false, afterTurnId } = {}) => {
         const previous = record.modelPin;
         if (savePin) record.modelPin = { ...pin };
         let changed;
@@ -3218,7 +3884,8 @@ export function createScopedAgents(config, {
           // With no explicit selection the SQL copies the live pin in the same
           // INSERT SELECT, so a poll's stale body cannot overwrite a newer value.
           changed = store.enqueueSupplement(record, requestId, message, pin ? { ...pin } : undefined,
-            { ...(usePinnedModel ? { usePinnedModel: true } : {}), ...(savePin ? { saveRecord: true } : {}) });
+            { ...(usePinnedModel ? { usePinnedModel: true } : {}), ...(savePin ? { saveRecord: true } : {}),
+              mode: mode ?? 'steer', selectionExplicit: selectionExplicit === true });
         } catch (error) {
           if (savePin) record.modelPin = previous;
           throw error;
@@ -3229,17 +3896,33 @@ export function createScopedAgents(config, {
         }
         await ensureWorker(store.get(record.agentId) ?? record, { wake: true });
         const current = store.get(record.agentId) ?? record;
+        // A queue that the caller can already place behind a named turn persists that
+        // route now, so the first inspect after this receipt says the same thing.
+        if (afterTurnId) saveSupplementReceipt(requestId, 'queued', null,
+          { delivery: 'after-current', afterTurnId, mode: mode ?? 'queue',
+            accepted: false, queued: true, selectionExplicit: selectionExplicit === true });
         // The INSERT SELECT may have captured a newer live pin than this caller
         // read; report the selection actually frozen on the queued row.
-        const frozen = store.supplements(record.agentId).find(item => item.requestId === requestId)?.selection;
-        return queued(current, pin ?? frozen ?? current.modelPin);
+        const frozen = (store.supplements(record.agentId) ?? []).find(item => item.requestId === requestId)?.selection;
+        return queued(current, pin ?? frozen ?? current.modelPin,
+          { requestId, mode: mode ?? 'steer', delivery: afterTurnId ? 'after-current' : 'local-pending',
+            ...(afterTurnId ? { afterTurnId } : {}) });
       };
       // The no-wait path is only for a supplement that changes no selection: the
       // INSERT SELECT itself freezes the current pin. An explicit model/effort must
       // take the ordinary 10s lock so a poll cannot save an older body over modelPin.
-      const enqueueWithoutWait = async record => {
+      const enqueueWithoutWait = async (record, { mode, afterTurnId } = {}) => {
         const fresh = store.get(record.agentId) ?? record;
-        return queue(fresh, undefined, { usePinnedModel: true });
+        return queue(fresh, undefined, { usePinnedModel: true, mode, afterTurnId });
+      };
+      const answerReceipt = async (record, requestId, pin, { selectionExplicit = false } = {}) => {
+        const result = await answerLocked(record, message, requestId,
+          { modelSelection: pin, selectionExplicit });
+        const delivery = result.error?.code === 'answer-not-delivered' ? 'blocked'
+          : result.answered !== true ? 'answer-pending'
+            : result.delivery === 'native-question' ? 'answered' : 'answer-pending';
+        return { ...result, requestId, mode: 'steer', delivery,
+          accepted: delivery === 'answered', queued: delivery === 'answer-pending' };
       };
       // Named so the busy retry below runs exactly this body against a fresh record.
       const operation = async record => {
@@ -3299,90 +3982,192 @@ export function createScopedAgents(config, {
           await requireSettledSubmissions(record);
           throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
         }
-        const existingQueued = !stoppedTask && store.supplements(record.agentId).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
-        // All rejections that must not touch the name are now past. Resolve a
-        // requested substring to its real ID first, so an unknown model still lists
-        // the catalog; only then decide whether a running Codex turn forbids a change.
-        const resolvePin = async () => {
+        const target = targetOf(record);
+        const activeTask = record.task && !stoppedTask && ACTIVE.has(record.state);
+        // An input that arrives behind an existing queue takes its place at the tail
+        // and never jumps a queued start, even when this caller could write at once.
+        const queuedAhead = () => activeTask
+          && (store.supplements(record.agentId) ?? []).some(item => item.task === record.task?.taskId && item.status !== 'blocked');
+        // Everything that must refuse before touching the name is past. A requested
+        // substring is resolved to its real ID before any busy/model decision, so an
+        // unknown model still reports the catalog.
+        const resolvePin = async (root, view) => {
           if (!wantsSelection) return dshDefaultOnly(record) ? undefined : record.modelPin;
           const pin = await resolveRequestedPin(record, request);
-          if (targetOf(record) === 'codex-desktop' && codexTurnRunning(record)
-              && (!record.modelPin || !sameModelSelection(pin, record.modelPin))) {
-            throw modelChangeRefused();
+          if (target === 'codex-desktop' && activeTask) {
+            if (!root || root.known === false) {
+              throw Object.assign(new Error('The running turn’s model and reasoning effort could not be confirmed, so this selection was not sent.'),
+                { code: 'model-selection-unconfirmed', uncertain: true, terminal: true });
+            }
+            if (root.running) await assertExplicitSelectionForRunning(record, pin, root);
           }
           return pin;
         };
-        if (existingQueued) {
-          const pin = await resolvePin();
-          // An explicit pin and its queued supplement commit in one transaction
-          // before the worker can wake; no-selection input copies the live pin.
-          return wantsSelection
-            ? queue(record, pin, { savePin: true })
-            : queue(record, undefined, { usePinnedModel: true });
-        }
-        if (record.task && !stoppedTask && ACTIVE.has(record.state)) {
-          if (targetOf(record) !== 'dsh' || !record.task.dispatches.length) {
-            const pin = await resolvePin();
-            return wantsSelection
-              ? queue(record, pin, { savePin: true })
-              : queue(record, undefined, { usePinnedModel: true });
+        if (activeTask) {
+          // Before the first write there is no native root to read yet. An ordinary
+          // supplement without a new selection is stored straight away; probing the
+          // host here would turn a normal queue write into a failed send.
+          if (target === 'codex-desktop' && !wantsSelection
+              && record.task.dispatches?.[0]?.accepted !== true) {
+            const mode = effectiveMode(record);
+            const receipt = await queue(record, undefined, { usePinnedModel: true, mode, selectionExplicit: false });
+            return supplementReceipt(record, receipt.requestId, { mode, delivery: 'local-pending' });
           }
-          // DSH can switch on its next step. Observe first, so a final report or a
-          // broken observation refuses the input before the pin is persisted.
-          await negotiateTree(record);
-          const view = await observe(record);
-          if ((view.reports ?? []).some(report => report.final)) throw new Error('The agent has already submitted its final report.');
-          const pin = await resolvePin();
-          persistPin(record, pin);
-          if ((view.questions ?? []).some(question => question.state === 'pending')) return answerLocked(record, message);
-          await sendDispatch(record, message, 'supplement', [], undefined, view);
-        } else {
-          if (record.task?.treeUnavailable === MISSING_THREAD_CODE || record.task?.expired?.unconfirmed) {
-            const view = await observe(record, { checkingRestoredProfile: true });
-            // An earlier cancellation request can no longer keep a missing task open.
-            // After the profile returns, verify that the old tree has actually stopped.
-            const settled = view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
-            if (view.running || !settled) {
-              throw Object.assign(new Error('The previous task is visible again but its task tree has not settled.'),
-                { code: 'previous-task-unsettled', retryable: true });
-            }
-          }
-          const pin = await resolvePin();
-          const snapshot = record.task ? { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
-            coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) } : undefined;
-          // finalReminder marks this task as one that may be reminded once when a turn
-          // ends without a final report. Tasks created before this rule carry no
-          // marker, so a sleeping awaiting_report from an older version stays quiet.
-          // The selected model is frozen with the task: a desktop first dispatch is
-          // delayed through the worker queue and must not read a later pin change.
-          const next = { ...record, state: 'running', observation: undefined, error: undefined,
-            nextAttemptAt: undefined, retryAttempts: 0, sleep: undefined,
-            ...(wantsSelection ? { modelPin: { ...pin } } : {}),
-            // A pin saved before the lock was turned on goes with the next task.
-            ...(dshDefaultOnly(record) ? { modelPin: undefined } : {}),
-            task: { taskId: uid('task'), message, state: 'starting', startedAt: now(), dispatches: [], answers: [],
-              modelSelection: pin ? { ...pin } : null, finalReminder: 'armed' } };
-          // A task assignment ends the previous round for good: its release attempt loses
-          // its ticket here, so the host refuses it at the point where it would unsubscribe
-          // and the new turn is free to subscribe the thread again.
-          invalidateRelease(next);
-          if (!store.replaceTask(next, record, snapshot)) {
-            const latest = store.get(record.agentId);
-            if (!latest) throw new Error('This subagent instance has already been removed.');
-            return operation(latest);
-          }
-          record = next;
-          if (targetOf(record) !== 'dsh') {
-            await ensureWorker(record, { wake: true });
-            return { ...queued(record, pin), ...(previousReport ? { previousReport } : {}) };
-          }
-          try { await beginTask(record); }
+          if (target === 'dsh') await negotiateTree(record);
+          let view;
+          try { view = await observe(record); }
           catch (error) {
-            if (error?.notSent === true) {
-              if (store.get(record.agentId)?.task?.taskId !== record.task.taskId) throw error;
-            } else {
-              record.state = 'reconnecting'; record.error = safeError(error); store.save(record);
+            if (target !== 'codex-desktop') throw error;
+            // A root observation failure is not permission to drop the input. An
+            // ordinary queue is stored first and reported local-pending; the worker
+            // will read the root when it is readable again.
+            const pin = wantsSelection ? await resolveRequestedPin(record, request)
+              : dshDefaultOnly(record) ? undefined : record.modelPin;
+            const mode = effectiveMode(record);
+            const receipt = await queue(record, pin, { ...(wantsSelection ? {} : { usePinnedModel: true }),
+              mode, selectionExplicit: wantsSelection });
+            return supplementReceipt(record, receipt.requestId, { pin, mode, delivery: 'local-pending' });
+          }
+          if ((view.reports ?? []).some(report => report.final)) throw new Error('The agent has already submitted its final report.');
+          const pendingQuestion = (view.questions ?? []).some(question => question.state === 'pending');
+          // DSH supports steering only. A native turn that ended in ask_parent still
+          // leaves a pending question: that is busy too, and explicit queue must never
+          // turn the problem into an answer or a supplement. awaiting_report without a
+          // question is idle, so both modes start a new turn there.
+          if (target === 'dsh' && requestedMode === 'queue' && (view.running === true || pendingQuestion)) {
+            return modeUnsupported(record, 'queue', ['steer']);
+          }
+          if (target === 'claude-cli') {
+            // An omitted mode or explicit steer given while a question is pending is
+            // the answer, never a queued supplement: the caller is answering.
+            if (pendingQuestion && requestedMode !== 'queue') {
+              const pin = await resolvePin(undefined, view);
+              return answerReceipt(record, uid('request'), pin, { selectionExplicit: wantsSelection });
             }
+            if (pendingQuestion && requestedMode === 'queue') {
+              const pin = await resolvePin(undefined, view);
+              const receipt = await queue(record, pin, { ...(wantsSelection ? { savePin: true } : { usePinnedModel: true }),
+                mode: 'queue', selectionExplicit: wantsSelection });
+              return supplementReceipt(record, receipt.requestId, { pin, mode: 'queue', delivery: 'local-pending' });
+            }
+            if (view.running === true && requestedMode === 'steer') {
+              return modeUnsupported(record, 'steer', ['queue']);
+            }
+            const pin = await resolvePin(undefined, view);
+            const ahead = queuedAhead();
+            // An explicit steer between turns starts now; an omitted or queue input
+            // waits for the next resume. Neither is ever reported as a steer.
+            const cliMode = requestedMode === 'steer' ? 'steer' : 'queue';
+            const receipt = await queue(record, pin, { ...(wantsSelection ? { savePin: true } : { usePinnedModel: true }),
+              mode: cliMode, selectionExplicit: wantsSelection });
+            if (!ahead) await drainSupplements(record, { view });
+            return supplementReceipt(store.get(record.agentId) ?? record, receipt.requestId,
+              { pin, mode: cliMode, delivery: 'local-pending' });
+          }
+          if (target === 'dsh') {
+            if (pendingQuestion) {
+              const pin = await resolvePin(undefined, view);
+              persistPin(record, pin);
+              return answerReceipt(record, uid('request'), pin, { selectionExplicit: wantsSelection });
+            }
+            const pin = await resolvePin(undefined, view);
+            persistPin(record, pin);
+            const ahead = queuedAhead();
+            const receipt = await queue(record, pin, { ...(wantsSelection ? { savePin: true } : { usePinnedModel: true }),
+              mode: 'steer', selectionExplicit: wantsSelection });
+            if (!ahead) await drainSupplements(record, { view });
+            return supplementReceipt(store.get(record.agentId) ?? record, receipt.requestId,
+              { pin, mode: 'steer' });
+          }
+          // Codex: only the native root turn decides current vs next turn. A read
+          // failure leaves the input local; it never guesses an idle root.
+          let root;
+          try { root = await rootTurnFor(record); }
+          catch { root = { known: false }; }
+          if (pendingQuestion && effectiveMode(record) === 'queue') {
+            const pin = await resolvePin(root, view);
+            // A running turn cannot change its selection through a queue row either.
+            // The pin is written only after a native start proves the new turn used it.
+            const receipt = await queue(record, pin, { ...(wantsSelection ? {} : { usePinnedModel: true }),
+              mode: 'queue', selectionExplicit: wantsSelection,
+              ...(root.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
+            // The return value is not the only place this route must survive: inspect
+            // reads the row later, after the caller's receipt is gone.
+            saveSupplementReceipt(receipt.requestId, 'queued', null,
+              { delivery: root.running ? 'after-current' : 'local-pending',
+                ...(root.running && root.turnId ? { afterTurnId: root.turnId } : {}),
+                mode: 'queue', accepted: false, queued: true, selectionExplicit: wantsSelection === true });
+            return supplementReceipt(record, receipt.requestId,
+              { pin, mode: 'queue', delivery: root.running ? 'after-current' : 'local-pending',
+                ...(root.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
+          }
+          if (pendingQuestion) {
+            const pin = await resolvePin(root, view);
+            return answerReceipt(record, uid('request'), pin, { selectionExplicit: wantsSelection });
+          }
+          const pin = await resolvePin(root, view);
+          const mode = effectiveMode(record);
+          const ahead = queuedAhead();
+          const receipt = await queue(record, pin, { ...(wantsSelection ? {} : { usePinnedModel: true }),
+            mode, selectionExplicit: wantsSelection,
+            ...(root.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
+          // A running root can take a steer even when earlier queue rows wait; only an
+          // idle root with rows ahead must leave the new input at the tail.
+          if (!ahead || root.running) await drainSupplements(record, { view });
+          return supplementReceipt(store.get(record.agentId) ?? record, receipt.requestId,
+            { pin, mode, delivery: root.running ? 'local-pending' : 'local-pending',
+              ...(root.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
+        }
+        // No live task: a new name/round starts normally. This is the one path where
+        // both modes mean the same thing.
+        if (record.task?.treeUnavailable === MISSING_THREAD_CODE || record.task?.expired?.unconfirmed) {
+          const view = await observe(record, { checkingRestoredProfile: true });
+          // An earlier cancellation request can no longer keep a missing task open.
+          // After the profile returns, verify that the old tree has actually stopped.
+          const settled = view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
+          if (view.running || !settled) {
+            throw Object.assign(new Error('The previous task is visible again but its task tree has not settled.'),
+              { code: 'previous-task-unsettled', retryable: true });
+          }
+        }
+        const pin = await resolvePin(undefined, undefined);
+        const snapshot = record.task ? { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
+          coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) } : undefined;
+        // finalReminder marks this task as one that may be reminded once when a turn
+        // ends without a final report. Tasks created before this rule carry no marker,
+        // so a sleeping awaiting_report from an older version stays quiet.
+        // The selected model is frozen with the task: a desktop first dispatch is
+        // delayed through the worker queue and must not read a later pin change.
+        const requestId = uid('request');
+        const next = { ...record, state: 'running', observation: undefined, error: undefined,
+          nextAttemptAt: undefined, retryAttempts: 0, sleep: undefined,
+          ...(wantsSelection ? { modelPin: { ...pin } } : {}),
+          // A pin saved before the lock was turned on goes with the next task.
+          ...(dshDefaultOnly(record) ? { modelPin: undefined } : {}),
+          task: { taskId: uid('task'), requestId, message, mode: requestedMode ?? 'steer',
+            state: 'starting', startedAt: now(), dispatches: [], answers: [],
+            modelSelection: pin ? { ...pin } : null, selectionExplicit: wantsSelection, finalReminder: 'armed' } };
+        // A task assignment ends the previous round for good: its release attempt loses
+        // its ticket here, so the host refuses it at the point where it would unsubscribe
+        // and the new turn is free to subscribe the thread again.
+        invalidateRelease(next);
+        if (!store.replaceTask(next, record, snapshot)) {
+          const latest = store.get(record.agentId);
+          if (!latest) throw new Error('This subagent instance has already been removed.');
+          return operation(latest);
+        }
+        record = next;
+        if (targetOf(record) !== 'dsh') {
+          await ensureWorker(record, { wake: true });
+          return { ...queued(record, pin, { requestId, mode: effectiveMode(record, { start: true }),
+            delivery: 'local-pending' }), ...(previousReport ? { previousReport } : {}) };
+        }
+        try { await beginTask(record); }
+        catch (error) {
+          if (error?.notSent === true) {
+            if (store.get(record.agentId)?.task?.taskId !== record.task.taskId) throw error;
+          } else {
+            record.state = 'reconnecting'; record.error = safeError(error); store.save(record);
           }
         }
         await ensureWorker(record, { wake: true });
@@ -3390,6 +4175,9 @@ export function createScopedAgents(config, {
         const dispatch = record.task.dispatches.at(-1);
         const error = current.error ?? dispatch?.error;
         return { name: current.name, accepted: dispatch?.accepted === true, state: current.state,
+          requestId, mode: effectiveMode(record, { start: true }), delivery: dispatch?.delivery,
+          ...(dispatch?.turnId ? { turnId: dispatch.turnId } : {}),
+          ...(dispatch?.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
           actualModel: actualModelName(current.model) ?? actualModelName(current.modelPin),
           ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
           ...(previousReport ? { previousReport } : {}),
@@ -3401,19 +4189,44 @@ export function createScopedAgents(config, {
         const owner = await context(extra);
         const record = requireWritableTarget(named(owner, name));
         ignoreSelectionFor(record);
+        const target = targetOf(record);
+        const activeTask = record.task && !terminalRound(record) && ACTIVE.has(record.state);
+        // Capability refusals do not wait for the name lock: they never write.
+        if (activeTask && target === 'dsh' && effectiveMode(record) === 'queue') {
+          return modeUnsupported(record, 'queue', ['steer']);
+        }
+        if (activeTask && target === 'claude-cli' && effectiveMode(record) === 'steer') {
+          let view;
+          try { view = await observe(record); } catch { view = undefined; }
+          if (view?.running === true && !(view.questions ?? []).some(question => question.state === 'pending')) {
+            return modeUnsupported(record, 'steer', ['queue']);
+          }
+        }
+        let root;
+        if (activeTask && target === 'codex-desktop') {
+          try { root = await rootTurnFor(record); }
+          catch { root = { known: false }; }
+        }
+        if (wantsSelection && activeTask && target === 'codex-desktop') {
+          const pin = await resolveRequestedPin(record, request);
+          if (!root || root.known === false) {
+            throw Object.assign(new Error('The running turn’s model and reasoning effort could not be confirmed, so this selection was not sent.'),
+              { code: 'model-selection-unconfirmed', uncertain: true, terminal: true });
+          }
+          if (root.running) {
+            await assertExplicitSelectionForRunning(record, pin, root);
+            // The same selection needs no pin write: queue it directly under the lock-
+            // free durable path. The worker will steer or start it.
+            return queue(record, pin, { mode: effectiveMode(record), selectionExplicit: true,
+              afterTurnId: root.running && root.turnId ? root.turnId : undefined });
+          }
+        }
         if (wantsSelection) {
           // Resolve first: a missing ID must report the catalog, not a busy state.
-          const pin = await resolveRequestedPin(record, request);
-          if (targetOf(record) === 'codex-desktop' && codexTurnRunning(record)) {
-            if (record.modelPin && sameModelSelection(pin, record.modelPin)) {
-              // The active turn already runs this exact pin; this is an ordinary
-              // supplement, not a selection change, so no lock or pin write is due.
-              return queue(record, pin);
-            }
-            throw modelChangeRefused();
-          }
-          // DSH, or a Codex name between turns: take the normal 10s lock so the
-          // pin is saved against the live body rather than a poll's stale snapshot.
+          await resolveRequestedPin(record, request);
+          // DSH, a CLI between turns, or a Codex name between turns: take the normal
+          // 10s lock so the pin is saved against the live body rather than a poll's
+          // stale snapshot.
           return withName(extra, name, operation);
         }
         // A poll holds this lock for one round only. A no-selection supplement keeps
@@ -3421,7 +4234,8 @@ export function createScopedAgents(config, {
         if (record.state === 'delivery_pending' || !supplementStates.has(record.state)) {
           return withName(extra, name, operation);
         }
-        return enqueueWithoutWait(record);
+        return enqueueWithoutWait(record, { mode: effectiveMode(record),
+          ...(root?.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
       }
     },
     /**
@@ -3429,15 +4243,21 @@ export function createScopedAgents(config, {
      * keeps its own application and lifetime, so a conflicting explicit value is
      * refused instead of quietly running the task on the wrong backend.
      */
-    async run({ name, message, lifetime, target, model, effort } = {}, extra) {
+    async run({ name, message, lifetime, target, model, effort, mode } = {}, extra) {
       textMessage(message);
+      const requestedMode = normalizeRequestedMode(mode);
       const owner = await context(extra);
       const wanted = normalizeTarget(target);
       const createdLifetime = lifetime ?? 'once';
       if (!['once', 'persistent'].includes(createdLifetime)) throw new Error('lifetime must be once or persistent.');
       const sent = result => ({ state: result.state, accepted: result.accepted === true,
+        ...(result.requestId ? { requestId: result.requestId } : {}),
+        ...(result.mode ? { mode: result.mode } : {}),
+        ...(result.delivery ? { delivery: result.delivery } : {}),
+        ...(result.turnId ? { turnId: result.turnId } : {}),
+        ...(result.afterTurnId ? { afterTurnId: result.afterTurnId } : {}),
         actualModel: result.actualModel ?? null,
-        ...(result.queued ? { queued: true } : {}), ...(result.retrying ? { retrying: true } : {}),
+        ...(result.queued !== undefined ? { queued: result.queued === true } : {}), ...(result.retrying ? { retrying: true } : {}),
         ...(result.callbackError ? { callbackError: result.callbackError } : {}), ...(result.error ? { error: result.error } : {}) });
       const existing = name === undefined ? undefined : store.named(owner.ownerId, assertName(name));
       if (existing) {
@@ -3450,7 +4270,7 @@ export function createScopedAgents(config, {
         const boundTarget = targetOf(existing);
         if (target !== undefined && wanted !== boundTarget) throw Object.assign(new Error(`The name “${existing.name}” is already bound to ${hostLabel(existing)}; it cannot run on ${TARGET_LABELS[wanted]}. Omit target to continue this name, or use another name.`), { code: 'target-conflict' });
         if (lifetime !== undefined && lifetime !== existing.lifetime) throw Object.assign(new Error(`The name “${existing.name}” is already a ${existing.lifetime} subagent; omit lifetime, pass ${existing.lifetime}, or use another name.`), { code: 'lifetime-conflict' });
-        const result = await service.send({ name: existing.name, message, model, effort }, extra);
+        const result = await service.send({ name: existing.name, message, model, effort, mode: requestedMode }, extra);
         return { name: existing.name, lifetime: existing.lifetime, ...(boundTarget !== 'dsh' ? { target: boundTarget } : {}), ...sent(result), reused: true };
       }
       let chosen = name === undefined ? undefined : assertName(name);
@@ -3466,7 +4286,7 @@ export function createScopedAgents(config, {
       // connected would report a delivery nobody is waiting for.
       if (created.created !== true || created.error) return created;
       try {
-        const result = await service.send({ name: chosen, message, model, effort }, extra);
+        const result = await service.send({ name: chosen, message, model, effort, mode: requestedMode }, extra);
         return { name: chosen, lifetime: createdLifetime, ...(wanted !== 'dsh' ? { target: wanted } : {}), ...sent(result), created: true };
       } catch (error) {
         // The name exists now, so a thrown send would hide the name the caller must
@@ -3572,6 +4392,7 @@ export function createScopedAgents(config, {
           }
         }
         return { ...publicResult(record), ...(rootHistory ?? {}), ...(rootError ? { error: rootError } : {}),
+          inputs: taskInputs(store, record),
           reports: { ...publicResult(record).reports, items: (record.task?.reports ?? []).map(report => ({ message: report.message, final: report.final, delivery: report.delivery.state })) },
           tree,
           inspectionIncomplete: tree.nodes.some(node => node.error !== undefined),
@@ -3868,7 +4689,7 @@ export function createScopedAgents(config, {
     },
   };
 
-  async function answerLocked(record, message, queuedAnswerId, { modelSelection } = {}) {
+  async function answerLocked(record, message, queuedAnswerId, { modelSelection, selectionExplicit = false, created } = {}) {
     if (!record.task || record.closed || record.task.cancelRequested) throw new Error('This subagent has no open task waiting for an answer.');
     // A finished round cannot be answered: its question is only information by then.
     if (terminalRound(record)) throw Object.assign(new Error('This subagent’s round has already ended, so the question is only information; the answer was not delivered.'),
@@ -3881,12 +4702,16 @@ export function createScopedAgents(config, {
     if (!existing && !(view.questions ?? []).some(question => question.state === 'pending')) throw new Error('This subagent has no unanswered question.');
     record.task.answers ??= [];
     const answer = existing ?? { answerId: queuedAnswerId ?? uid('answer'), message, dispatched: false };
+    // The six-hour clock belongs to the caller's original input, not to the later poll
+    // that happens to dispatch the continuation. Keep the supplement's enqueue time.
+    answer.created ??= created ?? now();
     // The continuation is dispatched on a later poll. Freeze the selection on the
     // answer intent now: a queued supplement carries its enqueue-time selection,
     // while a direct answer freezes the name's current pin.
     if (!Object.prototype.hasOwnProperty.call(answer, 'modelSelection')) {
       const frozen = modelSelection !== undefined ? modelSelection : record.modelPin;
       answer.modelSelection = frozen ? { ...frozen } : null;
+      answer.selectionExplicit = selectionExplicit === true;
     }
     if (!existing) record.task.answers.push(answer);
     saveDispatch(record);
@@ -3914,7 +4739,7 @@ export function createScopedAgents(config, {
     record.state = 'running'; record.task.state = 'running'; store.save(record);
     await ensureWorker(record, { wake: true });
     return { name: record.name, answered: true, state: 'resuming',
-      ...(answer.nativeAnswered ? { delivery: 'native-question' } : answer.nativeFallback ? { delivery: 'continuation-queued' } : {}),
+      ...(answer.nativeAnswered ? { delivery: 'native-question', ...(answer.turnId ? { turnId: answer.turnId } : {}) } : answer.nativeFallback ? { delivery: 'continuation-queued' } : {}),
       actualModel: actualModelName(answer.modelSelection) ?? actualModelName(record.model) };
   }
   return service;

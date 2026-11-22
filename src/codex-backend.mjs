@@ -4,7 +4,7 @@ import { isCodexReadRetryable, isCodexRpcUnavailable, isCodexThreadMissing } fro
 import { CODEX_ASK_PARENT_INSTRUCTION, presentedNativeQuestion } from './report-contract.mjs';
 
 const METHODS = ['probe', 'create', 'beginTask', 'observe', 'history', 'answer', 'deliver', 'receipt',
-  'turn', 'models', 'model', 'selectModel', 'cancel', 'destroy', 'cursor'];
+  'rootTurn', 'matchRootSelection', 'turn', 'models', 'model', 'selectModel', 'cancel', 'destroy', 'cursor'];
 const MAX_TITLE_ATTEMPTS = 5;
 const FIRST_DISPATCH_GRACE_MS = 2 * 60 * 1000;
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
@@ -436,17 +436,134 @@ export async function createCodexBackend(record, deps = {}) {
     value.projections = observed.projections;
     value.tree = observed.tree;
     for (const [id, delivery] of Object.entries(value.projections[value.binding.sessionId]?.deliveries ?? {})) {
-      if (value.requests[id]) Object.assign(value.requests[id], { status: 'accepted', turnId: delivery.turnId, deliverySeq: delivery.seq });
+      const request = value.requests[id];
+      if (!request || request.status !== 'accepted') continue;
+      // The projection is observation, not recovery: an unknown write with a
+      // write-ahead intent is settled only by the strict read-only reconciliation.
+      // A body reference can no longer become a delivery because projectCodexTurns
+      // now requires the exact final-line marker.
+      request.deliverySeq = delivery.seq;
+      if (!request.turnId) request.turnId = delivery.turnId;
+      if (request.route === 'accepted-route-unknown') {
+        // The same criteria as reconcile: a start needs the exact marker as the
+        // first user input of a turn different from the recorded prior turn; a
+        // steer needs the expected turn and a non-first input. A planned start is
+        // never evidence by itself.
+        const intended = request.intent ?? request.native ?? {};
+        const method = intended.method;
+        if (method === 'turn/start' && delivery.firstUser === true
+            && intended.priorTurnId !== undefined && delivery.turnId !== intended.priorTurnId) {
+          request.route = 'new-turn';
+          request.turnId = delivery.turnId;
+          request.native = { ...(request.native ?? {}), method, turnId: delivery.turnId, strengthened: true };
+        } else if (method === 'turn/steer' && delivery.firstUser === false
+            && typeof intended.expectedTurnId === 'string' && delivery.turnId === intended.expectedTurnId) {
+          request.route = 'current-turn';
+          request.turnId = delivery.turnId;
+          request.native = { ...(request.native ?? {}), method, turnId: delivery.turnId, strengthened: true };
+        }
+      }
     }
     await applyPendingTitle(value);
     save(value);
     return { value, ...observed };
   }
   function projection(value) { return value.projections[value.binding?.sessionId] ?? emptyProjection(); }
+  /**
+   * One request's public receipt. `delivery` is the route the native write took
+   * (`current-turn` / `new-turn` / `after-current` / `accepted-route-unknown`);
+   * the stored wire selection stays on `request.delivery` for old readers.
+   */
   function receiptFrom(value, id) {
     const request = value.requests[id];
-    return request && { status: request.status, afterSeq: request.afterSeq,
-      ...(request.status === 'accepted' ? { result: { accepted: true, requestId: id } } : {}) };
+    if (!request) return undefined;
+    return {
+      accepted: request.status === 'accepted',
+      status: request.status,
+      ...(Number.isSafeInteger(request.afterSeq) ? { afterSeq: request.afterSeq } : {}),
+      ...(request.route ? { delivery: request.route } : {}),
+      ...(request.turnId ? { turnId: request.turnId } : {}),
+      ...(request.afterTurnId ? { afterTurnId: request.afterTurnId } : {}),
+      ...(request.mode ? { mode: request.mode } : {}),
+      ...(request.intent ? { intent: request.intent } : {}),
+      ...(request.native ? { native: request.native } : {}),
+      ...(request.reschedule ? { reschedule: request.reschedule } : {}),
+      ...(request.status === 'accepted' ? { result: { accepted: true, requestId: id } } : {}),
+    };
+  }
+  /** Request ids the shared task record independently proves are first dispatches. */
+  const taskStartIds = () => new Set((load().task?.dispatches ?? [])
+    .filter(dispatch => dispatch?.kind === 'task' && dispatch.accepted === true
+      && typeof dispatch.turnId === 'string' && dispatch.model)
+    .map(dispatch => dispatch.requestId));
+  /** Accepted turn/start evidence, keyed by the native turn it started. A steer's
+   * frozen pin is never evidence of how that turn was started, even when the steer
+   * shares the turn id; only a recorded start, a legacy task row, or a task dispatch
+   * the shared layer marked as the first dispatch counts. */
+  const knownSelectionsFor = value => {
+    const taskStarts = taskStartIds();
+    return Object.values(value.requests ?? {})
+      .filter(request => request?.status === 'accepted' && typeof request.turnId === 'string'
+        && typeof request.delivery?.model === 'string'
+        && (request.route === 'new-turn' || request.kind === 'task'
+          || taskStarts.has(request.requestId)))
+      .map(request => ({ turnId: request.turnId, model: request.delivery.model,
+        ...(request.delivery.effort ? { reasoningEffort: request.delivery.effort } : {}) }));
+  };
+  /**
+   * A process can die after the native write and before its receipt is saved. Recovery
+   * only reads the bound thread's own user inputs and never sends the message again.
+   * A marker proves receipt; the write-ahead intent decides the route, and a route it
+   * cannot prove stays explicitly unknown.
+   */
+  async function reconcileRequest(value, request) {
+    if (!request || !['unknown', 'sending'].includes(request.status)) return request;
+    if (!value.binding || typeof host.findDispatchInput !== 'function') return request;
+    let evidence;
+    try {
+      evidence = await host.findDispatchInput({ nativeSessionId: value.binding.sessionId, marker: request.marker });
+    } catch {
+      return request;
+    }
+    if (evidence?.status === 'not-found') {
+      request.reconcile = { at: new Date().toISOString(), result: 'not-found' };
+      save(value);
+      return request;
+    }
+    if (evidence?.status === 'ambiguous') {
+      Object.assign(request, { status: 'accepted', route: 'accepted-route-unknown',
+        native: { method: request.intent?.method ?? null, ambiguous: true, at: new Date().toISOString() } });
+      save(value);
+      return request;
+    }
+    if (evidence?.status !== 'found') return request;
+    if (!request.intent) {
+      // A legacy unknown has no write-ahead intent. The exact marker in this
+      // request's own native user input proves it was written, but nothing can
+      // prove which method took it. Accept the fact and leave the route unknown;
+      // never reverse-infer steer/start and never replay.
+      Object.assign(request, {
+        status: 'accepted', route: 'accepted-route-unknown', turnId: evidence.turnId,
+        native: { method: null, turnId: evidence.turnId, recovered: true, legacy: true,
+          at: new Date().toISOString() },
+      });
+      save(value);
+      return request;
+    }
+    const route = request.intent.method === 'turn/steer' && evidence.turnId === request.intent.expectedTurnId
+      ? 'current-turn'
+      : request.intent.method === 'turn/start' && evidence.firstUser === true
+        && evidence.turnId !== request.intent.priorTurnId
+        ? 'new-turn' : 'accepted-route-unknown';
+    Object.assign(request, {
+      status: 'accepted',
+      route,
+      ...(route === 'accepted-route-unknown' ? {} : { turnId: evidence.turnId }),
+      native: { method: request.intent.method, turnId: evidence.turnId, recovered: true,
+        at: new Date().toISOString() },
+    });
+    save(value);
+    return request;
   }
   const ownedIds = value => value.tree?.nodes?.map(node => node.sessionId) ?? (value.binding ? [value.binding.sessionId] : []);
   async function reportState(value) {
@@ -537,33 +654,62 @@ export async function createCodexBackend(record, deps = {}) {
       (value.answers ??= {})[answerId] = result; save(value);
       return result;
     },
-    async deliver({ requestId, message, kind, model: dispatchModel, explicitModel = false, writeBlockReason }) {
+    async deliver({ requestId, message, kind, mode, selectionExplicit, model: dispatchModel,
+      explicitModel, allowStart = true, writeBlockReason }) {
       // The shared layer's fence for this call. Absent means the caller never gated its
       // dispatch, and then nothing here may behave differently.
       const asksWrite = fenceOf(writeBlockReason);
       if (!requestId || typeof message !== 'string' || !message.trim()) throw fail('invalid-dispatch', 'A request id and message are required.');
+      if (mode !== undefined && !['steer', 'queue'].includes(mode)) {
+        throw fail('invalid-mode', 'mode must be steer or queue; no name, record or native write was touched.',
+          { terminal: true });
+      }
       await reportsReady();
       let value = await recover(state());
       const hash = createHash('sha256').update(message).digest('hex');
-      const prior = value.requests[requestId];
+      let prior = value.requests[requestId];
       if (prior && prior.messageHash !== hash) throw fail('request-id-conflict', 'This request id already belongs to another message.');
-      if (prior && prior.status !== 'retryable') return { accepted: prior.status === 'accepted', status: prior.status, afterSeq: prior.afterSeq };
-      // A selection and its resolved wire values are frozen together with the
-      // request. Recovery must not re-resolve a catalog id to a different slug;
-      // a name without a pin never falls back to a deploy-time default either.
-      // A 0.5.13 request may carry `model` even though it was never explicit:
-      // that historical display value is ignored and the turn inherits.
-      const explicit = prior ? prior.explicitModel === true : explicitModel === true;
-      const frozenSelection = explicit
-        ? (prior?.model
-          ?? (explicitModel === true ? dispatchModel : undefined)
-          ?? load().task?.dispatches?.find(item => item.requestId === requestId && item.explicitModel === true)?.model
-          ?? value.selectedModels?.[`${requestId}-model`])
-        : undefined;
-      // A retry may omit the flag and still reuses its frozen selection; adding a
-      // selection to a request that was first written without one is a conflict.
-      if (prior && prior.explicitModel !== true && explicitModel === true) {
+      // A lost RPC reply or a process exit before the receipt is persisted is verified
+      // read-only against the bound thread. It is never sent again.
+      if (prior && ['unknown', 'sending'].includes(prior.status)) {
+        prior = await reconcileRequest(value, prior);
+        if (['accepted', 'unknown', 'sending'].includes(prior.status)) return receiptFrom(value, requestId);
+      }
+      if (prior && ['accepted', 'rejected', 'failed'].includes(prior.status)) {
+        return receiptFrom(value, requestId);
+      }
+      // The tri-state selection intent:
+      //   true      - this call explicitly selects; an active turn must prove it;
+      //   false     - this call made no selection; a frozen pin is for the next turn;
+      //   undefined - a legacy call/record. With an old frozen selection, an active
+      //               turn must prove that selection or nothing is written.
+      const priorExplicit = prior?.explicitModel === true;
+      const explicitNow = selectionExplicit !== undefined ? selectionExplicit === true
+        : (explicitModel === true || priorExplicit);
+      if (prior && !priorExplicit && selectionExplicit === true) {
         throw fail('request-id-conflict', 'This request id was already recorded without a model selection.');
+      }
+      if (prior && !priorExplicit && dispatchModel !== undefined && selectionExplicit === undefined) {
+        throw fail('request-id-conflict', 'This request id was already recorded without a model selection.');
+      }
+      let frozenSelection;
+      if (explicitNow) {
+        frozenSelection = prior?.model
+          ?? dispatchModel
+          ?? load().task?.dispatches?.find(item => item.requestId === requestId && item.explicitModel === true)?.model
+          ?? value.selectedModels?.[`${requestId}-model`];
+      } else if (selectionExplicit === false) {
+        // A queue row freezes the pin it was accepted with, even when the caller did
+        // not select it. It is used only if this input later starts a new turn.
+        frozenSelection = prior?.model ?? dispatchModel;
+      } else {
+        // Legacy: an old explicit selection must be verified on an active turn; a
+        // 0.5.13 display-only model without the flag is ignored and the turn inherits.
+        frozenSelection = priorExplicit ? prior?.model
+          : (prior ? undefined : dispatchModel);
+      }
+      if (explicitNow && !frozenSelection?.model) {
+        throw fail('model-required', 'An explicit Codex model selection requires a model id; no turn was started.', { terminal: true });
       }
       if (explicitModel === true && dispatchModel !== undefined && frozenSelection
           && (dispatchModel.model !== frozenSelection.model
@@ -571,19 +717,10 @@ export async function createCodexBackend(record, deps = {}) {
             || (dispatchModel.provider ?? undefined) !== (frozenSelection.provider ?? undefined))) {
         throw fail('request-id-conflict', 'This request id already belongs to another model selection.');
       }
-      if (explicit && !frozenSelection?.model) {
-        throw fail('model-required', 'An explicit Codex model selection requires a model id; no turn was started.', { terminal: true });
-      }
-      if (!explicit && dispatchModel !== undefined) {
-        throw fail('invalid-dispatch',
-          'A model selection was supplied without explicitModel:true. Refusing to start a turn that would silently drop it.',
-          { terminal: true });
-      }
-      // Resolve only when this is the first attempt that carries a selection.
-      // The result is stored beside the request so every later receipt/retry
-      // reuses the same native slug and effort.
+      // Resolve only when this request carries a frozen selection and has no resolved
+      // wire value yet. Every retry reuses the same native slug and effort.
       let delivery = prior?.delivery;
-      if (explicit && !delivery) {
+      if (frozenSelection?.model && !delivery) {
         try {
           delivery = await host.resolveModelDelivery({ selection: frozenSelection, workspace: load().workspace });
         } catch (error) {
@@ -607,13 +744,47 @@ export async function createCodexBackend(record, deps = {}) {
           'The selected model could not be mapped to a native Codex model slug.', { terminal: true });
       }
       value.nonce ??= randomUUID();
-      const marker = markerLine(requestId, value.nonce);
-      const request = { requestId, marker, messageHash: hash, taskId: load().task?.taskId,
-        startedAt: new Date().toISOString(), afterSeq: projection(value).seq, status: 'retryable', attempted: false,
-        ...(explicit ? { model: { ...frozenSelection }, explicitModel: true,
-          delivery: { model: delivery.model, ...(delivery.effort ? { effort: delivery.effort } : {}) } }
-          : { explicitModel: false }) };
-      value.requests[requestId] = request; save(value);
+      if (!prior) {
+        prior = { requestId, marker: markerLine(requestId, value.nonce), messageHash: hash, taskId: load().task?.taskId,
+          kind: kind ?? (value.binding ? 'supplement' : 'task'),
+          startedAt: new Date().toISOString(), afterSeq: projection(value).seq, status: 'retryable', attempted: false,
+          mode: mode ?? 'steer', selectionExplicit: explicitNow,
+          ...(frozenSelection ? { model: { ...frozenSelection }, explicitModel: explicitNow,
+            ...(delivery ? { delivery: { model: delivery.model, ...(delivery.effort ? { effort: delivery.effort } : {}) } } : {}) }
+            : { explicitModel: false }) };
+        value.requests[requestId] = prior; save(value);
+      } else {
+        prior.mode = mode ?? prior.mode ?? 'steer';
+        prior.selectionExplicit = selectionExplicit === undefined ? prior.selectionExplicit : explicitNow;
+        if (frozenSelection?.model) {
+          prior.model ??= { ...frozenSelection };
+          prior.explicitModel = prior.explicitModel === true || explicitNow;
+        }
+        if (delivery?.model && !prior.delivery) {
+          prior.delivery = { model: delivery.model, ...(delivery.effort ? { effort: delivery.effort } : {}) };
+        }
+        // A 0.5.13 request may carry a model without the explicit flag; that
+        // historical display value is not a selection and must not leak into a turn.
+        if (!frozenSelection && !priorExplicit && selectionExplicit === undefined) {
+          delete prior.model; delete prior.delivery;
+        }
+        if (prior.explicitModel === undefined) prior.explicitModel = false;
+        save(value);
+      }
+      const request = prior;
+      const marker = request.marker;
+      const effectiveMode = mode ?? request.mode ?? 'steer';
+      request.mode = effectiveMode;
+      // The caller persists the intended method and target here, after the final read
+      // and immediately before the native write leaves. If the process dies after the
+      // write, recovery reads this record instead of replaying the message.
+      const onIntent = async intent => {
+        request.intent = { ...intent, at: new Date().toISOString() };
+        request.attempted = true;
+        request.status = 'unknown';
+        save(value);
+      };
+      let waiting = false;
       await locked(async () => {
         // The shared layer may fence this dispatch against a round that has already
         // ended, and the host lock can have queued for a while: nothing is attempted
@@ -624,7 +795,11 @@ export async function createCodexBackend(record, deps = {}) {
           throw fail(refused, 'The round ended before this input was written; nothing was sent.',
             { terminal: true, notSent: true });
         }
-        request.attempted = true; request.status = 'unknown'; save(value);
+        if (!value.binding) {
+          // The first dispatch writes its attempt before thread/start, so a round that
+          // ends while the page is being opened is still fenced before any thread.
+          request.attempted = true; request.status = 'unknown'; save(value);
+        }
         // A thread this name already asked the desktop to release can still read as
         // idle while no subscription is left. The first real write after that has to
         // put the subscription back; a brand-new thread never does, and with the switch
@@ -637,18 +812,26 @@ export async function createCodexBackend(record, deps = {}) {
           const taskMessage = !value.binding || kind === 'task'
             ? `${message}\n\n${CODEX_ASK_PARENT_INSTRUCTION}` : message;
           if (!value.binding) {
-            // The attempt record was just written; a new thread is not even created for
-            // a round that ended in that step.
+            if (allowStart === false) {
+              Object.assign(request, { status: 'retryable', route: 'local-pending', attempted: false,
+                reschedule: { reason: 'queue-head-pending', notSent: true, afterTurnId: null,
+                  at: new Date().toISOString() } });
+              save(value);
+              waiting = true;
+              return;
+            }
+            // The attempt record is written; a new thread is not even created for a
+            // round that ended in that step.
             const late = asksWrite?.();
             if (late) {
               request.status = 'rejected'; request.refused = late; save(value);
               throw fail(late, 'The round ended before this input was written; no thread was created.',
                 { terminal: true, notSent: true });
             }
-            // With no explicit selection no model, reasoning effort or permission
-            // field is passed: the new thread inherits every one of them from the
-            // user's defaults. The caller's task stays first; the marker moves to
-            // the last line so the user sees the original request at the top.
+            // With no selection no model, reasoning effort or permission field is
+            // passed: the new thread inherits every one of them from the user's
+            // defaults. The caller's task stays first; the marker moves to the last
+            // line so the user sees the original request at the top.
             const first = await host.createFirstTurn({ workspace: load().workspace, title: load().name,
               requestId, message: `${taskMessage}\n\nYou are FutureAide managed helper ${JSON.stringify(load().name)}. `
                 + 'Deliver the final result with '
@@ -657,6 +840,7 @@ export async function createCodexBackend(record, deps = {}) {
               // The thread/start inside this call takes time; the shared fence is asked
               // once more between creating the thread and starting its first turn.
               ...(asksWrite ? { blockReason: asksWrite } : {}),
+              onIntent,
               ...(request.delivery ? { model: request.delivery.model,
                 effort: request.delivery.effort } : {}) });
             turnId = first?.turnId;
@@ -666,25 +850,62 @@ export async function createCodexBackend(record, deps = {}) {
               value.pendingTitle ??= { name: load().name, attempts: 0 };
               save(value);
             }
+            if (acceptedWrite) {
+              Object.assign(request, { status: 'accepted', turnId, route: 'new-turn',
+                native: { method: 'turn/start', turnId, priorTurnId: null, at: new Date().toISOString() } });
+              save(value);
+            }
           } else {
             const sent = await host.send({ nativeSessionId: value.binding.sessionId, message: `${taskMessage}\n\n${marker}`, requestId,
+              mode: effectiveMode,
               ...(resubscribe ? { resubscribe: true } : {}),
               // The thread read and its resume come first; the fence is asked again
               // right before the turn would actually be written.
               ...(asksWrite ? { blockReason: asksWrite } : {}),
-              ...(request.delivery ? { model: request.delivery.model,
-                effort: request.delivery.effort } : {}) });
-            turnId = sent?.turnId;
+              ...(request.delivery ? { selection: { model: request.delivery.model,
+                ...(request.delivery.effort ? { reasoningEffort: request.delivery.effort } : {}) } }
+                : (dispatchModel === undefined ? {} : { selection: dispatchModel })),
+              selectionExplicit: explicitNow ? true : (selectionExplicit === false ? false : undefined),
+              ...(selectionExplicit === undefined && request.model?.model && !explicitNow ? { legacySelection: true } : {}),
+              knownSelections: knownSelectionsFor(value),
+              ...(allowStart === false ? { allowStart: false } : {}),
+              onIntent });
+            if (sent?.waiting === true) {
+              // Queue met an active root turn: durable "after A", no native write.
+              Object.assign(request, { status: 'waiting', route: 'after-current',
+                afterTurnId: sent.afterTurnId, attempted: false });
+              save(value);
+              waiting = true;
+              return;
+            }
+            if (sent?.reschedule === true) {
+              // A native rejection proved the write never happened. If an active
+              // root turn is now visible, wait behind it (`after-current`); if the
+              // root is idle, another queued input or answer may be ahead, so hand
+              // the item back to the shared FIFO as local-pending.
+              const route = sent.delivery === 'after-current' ? 'after-current' : 'local-pending';
+              Object.assign(request, { status: route === 'after-current' ? 'waiting' : 'retryable',
+                route, attempted: false,
+                ...(sent.afterTurnId ? { afterTurnId: sent.afterTurnId } : {}),
+                reschedule: { reason: sent.reason ?? 'steer-turn-ended',
+                  notSent: true, afterTurnId: sent.afterTurnId ?? null, at: new Date().toISOString() } });
+              if (request.intent) request.intent = { ...request.intent, outcome: 'not-sent' };
+              save(value);
+              waiting = true;
+              return;
+            }
+            turnId = sent?.turnId ?? sent?.turn?.id;
             acceptedWrite = sent?.sent === true || Boolean(turnId);
-          }
-          // turn/start and turn/steer returning success is already acceptance. A
-          // later summary page that omits a steer message must not downgrade it.
-          if (acceptedWrite) {
-            Object.assign(request, { status: 'accepted', ...(turnId ? { turnId } : {}) });
-            // The subscription is back on this thread, so the next release asks again
-            // instead of trusting the previous answer.
-            if (resubscribe) await markResubscribed(value.binding.sessionId, request.taskId ?? load().task?.taskId);
-            save(value);
+            if (acceptedWrite) {
+              Object.assign(request, { status: 'accepted', ...(turnId ? { turnId } : {}),
+                route: sent?.delivery ?? 'accepted-route-unknown',
+                native: { method: sent?.method ?? null, turnId,
+                  ...(sent?.priorTurnId !== undefined ? { priorTurnId: sent.priorTurnId }
+                    : request.intent?.priorTurnId !== undefined ? { priorTurnId: request.intent.priorTurnId } : {}),
+                  at: new Date().toISOString() } });
+              if (resubscribe) await markResubscribed(value.binding.sessionId, request.taskId ?? load().task?.taskId);
+              save(value);
+            }
           }
         } catch (error) {
           if (error.nativeSessionId) {
@@ -692,13 +913,13 @@ export async function createCodexBackend(record, deps = {}) {
             value.pendingTitle ??= { name: load().name, attempts: 0 };
             save(value);
           }
-          // A terminal refusal happened before the native write (an ended round, or a
-          // model change requested on a running turn). It is not an unknown write and
-          // must not be retried; a refused fence is recorded as a rejection, so every
-          // "definitely not written" outcome reads the same way.
+          // A terminal refusal happened before the native write (an ended round, a
+          // model change, or a selection that could not be proven). It is not an
+          // unknown write and must not be retried.
           if (error.terminal === true) {
             request.status = error.notSent === true ? 'rejected' : 'failed';
             if (error.notSent === true) request.refused = error.code; else delete request.refused;
+            if (request.intent) request.intent = { ...request.intent, outcome: 'not-sent' };
             save(value);
             throw fail(error.code ?? 'codex-delivery-refused', error.message,
               { terminal: true, ...(error.notSent === true ? { notSent: true } : {}) });
@@ -706,31 +927,120 @@ export async function createCodexBackend(record, deps = {}) {
           // No debug port means the write never reached Codex, so this is a
           // retryable transport failure rather than an unknown write outcome.
           if (isCodexRpcUnavailable(error)) {
-            request.attempted = false; request.status = 'retryable'; save(value);
+            request.attempted = false; request.status = 'retryable'; delete request.intent; save(value);
             throw fail(error.code, error.message, { retryableRead: true });
           }
+          // A read-only failure before the write-ahead intent leaves nothing sent; a
+          // failure after it is an unknown write and is never replayed. A first
+          // dispatch whose thread/start may have left the page is also unknown.
+          if (!request.intent) {
+            // A read that never reached a write (thread/read, turns/list, a cold
+            // resume) is local-pending: the same request id may be attempted again.
+            // Only a write that might have left but has no intent is unknown/failed.
+            const retryableRead = error.retryableRead === true || isCodexReadRetryable(error);
+            if (retryableRead) {
+              request.status = 'retryable'; request.attempted = false;
+            } else if (request.attempted === true) {
+              request.status = 'unknown';
+            } else {
+              request.status = 'failed';
+            }
+            save(value);
+            throw fail(error.code ?? 'codex-delivery-unconfirmed', error.message,
+              { ...(retryableRead ? { retryableRead: true } : { uncertain: true }) });
+          }
+          save(value);
           throw fail(error.code ?? 'codex-delivery-unconfirmed', error.message,
             { uncertain: true, ...(error.terminal ? { terminal: true } : {}) });
         }
       });
+      if (waiting) return receiptFrom(state(), requestId);
       try { ({ value } = await refresh()); }
       catch (error) {
         // The native turn id already proved acceptance. A later read failure is
         // an observation gap, not a reason to downgrade that accepted write.
-        if (request.status === 'accepted') return { accepted: true, status: 'accepted', afterSeq: request.afterSeq };
+        if (request.status === 'accepted') return receiptFrom(state(), requestId);
         throw fail(error.code ?? 'codex-observation-pending', error.message, { uncertain: true });
       }
-      const receipt = receiptFrom(value, requestId);
-      return { accepted: receipt.status === 'accepted', status: receipt.status, afterSeq: receipt.afterSeq };
+      return receiptFrom(state(), requestId);
     },
     async receipt({ requestId }) {
       const value = state();
-      if (!value.requests[requestId]) return undefined;
-      try { return receiptFrom((await refresh()).value, requestId); }
-      catch (error) {
-        if (value.requests[requestId].status === 'accepted') return receiptFrom(value, requestId);
+      const request = value.requests[requestId];
+      if (!request) return undefined;
+      await reconcileRequest(value, request);
+      return receiptFrom(state(), requestId);
+    },
+    /**
+     * The root thread's own turn. It never includes a native descendant and never
+     * invents a selection: when the root state cannot be read, the typed error is
+     * `codex-root-turn-unconfirmed` rather than an idle answer.
+     */
+    async rootTurn() {
+      const value = state();
+      if (!value.binding) return { running: false, confirmed: true };
+      if (typeof host.rootTurn !== 'function') {
+        throw fail('codex-root-turn-unconfirmed', 'This Codex host cannot read the root turn; nothing was read.',
+          { uncertain: true });
+      }
+      try {
+        return await host.rootTurn({ nativeSessionId: value.binding.sessionId, requests: value.requests,
+          startRequestIds: taskStartIds() });
+      } catch (error) {
+        if (error.code === 'codex-empty-rollout') {
+          return { running: true, confirmed: false, reason: 'empty-rollout' };
+        }
+        throw fail('codex-root-turn-unconfirmed', error.message, { uncertain: true, cause: error.code });
+      }
+    },
+    /**
+     * Compare a caller's catalog selection with the root turn's actual wire
+     * selection. The catalog id (preset-a) is resolved to the native slug (wire-a)
+     * first; a catalog id is never compared with a wire slug. `status` is `same`,
+     * `different`, `unknown` (no proof), or `idle` (no running root turn).
+     */
+    async matchRootSelection({ selection: wanted, turnId } = {}) {
+      if (!wanted?.model) {
+        throw fail('model-required', 'An explicit model selection requires a model id; nothing was compared.',
+          { terminal: true });
+      }
+      let resolved;
+      try {
+        resolved = await host.resolveModelDelivery({ selection: wanted, workspace: load().workspace });
+      } catch (error) {
+        if (['model-required', 'model-not-found', 'effort-not-supported',
+          'codex-model-catalog-empty'].includes(error?.code)) error.terminal = true;
         throw error;
       }
+      const value = state();
+      if (!value.binding) return { status: 'idle', running: false, resolved };
+      if (typeof host.rootTurn !== 'function') {
+        return { status: 'unknown', reason: 'root-turn-unsupported', resolved };
+      }
+      let root;
+      try {
+        root = await host.rootTurn({ nativeSessionId: value.binding.sessionId, requests: value.requests,
+          startRequestIds: taskStartIds() });
+      } catch (error) {
+        return { status: 'unknown', reason: error.code ?? 'codex-root-turn-unconfirmed', resolved };
+      }
+      if (!root.running) return { status: 'idle', running: false, resolved };
+      if (turnId && root.turnId !== turnId) {
+        return { status: 'unknown', reason: 'turn-changed', running: true,
+          ...(root.turnId ? { turnId: root.turnId } : {}), resolved };
+      }
+      const actual = root.wireSelection;
+      if (!actual?.model) {
+        return { status: 'unknown', reason: 'no-wire-selection', running: true,
+          ...(root.turnId ? { turnId: root.turnId } : {}), resolved };
+      }
+      const status = actual.model !== resolved.model ? 'different'
+        : resolved.effort === undefined ? 'same'
+          : actual.reasoningEffort === undefined ? 'unknown'
+            : actual.reasoningEffort === resolved.effort ? 'same' : 'different';
+      return { status, running: true, ...(root.turnId ? { turnId: root.turnId } : {}),
+        ...(root.selectionSource ? { source: root.selectionSource } : {}),
+        resolved, actual: { ...actual } };
     },
     async turn({ requestId }) {
       const { value, tree } = await refresh(), p = projection(value), request = value.requests[requestId];

@@ -306,7 +306,10 @@ test('empty thread metadata cannot bypass the active-turn selection guard', asyn
     if (method === 'thread/turns/list') return livePage([liveTurn({ id: 'turn-active', status: 'inProgress', completedAt: null, durationMs: null })]);
     throw new Error('unexpected ' + method);
   });
+  // With no model or effort in the thread metadata there is no evidence that the
+  // running turn uses the requested selection. The new contract says so instead of
+  // presenting "cannot prove" as a proven model change.
   await assert.rejects(sendCodexTextNative('thread-1', 'change', { request: fake.request,
-    model: 'wire-b', effort: 'high' }), { code: 'codex-model-change-while-running', terminal: true });
+    model: 'wire-b', effort: 'high' }), { code: 'codex-model-selection-unconfirmed', terminal: true });
   assert.equal(fake.calls.some(call => call.method === 'turn/steer'), false);
 });

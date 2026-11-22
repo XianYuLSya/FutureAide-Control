@@ -1,11 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdir, mkdtemp } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { makeScopedServer } from '../src/mcp-server.mjs';
 import { compactList } from '../src/tool-view.mjs';
+import { createScopedAgents } from '../src/scoped-agents.mjs';
+import { RosterStore } from '../src/roster-store.mjs';
+import { ownerIdFor } from '../src/calling-context.mjs';
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const THREAD = '11111111-1111-4111-8111-111111111111';
 
 test('MCP connection restores monitor health before any tool call', async () => {
   let restored;
@@ -335,4 +342,89 @@ test('run answers an existing name normally and a creation failure as an error',
     assert.equal(failed.isError, true);
     assert.equal(JSON.parse(failed.content[0].text).error.code, 'managed-host-required');
   } finally { await close(); }
+});
+
+test('both task entries advertise the same optional mode and no other tool does', async () => {
+  const { client, close } = await connected({ async resume() {} });
+  try {
+    const tools = (await client.listTools()).tools;
+    for (const name of ['futureaide_send_agent', 'futureaide_run_agent']) {
+      const entry = tools.find(tool => tool.name === name);
+      assert.deepEqual(entry.inputSchema.properties.mode.enum, ['steer', 'queue'], name);
+      assert.ok(!entry.inputSchema.required?.includes('mode'), `${name}: mode stays optional`);
+      assert.match(entry.description, /mode-unsupported/, `${name} states the refusal`);
+      assert.match(entry.description, /supportedModes/, `${name} names the allowed modes`);
+    }
+    for (const tool of tools.filter(entry => !['futureaide_send_agent', 'futureaide_run_agent'].includes(entry.name))) {
+      assert.ok(!('mode' in (tool.inputSchema.properties ?? {})), `${tool.name} takes no mode`);
+    }
+  } finally { await close(); }
+});
+
+test('mode is forwarded unchanged by send and run and rejected before the service', async () => {
+  const calls = [];
+  const service = {
+    async resume() {},
+    async send(args) { calls.push({ tool: 'send', args }); return { name: args.name, accepted: true, mode: args.mode }; },
+    async run(args) { calls.push({ tool: 'run', args }); return { name: args.name, accepted: true, mode: args.mode, delivery: 'new-turn' }; },
+  };
+  const { client, close } = await connected(service);
+  try {
+    for (const chosen of ['steer', 'queue', undefined]) {
+      const args = { name: 'helper', message: 'go', ...(chosen === undefined ? {} : { mode: chosen }) };
+      const sent = await client.callTool({ name: 'futureaide_send_agent', arguments: args, _meta: { threadId: THREAD } });
+      assert.notEqual(sent.isError, true);
+      const ran = await client.callTool({ name: 'futureaide_run_agent', arguments: args, _meta: { threadId: THREAD } });
+      assert.notEqual(ran.isError, true);
+    }
+    assert.deepEqual(calls.map(call => call.args.mode), ['steer', 'steer', 'queue', 'queue', undefined, undefined],
+      'an omitted mode stays omitted; it is never replaced by a guessed default');
+    assert.deepEqual(calls.map(call => call.args.name), ['helper', 'helper', 'helper', 'helper', 'helper', 'helper']);
+
+    const before = calls.length;
+    for (const name of ['futureaide_send_agent', 'futureaide_run_agent']) {
+      const refused = await client.callTool({ name, arguments: { name: 'new-name', message: 'go', mode: 'later' }, _meta: { threadId: THREAD } });
+      assert.equal(refused.isError, true, `${name} lets the schema own the enum`);
+    }
+    assert.equal(calls.length, before, 'an invalid mode reaches neither the service nor a name record');
+  } finally { await close(); }
+});
+
+test('a supplement receipt keeps its delivery evidence and its refusal shape', async () => {
+  let response = { name: 'helper', state: 'running', accepted: true, queued: false,
+    requestId: 'request-0123456789abcdef', mode: 'steer', delivery: 'current-turn', turnId: 'turn-A' };
+  const { client, close } = await connected({ async resume() {}, async send() { return response; }, async run() { return response; } });
+  try {
+    for (const name of ['futureaide_send_agent', 'futureaide_run_agent']) {
+      const shown = await client.callTool({ name, arguments: { name: 'helper', message: 'go', mode: 'steer' } });
+      assert.notEqual(shown.isError, true);
+      assert.deepEqual(JSON.parse(shown.content[0].text), response, `${name} passes every receipt field through`);
+    }
+    response = { name: 'helper', accepted: false,
+      error: { code: 'mode-unsupported', target: 'dsh', supportedModes: ['steer'] } };
+    for (const name of ['futureaide_send_agent', 'futureaide_run_agent']) {
+      const refused = await client.callTool({ name, arguments: { name: 'helper', message: 'go', mode: 'queue' } });
+      assert.equal(refused.isError, true, `${name} reports a refused mode as an error`);
+      assert.deepEqual(JSON.parse(refused.content[0].text), response, `${name} uses the same refusal shape`);
+    }
+  } finally { await close(); }
+});
+
+test('the installed entry rejects an invalid mode before creating a name', async () => {
+  const base = path.join(root, 'clean', 'scoped-mcp-tests');
+  await mkdir(base, { recursive: true });
+  const stateDirectory = await mkdtemp(path.join(base, 'run-'));
+  const config = { stateDirectory, workspace: root, configFile: path.join(stateDirectory, 'config.json') };
+  const store = new RosterStore(':memory:');
+  const service = createScopedAgents(config, { store, startSharedMonitor: () => false });
+  const server = makeScopedServer({ configReady: Promise.resolve(config), scopedFactory: () => service });
+  const client = new Client({ name: 'scoped-test', version: '1.0.0' });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  await server.connect(b); await client.connect(a);
+  try {
+    const refused = await client.callTool({ name: 'futureaide_run_agent',
+      arguments: { name: 'ghost', message: 'go', mode: 'later' }, _meta: { threadId: THREAD } });
+    assert.equal(refused.isError, true);
+    assert.equal(store.named(ownerIdFor(THREAD), 'ghost'), undefined, 'the invalid request created no name');
+  } finally { await client.close(); await server.close(); }
 });

@@ -28,6 +28,18 @@ const submissionFromRow = row => ({ id: row.id, ownerId: row.owner, agentId: row
   delivery: row.delivery ? JSON.parse(row.delivery)
     : { id: submissionNoticeId(row.id), state: 'pending', createdAt: row.created } });
 
+// A queued input as its callers read it. mode, the explicit-selection flag and the receipt
+// are compatibility columns: a row written before they existed reads them as undefined, so
+// the old target behaviour still applies and no reader mistakes silence for a choice.
+const supplementFromRow = row => ({
+  ...row,
+  selection: row.selection ? JSON.parse(row.selection) : undefined,
+  mode: row.mode ?? undefined,
+  selectionExplicit: row.selectionExplicit === null || row.selectionExplicit === undefined ? undefined
+    : row.selectionExplicit === 1 || row.selectionExplicit === '1' || row.selectionExplicit === true,
+  receipt: row.receipt ? JSON.parse(row.receipt) : undefined,
+});
+
 // A final report seals its task, so a helper may not submit one while a question it
 // asked is still open: the parent has not answered, or the answer was accepted but has
 // not been written into the helper's conversation yet. DSH enforces this in its own
@@ -40,6 +52,8 @@ const ANSWER_UNDELIVERED = 'Your parent has answered your question and the answe
   + 'Read that answer and apply it before you submit the final report. If it has not appeared yet, end this turn without a final report; it arrives as the next message.';
 const SUPPLEMENT_UNDELIVERED = 'This final report was declined because your parent has queued more input. '
   + 'End this turn to receive the next queued message in this conversation. Read and apply it before submitting a final report.';
+const SUPPLEMENT_AFTER_FINAL = 'This task has already submitted its final report, so this input was not queued and was not sent. '
+  + 'Wait for the final report to be delivered, then start a new task.';
 
 /** One small local database serializes overlapping MCP and recovery-worker calls. */
 export class RosterStore {
@@ -79,7 +93,7 @@ export class RosterStore {
       -- reads every body. One small value, maintained on write.
       CREATE INDEX IF NOT EXISTS agents_target ON agents(json_extract(body,'$.target'));
       CREATE TABLE IF NOT EXISTS leases (key TEXT PRIMARY KEY, holder TEXT NOT NULL, expires INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL, selection TEXT);
+      CREATE TABLE IF NOT EXISTS supplements (requestId TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL, session TEXT NOT NULL, task TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, created TEXT NOT NULL, selection TEXT, mode TEXT, selectionExplicit INTEGER, receipt TEXT);
       CREATE TABLE IF NOT EXISTS backend_state (agent TEXT PRIMARY KEY, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS submissions (id TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL,
         task TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, final INTEGER NOT NULL,
@@ -103,6 +117,12 @@ export class RosterStore {
     // submissions). The body cache and the sweep ignore them; see agentChanges().
     this.quiet = 0;
     this.addTextColumn('supplements', 'selection');
+    // The request mode, whether this call explicitly chose a model, and the receipt the
+    // scheduler wrote for it. NULL on every row from an older build: the old target
+    // behaviour stands and inspect shows the fields as unknown.
+    this.addTextColumn('supplements', 'mode');
+    this.addTextColumn('supplements', 'selectionExplicit', 'INTEGER');
+    this.addTextColumn('supplements', 'receipt');
     // A roster from an older build carries neither column. Both are plain data, and NULL
     // keeps its rows valid: a row with no notice yet counts as not delivered.
     this.addTextColumn('submissions', 'consumed');
@@ -118,7 +138,7 @@ export class RosterStore {
    * Add optional data to an existing roster. NULL keeps old queue rows valid.
    * A submission needs its own delivery state only when its task no longer owns it.
    */
-  addTextColumn(table, column) {
+  addTextColumn(table, column, type = 'TEXT') {
     const exists = () => this.db.prepare('SELECT 1 FROM pragma_table_info(?) WHERE name=?').get(table, column);
     // New rosters already have the column; keep that path free of a write lock.
     if (exists()) return;
@@ -128,7 +148,7 @@ export class RosterStore {
     this.db.exec('PRAGMA busy_timeout=30000');
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      if (!exists()) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+      if (!exists()) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
       this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -444,61 +464,149 @@ export class RosterStore {
    * commits this record (for example a new explicit pin) in the same transaction:
    * a caller holding the name lock gets an all-or-nothing queue write, and the
    * worker is only woken after both the supplement and the pin are durable.
-   * The CLI may submit its final before the monitor absorbs it onto the task.
-   * Check those submissions in the same write that queues more input.
+   * `mode` is the request mode the caller asked for (steer/queue; omitted keeps the
+   * target's old behaviour), `selectionExplicit` says whether this call chose a model,
+   * and `receipt` is the first delivery receipt the scheduler already knows.
+   * A final report closes its round for new input, in both directions: the final may
+   * still be only in submissions (not absorbed onto the task yet), so that table is
+   * checked in the same write as the queue insert. The insert is one statement, so two
+   * connections ordering a supplement and a final cannot interleave.
    */
-  enqueueSupplement(record, requestId, message, selection = undefined, { usePinnedModel = false, saveRecord = false } = {}) {
+  enqueueSupplement(record, requestId, message, selection = undefined,
+    { usePinnedModel = false, saveRecord = false, mode = undefined, selectionExplicit = undefined, receipt = undefined } = {}) {
+    // Reject illegal modes before a record or a row is written.
+    if (mode !== undefined && mode !== null && !['steer', 'queue'].includes(mode)) {
+      throw Object.assign(new Error('mode must be steer or queue when it is given.'), { code: 'invalid-mode' });
+    }
+    if (receipt !== undefined && receipt !== null && (typeof receipt !== 'object' || Array.isArray(receipt))) {
+      throw Object.assign(new Error('A receipt must be a plain object.'), { code: 'invalid-receipt' });
+    }
     const body = selection === undefined ? null : JSON.stringify(selection);
-    const insert = () => this.db.prepare(`INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created,selection)
+    // A selection given to this call is the explicit choice it always was; the scheduler
+    // may state the intent directly when it knows the caller omitted it.
+    const explicit = typeof selectionExplicit === 'boolean' ? selectionExplicit : selection !== undefined;
+    const insert = () => this.db.prepare(`INSERT INTO supplements(requestId,owner,agent,session,task,message,status,created,selection,mode,selectionExplicit,receipt)
       SELECT ?,id.owner,id.id,json_extract(id.body,'$.sessionId'),json_extract(id.body,'$.task.taskId'),?,'queued',?,
-        CASE WHEN ?=1 THEN json_extract(id.body,'$.modelPin') ELSE ? END
+        CASE WHEN ?=1 THEN json_extract(id.body,'$.modelPin') ELSE ? END,?,?,?
       FROM agents AS id WHERE id.id=? AND id.owner=? AND id.name=? AND json_extract(id.body,'$.sessionId')=?
       AND json_extract(id.body,'$.task.taskId')=? AND coalesce(json_extract(id.body,'$.closed'),0)=0
       AND coalesce(json_extract(id.body,'$.task.cancelRequested'),0)=0
       AND json_extract(id.body,'$.state') IN ('running','awaiting_input','awaiting_report','reconnecting')
       AND NOT EXISTS (SELECT 1 FROM json_each(id.body,'$.task.reports') WHERE json_extract(value,'$.final')=1)
-      AND (coalesce(json_extract(id.body,'$.target'),'dsh')<>'claude-cli' OR NOT EXISTS (
-        SELECT 1 FROM submissions WHERE owner=id.owner AND agent=id.id AND task=json_extract(id.body,'$.task.taskId') AND final=1))`)
+      AND NOT EXISTS (SELECT 1 FROM submissions WHERE agent=id.id
+        AND task=json_extract(id.body,'$.task.taskId') AND final=1)`)
       .run(requestId, message, new Date().toISOString(), usePinnedModel ? 1 : 0, body,
+        mode ?? null, explicit ? 1 : 0, receipt === undefined || receipt === null ? null : JSON.stringify(receipt),
         record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
+    // Why a refused insert was refused, when the round is sealed by a final that may not
+    // have been absorbed onto the agent body yet. Every other refusal stays a plain false.
+    const sealed = () => this.db.prepare(`SELECT 1 AS found FROM agents AS id
+      WHERE id.id=? AND id.owner=? AND json_extract(id.body,'$.task.taskId') IS ?
+      AND (EXISTS (SELECT 1 FROM json_each(id.body,'$.task.reports') WHERE json_extract(value,'$.final')=1)
+        OR EXISTS (SELECT 1 FROM submissions WHERE agent=id.id
+          AND task=json_extract(id.body,'$.task.taskId') AND final=1))`)
+      .get(record.agentId, record.ownerId, record.task?.taskId ?? null) !== undefined;
+    const refuse = () => Object.assign(new Error(SUPPLEMENT_AFTER_FINAL), { code: 'final-already-submitted' });
     if (!saveRecord) {
       const changed = insert();
+      const refused = !changed && sealed();
       this.dropProjections();
+      if (refused) throw refuse();
       return changed;
     }
     this.db.exec('BEGIN IMMEDIATE');
+    let changed = false;
+    let refused = false;
     try {
       this.save(record);
-      const changed = insert();
-      if (!changed) {
+      changed = insert();
+      if (changed) this.db.exec('COMMIT');
+      else {
+        refused = sealed();
         this.db.exec('ROLLBACK');
-        this.bodies.delete(record.agentId);
-        this.dropProjections();
-        return false;
       }
-      this.db.exec('COMMIT');
-      this.dropProjections();
-      return true;
     } catch (error) {
       this.db.exec('ROLLBACK');
       this.bodies.delete(record.agentId);
       this.dropProjections();
       throw error;
     }
+    if (!changed) {
+      this.bodies.delete(record.agentId);
+      this.dropProjections();
+      if (refused) throw refuse();
+      return false;
+    }
+    this.dropProjections();
+    return true;
   }
   supplements(agentId) {
     return this.db.prepare("SELECT * FROM supplements WHERE agent=? AND status IN ('queued','sending','unknown','blocked') ORDER BY rowid")
-      .all(agentId).map(row => ({
-        ...row,
-        selection: row.selection ? JSON.parse(row.selection) : undefined,
-      }));
+      .all(agentId).map(supplementFromRow);
   }
   supplement(requestId) {
-    return typeof requestId === 'string'
-      ? this.db.prepare('SELECT requestId, agent, task, status, created FROM supplements WHERE requestId=?').get(requestId)
-      : undefined;
+    if (typeof requestId !== 'string') return undefined;
+    const row = this.db.prepare(`SELECT requestId, owner, agent, session, task, message, status, reason, created, selection, mode, selectionExplicit, receipt
+      FROM supplements WHERE requestId=?`).get(requestId);
+    return row ? supplementFromRow(row) : undefined;
   }
-  setSupplement(requestId, status, reason = null) { this.db.prepare('UPDATE supplements SET status=?,reason=? WHERE requestId=?').run(status, reason, requestId); this.dropProjections(); }
+  /**
+   * Record the next step of one input. `receipt` is merged into the receipt already on
+   * the row (RFC 7386, in one statement) so a later step adds turnId/afterTurnId without
+   * dropping what an earlier step knew. Omitted receipt leaves the stored one untouched.
+   * @returns {boolean} True when the input exists and was updated.
+   */
+  setSupplement(requestId, status, reason = null, receipt = undefined) {
+    if (typeof requestId !== 'string' || !requestId) return false;
+    let result;
+    if (receipt === undefined || receipt === null) {
+      result = this.db.prepare('UPDATE supplements SET status=?,reason=? WHERE requestId=?').run(status, reason, requestId);
+    } else {
+      if (typeof receipt !== 'object' || Array.isArray(receipt)) {
+        throw Object.assign(new Error('A receipt must be a plain object.'), { code: 'invalid-receipt' });
+      }
+      result = this.db.prepare(`UPDATE supplements SET status=?,reason=?,receipt=json_patch(coalesce(receipt,'{}'),?)
+        WHERE requestId=?`).run(status, reason, JSON.stringify(receipt), requestId);
+    }
+    this.dropProjections();
+    return result.changes === 1;
+  }
+  /**
+   * Every input this name queued for one round, accepted ones included: the work queue
+   * above hides them, while inspect must show what was written, how it was routed and
+   * why it ended. `taskId` omitted returns every round of the name. The presentation
+   * fields are derived from the stored receipt and status; a turn is never inferred from
+   * `accepted` alone — without a receipt an accepted row reports its route as unknown.
+   */
+  supplementInputs(agentId, taskId) {
+    if (typeof agentId !== 'string' || !agentId) return [];
+    const scoped = taskId !== undefined && taskId !== null && taskId !== '';
+    const rows = this.db.prepare(`SELECT * FROM supplements WHERE agent=? ${scoped ? 'AND task=?' : ''} ORDER BY rowid`)
+      .all(...(scoped ? [agentId, taskId] : [agentId]));
+    return rows.map(row => {
+      const item = supplementFromRow(row);
+      const receipt = item.receipt;
+      const accepted = typeof receipt?.accepted === 'boolean' ? receipt.accepted : item.status === 'accepted';
+      const queued = item.status === 'blocked' ? false
+        : typeof receipt?.queued === 'boolean' ? receipt.queued
+        : item.status === 'queued' || item.status === 'sending';
+      const delivery = item.status === 'blocked' ? 'blocked'
+        : typeof receipt?.delivery === 'string' && receipt.delivery ? receipt.delivery
+        : item.status === 'accepted' ? 'accepted-route-unknown'
+        : item.status === 'unknown' ? 'unknown'
+        : item.status === 'queued' || item.status === 'sending' ? 'local-pending' : 'unknown';
+      return {
+        requestId: item.requestId, owner: item.owner, agent: item.agent, session: item.session,
+        task: item.task, message: item.message, selection: item.selection,
+        mode: item.mode, selectionExplicit: item.selectionExplicit, receipt,
+        delivery, accepted, queued,
+        ...(receipt?.turnId ? { turnId: receipt.turnId } : {}),
+        ...(receipt?.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}),
+        ...(item.reason ? { reason: item.reason } : {}),
+        status: item.status, createdAt: item.created,
+      };
+    });
+  }
   blockQueued(agentId, taskId, reason) { this.db.prepare("UPDATE supplements SET status='blocked',reason=? WHERE agent=? AND task=? AND status='queued'").run(reason, agentId, taskId); this.dropProjections(); }
   supplementSummary(agentId, taskId) {
     const rows = this.db.prepare('SELECT status,count(*) AS count FROM supplements WHERE agent=? AND task=? GROUP BY status').all(agentId, taskId);
@@ -1133,14 +1241,41 @@ export class RosterStore {
         const open = this.openQuestions(record);
         if (open.unanswered) throw Object.assign(new Error(QUESTION_UNANSWERED), { code: 'question-unanswered' });
         if (open.undelivered) throw Object.assign(new Error(ANSWER_UNDELIVERED), { code: 'answer-undelivered' });
-        // A CLI turn must end before the next queued supplement can reach it. Its
-        // bound callback proves the current request arrived even if its receipt
-        // is still being recorded. This check and the final insert share the lock.
-        if (cliDispatch && this.db.prepare(`SELECT 1 FROM supplements
-          WHERE owner=? AND agent=? AND session=? AND task=? AND requestId<>?
-          AND status IN ('queued','sending','unknown') LIMIT 1`)
-          .get(record.ownerId, agentId, record.sessionId, task.taskId, cliDispatch.requestId)) {
-          throw Object.assign(new Error(SUPPLEMENT_UNDELIVERED), { code: 'supplement-undelivered' });
+        // A queued input closes this round: the helper must end this turn so the input
+        // can reach it, then submit the final. The check and the final insert share
+        // this transaction, so a supplement queued from another connection is either
+        // before this check (and declined) or after the final (and refused there).
+        if (cliDispatch) {
+          // A CLI turn proves the current request arrived through its bound callback
+          // even if its receipt is still being recorded.
+          if (this.db.prepare(`SELECT 1 FROM supplements
+            WHERE owner=? AND agent=? AND session=? AND task=? AND requestId<>?
+            AND status IN ('queued','sending','unknown') LIMIT 1`)
+            .get(record.ownerId, agentId, record.sessionId, task.taskId, cliDispatch.requestId)) {
+            throw Object.assign(new Error(SUPPLEMENT_UNDELIVERED), { code: 'supplement-undelivered' });
+          }
+        } else if (record.target === 'codex-desktop') {
+          // An input the native side already accepted is on its way into the
+          // conversation (a new turn may be reading it while the monitor still writes
+          // its receipt), so it does not hold the final. Acceptance is read from the
+          // three places it can be recorded before the receipt: the receipt itself, the
+          // dispatch for the same request id in this task, and the target's own state
+          // for that request. The last two are bound to this task/request exactly, and
+          // every other undecided input still holds the final; blocked, expired and
+          // other-round rows are settled elsewhere and must not wait here for ever.
+          if (this.db.prepare(`SELECT 1 FROM supplements AS s
+            JOIN agents AS a ON a.id=s.agent AND a.owner=s.owner
+            LEFT JOIN backend_state AS b ON b.agent=s.agent
+            WHERE s.agent=? AND s.task=? AND s.status IN ('queued','sending','unknown')
+              AND coalesce(json_extract(s.receipt,'$.accepted'),0)<>1
+              AND NOT EXISTS (SELECT 1 FROM json_each(coalesce(json_extract(a.body,'$.task.dispatches'),'[]')) AS d
+                WHERE json_extract(d.value,'$.requestId')=s.requestId AND json_extract(d.value,'$.accepted')=1)
+              AND NOT EXISTS (SELECT 1 FROM json_each(coalesce(json_extract(b.body,'$.requests'),'{}')) AS r
+                WHERE r.key=s.requestId AND json_extract(r.value,'$.status')='accepted'
+                  AND json_extract(r.value,'$.taskId')=s.task)
+            LIMIT 1`).get(agentId, task.taskId)) {
+            throw Object.assign(new Error(SUPPLEMENT_UNDELIVERED), { code: 'supplement-undelivered' });
+          }
         }
       }
       const id = 'submission-' + randomUUID().replaceAll('-', '');

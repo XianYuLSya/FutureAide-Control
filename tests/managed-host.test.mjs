@@ -215,6 +215,31 @@ test('managed feedback records bound task context and recent report failure whil
   await assert.rejects(agent.definitions.get('feedback').execute({ kind: 'problem', message: 'x' }, { agent: {} }), e => e.controlCode === 'managed-task-closed');
 });
 
+test('feedback native hooks preserve awaiting-answer and never persist feedback arguments or result', async () => {
+  const f = await fixture(), input = identity(f.workspace), configFile = path.join(f.root, 'config.json');
+  await writeFile(configFile, '{}');
+  const host = f.create(f.ctx, { feedbackNode: process.execPath, feedbackConfigFile: configFile });
+  await host.managedCreate(input); await host.managedBeginTask({ ...input, taskId: 'task-hooks' });
+  const agent = f.live.get(input.sessionId), exec = { agent, name: 'feedback', concludeTurn() {} };
+  await agent.definitions.get('ask_parent').execute({ message: '需要决定' }, exec);
+  const before = await host.managedStatus(input);
+  assert.equal(before.activity, 'awaiting-answer');
+  const secret = 'e9'.repeat(32), feedbackInput = { kind: 'problem', message: `普通文字 token=${secret}` };
+  const pre = agent.callbacks.get('tools/pre-execute')[0], resultHook = agent.callbacks.get('tools/result')[0];
+  const receipt = await pre({ ...exec, args: feedbackInput }, () => agent.definitions.get('feedback').execute(feedbackInput, exec));
+  assert.equal(receipt.saved, true);
+  resultHook({ ...exec, args: feedbackInput }, { value: { ...receipt, path: path.join(f.workspace, 'should-not-be-change'), operation: 'update', after: secret } });
+  // DSH may emit a generic session event too; that observer may persist only the cursor.
+  agent.callbacks.get('session/event')[0](agent.session, { type: 'tool/call', seq: 42, data: { args: feedbackInput, result: secret } });
+  const after = await host.managedStatus(input);
+  assert.equal(after.activity, 'awaiting-answer');
+  assert.deepEqual(after.questions, before.questions); assert.deepEqual(after.reports, before.reports);
+  assert.deepEqual(after.changes, before.changes);
+  const persisted = JSON.stringify([...f.records.values()]);
+  assert.equal(persisted.includes(secret), false); assert.equal(persisted.includes('普通文字'), false);
+  assert.equal(persisted.includes(receipt.id), false); assert.equal(persisted.includes('should-not-be-change'), false);
+});
+
 test('legacy managed bridge returns feedback unavailable without affecting reports', async () => {
   const f = await fixture(), input = identity(f.workspace), host = f.create();
   await host.managedCreate(input); await host.managedBeginTask({ ...input, taskId: 'task-a' });

@@ -521,7 +521,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         text: 'Keep routine progress in the task record. Use report_parent for agreed milestones, deliverables or issues requiring your controlling agent\'s action, and final: true when the task is complete. Use ask_parent for a decision you need. Use feedback to record plugin problems or friction.' });
     }
     binding.preExecute = async (exec, next) => {
-      if (exec.agent === agent && record.taskId && !record.closing) {
+      if (exec.agent === agent && exec.name !== 'feedback' && record.taskId && !record.closing) {
         record.activity = `tool: ${exec.name}`;
         observeWrite(record);
       }
@@ -536,7 +536,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     };
     if (fresh) agentCtx.on('tools/pre-execute', (...args) => binding.preExecute(...args));
     binding.result = (exec, result) => {
-      if (exec.agent !== agent || !record.taskId || record.closing) return;
+      if (exec.agent !== agent || exec.name === 'feedback' || !record.taskId || record.closing) return;
       if (result?.isError) {
         if (exec.name !== 'feedback' && ['ask_parent', 'report_parent', 'managed_subagent'].includes(exec.name)) {
           const code = result.value?.controlCode ?? result.value?.code ?? result.error?.controlCode ?? result.error?.code;

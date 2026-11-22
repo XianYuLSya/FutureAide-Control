@@ -8,6 +8,7 @@ import { boundedOutput, createControl, errorResult } from './control.mjs';
 import { installDesktopHostBridge, installHostBridge, maintenanceConfigPath } from './host-install.mjs';
 import { createAgents } from './agents.mjs';
 import { createPeers } from './peers.mjs';
+import { pendingFeedback, organizeFeedback, feedbackTodos } from './feedback-inbox.mjs';
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -29,11 +30,15 @@ const { values, positionals } = parseArgs({
     'from-peer-id': { type: 'string' }, 'to-peer-id': { type: 'string' }, 'exchange-id': { type: 'string' },
     'parent-exchange-id': { type: 'string' },
     'timeout-minutes': { type: 'string' },
+    id: { type: 'string' }, through: { type: 'string' }, todo: { type: 'string' },
     help: { type: 'boolean', short: 'h' },
   },
 });
 
 const usage = `futureaide-control <connect|status|sessions|read|send|wait|watch|cancel|models|notify|codex-status|profiles|profile-create|create-session|select-model|capabilities|host-install|host-status>
+  feedback-pending
+  feedback-organize --id ID --through N --todo KEY --message-file FILE
+  feedback-todos
   spawn-agent --workspace ABSOLUTE_PATH --message TEXT [--task-name NAME] [--request-id ID]
               [--project-workspace PROJECT_ROOT] [--project-name TITLE]
               [--codex-thread-id UUID]   Bind THIS agent's completion notice to that chat; omit for report-only
@@ -92,7 +97,7 @@ if (values.help || !positionals.length) {
   try {
     const command = positionals[0];
     values.config = await maintenanceConfigPath(values.config, path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
-    const control = ['profiles', 'profile-create'].includes(command) ? undefined : createControl(await loadConfig(values.config, values.profile));
+    const control = ['profiles', 'profile-create', 'feedback-pending', 'feedback-organize', 'feedback-todos'].includes(command) ? undefined : createControl(await loadConfig(values.config, values.profile));
     const sessionId = values['session-id'];
     const number = name => {
       if (values[name] === undefined) return undefined;
@@ -188,6 +193,9 @@ if (values.help || !positionals.length) {
       }
     };
     switch (command) {
+      case 'feedback-pending': result = pendingFeedback((await loadConfig(values.config)).configFile); break;
+      case 'feedback-organize': result = organizeFeedback((await loadConfig(values.config)).configFile, {id: values.id, through: number('through'), todo: values.todo, message: values['message-file'] ? await readFile(values['message-file'], 'utf8') : undefined}); break;
+      case 'feedback-todos': result = feedbackTodos((await loadConfig(values.config)).configFile); break;
       case 'register-peer': result = await (await peers()).register({ peerId: values['peer-id'], kind: values.kind, workspace: values.workspace, threadId: values['codex-thread-id'], agentId: values['agent-id'], label: values.label }); break;
       case 'list-peers': result = await (await peers()).list({ workspace: values.workspace }); break;
       case 'inbox': result = await (await peers()).inbox({ peerId: values['peer-id'], state: values.state }); break;

@@ -682,7 +682,8 @@ test('a 123-name retained roster serves HTTP during a scan without loading idle 
 });
 
 test('pre-delivery failures back off visibly, while ambiguous delivery is never sent again', async () => {
-  let beginFailures = 1, modelFailures = 1, begins = 0, models = 0, sends = 0;
+  // Fail once at collection and again when the same dispatch prepares its pending selection.
+  let beginFailures = 1, modelFailures = 2, begins = 0, models = 0, sends = 0;
   const base = fakeBackend();
   const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     beginTask: async () => { begins++; if (beginFailures-- > 0) throw Object.assign(new Error('host busy before begin'), { code: 'agent-busy' }); return { treeProtocol: 1, reportProtocol: 1 }; },
@@ -699,7 +700,7 @@ test('pre-delivery failures back off visibly, while ambiguous delivery is never 
     assert.ok(f.store.get('retry').nextAttemptAt > Date.now());
     let r = f.store.get('retry'); r.nextAttemptAt = 0; f.store.save(r);
     await f.service.poll('retry'); await f.service.poll('retry');
-    assert.equal(models, 1);
+    assert.equal(models, 2);
     r = f.store.get('retry');
     assert.equal(r.task.dispatches[0].state, 'retrying');
     const waiting = await f.service.wait({ names: ['retry'], timeoutSeconds: 1 }, extra(THREAD));

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { apply, createHostHandler, createManagedHost, CHILD_QUESTION_REFUSAL, ROOT_QUESTION_REFUSAL } from '../src/host-plugin.mjs';
+import { pendingFeedback } from '../src/feedback-inbox.mjs';
 
 // Fixtures remain in the project's clean directory. No test deletes or moves files.
 async function fixture() {
@@ -190,6 +191,34 @@ test('explicit reports persist across reload and final seals reporting', async (
   assert.equal(new Set(reports.map(item => item.id)).size, 2);
   await assert.rejects(reloaded.managedStatus({ ...input, reportProtocol: undefined }), error => error.controlCode === 'managed-report-protocol-required');
   await assert.rejects(reloaded.managedDestroy({ ...input, reportProtocol: undefined }), error => error.controlCode === 'managed-report-protocol-required');
+});
+
+test('managed feedback records bound task context and recent report failure while waiting', async () => {
+  const f = await fixture(), input = identity(f.workspace), configFile = path.join(f.root, 'config.json');
+  await writeFile(configFile, '{}');
+  const host = f.create(f.ctx, { feedbackNode: process.execPath, feedbackConfigFile: configFile, feedbackVersion: 'test-version' });
+  await host.managedCreate(input);
+  await host.managedBeginTask({ ...input, taskId: 'task-a', feedbackAgentName: '测试助手', feedbackCallerHost: 'codex' });
+  const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
+  await assert.rejects(agent.definitions.get('report_parent').execute({ message: '  ' }, exec), e => e.controlCode === 'invalid-report');
+  await agent.definitions.get('ask_parent').execute({ message: '需要决定' }, exec);
+  assert.equal(agent.guards.map(guard => guard({ agent, name: 'feedback' })).find(Boolean), undefined);
+  const receipt = await agent.definitions.get('feedback').execute({ kind: 'problem', message: '报告空白未通过' }, exec);
+  assert.equal(receipt.saved, true);
+  const [row] = pendingFeedback(configFile);
+  assert.deepEqual({ source: row.occurrences[0].source, caller: row.occurrences[0].caller, target: row.occurrences[0].target, name: row.occurrences[0].name, version: row.occurrences[0].version },
+    { source: 'dsh', caller: 'codex', target: 'dsh', name: '测试助手', version: 'test-version' });
+  assert.equal(row.occurrences[0].error.tool, 'report_parent');
+  assert.equal(row.occurrences[0].error.code, 'invalid-report');
+  await assert.rejects(agent.definitions.get('feedback').execute({ kind: 'problem', message: 'x' }, { agent: {} }), e => e.controlCode === 'managed-task-closed');
+});
+
+test('legacy managed bridge returns feedback unavailable without affecting reports', async () => {
+  const f = await fixture(), input = identity(f.workspace), host = f.create();
+  await host.managedCreate(input); await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
+  assert.deepEqual(await agent.definitions.get('feedback').execute({ kind: 'problem', message: '问题' }, exec), { saved: false, code: 'feedback-unavailable' });
+  assert.equal((await agent.definitions.get('report_parent').execute({ message: '正常报告' }, exec)).accepted, true);
 });
 
 test('a final is refused while a steer input still waits for the model’s next step', async () => {

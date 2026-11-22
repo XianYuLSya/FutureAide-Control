@@ -4,8 +4,25 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promi
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { installDesktopHostBridge } from '../src/host-install.mjs';
+import { installDesktopHostBridge, installHostBridge } from '../src/host-install.mjs';
 import { apply, inject } from '../src/host-plugin.mjs';
+
+test('both installation paths bind feedback to the installer Node and main configuration', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'dsh-feedback-install-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const profile = path.join(root, 'desktop'); await mkdir(profile);
+  await writeFile(path.join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-web-app'] } } }));
+  await writeFile(path.join(profile, 'cordis.patch.yml'), '[]\n');
+  const config = { hostBridgeFile: path.join(root, 'private', 'bridge.json'), configFile: path.join(root, 'config.json'), dataRoot: path.join(root, 'data') };
+  await installDesktopHostBridge(config, profile);
+  const patch = await readFile(path.join(profile, 'cordis.patch.yml'), 'utf8');
+  assert.ok(patch.includes(`feedbackNode: ${JSON.stringify(process.execPath)}`));
+  assert.ok(patch.includes(`feedbackConfigFile: ${JSON.stringify(config.configFile)}`));
+  const preset = await installHostBridge(config);
+  const [entry] = JSON.parse(await readFile(path.join(preset.presetDirectory, 'agent.cordis.yml'), 'utf8'));
+  assert.equal(entry.config.feedbackNode, process.execPath);
+  assert.equal(entry.config.feedbackConfigFile, config.configFile);
+});
 
 test('Desktop installation preserves unrelated patches and credentials and is idempotent', async t => {
   const root = await mkdtemp(path.join(tmpdir(), 'dsh-desktop-'));

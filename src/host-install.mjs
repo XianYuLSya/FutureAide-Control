@@ -92,8 +92,9 @@ export async function installDesktopHostBridge(config, profileDirectory, { refre
   const stateConfig = config.managedStateDirectory ? `        managedStateDirectory: ${JSON.stringify(config.managedStateDirectory)}\n` : '';
   // The bridge enforces the same lock as the plugin, for callers still on an older one.
   const policyConfig = config.dshDefaultModelOnly === true ? '        defaultModelOnly: true\n' : '';
-  const registration = createHash('sha256').update(JSON.stringify(stateConfig ? [module.href, credentialFile, discoveryConfig, stateConfig] : [module.href, credentialFile, discoveryConfig])).digest('hex').slice(0, 16);
-  const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${registration}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${stateConfig}${discoveryConfig}${policyConfig}${end}\n`;
+  const feedbackConfig = path.isAbsolute(config.configFile || '') ? `        feedbackNode: ${JSON.stringify(process.execPath)}\n        feedbackConfigFile: ${JSON.stringify(config.configFile)}\n` : '';
+  const registration = createHash('sha256').update(JSON.stringify([module.href, credentialFile, discoveryConfig, stateConfig, feedbackConfig])).digest('hex').slice(0, 16);
+  const patch = `${begin}\n- insert:\n    - id: codex-control-host-bridge-${registration}\n      name: ${JSON.stringify(module.href)}\n      config:\n        credentialFile: ${JSON.stringify(credentialFile)}\n${stateConfig}${discoveryConfig}${policyConfig}${feedbackConfig}${end}\n`;
   const content = before.trimEnd() + '\n' + patch;
   if (content !== original) {
     const backup = path.join(path.dirname(credentialFile), 'rollback', `desktop-bridge-${Date.now()}`);
@@ -136,6 +137,6 @@ export async function installHostBridge(config) {
   const revision = await hostBridgeRevision();
   await writeFile(marker, JSON.stringify({ owner: 'futureaide-control', version: 1 }) + '\n');
   await writeFile(path.join(root, 'preset.yml'), 'name: Codex Control Bridge\ndescription: Local control transport bootstrap. No model prompt is submitted.\norder: 999\n');
-  await writeFile(path.join(root, 'agent.cordis.yml'), JSON.stringify([{ id: 'codex-control-host', name: pathToFileURL(plugin).href + '?v=' + revision, config: { credentialFile } }], null, 2) + '\n');
+  await writeFile(path.join(root, 'agent.cordis.yml'), JSON.stringify([{ id: 'codex-control-host', name: pathToFileURL(plugin).href + '?v=' + revision, config: { credentialFile, ...(path.isAbsolute(config.configFile || '') ? { feedbackNode: process.execPath, feedbackConfigFile: config.configFile } : {}) } }], null, 2) + '\n');
   return { installed: true, preset: HOST_PRESET, presetDirectory: root, revision, requiresBootstrapSession: true };
 }

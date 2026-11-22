@@ -1,6 +1,26 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+function writeFeedback(node, configFile, input, context, deadline) {
+  if (Date.now() >= deadline) return Promise.resolve({ saved: false, code: 'feedback-unavailable' });
+  return new Promise(resolve => {
+    let child, handedOff = false, settled = false, output = '';
+    const unknown = () => ({ saved: null, code: 'feedback-outcome-unknown' });
+    const finish = value => { if (settled) return; settled = true; clearTimeout(timer); if (child && child.exitCode === null) child.kill(); resolve(value); };
+    const timer = setTimeout(() => finish(handedOff ? unknown() : { saved: false, code: 'feedback-unavailable' }), Math.max(0, deadline - Date.now()));
+    try {
+      child = spawn(node, [fileURLToPath(new URL('./feedback-inbox.mjs', import.meta.url)), '--write', '--config', configFile], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true });
+      child.once('error', () => finish(handedOff ? unknown() : { saved: false, code: 'feedback-unavailable' }));
+      child.stdout.on('data', chunk => { output += chunk; if (output.length > 8192) finish(unknown()); });
+      child.once('close', code => { try { const value = JSON.parse(output); if (code === 0 && [true, false, null].includes(value.saved)) return finish(value); } catch {} finish(handedOff ? unknown() : { saved: false, code: 'feedback-unavailable' }); });
+      child.stdin.on('error', () => finish(handedOff ? unknown() : { saved: false, code: 'feedback-unavailable' }));
+      child.once('spawn', () => { if (settled || Date.now() >= deadline) return finish({ saved: false, code: 'feedback-unavailable' }); handedOff = true; child.stdin.end(JSON.stringify({ input, context })); });
+    } catch { finish(handedOff ? unknown() : { saved: false, code: 'feedback-unavailable' }); }
+  });
+}
 
 // The report and question contract shared by every surface. This plugin may import
 // only Node builtins, so the text is kept here literally; tests/report-contract.test.mjs
@@ -203,7 +223,7 @@ function managedFileStore(directory) {
  * DSH 0.2.1-rc.3; unsupported storage refuses cleanup instead of archiving it.
  */
 export function createManagedHost(ctx, { stateDirectory, store, removeDirectory = rm, installDelegation: testInstallDelegation,
-  defaultModelOnly = false } = {}) {
+  defaultModelOnly = false, feedbackNode, feedbackConfigFile, feedbackVersion } = {}) {
   const root = ctx.root ?? ctx;
   const runtimeKey = Symbol.for('futureaide-control.managed-runtimes');
   const runtimes = root[runtimeKey] ??= new Map();
@@ -407,7 +427,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       }
       if (exec.agent !== agent) return undefined;
       if (record.closing || record.cancelled) return 'The controlling agent has stopped this task.';
-      if (record.questions.some(question => question.state === 'pending') && exec.name !== 'ask_parent') {
+      if (record.questions.some(question => question.state === 'pending') && exec.name !== 'ask_parent' && exec.name !== 'feedback') {
         return 'Wait for the controlling agent to answer before continuing this task.';
       }
       if (record.treeProtocol !== 1 && (exec.name === 'managed_subagent' || exec.name === 'subagent' || exec.name === 'subagent_fork')) {
@@ -416,6 +436,21 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       return undefined;
     };
     if (fresh) tools.guard(exec => binding.guard(exec));
+    binding.feedbackTool = {
+      name: 'feedback',
+      description: 'Record a plugin problem or friction in the local feedback inbox. Use ask_parent for decisions and report_parent for deliverables.',
+      parameters: { type: 'object', properties: { kind: { type: 'string', enum: ['problem', 'friction'] }, message: { type: 'string', minLength: 1, maxLength: 1200 }, severity: { type: 'string', enum: ['low', 'medium', 'high'] } }, required: ['kind', 'message'], additionalProperties: false },
+      async execute(args, exec) {
+        const deadline = Date.now() + 2000;
+        if (exec.agent !== agent || record.closing || record.cancelled) reject('managed-task-closed');
+        if (!record.taskId || (record.reports ?? []).some(report => report.taskId === record.taskId && report.final)) reject('managed-task-required');
+        if (!path.isAbsolute(feedbackNode || '') || !path.isAbsolute(feedbackConfigFile || '')) return { saved: false, code: 'feedback-unavailable' };
+        const recent = binding.feedbackError;
+        const error = recent?.taskId === record.taskId && Date.now() - Date.parse(recent.at) <= 900000 ? recent : null;
+        return writeFeedback(feedbackNode, feedbackConfigFile, args, { version: feedbackVersion ?? null, source: 'dsh', caller: record.feedbackCallerHost ?? null, target: 'dsh', name: record.feedbackAgentName ?? null, error: error && { tool: error.tool, code: error.code, httpStatus: error.httpStatus ?? null, at: error.at } }, deadline);
+      },
+    };
+    if (fresh) tools.register({ ...binding.feedbackTool, execute: (args, exec) => binding.feedbackTool.execute(args, exec) });
     binding.questionTool = {
       name: 'ask_parent',
       description: 'Ask the controlling agent a question needed for your current task. Provide the question directly. This ends the current turn; the answer will resume this same task. Do not create a file or run a command to communicate. '
@@ -436,7 +471,16 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         return { waiting: true };
       },
     };
-    if (fresh) tools.register({ ...binding.questionTool, execute: (args, exec) => binding.questionTool.execute(args, exec) });
+    const observeToolFailure = async (tool, args, exec) => {
+      try { return await binding[tool === 'ask_parent' ? 'questionTool' : 'reportTool'].execute(args, exec); }
+      catch (error) {
+        if (exec.agent === agent && record.taskId && typeof error?.controlCode === 'string' && /^[a-z][a-z0-9-]{0,79}$/.test(error.controlCode)) {
+          binding.feedbackError = { taskId: record.taskId, tool, code: error.controlCode, at: new Date().toISOString() };
+        }
+        throw error;
+      }
+    };
+    if (fresh) tools.register({ ...binding.questionTool, execute: (args, exec) => observeToolFailure('ask_parent', args, exec) });
     binding.reportTool = {
       name: 'report_parent',
       description: 'Send a report to your controlling agent. Set final to true for the completed task deliverable. Descendants report to their native parent. '
@@ -466,10 +510,10 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       },
     };
     if (!binding.reportRegistered) {
-      tools.register({ ...binding.reportTool, execute: (args, exec) => binding.reportTool.execute(args, exec) });
+      tools.register({ ...binding.reportTool, execute: (args, exec) => observeToolFailure('report_parent', args, exec) });
       binding.reportRegistered = true;
       agentCtx.get('systemPrompt')?.context?.({ name: 'futureaide:reports', order: 100,
-        text: 'Keep routine progress in the task record. Use report_parent for agreed milestones, deliverables or issues requiring your controlling agent\'s action, and final: true when the task is complete. Use ask_parent for a decision you need.' });
+        text: 'Keep routine progress in the task record. Use report_parent for agreed milestones, deliverables or issues requiring your controlling agent\'s action, and final: true when the task is complete. Use ask_parent for a decision you need. Use feedback to record plugin problems or friction.' });
     }
     binding.preExecute = async (exec, next) => {
       if (exec.agent === agent && record.taskId && !record.closing) {
@@ -480,7 +524,14 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
     };
     if (fresh) agentCtx.on('tools/pre-execute', (...args) => binding.preExecute(...args));
     binding.result = (exec, result) => {
-      if (exec.agent !== agent || !record.taskId || record.closing || result.isError) return;
+      if (exec.agent !== agent || !record.taskId || record.closing) return;
+      if (result?.isError) {
+        if (exec.name !== 'feedback' && ['ask_parent', 'report_parent', 'managed_subagent'].includes(exec.name)) {
+          const code = result.value?.controlCode ?? result.value?.code ?? result.error?.controlCode ?? result.error?.code;
+          if (typeof code === 'string' && /^[a-z][a-z0-9-]{0,79}$/.test(code)) binding.feedbackError = { taskId: record.taskId, tool: exec.name, code, at: new Date().toISOString() };
+        }
+        return;
+      }
       const value = result.value;
       const values = Array.isArray(value?.changes) ? value.changes : [value];
       for (const change of values) {
@@ -652,7 +703,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         agent = await activate(record);
       }
       runtime.treeBarriers.delete(key); runtime.treeInspections.delete(key);
-      Object.assign(record, { taskId: input.taskId, reportProtocol: 1, reports: [], treeProtocol: treeProtocol ? 1 : undefined, taskStartSeq: sessionCursor(agent.session), taskTurnEndSeq: undefined, questions: [], changes: [], descendantChanges: {}, cancelled: false, cancellationSettled: false,
+      Object.assign(record, { feedbackAgentName: typeof input.feedbackAgentName === 'string' ? input.feedbackAgentName : null, feedbackCallerHost: typeof input.feedbackCallerHost === 'string' ? input.feedbackCallerHost : null, taskId: input.taskId, reportProtocol: 1, reports: [], treeProtocol: treeProtocol ? 1 : undefined, taskStartSeq: sessionCursor(agent.session), taskTurnEndSeq: undefined, questions: [], changes: [], descendantChanges: {}, cancelled: false, cancellationSettled: false,
         activity: 'ready', answers: [], throughSeq: sessionCursor(agent.session) });
       await persist(record);
       return { ...snapshot(record, agent), reportProtocol: 1, ...(treeProtocol ? { treeProtocol: 1 } : {}) };
@@ -1073,10 +1124,13 @@ export function createHostHandler(ctx, token, options = {}) {
 export async function apply(ctx, config) {
   if (typeof config?.credentialFile !== 'string' || !path.isAbsolute(config.credentialFile)) throw new Error('credentialFile must be absolute.');
   const record = JSON.parse(await readFile(config.credentialFile, 'utf8'));
+  let feedbackVersion = null;
+  try { feedbackVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version ?? null; } catch { /* Optional for legacy standalone bridges. */ }
   const handler = createHostHandler(ctx, record.token, {
     stateDirectory: config.managedStateDirectory ?? path.join(path.dirname(config.credentialFile), 'managed-host'),
     revision: new URL(import.meta.url).searchParams.get('v'),
     defaultModelOnly: config.defaultModelOnly === true,
+    feedbackNode: config.feedbackNode, feedbackConfigFile: config.feedbackConfigFile, feedbackVersion,
   });
   const key = Symbol.for('futureaide-control.host-handler');
   const current = ctx.root[key];

@@ -1995,7 +1995,8 @@ export function createScopedAgents(config, {
       const state = error.terminal === true || modelError ? 'failed'
         : targetOf(record) !== 'dsh' && !delivering ? 'retrying'
           : error.uncertain ? 'unknown' : retryable ? 'retrying' : 'failed';
-      Object.assign(dispatch, { state, afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
+      Object.assign(dispatch, { state, ...(state === 'unknown' ? { delivery: 'unknown' } : {}),
+        afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
       if (dispatch.state === 'retrying' && targetOf(record) !== 'dsh') deferRetry(dispatch);
     }
     saveDispatch(record);
@@ -3148,8 +3149,8 @@ export function createScopedAgents(config, {
       // this intent never reached that send; keep the exact request ID. A direct
       // answer or a first task dispatch has no supplement row, so this loop is the
       // only place that can retry it after a transient root read.
-      if (!allowResend) return 'not-sent';
       if (dshDefaultOnly(record)) { delete dispatch.deliveryIntent; dispatch.modelReady = false; }
+      if (!allowResend) return 'not-sent';
       await dispatchOnce(record, dispatch);
       return;
     }
@@ -3172,6 +3173,7 @@ export function createScopedAgents(config, {
       dispatch.error = receipt.error ?? { code: receipt.code ?? 'send-rejected', message: receipt.message ?? 'The input was not accepted.' };
     }
     if (receipt.status === 'retryable') {
+      if (dshDefaultOnly(record)) { delete dispatch.deliveryIntent; dispatch.modelReady = false; }
       if (!allowResend) return 'not-sent';
       await dispatchOnce(record, dispatch);
     }

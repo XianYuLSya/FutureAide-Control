@@ -2282,3 +2282,22 @@ test('locked DSH accepted request stays on original receipt after default change
     assert.equal(dispatch.model.provider, 'fixture');
   } finally { f.service.close(); }
 });
+test('a locked DSH supplement with uncertain write is never resent after default changes', async () => {
+  let attempts = 0;
+  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
+    if (++attempts === 2) throw Object.assign(new Error('lost supplement receipt'), { uncertain: true });
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'uncertain supplement', effort: 'high' }, extra(A));
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    await f.service.poll(f.record().agentId);
+    await f.service.poll(f.record().agentId);
+    assert.equal(attempts, 2);
+    assert.equal(f.sends.length, 1);
+    const dispatch = f.record().task.dispatches.find(item => item.requestId === receipt.requestId);
+    assert.equal(dispatch.state, 'unknown');
+    assert.equal(dispatch.delivery, 'unknown');
+  } finally { f.service.close(); }
+});

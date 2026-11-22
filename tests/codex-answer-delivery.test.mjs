@@ -9,6 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { mkdir, mkdtemp } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
@@ -155,7 +156,8 @@ function codexDesktop(snapshot, { raceAnswer = false, loseStartReply = false, ra
   };
 }
 
-async function fixture({ onBackend, host, directory, snapshot, raceAnswer = false, loseStartReply = false, raceExternalTurn = false } = {}) {
+async function fixture({ onBackend, host, directory, snapshot, raceAnswer = false, loseStartReply = false, raceExternalTurn = false,
+  registration = { ready: true } } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = directory ?? await mkdtemp(path.join(base, 'answer-'));
@@ -176,13 +178,14 @@ async function fixture({ onBackend, host, directory, snapshot, raceAnswer = fals
       onBackend?.(backend);
       return backend;
     } },
-    codexProbeRegistration: async () => ({ ready: true, registered: true, tools: ['ask_parent', 'report_parent'], sessionVerified: false }),
+    codexProbeRegistration: async () => ({ ready: registration.ready !== false,
+      registered: registration.ready !== false, tools: ['ask_parent', 'report_parent'], sessionVerified: false }),
     startSharedMonitor: () => true,
     removeTree: async () => {},
   });
   const record = name => store.named(ownerIdFor(BOSS), name);
   return {
-    service, store, codex, notices, record, stateDirectory,
+    service, store, codex, notices, record, stateDirectory, registration,
     /** Create a persistent Codex helper, hand it a task and let the first turn start. */
     async start(name, task, selection = {}) {
       await service.create({ name, lifetime: 'persistent', target: 'codex-desktop', ...selection }, extra(BOSS));
@@ -568,6 +571,15 @@ const pollTimes = async (f, seed, times = 5) => {
   for (let index = 0; index < times; index++) await f.service.poll(seed.agentId);
 };
 
+/** Age an answer by its caller's original clock, never by a later poll. */
+const ageAnswer = (f, seed, ageMs = 7 * 60 * 60 * 1000) => {
+  const record = f.record('lead');
+  const answer = record.task.answers.find(entry => entry.answerId === seed.requestId);
+  const dispatch = record.task.dispatches.find(entry => entry.requestId === seed.requestId);
+  dispatch.requestedAt = answer.created = new Date(Date.now() - ageMs).toISOString();
+  f.store.save(record);
+};
+
 test('a rejected answer steer recovers as one new turn under the same request id after restart', async () => {
   const seed = await answerRaceSeed();
   const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
@@ -810,4 +822,208 @@ test('legacy unknown answer does not reuse old not-sent evidence over a newer in
     assert.equal(answerDispatch(f, seed.requestId).state, 'unknown');
     assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
   } finally { f.service.close(); }
+});
+
+test('a temporary registration probe keeps the answer recoverable and ahead of the queued input', async () => {
+  const seed = await answerRaceSeed({ queuedInput: true });
+  const registration = { ready: false };
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop, registration });
+  try {
+    await f.poll(seed);
+    const dispatch = answerDispatch(f, seed.requestId);
+    assert.equal(dispatch.state, 'retrying', 'a read-only preflight refusal is not a failed send');
+    assert.equal(dispatch.error.code, 'codex-report-not-ready');
+    assert.ok(dispatch.nextAttemptAt > Date.now(), 'repeated refusals keep the normal backoff');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+    assert.deepEqual(queueWrites(f), [], 'Q never starts while R is waiting out its backoff or recovery');
+
+    registration.ready = true;
+    await delay(Math.max(0, dispatch.nextAttemptAt - Date.now()) + 50);
+    await f.poll(seed);
+    const recovered = answerDispatch(f, seed.requestId);
+    assert.deepEqual([recovered.accepted, recovered.delivery], [true, 'new-turn']);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start']);
+    assert.ok(answerWrites(f).every(input => input.text.includes(seed.requestId)), 'the same request id carries the recovered write');
+    assert.deepEqual(queueWrites(f), [], 'Q waits behind the recovered answer turn');
+
+    f.codex.endTurn(seed.threadId, 'answer applied');
+    await f.poll(seed); await f.poll(seed);
+    assert.deepEqual(queueWrites(f).map(input => input.method), ['turn/start'], 'Q starts only after the answer turn ends');
+    const before = f.codex.inputs().length;
+    await f.poll(seed);
+    assert.equal(f.codex.inputs().length, before, 'the recovered answer is never written twice');
+  } finally { f.service.close(); }
+});
+
+test('a legacy failed answer is repaired under the same request id before the queued input', async () => {
+  const seed = await answerRaceSeed({ queuedInput: true });
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = answerDispatch(f, seed.requestId);
+    Object.assign(dispatch, { state: 'failed', delivery: 'local-pending',
+      error: { code: 'codex-report-not-ready', message: 'The explicit Codex parent-report tools have not been connected.' } });
+    f.store.save(record);
+
+    await pollTimes(f, seed, 4);
+    const recovered = answerDispatch(f, seed.requestId);
+    assert.deepEqual([recovered.accepted, recovered.delivery], [true, 'new-turn']);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start']);
+    assert.deepEqual(queueWrites(f), [], 'the old failed answer is repaired before Q');
+
+    f.codex.endTurn(seed.threadId, 'answer applied');
+    await f.service.poll(seed.agentId); await f.service.poll(seed.agentId);
+    assert.deepEqual(queueWrites(f).map(input => input.method), ['turn/start']);
+    const before = f.codex.inputs().length;
+    await f.service.poll(seed.agentId);
+    assert.equal(f.codex.inputs().length, before, 'the repaired answer is not replayed');
+  } finally { f.service.close(); }
+});
+
+test('a legacy failed answer without native proof is never resent', async () => {
+  for (const status of ['absent', 'unknown', 'sending', 'rejected']) {
+    const seed = await answerRaceSeed();
+    const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+    try {
+      const record = f.record('lead');
+      const dispatch = record.task.dispatches.find(entry => entry.requestId === seed.requestId);
+      dispatch.state = 'failed';
+      const backendState = f.store.backendState(seed.agentId);
+      if (status === 'absent') delete backendState.requests[seed.requestId];
+      else {
+        backendState.requests[seed.requestId].status = status;
+        if (status === 'rejected') backendState.requests[seed.requestId].route = 'blocked';
+      }
+      f.store.saveBackendState(seed.agentId, backendState);
+      f.store.save(record);
+
+      await pollTimes(f, seed, 3);
+      assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer'],
+        `a ${status} native receipt never authorises a fresh answer`);
+      assert.equal(answerDispatch(f, seed.requestId).state, 'failed', 'an unproven or terminal receipt keeps its failed evidence');
+    } finally { f.service.close(); }
+  }
+});
+
+test('an expired waiting answer shows dispatch-expired while the external turn is still active', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop, raceExternalTurn: true });
+  try {
+    await pollTimes(f, seed, 2);
+    assert.equal(answerDispatch(f, seed.requestId).state, 'queued');
+    const writesBefore = f.codex.inputs().length;
+    ageAnswer(f, seed);
+    await f.poll(seed);
+
+    const dispatch = answerDispatch(f, seed.requestId);
+    assert.equal(dispatch.expired, 'dispatch-expired');
+    assert.deepEqual([dispatch.state, dispatch.delivery], ['unknown', 'blocked']);
+    const row = (await f.service.inspect({ name: 'lead' }, extra(BOSS))).inputs
+      .find(entry => entry.requestId === seed.requestId);
+    assert.deepEqual([row.delivery, row.status, row.reason, row.queued], ['blocked', 'blocked', 'dispatch-expired', false]);
+    assert.equal(f.codex.inputs().length, writesBefore, 'expiry writes nothing while the external turn is active');
+
+    const expiredCount = f.record('lead').expired?.count;
+    f.codex.endTurn(seed.threadId, 'external complete');
+    await pollTimes(f, seed, 3);
+    assert.equal(f.record('lead').expired?.count, expiredCount, 'the same answer is not expired twice');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start'],
+      'the expired answer is never started after the external turn ends');
+  } finally { f.service.close(); }
+});
+
+test('a cancelled answer with an unknown native outcome inspects as unknown, not queued or blocked', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop, loseStartReply: true });
+  try {
+    await pollTimes(f, seed, 2);
+    assert.equal(answerDispatch(f, seed.requestId).state, 'unknown');
+    await f.service.cancel({ name: 'lead' }, extra(BOSS));
+    await pollTimes(f, seed, 4);
+
+    const row = (await f.service.inspect({ name: 'lead' }, extra(BOSS))).inputs
+      .find(entry => entry.requestId === seed.requestId);
+    assert.deepEqual([row.status, row.delivery, row.accepted, row.queued], ['unknown', 'unknown', false, false]);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start'],
+      'cancellation never writes the unknown answer again');
+  } finally { f.service.close(); }
+});
+test('a read-only retryable answer still joins its own live turn after restart', async () => {
+  const seed = await answerRaceSeed();
+  // Put the original turn A back in progress: a read that failed before any write
+  // must not turn the answer into a start-only recovery.
+  const thread = seed.desktop.threads.find(([id]) => id === seed.threadId)[1];
+  thread.turns.find(turn => turn.id === 'turn-1793932681').status = 'inProgress';
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.requestId === seed.requestId);
+    const backendState = f.store.backendState(seed.agentId);
+    const request = backendState.requests[seed.requestId];
+    delete request.intent; delete request.reschedule; delete request.route; delete request.afterTurnId;
+    request.attempted = false; request.status = 'retryable';
+    f.store.saveBackendState(seed.agentId, backendState);
+    delete dispatch.delivery; dispatch.state = 'retrying'; delete dispatch.nextAttemptAt;
+    f.store.save(record);
+
+    await pollTimes(f, seed, 2);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/steer'],
+      'the pure read retry steers the live turn instead of opening a new one');
+    const steered = answerWrites(f).at(-1);
+    assert.equal(steered.turnId, 'turn-1793932681');
+    const recovered = answerDispatch(f, seed.requestId);
+    assert.deepEqual([recovered.accepted, recovered.delivery], [true, 'current-turn']);
+    assert.equal(f.codex.runningTurn(seed.threadId), 'turn-1793932681');
+  } finally { f.service.close(); }
+});
+test('legacy failed answer migration skips cancelled, final and expired rounds', async () => {
+  const fail = async (entry) => {
+    const record = entry.f.record('lead');
+    const dispatch = record.task.dispatches.find(item => item.requestId === entry.seed.requestId);
+    Object.assign(dispatch, { state: 'failed', delivery: 'local-pending',
+      error: { code: 'codex-report-not-ready', message: 'The explicit Codex parent-report tools have not been connected.' } });
+    entry.f.store.save(record);
+    return dispatch;
+  };
+
+  // Cancelled: a cancelled round never reopens for an old failed answer.
+  {
+    const seed = await answerRaceSeed();
+    const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+    try {
+      await fail({ f, seed });
+      await f.service.cancel({ name: 'lead' }, extra(BOSS));
+      await pollTimes(f, seed, 3);
+      assert.equal(answerDispatch(f, seed.requestId).state, 'failed');
+      assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+    } finally { f.service.close(); }
+  }
+
+  // Final: a sealed round keeps its answer row exactly as evidence.
+  {
+    const seed = await answerRaceSeed();
+    const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+    try {
+      await fail({ f, seed });
+      f.store.enqueueSubmission({ id: 'legacy-final-hotfix', ownerId: ownerIdFor(BOSS), agentId: seed.agentId,
+        taskId: f.record('lead').task.taskId, kind: 'report', message: 'done', final: true });
+      await pollTimes(f, seed, 3);
+      assert.equal(answerDispatch(f, seed.requestId).state, 'failed');
+      assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+    } finally { f.service.close(); }
+  }
+
+  // Expired: expiry settles it as a blocked no-write before migration could queue it.
+  {
+    const seed = await answerRaceSeed();
+    const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+    try {
+      await fail({ f, seed });
+      ageAnswer(f, seed);
+      await f.poll(seed);
+      const dispatch = answerDispatch(f, seed.requestId);
+      assert.equal(dispatch.expired, 'dispatch-expired');
+      assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+    } finally { f.service.close(); }
+  }
 });

@@ -676,7 +676,7 @@ export async function createCodexBackend(record, deps = {}) {
       return result;
     },
     async deliver({ requestId, message, kind, mode, selectionExplicit, model: dispatchModel,
-      explicitModel, allowStart = true, writeBlockReason }) {
+      explicitModel, allowStart = true, startOnly = false, writeBlockReason }) {
       snapshotRevision++;
       // The shared layer's fence for this call. Absent means the caller never gated its
       // dispatch, and then nothing here may behave differently.
@@ -888,11 +888,15 @@ export async function createCodexBackend(record, deps = {}) {
               ...(selectionExplicit === undefined && request.model?.model && !explicitNow ? { legacySelection: true } : {}),
               knownSelections: knownSelectionsFor(value),
               ...(allowStart === false ? { allowStart: false } : {}),
+              ...(startOnly ? { startOnly: true } : {}),
               onIntent });
             if (sent?.waiting === true) {
               // Queue met an active root turn: durable "after A", no native write.
               Object.assign(request, { status: 'waiting', route: 'after-current',
-                afterTurnId: sent.afterTurnId, attempted: false });
+                afterTurnId: sent.afterTurnId, attempted: false,
+                ...(sent.reschedule === true && sent.notSent === true ? {
+                  reschedule: { reason: sent.reason ?? 'turn-started-before-write',
+                    notSent: true, afterTurnId: sent.afterTurnId ?? null, at: new Date().toISOString() } } : {}) });
               save(value);
               waiting = true;
               return;

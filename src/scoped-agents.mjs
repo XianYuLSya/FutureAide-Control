@@ -379,9 +379,7 @@ function taskInputs(store, record) {
     const route = dispatch?.delivery;
     const existing = rows.get(answer.answerId);
     let delivery, accepted = false, queued = false, reason;
-    if (answer.undelivered) {
-      delivery = 'blocked'; reason = answer.undelivered;
-    } else if (answer.nativeAnswered === true) {
+    if (answer.nativeAnswered === true) {
       // The adapter answered the native question card itself; that is the delivery,
       // not a text turn, so no turn id is invented for it.
       delivery = 'answered'; accepted = true;
@@ -392,6 +390,13 @@ function taskInputs(store, record) {
         // A proven no-write (expired, refused or cancelled) is the public end of this
         // answer even when its internal state is unknown so a final report can settle.
         delivery = 'blocked'; reason = dispatch.error?.code ?? 'send-failed';
+      } else if (dispatch.accepted !== true && route === 'unknown') {
+        // A cancelled or failed answer whose native write was never proven is neither
+        // a proven no-write nor a local wait: keep the unknown evidence.
+        delivery = 'unknown'; reason = dispatch.error?.code ?? 'answer-outcome-unknown';
+      } else if (dispatch.accepted !== true && answer.undelivered) {
+        // A legacy row with no dispatch proof keeps the terminal reason its sender wrote.
+        delivery = 'blocked'; reason = answer.undelivered;
       } else if (dispatch.accepted !== true && dispatch.state === 'unknown') {
         // An answer write whose native outcome was never proven is never replayed;
         // keep that evidence as unknown even if an older row still names a wait route.
@@ -409,6 +414,8 @@ function taskInputs(store, record) {
       } else {
         delivery = 'unknown'; reason = dispatch.error?.code ?? 'answer-outcome-unknown';
       }
+    } else if (answer.undelivered) {
+      delivery = 'blocked'; reason = answer.undelivered;
     } else if (questionIds.length && answer.dispatched !== true) {
       // Registered against a real question and waiting for its dispatch.
       delivery = 'answer-pending'; queued = true;
@@ -438,7 +445,8 @@ function taskInputs(store, record) {
     const delivery = dispatch.accepted === true && acceptedRoute(route) ? 'answered'
       : dispatch.accepted === true ? 'accepted-route-unknown'
         : route === 'blocked' ? 'blocked'
-          : dispatch.state === 'unknown' ? 'unknown'
+          : route === 'unknown' ? 'unknown'
+            : dispatch.state === 'unknown' ? 'unknown'
             : ['cancelled', 'failed', 'blocked'].includes(dispatch.state) ? 'blocked'
               : waitingRoute(route) ? route
                 : ['sending', 'queued', 'retrying'].includes(dispatch.state) ? 'answer-pending'
@@ -1808,7 +1816,7 @@ export function createScopedAgents(config, {
       { delivery: 'blocked', accepted: false, queued: false });
   }
 
-  async function dispatchOnce(record, dispatch, observed) {
+  async function dispatchOnce(record, dispatch, observed, { recoveryNotSent = false, startOnly = false } = {}) {
     const current = store.get(record.agentId);
     if (roundMovedOn(record, current)) throw dispatchRefused();
     if (current.task.cancelRequested) return;
@@ -1886,6 +1894,7 @@ export function createScopedAgents(config, {
         message: dispatch.message, kind: dispatch.kind,
         writeBlockReason: reasonFor,
         allowStart,
+        ...(startOnly ? { startOnly: true } : {}),
         mode: dispatch.mode === 'queue' ? 'queue' : 'steer',
         ...(dispatch.selectionExplicit === undefined ? {}
           : { selectionExplicit: dispatch.selectionExplicit === true }),
@@ -1956,7 +1965,14 @@ export function createScopedAgents(config, {
       // transient transport failure: retrying it would loop forever and hide the typo.
       const modelError = ['model-required', 'model-required-for-effort', 'model-not-found',
         'effort-not-supported', 'model-default-invalid', 'codex-model-change-while-running'].includes(error.code);
-      const retryable = !modelError && (error.retryableRead === true
+      // The registration probe is a read-only preflight that runs before any native
+      // write. Only a Codex answer that this poll's recovery already proved unwritten
+      // may treat a missing probe as a temporary prerequisite; a first task dispatch,
+      // an ordinary supplement or another backend keeps the original failure policy.
+      const registrationUnavailable = error.code === 'codex-report-not-ready'
+        && targetOf(record) === 'codex-desktop' && dispatch.kind === 'answer'
+        && recoveryNotSent === true;
+      const retryable = !modelError && (error.retryableRead === true || registrationUnavailable
         || (targetOf(record) !== 'dsh' && (!delivering || error.code === 'agent-busy')));
       const state = error.terminal === true || modelError ? 'failed'
         : targetOf(record) !== 'dsh' && !delivering ? 'retrying'
@@ -3169,7 +3185,7 @@ export function createScopedAgents(config, {
       }
       delete dispatch.afterTurnId;
       if (!allowResend) return 'not-sent';
-      await dispatchOnce(record, dispatch);
+      await dispatchOnce(record, dispatch, undefined, { recoveryNotSent: true, startOnly: true });
       return;
     }
     // A Codex answer may ignore the local-pending early return only when the native
@@ -3198,7 +3214,24 @@ export function createScopedAgents(config, {
       // remain read-only; a retryable label alone is not that proof.
       if (dispatch.state === 'unknown' && !(answer && receipt.verifiedNotSent === true)) return;
       if (!allowResend) return 'not-sent';
-      await dispatchOnce(record, dispatch);
+      // Only a steer the native side proved it rejected turns this recovery into
+      // "wait for a new turn". An ordinary read-only retry keeps the original steer
+      // behaviour: the answer may still need to join its own live turn A.
+      const rejectedSteer = answer && receipt.reschedule?.notSent === true
+        && receipt.reschedule.reason === 'steer-turn-ended';
+      if (rejectedSteer) {
+        let root;
+        try { root = await rootTurnFor(record); } catch { root = { known: false }; }
+        const expected = receipt.intent?.expectedTurnId;
+        if (root.known === false || (root.running && expected !== root.turnId)) {
+          Object.assign(dispatch, { state: 'queued', accepted: false, delivery: 'after-current',
+            ...(root.turnId ? { afterTurnId: root.turnId } : {}) });
+          return 'waiting';
+        }
+        delete dispatch.afterTurnId;
+      }
+      await dispatchOnce(record, dispatch, undefined,
+        rejectedSteer ? { recoveryNotSent: true, startOnly: true } : {});
     }
   }
 
@@ -3218,6 +3251,13 @@ export function createScopedAgents(config, {
         if (receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
         return 'accepted';
       }
+      // Only a Codex answer waiting receipt that carries its own no-write evidence is
+      // proof of no write. A bare waiting status from another backend or an older
+      // adapter may mean a different thing and is never promoted to proof here.
+      const codexAnswerNotSent = targetOf(record) === 'codex-desktop' && dispatch.kind === 'answer'
+        && receipt?.status === 'waiting'
+        && (receipt.reschedule?.notSent === true || receipt.intent?.outcome === 'not-sent');
+      if (codexAnswerNotSent) return 'not-sent';
       if (['rejected', 'retryable', 'failed'].includes(receipt?.status)
           || (!receipt && ['sending', 'retrying', 'failed'].includes(dispatch.state))) return 'not-sent';
       const turn = await backend.turn({ requestId: dispatch.requestId,
@@ -3777,6 +3817,27 @@ export function createScopedAgents(config, {
           if (task.cancelPending) task.cancelTreeSettled = false;
           store.save(record);
         }
+      }
+      // Older 4947683 rows recorded a read-only registration preflight refusal as a
+      // failed answer. Only that exact row, and only when a fresh native receipt still
+      // proves the write never happened, returns to the queue; the ordinary poll then
+      // recovers it in request order. Missing, unknown or terminal receipts stay as
+      // evidence and are never sent again.
+      if (task && targetOf(record) === 'codex-desktop' && !task.cancelRequested
+          && !(task.reports ?? []).some(report => report.final)) {
+        let restored = false;
+        for (const dispatch of task.dispatches ?? []) {
+          if (dispatch.kind !== 'answer' || dispatch.state !== 'failed' || dispatch.expired
+              || dispatch.error?.code !== 'codex-report-not-ready') continue;
+          const receipt = await (await backendFor(record)).receipt({ requestId: dispatch.requestId });
+          const provenUnsent = receipt?.status === 'retryable'
+            || (receipt?.status === 'waiting' && receipt.reschedule?.notSent === true);
+          if (!provenUnsent) continue;
+          Object.assign(dispatch, { state: 'queued', delivery: 'local-pending' });
+          delete dispatch.nextAttemptAt;
+          restored = true;
+        }
+        if (restored) saveDispatch(record);
       }
       if (task && store.supplements(record.agentId).length) await drainSupplements(record);
       if (task?.reports?.length) {

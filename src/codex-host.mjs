@@ -643,7 +643,7 @@ export function createCodexHost(options = {}) {
       return { renamed: true };
     },
     async send({ nativeSessionId, message, model, effort, mode, selection, selectionExplicit,
-      legacySelection = false, knownSelections, onIntent, allowStart = true, resubscribe = false, blockReason }) {
+      legacySelection = false, knownSelections, onIntent, allowStart = true, startOnly = false, resubscribe = false, blockReason }) {
       // A thread whose release we already asked for may still read as idle while this
       // connection holds no subscription: the request was acknowledged, the idle grace
       // is running. Only a resume puts the subscription back before a turn rides it, so
@@ -664,6 +664,7 @@ export function createCodexHost(options = {}) {
         ...(knownSelections === undefined ? {} : { knownSelections }),
         ...(onIntent === undefined ? {} : { onIntent }),
         ...(allowStart === false ? { allowStart: false } : {}),
+        ...(startOnly ? { startOnly: true } : {}),
       });
       // A queue that met an active root turn is a durable "after A" answer, not a send.
       if (result?.waiting === true) return result;

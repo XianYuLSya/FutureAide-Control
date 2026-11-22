@@ -661,3 +661,34 @@ test('a managed agent cannot raise a UI question the dispatching chat never sees
   assert.equal(agent.guards[0]({ agent: child.agent, name: 'ask_user_question' }), CHILD_QUESTION_REFUSAL,
     'if the root guard does see a descendant call, it names the parent route');
 });
+
+
+test('managed prompt checks live default and selection at synchronous inbox write and deduplicates', async () => {
+  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
+  await host.managedCreate(input);
+  const selection = { provider: 'provider', model: 'model', reasoningEffort: 'high' };
+  await host.managedSelectModel({ ...input, selection });
+  const agent = f.live.get(input.sessionId), accepted = [];
+  agent.steer = message => accepted.push(message);
+  agent.followup = message => accepted.push(message);
+  let changeBeforeWrite = true;
+  f.services.sessionController.commands = {
+    hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
+    async prompt(request, source) {
+      await Promise.resolve();
+      if (changeBeforeWrite) f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'second' });
+      agent.followup({ source, content: request.content });
+      return { accepted: true };
+    },
+  };
+  const dispatch = { ...input, selection, requestId: 'request-1', mode: 'queue', message: 'business input' };
+  assert.deepEqual(await host.managedPrompt(dispatch), { accepted: false, status: 'retryable', notSent: true, code: 'managed-model-changed' });
+  assert.equal(accepted.length, 0);
+  changeBeforeWrite = false;
+  f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'model' });
+  const result = await host.managedPrompt(dispatch);
+  assert.equal(result.accepted, true); assert.deepEqual(result.selected, selection); assert.equal(accepted.length, 1);
+  f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'second' });
+  const duplicate = await host.managedPrompt(dispatch);
+  assert.equal(duplicate.duplicate, true); assert.deepEqual(duplicate.selected, selection); assert.equal(accepted.length, 1);
+});

@@ -345,7 +345,7 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
       return view === 'events' ? page : historyMessages(page, row);
     },
     async send({ sessionId, message, requestId, mode = 'queue', background = false, agentId, codexThreadId,
-      suppressCallback = false, archive = false, taskName, writeBlockReason } = {}) {
+      suppressCallback = false, archive = false, taskName, writeBlockReason, selection } = {}) {
       // The callback target is only what this connection was explicitly given: an agent's own
       // bound task, or a profile that names one. Nothing is guessed from the environment.
       const target = codexThreadId === undefined ? config.codexThreadId : codexThreadId;
@@ -372,7 +372,7 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
           { code: blocked, terminal: true, notSent: true });
         }
         const sent = managed ? await api.managedSendMessage(managed, message, { requestId, mode,
-          ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) })
+          ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}), ...(selection ? { selection } : {}) })
           : await api.sendMessage(id, message, { requestId, mode });
         return { ...sent, afterSeq };
       });

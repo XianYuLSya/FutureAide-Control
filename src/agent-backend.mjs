@@ -260,7 +260,7 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
         ...(history.note ? { note: history.note } : {}), ...(failure ? { failure } : {}) };
     },
     async answer({ answerId, message } = {}) { return client.managedAnswer({ ...args(), answerId, message }); },
-    async deliver({ requestId, message, kind, writeBlockReason } = {}) {
+    async deliver({ requestId, message, kind, writeBlockReason, model } = {}) {
       // A supplement has to be read on the model's next step. A queued input waits for
       // the current turn to end, and by then the model has usually submitted its final
       // report already, which seals the task and strands the input forever.
@@ -268,7 +268,7 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
       // receipt checkpoint exists and before the native write, so a task that finished
       // while this call was preparing is refused with nothing sent.
       return control().send({ sessionId: args().sessionId, message, requestId,
-        background: false, suppressCallback: true, mode: kind === 'supplement' ? 'steer' : 'queue',
+        background: false, suppressCallback: true, mode: kind === 'supplement' ? 'steer' : 'queue', ...(model ? { selection: model } : {}),
         ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) });
     },
     async receipt({ requestId } = {}) {
@@ -276,6 +276,8 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
       try {
         const value = JSON.parse(await readFile(receiptFile(requestId), 'utf8'));
         return { status: value.status ?? 'unknown', afterSeq: value.result?.afterSeq ?? value.afterSeq,
+          ...(value.result && Object.hasOwn(value.result, 'actualEffort') ? { actualEffort: value.result.actualEffort } : {}),
+          ...(value.result && Object.hasOwn(value.result, 'actualModel') ? { actualModel: value.result.actualModel } : {}),
           ...(value.result ? { result: value.result } : {}) };
       } catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
     },

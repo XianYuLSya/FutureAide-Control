@@ -636,24 +636,24 @@ export class FutureAideClient {
     return { accepted: true, sessionId, workspaceId: workspace.workspaceId, workspaceTitle: workspace.title, projectVisible: true, modelRequestsStarted: 0 };
   }
 
-  async #hostCall(endpoint, args, { write = false, expectedInstance } = {}) {
+  async #hostCall(endpoint, args, { write = false, expectedInstance, beforeWrite } = {}) {
     if (!this.#hostBridgeFile) fail('host-bridge-required', 'Install and bootstrap the FutureAide host bridge first.');
     let credential;
     try { credential = JSON.parse(await readBoundedFile(this.#hostBridgeFile, 2048)); }
     catch { fail('host-bridge-required', 'The local host bridge credential is unavailable.'); }
     if (credential.version !== 1 || !/^[a-f0-9]{64}$/.test(credential.token ?? '')) fail('host-bridge-required', 'The local host bridge credential is invalid.');
-    return (await this.#rpc(endpoint, { ...args, token: credential.token }, { write, expectedInstance, channel: 'futureaide-control' })).value;
+    return (await this.#rpc(endpoint, { ...args, token: credential.token }, { write, expectedInstance, beforeWrite, channel: 'futureaide-control' })).value;
   }
 
   async hostStatus() { return this.#hostCall('ping', {}); }
 
-  async #managedCall(method, input, write) {
+  async #managedCall(method, input, write, beforeWrite, pinnedInstance) {
     validId(input?.ownerId, 'ownerId');
     validId(input?.agentId, 'agentId');
     if (input.sessionId !== undefined) validId(input.sessionId);
     if (input.taskId !== undefined) validId(input.taskId, 'taskId');
-    const expectedInstance = await this.#discover();
-    return this.#hostCall(method, input, { write, expectedInstance });
+    const expectedInstance = pinnedInstance ?? await this.#discover();
+    return this.#hostCall(method, input, { write, expectedInstance, beforeWrite });
   }
 
   /** Managed identities are internal to one caller's roster, never model-entered addresses. */
@@ -674,7 +674,7 @@ export class FutureAideClient {
     return { sessionId: view.sessionId, cwd: view.workspace, running: view.running,
       projections: { asOfSeq: view.throughSeq, values: { modelSelection: { next: view.currentModel } } } };
   }
-  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID(), writeBlockReason } = {}) {
+  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID(), writeBlockReason, selection } = {}) {
     validId(requestId, 'requestId');
     if (typeof text !== 'string' || text.trim().length === 0 || Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES
         || !['queue', 'steer'].includes(mode)) fail('invalid-input', 'A nonempty message up to 128 KiB and queue or steer mode are required.');
@@ -690,6 +690,18 @@ export class FutureAideClient {
       if (reason) throw blockedSend(reason);
     } : undefined;
     if (gate) gate();
+    if (selection) {
+      let value;
+      try { value = await this.#managedCall('managedPrompt', { ...input, message: text, mode, requestId, selection }, true, gate, expectedInstance); }
+      catch (error) {
+        if (['unknown-method', 'remote-not-found', 'not-found', 'managed-prompt-unsupported'].includes(error.code)) fail('managed-prompt-unsupported', 'This DSH host bridge cannot atomically validate model selection before sending. Update and reinstall the host bridge.');
+        if (!error.notSent && !['authentication-required', 'instance-changed'].includes(error.code)) error.uncertain = true;
+        throw error;
+      }
+      if (value?.status === 'retryable' && value.notSent === true) throw Object.assign(new Error('DSH default model or session selection changed before writing.'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
+      if (value?.accepted !== true || value.requestId !== requestId || !value.selected) fail('invalid-response', 'DSH did not confirm the managed prompt.', { uncertain: true });
+      return { ...value, accepted: true, requestId, actualEffort: value.selected.reasoningEffort ?? null, actualModel: value.selected.model };
+    }
     return this.#sendPrompt(row.sessionId, text, { mode, requestId }, expectedInstance, gate);
   }
   async managedSelectModel(input, selection, { sessionOnly = false } = {}) {

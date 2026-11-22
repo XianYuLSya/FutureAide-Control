@@ -82,7 +82,7 @@ export const name = 'futureaide-control-host';
 export const inject = ['connection', 'webServer', 'agents', 'sessions'];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedSelectModel',
-  'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+  'managedPrompt', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
 
 // DSH's own question tool opens a prompt in the DSH window, which the chat that
 // dispatched the task never sees: the agent waits and the caller is never asked.
@@ -721,6 +721,51 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
           source: 'managed-session-selectModel',
           defaultModelBehavior: 'Session-only: the app-wide default model is unchanged.',
           modelRequestsStarted: 0 };
+      });
+    }); },
+    // Use the host's text-prompt admission and fence its synchronous inbox write.
+    managedPrompt(input) { return serial(input, async () => {
+      managedId(input.sessionId); managedId(input.requestId);
+      if (typeof input.message !== 'string' || !input.message.trim() || Buffer.byteLength(input.message, 'utf8') > 131072 || !['queue', 'steer'].includes(input.mode)) reject('invalid-input');
+      const selection = modelValue(input.selection);
+      const record = await load(input);
+      if (record.closing || record.cancelled) reject('managed-task-closed');
+      const agent = await activate(record);
+      const controller = service('sessionController'), commands = controller?.commands, agents = controller?.agents;
+      if (typeof commands?.prompt !== 'function' || typeof commands?.hasPromptRequest !== 'function' || typeof agents?.serializeImageAdmission !== 'function') reject('managed-prompt-unsupported');
+      record.promptSelections ??= {};
+      const prior = record.promptSelections[input.requestId];
+      if (prior && (prior.message !== input.message || prior.mode !== input.mode)) reject('managed-prompt-conflict');
+      if (commands.hasPromptRequest(agent.session, input.requestId)) {
+        if (!prior?.selection) reject('managed-prompt-receipt-unavailable');
+        return { accepted: true, requestId: input.requestId, selected: prior.selection, duplicate: true };
+      }
+      record.promptSelections[input.requestId] = { message: input.message, mode: input.mode, selection };
+      await persist(record);
+      return agents.serializeImageAdmission(agent, async () => {
+        let mismatch = false, intercepted = false;
+        const originals = { steer: agent.steer, followup: agent.followup };
+        if (typeof originals.steer !== 'function' || typeof originals.followup !== 'function') reject('managed-prompt-unsupported');
+        for (const method of ['steer', 'followup']) agent[method] = function(message, ...args) {
+          if (message?.source?.rpcId === input.requestId) {
+            intercepted = true;
+            const current = typeof agent.model?.current === 'function' ? agent.model.current() : undefined;
+            const fallback = service('agentDefaultModel')?.currentSelection();
+            if (!sameSelectionValue(current, selection) || (defaultModelOnly && (!fallback || fallback.provider !== selection.provider || fallback.model !== selection.model))) {
+              mismatch = true; throw new Error('managed-model-changed');
+            }
+          }
+          return originals[method].call(this, message, ...args);
+        };
+        try {
+          const request = { sessionId: input.sessionId, requestId: input.requestId, mode: input.mode, content: [{ type: 'text', text: input.message }], clientTimeZone: 'Asia/Shanghai' };
+          const result = await commands.prompt(request, { kind: 'user', rpcId: input.requestId, clientTimeZone: 'Asia/Shanghai' });
+          if (result?.accepted !== true || (!intercepted && !commands.hasPromptRequest(agent.session, input.requestId))) reject('managed-prompt-unconfirmed');
+          return { accepted: true, requestId: input.requestId, selected: selection };
+        } catch (error) {
+          if (mismatch && !commands.hasPromptRequest(agent.session, input.requestId)) return { accepted: false, status: 'retryable', notSent: true, code: 'managed-model-changed' };
+          throw error;
+        } finally { agent.steer = originals.steer; agent.followup = originals.followup; }
       });
     }); },
     managedHistory(input) { return serial(input, async () => {

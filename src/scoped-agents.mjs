@@ -1,4 +1,12 @@
 import { submitFeedback } from './feedback-client.mjs';
+
+function feedbackRecordError(record, candidate) {
+  if (candidate) return candidate;
+  const error = record?.error, at = Date.parse(error?.at), started = Date.parse(record?.task?.startedAt);
+  if (!error || typeof error.tool !== 'string' || typeof error.code !== 'string' || !Number.isFinite(at) || !Number.isFinite(started) || at < started || at > Date.now() || Date.now() - at > 900000) return null;
+  return {tool:error.tool, code:error.code, ...(Number.isInteger(error.httpStatus) ? {httpStatus:error.httpStatus} : {}), at:new Date(at).toISOString()};
+}
+
 import { createHash, randomUUID } from 'node:crypto';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
@@ -805,7 +813,7 @@ export function createScopedAgents(config, {
         readParentSubmissions: () => readParentSubmissions(load()),
         claudeReportConfig: requestId => ({ mcpServers: { futureaide: { type: 'stdio', command: process.execPath,
           args: [fileURLToPath(new URL('./mcp-server.mjs', import.meta.url)), '--claude-cli-reports',
-            store.location, record.agentId, load().task.taskId, requestId,
+            store.location, record.agentId, load().task.taskId, requestId, config.configFile ?? '',
             ...(config.idleSessionCleanup === false ? ['--no-idle-session-cleanup'] : [])] } } }),
       } : {}),
       // The Codex probe reads its protocol readiness only; this must never start a
@@ -4481,17 +4489,30 @@ export function createScopedAgents(config, {
      * argument) through the binding its backend recorded, and the submission joins
      * the same task so the one state machine delivers it to the parent.
      */
+    feedbackScope(tool, args, extra) {
+      const caller = trustedCaller(extra);
+      if (tool === 'feedback' || tool === 'report_parent' || tool === 'ask_parent') {
+        if (caller) return '';
+        const bound = store.agentForCodexThread(callingThread(extra));
+        const record = bound && store.get(bound.agentId);
+        return record ? [record.agentId, record.task?.taskId ?? ''].join(':') : '';
+      }
+      if (!args?.name) return '';
+      const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+      const record = store.named(ownerId, args.name);
+      return record ? [record.agentId, record.task?.taskId ?? ''].join(':') : 'unbound';
+    },
     async submitCallerFeedback({ name, ...input }, extra, error, deadline) {
       const caller = trustedCaller(extra);
       const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
       const record = name ? store.named(ownerId, name) : null;
-      return submitFeedback(input, { source: caller?.source ?? 'codex-desktop', caller: caller?.source ?? 'codex-desktop', target: name ? (record ? targetOf(record) : null) : 'plugin', name: record?.name ?? null, error }, { configFile: config.configFile, deadline });
+      return submitFeedback(input, { source: caller?.source ?? 'codex-desktop', caller: caller?.source ?? 'codex-desktop', target: name ? (record ? targetOf(record) : null) : 'plugin', name: record?.name ?? null, error: feedbackRecordError(record, error) }, { configFile: config.configFile, deadline });
     },
     async submitManagedFeedback(input, extra, error, deadline) {
       const bound = store.agentForCodexThread(callingThread(extra));
       const record = bound && store.get(bound.agentId);
-      if (!record || record.closed || !record.task) throw Object.assign(new Error('This caller has no active managed task.'), { code: 'submission-not-owned' });
-      return submitFeedback(input, { source: 'codex-desktop', caller: store.owner(record.ownerId)?.source ?? null, target: 'codex-desktop', name: record.name ?? null, error: error && record.task.startedAt && Date.parse(error.at) >= Date.parse(record.task.startedAt) ? error : null }, { configFile: config.configFile, deadline });
+      if (!record || record.closed || !record.task || ['idle', 'failed'].includes(record.state) || record.task.cancelRequested || record.task.reports?.some(report => report.final) || store.submissions(record.agentId, record.task.taskId).some(report => report.final)) throw Object.assign(new Error('This caller has no active managed task.'), { code: 'submission-not-owned' });
+      return submitFeedback(input, { source: 'codex-desktop', caller: store.owner(record.ownerId)?.source ?? null, target: 'codex-desktop', name: record.name ?? null, error: feedbackRecordError(record, error && record.task.startedAt && Date.parse(error.at) >= Date.parse(record.task.startedAt) ? error : null) }, { configFile: config.configFile, deadline });
     },
     async submitToParent({ kind, message, final = false }, extra) {
       textMessage(message);

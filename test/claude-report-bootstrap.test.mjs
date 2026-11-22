@@ -354,3 +354,25 @@ test('feedback actually saved before reply loss remains one write', async () => 
     assert.equal(pendingFeedback(configFile)[0].count,1);
   } finally { await close(); await bridge.close(); }
 });
+
+test('a timed out feedback does not close the shared client or interrupt another write', async () => {
+  let completeFeedback;
+  const slow = new Promise(resolve => { completeFeedback = resolve; });
+  let closed = 0;
+  const remoteServer = remote({ tools: [{name:'futureaide_feedback',inputSchema:{type:'object'}},{name:'futureaide_run_agent',inputSchema:{type:'object'}}], onCall: async request => request.name === 'futureaide_feedback' ? slow : {content:[{type:'text',text:'{"accepted":true}'}]} });
+  remoteServer.client.close = async () => { closed++; };
+  const { bridge } = await bridgeWith({remotes:[remoteServer]});
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    const pending = client.callTool({name:'futureaide_feedback',arguments:{kind:'problem',message:'wait'}});
+    await new Promise(resolve => setTimeout(resolve,30));
+    const dispatch = await client.callTool({name:'futureaide_run_agent',arguments:{}});
+    assert.equal(JSON.parse(dispatch.content[0].text).accepted,true);
+    const reply = await pending;
+    assert.match(reply.content[0].text,/write-outcome-unknown/); assert.equal(closed,0);
+    completeFeedback({content:[{type:'text',text:'{"saved":true}'}]});
+    await new Promise(resolve => setTimeout(resolve,20)); assert.equal(closed,0);
+    const again = await client.callTool({name:'futureaide_run_agent',arguments:{}});
+    assert.equal(JSON.parse(again.content[0].text).accepted,true);
+  } finally { completeFeedback({}); await close(); await bridge.close(); }
+});

@@ -51,6 +51,13 @@ test('isolated actual feedback writes from Codex, Claude management, managed Cod
   assert.equal(rows.find(x=>x.message==='codex symptom').error.code,'operation-failed');
   assert.equal(rows.find(x=>x.message==='cli symptom').error.code,'invalid-message');
   assert.equal(rows.find(x=>x.message==='claude symptom').error,null);
+  const dsh = store.get('dsh-agent'); dsh.task = {...dsh.task, taskId:'new-task', startedAt:new Date().toISOString()}; store.save(dsh);
+  const after = result(await cx.callTool({name:'futureaide_feedback',arguments:{kind:'problem',message:'new round symptom',name:'target'},_meta:{threadId:thread}})); assert.equal(after.saved,true);
+  assert.equal(pendingFeedback(configFile).flatMap(x=>x.occurrences).find(x=>x.message==='new round symptom').error,null);
+  const ended=store.get('codex-agent'); ended.state='idle'; store.save(ended);
+  const denied=await cx.callTool({name:'feedback',arguments:{kind:'problem',message:'ended task'},_meta:{threadId:child}}); assert.equal(result(denied).error.code,'submission-not-owned');
+  const cliRecord=store.get('cli-agent'); cliRecord.task.cancelRequested=true; store.save(cliRecord);
+  const deniedCli=await cp.callTool({name:'feedback',arguments:{kind:'problem',message:'cancelled task'}}); assert.equal(result(deniedCli).error.code,'submission-not-owned');
   assert.deepEqual(rows.map(x=>[x.source,x.caller,x.target,x.name]).sort(),[
    ['codex-desktop','codex-desktop','dsh','target'],['claude-desktop','claude-desktop','plugin',null],['codex-desktop','codex-desktop','codex-desktop','codex helper'],['claude-cli','codex-desktop','claude-cli','cli helper']].sort());
  } finally { await cp.close(); await cl.close(); await mgmt.close(); await cx.close(); await scoped.close(); store.close(); }

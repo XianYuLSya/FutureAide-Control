@@ -19,8 +19,16 @@ import { TARGETS } from './agent-backend.mjs';
 import { RosterStore } from './roster-store.mjs';
 
 const recentErrors = new Map();
+
+function feedbackRecordError(record, candidate) {
+  if (candidate) return candidate;
+  const error = record?.error, at = Date.parse(error?.at), started = Date.parse(record?.task?.startedAt);
+  if (!error || typeof error.tool !== 'string' || typeof error.code !== 'string' || !Number.isFinite(at) || !Number.isFinite(started) || at < started || at > Date.now() || Date.now() - at > 900000) return null;
+  return {tool:error.tool, code:error.code, ...(Number.isInteger(error.httpStatus) ? {httpStatus:error.httpStatus} : {}), at:new Date(at).toISOString()};
+}
+
 const feedbackSchema = { kind: z.enum(['problem', 'friction']), message: z.string().min(1).max(1200), severity: z.enum(['low', 'medium', 'high']).optional() };
-function errorScope(extra, name) { const c = trustedCaller(extra); return (c ? c.source + ':' + c.nativeSessionId : 'codex:' + callingThread(extra)) + ':' + (name ?? ''); }
+function errorScope(extra, name) { const c = trustedCaller(extra); return (c ? c.source + ':' + c.nativeSessionId : 'codex:' + callingThread(extra)) + ':' + (name ?? '') + ':' + (extra.feedbackScope ?? ''); }
 function rememberError(extra, name, tool, error) { if (typeof error?.code !== 'string') return; try { const key = errorScope(extra, name); recentErrors.delete(key); recentErrors.set(key, { tool, code: error.code, ...(Number.isInteger(error.httpStatus) ? { httpStatus: error.httpStatus } : {}), at: new Date().toISOString() }); while (recentErrors.size > 500) recentErrors.delete(recentErrors.keys().next().value); } catch {} }
 function recentError(extra, name) { try { const v = recentErrors.get(errorScope(extra, name)); return v && Date.now() - Date.parse(v.at) <= 900000 ? v : null; } catch { return null; } }
 const name = z.string().min(1).max(80).describe('Subagent name in this chat. Names in other chats are unrelated.');
@@ -75,10 +83,10 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
       let result;
       if (tool === 'feedback' || tool === 'futureaide_feedback') {
         let timer, started = false;
-        const work = (async () => { const resolved = await resolve(); if (Date.now() >= deadline) return { saved: false, code: 'feedback-unavailable' }; started = true; return action(resolved, args, trusted); })();
+        const work = (async () => { const resolved = await resolve(); if (Date.now() >= deadline) return { saved: false, code: 'feedback-unavailable' }; trusted.feedbackScope = resolved.feedbackScope?.(tool, args, trusted) ?? ''; started = true; return action(resolved, args, trusted); })();
         result = await Promise.race([work, new Promise(done => { timer = setTimeout(() => done(started ? { saved: null, code: 'feedback-outcome-unknown' } : { saved: false, code: 'feedback-unavailable' }), Math.max(0, deadline - Date.now())); })]);
         clearTimeout(timer);
-      } else result = await action(await resolve(), args, trusted);
+      } else { const resolved = await resolve(); trusted.feedbackScope = resolved.feedbackScope?.(tool, args, trusted) ?? ''; result = await action(resolved, args, trusted); }
       if (!['feedback', 'futureaide_feedback'].includes(tool) && result?.error) rememberError(trusted, args?.name, tool, result.error);
       // isError is read from the full result: a compact view must never hide a real failure.
       // A view may also shape the detail answer (inspect's node filter lives there),
@@ -91,7 +99,7 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
         ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
       if (trusted && !['feedback', 'futureaide_feedback'].includes(tool)) rememberError(trusted, args?.name, tool, { code: error?.code ?? 'operation-failed', httpStatus: error?.httpStatus });
-      return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
+      return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: ['feedback', 'futureaide_feedback'].includes(tool) ? 'Feedback could not be submitted.' : error.message } }) }] };
     } finally { finished?.(); }
   });
 }
@@ -378,7 +386,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (process.argv[2] === '--claude-cli-reports') {
     // This server belongs to a single claude -p process. The runner sets the
     // route in its MCP config, outside the prompt and tool argument schemas.
-    const [roster, agentId, taskId, requestId, configFile, mode] = process.argv.slice(3);
+    const [roster, agentId, taskId, requestId, fifth, sixth] = process.argv.slice(3);
+    // Older dispatches supplied only the cleanup flag in the fifth slot.
+    const configFile = fifth === '--no-idle-session-cleanup' ? undefined : fifth;
+    const mode = fifth === '--no-idle-session-cleanup' ? fifth : sixth;
     if (!roster || !agentId || !taskId || !requestId) throw new Error('Missing managed Claude CLI dispatch.');
     const store = new RosterStore(roster);
     const server = new McpServer({ name: 'futureaide', version: '1.0.0' });
@@ -386,8 +397,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId }),
       submitManagedFeedback: (input, _extra, error, deadline) => {
         const record = store.get(agentId);
-        if (!record || record.closed || record.target !== 'claude-cli' || record.task?.taskId !== taskId || record.task?.dispatches?.at(-1)?.requestId !== requestId || ['idle', 'failed'].includes(record.state)) throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
-        return submitFeedback(input, { source: 'claude-cli', caller: store.owner(record.ownerId)?.source ?? null, target: 'claude-cli', name: record.name ?? null, error }, { configFile, deadline });
+        if (!record || record.closed || record.target !== 'claude-cli' || record.task?.taskId !== taskId || record.task?.dispatches?.at(-1)?.requestId !== requestId || ['idle', 'failed'].includes(record.state) || record.task.cancelRequested || record.task.reports?.some(report => report.final) || store.submissions(agentId, taskId).some(report => report.final)) throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
+        return submitFeedback(input, { source: 'claude-cli', caller: store.owner(record.ownerId)?.source ?? null, target: 'claude-cli', name: record.name ?? null, error: feedbackRecordError(record, error) }, { configFile, deadline });
       },
     } });
     const transport = new StdioServerTransport();

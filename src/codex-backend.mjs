@@ -936,8 +936,12 @@ export async function createCodexBackend(record, deps = {}) {
           if (!request.intent) {
             // A read that never reached a write (thread/read, turns/list, a cold
             // resume) is local-pending: the same request id may be attempted again.
+            // The root check also runs between those two reads and before onIntent;
+            // its stale 'active' metadata is the same read gap when this attempt
+            // wrote nothing and no earlier attempt left an intent behind.
             // Only a write that might have left but has no intent is unknown/failed.
-            const retryableRead = error.retryableRead === true || isCodexReadRetryable(error);
+            const retryableRead = error.retryableRead === true || isCodexReadRetryable(error)
+              || (error.code === 'codex-root-turn-unconfirmed' && request.attempted !== true);
             if (retryableRead) {
               request.status = 'retryable'; request.attempted = false;
             } else if (request.attempted === true) {

@@ -62,6 +62,7 @@ function desktop({ omitModel = false } = {}) {
       }
       case 'thread/name/set': { find(params.threadId).name = params.name; return {}; }
       case 'thread/turns/list': {
+        hooks.beforeTurnsList?.(params);
         const thread = find(params.threadId);
         const items = params.itemsView === 'summary' ? summaryItems
           : params.itemsView === 'notLoaded' ? () => [] : turn => turn.items;
@@ -493,6 +494,56 @@ test('a read timeout before any write is local-pending and the same request retr
   const result = await f.backend.deliver({ requestId: 'r2', message: 'read gap' });
   assert.equal(result.accepted, true);
   assert.equal(f.native.count('turn/start'), 1);
+});
+
+test('A ending between the root thread read and its turn page is retryable, then Q opens B and S joins once', async () => {
+  const f = await fixture({ omitModel: true, thread: { active: true, turns: [{ id: 'turn-a',
+    status: 'inProgress', startedAt: 1, items: [{ id: 'u1', type: 'userMessage',
+      content: [{ type: 'text', text: 'first task' }] }] }] } });
+  const q = await f.backend.deliver({ requestId: 'q1', message: 'older Q', mode: 'queue',
+    selectionExplicit: false, model: selection(SOL) });
+  assert.deepEqual([q.accepted, q.delivery, q.afterTurnId], [false, 'after-current', 'turn-a']);
+
+  // The race: thread/read returns `active` while A is still running, then A ends
+  // before turns/list is read. The turn page is already idle while the thread
+  // metadata the adapter holds is stale.
+  let ended = false;
+  f.native.hooks.beforeTurnsList = () => {
+    if (ended) return;
+    ended = true;
+    const thread = f.native.threads.get('native-1');
+    thread.active = false;
+    thread.turns[0].status = 'completed';
+  };
+  await assert.rejects(f.backend.deliver({ requestId: 's1', message: 'later S', allowStart: false }),
+    { code: 'codex-root-turn-unconfirmed', retryableRead: true });
+  const pending = f.state().requests.s1;
+  assert.deepEqual([pending.status, pending.attempted, pending.intent], ['retryable', false, undefined]);
+  assert.equal(f.native.count('turn/steer'), 0);
+  assert.equal(f.native.count('turn/start'), 0, 'the read gap never wrote');
+  assert.equal((await f.backend.receipt({ requestId: 's1' })).status, 'retryable');
+
+  // The same request id retries once the root is readable. Q is still the FIFO head,
+  // so S must not open the next turn itself.
+  const held = await f.backend.deliver({ requestId: 's1', message: 'later S', allowStart: false });
+  assert.deepEqual([held.accepted, held.status, held.delivery], [false, 'retryable', 'local-pending']);
+  assert.equal(f.native.count('turn/start'), 0);
+
+  const started = await f.backend.deliver({ requestId: 'q1', message: 'older Q', mode: 'queue',
+    selectionExplicit: false, model: selection(SOL) });
+  assert.deepEqual([started.accepted, started.delivery], [true, 'new-turn']);
+  assert.notEqual(started.turnId, 'turn-a');
+
+  const sent = await f.backend.deliver({ requestId: 's1', message: 'later S', allowStart: false });
+  assert.deepEqual([sent.accepted, sent.delivery, sent.turnId],
+    [true, 'current-turn', started.turnId]);
+  const texts = f.native.threads.get('native-1').turns.flatMap(turn => turn.items)
+    .map(item => item.content[0].text);
+  assert.equal(texts.filter(text => text.startsWith('later S')).length, 1, 'S arrives exactly once');
+  assert.ok(texts.findIndex(text => text.startsWith('older Q'))
+    < texts.findIndex(text => text.startsWith('later S')), 'Q opens B before S joins it');
+  assert.equal(f.native.count('turn/start'), 1);
+  assert.equal(f.native.count('turn/steer'), 1);
 });
 
 test('observe never upgrades a planned start whose marker is the prior turn first input', async () => {

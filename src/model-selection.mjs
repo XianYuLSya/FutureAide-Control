@@ -200,7 +200,9 @@ export function resolveDispatchSelection(catalog, input = {}, { pinned, current,
     if (!entry) throw failure('model-not-found', 'The effective model "' + text(query) + '" is not present in the target catalog.', { availableModels: modelCatalogSummary(catalog).models });
   }
   const explicit = input.effort !== undefined && input.effort !== null;
-  const normalized = Object.fromEntries(Object.entries(config.modelDefaultEfforts || FACTORY_MODEL_DEFAULT_EFFORTS).map(([k, v]) => [k.toLowerCase(), v]));
+  const normalized = { ...FACTORY_MODEL_DEFAULT_EFFORTS, ...Object.fromEntries(
+    Object.entries(config.modelDefaultEfforts ?? {}).map(([key, value]) => [key.toLowerCase(), value]),
+  ) };
   const keys = [entry.id, entry.model?.resolvedModel, entry.model?.model].filter(v => text(v)).map(v => text(v).toLowerCase());
   const key = keys.find(k => Object.hasOwn(normalized, k));
   const effortSource = explicit ? 'explicit' : key ? 'model-default' : 'global-default';
@@ -216,7 +218,9 @@ export function resolveDispatchSelection(catalog, input = {}, { pinned, current,
   if (!selected) {
     const index = EFFORT_ORDER.indexOf(requestedEffort.toLowerCase());
     if (index < 0) throw failure('effort-not-supported', 'Unknown reasoning effort "' + requestedEffort + '". Supported efforts: ' + available.join(', ') + '.', { availableEfforts: available });
-    const ranked = available.map(v => ({ value: v, index: EFFORT_ORDER.indexOf(v.toLowerCase()) })).filter(v => v.index >= 0)
+    // DSH calls the disabled level "off"; preserve its wire value.
+    const rank = value => EFFORT_ORDER.indexOf(value.toLowerCase() === 'off' ? 'none' : value.toLowerCase());
+    const ranked = available.map(v => ({ value: v, index: rank(v) })).filter(v => v.index >= 0)
       .sort((a, b) => Math.abs(a.index - index) - Math.abs(b.index - index) || a.index - b.index);
     if (!ranked.length) throw failure('effort-capability-unknown', 'Model "' + entry.id + '" exposes no comparable reasoning effort.', { availableEfforts: available });
     selected = ranked[0].value;

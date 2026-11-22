@@ -159,7 +159,7 @@ export function sharedCodexCatalog(models, { provider = 'openai', configured } =
         .filter(option => modelText(option?.reasoningEffort))
         .map(option => ({ id: modelText(option.reasoningEffort),
           ...(typeof option.description === 'string' ? { name: option.description } : {}) }))
-      : [];
+      : undefined;
     const defaultEffort = modelText(model.defaultReasoningEffort) || undefined;
     return {
       id,
@@ -168,8 +168,8 @@ export function sharedCodexCatalog(models, { provider = 'openai', configured } =
       ...(typeof model.description === 'string' && model.description ? { description: model.description } : {}),
       // `reasoning` is the shape model-selection.mjs reads; the flat fields keep
       // status and older readers able to show the same advertised values.
-      reasoning: { efforts, ...(defaultEffort ? { defaultEffort } : {}) },
-      reasoningEfforts: efforts.map(effort => effort.id),
+      reasoning: { ...(efforts ? { efforts } : {}), ...(defaultEffort ? { defaultEffort } : {}) },
+      ...(efforts ? { reasoningEfforts: efforts.map(effort => effort.id) } : {}),
       ...(defaultEffort ? { defaultEffort } : {}),
       isDefault: model.isDefault === true,
     };
@@ -235,7 +235,7 @@ export function codexDeliverySelection(catalog, selection) {
       `Model "${entry.id}" does not support reasoning effort "${requestedEffort}". Supported efforts: ${efforts.map(effort => effort.id).join(', ') || 'none'}.`,
       { availableEfforts: efforts.map(effort => effort.id), terminal: true });
   }
-  const effort = requestedEffort ?? entry.reasoning?.defaultEffort;
+  const effort = selection.selectedEffort === null ? undefined : requestedEffort ?? entry.reasoning?.defaultEffort;
   return { modelId: entry.id, model: entry.model, ...(effort ? { effort } : {}) };
 }
 

@@ -205,7 +205,7 @@ function fakeBackend({ nodes = [], changes = [], historyText = id => 'history:' 
     receipt: async () => undefined,
     turn: async () => ({ state: 'ended' }),
     models: async () => ({ default: MODEL, routableProviders: [MODEL.provider],
-      groups: [{ id: MODEL.provider, models: [{ id: MODEL.model }] }] }),
+      groups: [{ id: MODEL.provider, models: [{ id: MODEL.model, reasoningEfforts: ['high', 'max'] }] }] }),
     model: async () => MODEL,
     selectModel: async () => ({ accepted: true }),
     cancel: async () => ({ cancelRequested: true }),
@@ -535,6 +535,8 @@ test('Codex poll consumes submissions atomically while ask remains answerable th
   const adapter = (record, deps) => createCodexBackend(record, { ...deps, host: {
     probe: async () => ({ identity: { application: 'codex-desktop' }, missing: [] }),
     readDefaultModel: async () => ({ provider: 'openai', model: 'test' }),
+    models: async () => ({ default: { provider: 'openai', model: 'test' },
+      groups: [{ id: 'openai', models: [{ id: 'test', reasoningEfforts: ['max'] }] }] }),
   } });
   const f = await fixture({ adapters: { 'codex-desktop': adapter } });
   try {
@@ -605,9 +607,9 @@ test('Desktop first input and immediate supplement queue promptly and each dispa
     assert.equal((await f.service.send({ name: 'queue', message: 'first' }, extra(THREAD))).queued, true);
     assert.equal((await f.service.send({ name: 'queue', message: 'supplement' }, extra(THREAD))).queued, true);
     assert.equal(sent.length, 0);
-    assert.equal(instances, 0, 'queuing never probes the host or creates an adapter');
+    const beforePoll = instances; // Queuing resolves the model catalog without dispatching.
     await f.service.poll('queue');
-    assert.equal(instances, 1, 'a poll uses one backend instance');
+    assert.equal(instances, beforePoll + 1, 'a poll uses one backend instance');
     await f.service.poll('queue');
     await f.service.poll('queue');
     assert.deepEqual(sent.map(input => [input.message, input.kind]), [['first', 'task'], ['supplement', 'supplement']]);

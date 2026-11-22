@@ -23,7 +23,7 @@ import { loadConfig } from './config.mjs';
 import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './report-endpoint.mjs';
 import { ensureSharedMonitor } from './shared-monitor.mjs';
 import { RosterStore } from './roster-store.mjs';
-import { exitWhenInputCloses } from './stdio-exit.mjs';
+import { exitWhenInputCloses, stdioWaitSignal } from './stdio-exit.mjs';
 
 export const BOOTSTRAP_NAME = 'futureaide-report';
 export const BOOTSTRAP_VERSION = '1.0.0';
@@ -78,7 +78,7 @@ export function createForwardServer({ fetchTools, callTool, instructions, listCh
  * loopback service could not be reached and the session is served no tools instead
  * of tools that always fail.
  */
-export async function startColdStartBridge({ configPath = process.env.DSH_CONTROL_CONFIG, env = process.env,
+export async function startColdStartBridge({ configPath = process.env.DSH_CONTROL_CONFIG, env = process.env, inputSignal,
   waitMs = 10000, pollMs = 250, toolCheckMs = 45000, log = message => process.stderr.write(`[futureaide-report] ${message}\n`),
   load = loadConfig, status = readReportStatus, ensure = ensureSharedMonitor,
   storeFor = config => new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
@@ -182,9 +182,10 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     if (name === 'futureaide_wait_agents') {
       const controller = new AbortController();
       activeWaits.add(controller);
-      const abort = () => controller.abort(extra.signal?.reason);
-      if (extra.signal?.aborted) abort();
-      else extra.signal?.addEventListener('abort', abort, { once: true });
+      const callerSignal = AbortSignal.any([extra.signal, inputSignal].filter(Boolean));
+      const abort = () => controller.abort(callerSignal.reason);
+      if (callerSignal.aborted) abort();
+      else callerSignal.addEventListener('abort', abort, { once: true });
       let client;
       try {
         if (controller.signal.aborted) throw controller.signal.reason ?? new Error('Cancelled');
@@ -206,12 +207,12 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
           },
         }), lost, ended]);
       } catch (error) {
-        if (extra.signal?.aborted) throw error;
+        if (callerSignal.aborted) throw error;
         if (error?.code === -32001) throw error;
         return failure('transport-lost', 'The wait transport was lost. Do not resend the task; check the original task reference.',
           { operation: name, taskKeys: args.taskKeys, names: args.names, cause: error?.message ?? String(error) });
       } finally {
-        extra.signal?.removeEventListener('abort', abort);
+        callerSignal.removeEventListener('abort', abort);
         controller.abort();
         activeWaits.delete(controller);
         try { await client?.close(); } catch { /* already closed */ }
@@ -311,7 +312,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const index = argv.indexOf('--config');
   const configPath = index === -1 ? process.env.DSH_CONTROL_CONFIG : argv[index + 1];
-  const bridge = await startColdStartBridge({ configPath });
+  const bridge = await startColdStartBridge({ configPath, inputSignal: stdioWaitSignal() });
   const transport = new StdioServerTransport();
   // Installed before connect() so the protocol's handler is wrapped from the first
   // message. A forwarded call that is already being answered still goes out before the

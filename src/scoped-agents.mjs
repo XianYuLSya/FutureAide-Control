@@ -12,7 +12,7 @@ import { callCodexOwner, readCodexOwnerTurns, readCodexOwnerItems } from './code
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-sessions.mjs';
-import { isCancelledRound, RosterStore, submissionNoticeId, submissionRef } from './roster-store.mjs';
+import { captureNativeQuestionHistory, isCancelledRound, RosterStore, submissionNoticeId, submissionRef } from './roster-store.mjs';
 import { canReleaseThreads, canSleep, hasPendingDelivery, RELEASE_RECHECK_MS, releaseDue,
   releaseRetryDelay } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
@@ -1613,7 +1613,7 @@ export function createScopedAgents(config, {
     const reason = item?.reason ?? dispatch?.error?.code ?? fallback.reason;
     return {
       name: current.name, state: current.state, accepted, queued,
-      requestId,
+      requestId, taskKey: store.taskKeyForRequest(record.ownerId, requestId),
       mode: item?.mode ?? stored.mode ?? fallback.mode ?? 'steer',
       delivery,
       ...(turnId ? { turnId } : {}),
@@ -4185,7 +4185,8 @@ export function createScopedAgents(config, {
           }
         }
         const pin = await resolvePin(undefined, undefined);
-        const snapshot = record.task ? { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
+        const snapshot = record.task ? { ...record.task, ...(publicResult(record).error ? { error: publicResult(record).error } : {}),
+          changes: attributedChanges(record, record.observation ?? {}),
           coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) } : undefined;
         // finalReminder marks this task as one that may be reminded once when a turn
         // ends without a final report. Tasks created before this rule carry no marker,
@@ -4298,15 +4299,9 @@ export function createScopedAgents(config, {
     },
     async send(args, extra) {
       const result = await service.sendUnkeyed(args, extra);
-      if (!result.requestId || result.taskKey) return result;
-      const owner = await context(extra);
-      const record = store.named(owner.ownerId, args.name);
-      if (!record) throw Object.assign(new Error('The dispatched task is no longer available.'), { code: 'task-unavailable' });
-      const pending = result.mode === 'queue' && result.queued === true && record.task?.requestId !== result.requestId;
-      const taskKey = store.saveTaskKey(owner.ownerId, record.agentId, result.requestId, pending ? null : record.task?.taskId ?? null);
-      return { ...result, taskKey };
+      if (result.requestId && !result.taskKey) throw Object.assign(new Error('The original dispatch receipt is unavailable.'), { code: 'task-receipt-unavailable' });
+      return result;
     },
-
 
     /**
      * Create the name if it is new and send the task, in one call. An existing name
@@ -4545,7 +4540,7 @@ export function createScopedAgents(config, {
       const owner = await context(extra);
       if (names) names.forEach(assertName);
       if (taskKeys && (!Array.isArray(taskKeys) || taskKeys.some(key => typeof key !== 'string'))) throw new Error('taskKeys must be an array of task keys.');
-      const available = store.list(owner.ownerId);
+      const available = taskKeys ? [] : store.list(owner.ownerId);
       const selected = available.filter(record => !names || names.includes(record.name));
       const notListed = new Set((names ?? []).filter(name => !available.some(record => record.name === name)));
       // Legacy name snapshots retain their old bounded state-query behaviour.
@@ -4576,20 +4571,24 @@ export function createScopedAgents(config, {
           ...(notListed.size ? { note: 'These names are not in this chat’s current list. Absence alone does not prove task completion; use the delivered result.' } : {}),
           timedOut: Date.now() >= deadline && items.some(item => item.state === 'running') };
       }
-      const keys = taskKeys ?? selected.filter(record => record.task?.requestId).map(record => store.saveTaskKey(owner.ownerId, record.agentId, record.task.requestId, record.task.taskId));
+      const keys = taskKeys ?? selected.filter(record => record.task?.requestId).map(record =>
+        store.taskKeyForRequest(owner.ownerId, record.task.requestId)
+        ?? store.saveTaskKey(owner.ownerId, record.agentId, record.task.requestId, record.task.taskId));
       const selection = [...new Set(keys)].sort();
+      const selectionHash = createHash('sha256').update(JSON.stringify([owner.ownerId, selection])).digest('base64url');
+      const keyIndexes = new Map(selection.map((key, index) => [key, String(index)]));
       let positions = {};
       if (after !== undefined) {
         try {
           const parsed = JSON.parse(Buffer.from(after, 'base64url').toString('utf8'));
-          if (parsed.owner !== owner.ownerId || JSON.stringify(parsed.keys) !== JSON.stringify(selection)
-              || !parsed.positions || typeof parsed.positions !== 'object') throw new Error();
+          if (parsed.selection !== selectionHash || !parsed.positions || typeof parsed.positions !== 'object'
+              || Array.isArray(parsed.positions)) throw new Error();
           positions = parsed.positions;
         } catch {
           throw Object.assign(new Error('The wait cursor does not match this owner and task selection.'), { code: 'invalid-cursor' });
         }
       }
-      const cursor = () => Buffer.from(JSON.stringify({ owner: owner.ownerId, keys: selection, positions })).toString('base64url');
+      const cursor = value => Buffer.from(JSON.stringify({ selection: selectionHash, positions: value ?? positions })).toString('base64url');
       const deadline = timeoutSeconds === undefined ? Infinity : Date.now() + timeoutSeconds * 1000;
       const signal = extra?.signal;
       if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
@@ -4602,34 +4601,44 @@ export function createScopedAgents(config, {
         while (true) {
           if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
           if (waitsClosed) throw Object.assign(new Error('The service closed while waiting.'), { code: 'transport-lost' });
-          const events = [], items = [];
+          const events = [], items = [], initialPositions = new Map();
           for (const key of selection) {
+            const cursorIndex = keyIndexes.get(key);
             let mapping = store.resolveTaskKey(owner.ownerId, key);
             if (!mapping) throw Object.assign(new Error('Task receipt is unavailable for this owner.'), { code: 'task-receipt-unavailable' });
             if (mapping.receipt?.expired) throw Object.assign(new Error('Task receipt has expired.'), { code: 'task-receipt-expired' });
+            if (mapping.failureReason) throw Object.assign(new Error('The dispatched input failed.'), { code: mapping.failureReason, requestId: mapping.requestId });
             const record = store.get(mapping.agentId);
+            const supplement = store.supplement(mapping.requestId);
+            if (supplement?.status === 'blocked') throw Object.assign(new Error('The dispatched input failed.'), { code: supplement.reason ?? 'dispatch-failed', requestId: mapping.requestId });
             if (!mapping.taskId) {
-              const supplement = store.supplement(mapping.requestId);
-              if (supplement?.status === 'blocked') throw Object.assign(new Error('The queued dispatch failed.'), { code: supplement.reason ?? 'dispatch-failed' });
               if (supplement?.status === 'accepted' && supplement.task) {
                 store.saveTaskKey(owner.ownerId, mapping.agentId, mapping.requestId, supplement.task);
                 mapping = store.resolveTaskKey(owner.ownerId, key);
               }
             }
             if (record && record.ownerId !== owner.ownerId) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
-            if (mapping.receipt) { if (!positions[key]?.delivered) events.push({ id: key + ':delivered:' + mapping.receipt.finalSubmissionId, taskKey: key, type: 'delivered', final: true, createdAt: mapping.receipt.deliveredAt }); continue; }
+            if (!record && !mapping.receipt) mapping = store.resolveTaskKey(owner.ownerId, key);
+            if (!mapping) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
+            if (mapping.failureReason) throw Object.assign(new Error('The dispatched input failed.'), { code: mapping.failureReason, requestId: mapping.requestId });
+            if (mapping.receipt) { if (!positions[cursorIndex]?.delivered) events.push({ id: key + ':delivered:' + mapping.receipt.finalSubmissionId, taskKey: key, type: 'delivered', final: true, createdAt: mapping.receipt.deliveredAt }); continue; }
             if (!record) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
             if (!mapping.taskId) { items.push({ name: record.name, state: 'queued', task: null }); continue; }
-            const task = record.task?.taskId === mapping.taskId ? record.task : store.historyFor(mapping.agentId).find(item => item.taskId === mapping.taskId);
+            const task = record.task?.taskId === mapping.taskId ? record.task : store.historyTask(mapping.agentId, mapping.taskId);
             if (!task) throw Object.assign(new Error('The original task is unavailable.'), { code: 'task-receipt-unavailable' });
+            const answer = (task.answers ?? []).find(item => item.answerId === mapping.requestId);
+            if (answer?.undelivered) throw Object.assign(new Error('The answer was not delivered.'), { code: answer.undelivered, requestId: mapping.requestId });
             const dispatch = (task.dispatches ?? []).find(item => item.requestId === mapping.requestId);
-            if (dispatch?.state === 'failed') {
-              throw Object.assign(new Error('The dispatched task failed to send.'), { code: dispatch.failure?.code ?? dispatch.error?.code ?? 'dispatch-failed', detail: dispatch.failure ?? dispatch.error });
+            if (dispatch?.state === 'failed' && dispatch.accepted !== true) {
+              throw Object.assign(new Error('The dispatched task failed to send.'), { code: dispatch.failure?.code ?? dispatch.error?.code ?? 'dispatch-failed', requestId: mapping.requestId, detail: dispatch.failure ?? dispatch.error });
             }
             const taskRecord = task === record.task ? record : { ...record, task, state: task.state, observation: undefined, error: undefined };
             items.push(publicResult(taskRecord));
-            const submissions = store.submissionsInOrder(mapping.agentId, mapping.taskId);
-            for (let index = positions[key]?.count ?? 0; index < submissions.length; index++) {
+            const baseline = mapping.baseline ?? { count: 0, reportCount: 0, nativeCount: 0 };
+            const position = positions[cursorIndex] ?? { count: baseline.count ?? 0, reportCount: baseline.reportCount ?? 0, nativeCount: baseline.nativeCount ?? 0 };
+            initialPositions.set(cursorIndex, position);
+            const submissions = store.submissionsInOrder(mapping.agentId, mapping.taskId, position.count);
+            for (let index = 0; index < submissions.length; index++) {
               const submission = submissions[index];
               events.push({ id: key + ':submission:' + submission.id, taskKey: key, name: record.name,
                 type: submission.kind === 'ask' ? 'question' : submission.final ? 'final' : 'report',
@@ -4637,36 +4646,39 @@ export function createScopedAgents(config, {
                 final: submission.final === true, createdAt: submission.created });
             }
             const reports = (task.reports ?? []).filter(report => !report.failure && !report.id?.startsWith('submission:'));
-            for (let index = positions[key]?.reportCount ?? 0; index < reports.length; index++) {
+            for (let index = position.reportCount ?? 0; index < reports.length; index++) {
               const report = reports[index];
               events.push({ id: key + ':report:' + (report.id ?? index), taskKey: key, name: record.name,
                 type: report.final ? 'final' : 'report', source: 'task-report',
                 message: compactText(report.message, 4000), ...(report.message?.length > 4000 ? { truncated: true } : {}),
                 final: report.final === true, createdAt: report.createdAt });
             }
-            if (task === record.task) {
-              const nativeQuestions = (record.observation?.questions ?? []).filter(question =>
-                question.state === 'pending' && question.id && !question.id.startsWith('submission:'));
-              const last = nativeQuestions.findIndex(question => question.id === positions[key]?.nativeLast);
-              for (const question of nativeQuestions.slice(last + 1)) {
-                events.push({ id: key + ':native:' + question.id, taskKey: key, name: record.name,
-                  type: 'question', source: 'native', message: compactText(question.message, 4000), createdAt: question.createdAt });
-              }
+            // Old rosters may have only the last observation; read it without a write.
+            const nativeQuestions = task === record.task ? captureNativeQuestionHistory(taskRecord) : (task.nativeQuestions ?? []);
+            for (let index = position.nativeCount ?? 0; index < nativeQuestions.length; index++) {
+              const question = nativeQuestions[index];
+              events.push({ id: key + ':native:' + question.id, taskKey: key, name: record.name,
+                type: 'question', source: 'native', message: compactText(question.message, 4000), createdAt: question.createdAt });
             }
             const state = task === record.task ? terminalRound(record) : (['completed', 'failed', 'cancelled'].includes(task?.state) ? task.state : undefined);
-            if (state && !positions[key]?.terminal) events.push({ id: key + ':terminal:' + state, taskKey: key, name: record.name, type: state, source: 'task', ...((task === record.task ? record.error ?? task.cancelError : task.error ?? task.cancelError) ? { reason: task === record.task ? record.error ?? task.cancelError : task.error ?? task.cancelError } : {}), createdAt: task?.finishedAt });
+            if (state && !positions[cursorIndex]?.terminal) events.push({ id: key + ':terminal:' + state, taskKey: key, name: record.name, type: state, source: 'task', ...((task === record.task ? record.error ?? task.cancelError : task.error ?? task.cancelError) ? { reason: task === record.task ? record.error ?? task.cancelError : task.error ?? task.cancelError } : {}), createdAt: task?.finishedAt });
           }
           const batch = []; let size = 0;
           for (const event of events) {
             const length = JSON.stringify(event).length;
             if (batch.length && size + length > 20000) break;
-            batch.push(event); size += length;
-            const position = positions[event.taskKey] ??= { count: 0 };
+            const index = keyIndexes.get(event.taskKey);
+            const position = { ...(positions[index] ?? initialPositions.get(index) ?? { count: 0, reportCount: 0, nativeCount: 0 }) };
             if (event.type === 'delivered') position.delivered = true;
             else if (['completed', 'failed', 'cancelled'].includes(event.type)) position.terminal = true;
-            else if (event.source === 'native') position.nativeLast = event.id.slice((event.taskKey + ':native:').length);
+            else if (event.source === 'native') position.nativeCount = (position.nativeCount ?? 0) + 1;
             else if (event.source === 'task-report') position.reportCount = (position.reportCount ?? 0) + 1;
             else position.count++;
+            const nextPositions = { ...positions, [index]: position };
+            if (cursor(nextPositions).length > 20000 && batch.length) break;
+            if (cursor(nextPositions).length > 20000) throw Object.assign(new Error('Wait cursor exceeds its size limit; select fewer tasks.'), { code: 'wait-cursor-limit' });
+            positions = nextPositions;
+            batch.push(event); size += length;
           }
           const timedOut = Date.now() >= deadline;
           if (batch.length || timedOut || notListed.size || !selection.length) return { items, notListed: [...notListed], events: batch, nextCursor: cursor(), reason: batch.length ? 'event' : notListed.size ? 'not-listed' : timedOut ? 'timeout' : 'empty', timedOut: timedOut && !batch.length };

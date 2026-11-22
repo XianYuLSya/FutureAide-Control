@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { RosterStore } from '../src/roster-store.mjs';
 
 const record = () => ({ agentId: 'old', ownerId: 'owner', name: 'same', sessionId: 'session', state: 'completed',
@@ -92,5 +93,65 @@ test('answer intent and task key roll back together on key failure', () => {
     assert.throws(() => store.saveAnswerWithTaskKey(updated, 'answer-request'), /injected/);
     assert.equal(store.get(old.agentId).task.answers, undefined);
     assert.equal(store.db.prepare("SELECT count(*) AS n FROM task_keys WHERE request='answer-request'").get().n, 0);
+  } finally { store.close(); }
+});
+
+
+test('live task key reads do not request the WAL writer lock', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'task-key-read-'));
+  const file = path.join(dir, 'test.sqlite');
+  const store = new RosterStore(file);
+  const writer = new DatabaseSync(file);
+  try {
+    const key = store.saveTaskKey('owner', 'agent', 'request', 'task');
+    store.db.exec('PRAGMA busy_timeout=50');
+    writer.exec('BEGIN IMMEDIATE');
+    assert.equal(store.resolveTaskKey('owner', key).taskId, 'task');
+    writer.exec('ROLLBACK');
+  } finally { writer.close(); store.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('queued key captures its event baseline when bound, before later submissions', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const current = record(); current.state = 'running'; current.task.state = 'running'; current.task.reports = [];
+    store.insert(current);
+    const key = store.saveTaskKey('owner', 'old', 'queued', null);
+    store.enqueueSubmission({ id: 'before-bind', ownerId: 'owner', agentId: 'old', taskId: 'round', kind: 'report', message: 'old' });
+    assert.equal(store.saveTaskKey('owner', 'old', 'queued', 'round'), key);
+    store.enqueueSubmission({ id: 'after-bind', ownerId: 'owner', agentId: 'old', taskId: 'round', kind: 'report', message: 'new' });
+    const mapping = store.resolveTaskKey('owner', key);
+    assert.equal(mapping.baseline.count, 1);
+    assert.deepEqual(store.submissionsInOrder('old', 'round', mapping.baseline.count).map(row => row.id), ['after-bind']);
+  } finally { store.close(); }
+});
+
+
+test('delivery receipt retains a failed answer reason for its request key', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const old = record(); old.task.answers = [{ answerId: 'failed-answer', undelivered: 'final-submitted' }];
+    store.insert(old); const key = store.saveTaskKey('owner', 'old', 'failed-answer', 'round');
+    store.remove(old, { deliveredReceipt: true });
+    assert.equal(store.resolveTaskKey('owner', key).failureReason, 'final-submitted');
+  } finally { store.close(); }
+});
+
+
+test('legacy native questions migrate before observation disappears and cleanup removes their text', () => {
+  const store = new RosterStore(':memory:');
+  try {
+    const old = record(); old.observation = { questions: [{ id: 'legacy-q', state: 'pending', message: 'private native question' }] };
+    store.insert(old);
+    const key = store.saveTaskKey('owner', 'old', 'request', 'round');
+    const changed = store.get('old'); changed.observation = { questions: [] }; store.save(changed);
+    assert.equal(store.get('old').task.nativeQuestions[0].message, 'private native question');
+    store.remove(changed, { deliveredReceipt: true });
+    const receipt = store.resolveTaskKey('owner', key);
+    assert.equal(receipt.receipt.finalSubmissionId, 'final');
+    assert.doesNotMatch(JSON.stringify(receipt), /private native question/);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM agent_history WHERE agent=?').get('old').n, 0);
+    assert.equal(store.db.prepare('SELECT count(*) AS n FROM agents WHERE id=?').get('old').n, 0);
   } finally { store.close(); }
 });

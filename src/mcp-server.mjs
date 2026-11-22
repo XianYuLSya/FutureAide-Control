@@ -11,7 +11,7 @@ import { createScopedAgents } from './scoped-agents.mjs';
 import { createMcpDiagnostics } from './mcp-diagnostics.mjs';
 import { TRUSTED_CALLER } from './calling-context.mjs';
 import { monitorAlive } from './shared-monitor.mjs';
-import { exitWhenInputCloses } from './stdio-exit.mjs';
+import { exitWhenInputCloses, stdioWaitSignal } from './stdio-exit.mjs';
 import { compactChanges, compactCreate, compactInspect, compactList, compactStatus, compactWait } from './tool-view.mjs';
 import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
 import { TARGETS } from './agent-backend.mjs';
@@ -100,7 +100,9 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
       return { content: [{ type: 'text', text }],
         ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
-      return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: error.message } }) }] };
+      const failure = { code: error.code ?? 'operation-failed', message: error.message };
+      if (tool === 'futureaide_wait_agents' && error.requestId) failure.requestId = error.requestId;
+      return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: failure }) }] };
     } finally { finished?.(); }
   });
 }
@@ -140,7 +142,9 @@ export function registerScopedTools(server, options = {}) {
     taskKeys: z.array(z.string().min(1).max(512)).min(1).max(50).optional().describe('Copy taskKey from each original dispatch receipt.'),
     after: z.string().min(1).optional().describe('Copy nextCursor from the preceding event for the same selection.'),
     timeout_seconds: z.number().int().min(0).max(45).optional(), detail,
-  }, waitForAgents, compactWait);
+  }, (service, args, extra) => waitForAgents(service, args, options.inputSignal ? {
+    ...extra, signal: AbortSignal.any([extra.signal, options.inputSignal].filter(Boolean)),
+  } : extra), compactWait);
   registerView('futureaide_agent_changes', 'Read observed file changes across a named subagent’s tree, attributed by agentPath, without reading conversations. Each path keeps only its operation, plus agentPath below the root and attribution when a before/after comparison found it; pass detail: true for the complete entries, including any before/after content. Coverage is stated as one sentence, and unconfirmed paths are called out. task=0 selects the current/latest task; 1 selects the preceding task, and its task text is kept so the answer says which task it is.', {
     name, task: z.number().int().min(0).optional(), detail,
   }, (s, a, e) => s.changes(a, e), compactChanges);
@@ -159,7 +163,7 @@ export function registerScopedTools(server, options = {}) {
  * use the same settings.
  */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics,
-  configReady } = {}) {
+  configReady, inputSignal } = {}) {
   const server = new McpServer({ name: 'futureaide-control', version: '0.5.20' });
   let servicePromise;
   const service = () => servicePromise ??= (configReady ?? loadConfig(configPath)).then(async config => {
@@ -183,7 +187,7 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
     monitorHealth.unref();
     return value;
   });
-  registerScopedTools(server, { service, diagnostics });
+  registerScopedTools(server, { service, diagnostics, inputSignal });
   registerParentTools(server, { service, diagnostics });
   // Restore the shared listener on connection even before the first tool call.
   void service().catch(() => {});
@@ -408,7 +412,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const diagnostics = createMcpDiagnostics();
     const legacy = process.env.FUTUREAIDE_LEGACY_TOOLS === '1';
     const configReady = legacy ? undefined : loadConfig();
-    const server = legacy ? makeServer() : makeScopedServer({ diagnostics, configReady });
+    const server = legacy ? makeServer() : makeScopedServer({ diagnostics, configReady, inputSignal: stdioWaitSignal() });
     // Decide before connecting stdin. An early EOF must never install or enter
     // the new shutdown path on an installation with cleanup disabled.
     const cleanup = await configReady?.then(config => config.idleSessionCleanup !== false, () => false);

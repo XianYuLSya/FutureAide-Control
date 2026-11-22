@@ -28,6 +28,26 @@ const submissionFromRow = row => ({ id: row.id, ownerId: row.owner, agentId: row
   delivery: row.delivery ? JSON.parse(row.delivery)
     : { id: submissionNoticeId(row.id), state: 'pending', createdAt: row.created } });
 
+// Keep each native question in first-seen order, even if a later observation removes it.
+export function captureNativeQuestionHistory(record, previous) {
+  const task = record?.task;
+  if (!task?.taskId) return [];
+  const prior = previous?.task?.taskId === task.taskId ? previous : undefined;
+  const history = [];
+  const seen = new Set();
+  const add = question => {
+    if (!question?.id || typeof question.id !== 'string' || question.id.startsWith('submission:') || seen.has(question.id)) return;
+    seen.add(question.id);
+    history.push({ id: question.id, message: question.message, ...(question.createdAt ? { createdAt: question.createdAt } : {}) });
+  };
+  for (const question of prior?.task?.nativeQuestions ?? []) add(question);
+  for (const question of task.nativeQuestions ?? []) add(question);
+  for (const question of prior?.observation?.questions ?? []) if (question.state === 'pending') add(question);
+  for (const question of record.observation?.questions ?? []) if (question.state === 'pending') add(question);
+  if (history.length) task.nativeQuestions = history;
+  return history;
+}
+
 // A queued input as its callers read it. mode, the explicit-selection flag and the receipt
 // are compatibility columns: a row written before they existed reads them as undefined, so
 // the old target behaviour still applies and no reader mistakes silence for a choice.
@@ -65,6 +85,15 @@ export function writeDeliveredReceipts(db, record, retentionMs = 7 * 24 * 60 * 6
   if (!report) {
     db.prepare('DELETE FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL').run(record.ownerId, record.agentId);
     return false;
+  }
+  // Preserve request-specific failure independently of the round's final receipt.
+  for (const answer of current.task?.answers ?? []) {
+    if (answer.undelivered && answer.answerId) db.prepare('UPDATE task_keys SET failureReason=? WHERE owner=? AND agent=? AND request=?')
+      .run(answer.undelivered, record.ownerId, record.agentId, answer.answerId);
+  }
+  for (const dispatch of current.task?.dispatches ?? []) {
+    if (dispatch.state === 'failed' && dispatch.accepted !== true && dispatch.requestId) db.prepare('UPDATE task_keys SET failureReason=? WHERE owner=? AND agent=? AND request=?')
+      .run(dispatch.failure?.code ?? dispatch.error?.code ?? 'dispatch-failed', record.ownerId, record.agentId, dispatch.requestId);
   }
   const finalSubmissionId = report.id.startsWith('submission:') ? report.id.slice(11) : report.id;
   const deliveredAt = report.delivery.deliveredAt ?? null;
@@ -120,6 +149,7 @@ export class RosterStore {
         task TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, final INTEGER NOT NULL,
         created TEXT NOT NULL, state TEXT NOT NULL, consumed TEXT, delivery TEXT);
       CREATE INDEX IF NOT EXISTS submissions_pending ON submissions(agent,task) WHERE state='pending';
+      CREATE INDEX IF NOT EXISTS submissions_by_task ON submissions(agent,task);
       CREATE TABLE IF NOT EXISTS agent_history (agent TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
         PRIMARY KEY (agent, seq)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -152,6 +182,8 @@ export class RosterStore {
     // keeps its rows valid: a row with no notice yet counts as not delivered.
     this.addTextColumn('submissions', 'consumed');
     this.addTextColumn('submissions', 'delivery');
+    this.addTextColumn('task_keys', 'baseline');
+    this.addTextColumn('task_keys', 'failureReason');
     // Only now can the debt index name the notice column. A roster from an older build
     // gains that column on the line above; a new one created it with the table.
     this.db.exec(`CREATE INDEX IF NOT EXISTS submissions_debt ON submissions(agent, task)
@@ -228,8 +260,11 @@ export class RosterStore {
 
   owner(id) { const row = this.db.prepare('SELECT body FROM owners WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
   saveOwner(owner) {
-    this.db.prepare('INSERT OR IGNORE INTO owners(id,body) VALUES (?,?)').run(owner.ownerId, JSON.stringify(owner));
-    const saved = this.owner(owner.ownerId);
+    let saved = this.owner(owner.ownerId);
+    if (!saved) {
+      this.db.prepare('INSERT OR IGNORE INTO owners(id,body) VALUES (?,?)').run(owner.ownerId, JSON.stringify(owner));
+      saved = this.owner(owner.ownerId);
+    }
     // Both sources bind one owner to one chat/session and one project.
     const sameCaller = (saved.threadId ?? null) === (owner.threadId ?? null)
       && (saved.nativeSessionId ?? null) === (owner.nativeSessionId ?? null);
@@ -273,18 +308,40 @@ export class RosterStore {
     this.db.prepare('DELETE FROM task_keys WHERE expiresAt IS NOT NULL AND expiresAt<=?').run(new Date().toISOString());
   }
   saveTaskKey(ownerId, agentId, requestId, taskId = null) {
-    this.pruneExpiredTaskKeys();
-    this.db.prepare('INSERT OR IGNORE INTO task_keys(key,owner,agent,request,task) VALUES (?,?,?,?,?)')
-      .run(randomUUID(), ownerId, agentId, requestId, taskId ?? null);
-    const row = this.db.prepare('SELECT * FROM task_keys WHERE owner=? AND request=?').get(ownerId, requestId);
-    if (row.agent !== agentId || (row.task !== null && taskId != null && row.task !== taskId))
-      throw new Error('Task key cannot be rebound to another task.');
-    if (row.task === null && taskId != null) {
-      this.db.prepare('UPDATE task_keys SET task=? WHERE key=? AND task IS NULL').run(taskId, row.key);
-      const actual = this.db.prepare('SELECT task FROM task_keys WHERE key=?').get(row.key);
-      if (actual.task !== taskId) throw new Error('Task key cannot be rebound to another task.');
+    // A savepoint also composes with the dispatch transaction that called us.
+    this.db.exec('SAVEPOINT task_key_write');
+    try {
+      this.pruneExpiredTaskKeys();
+      let row = this.db.prepare('SELECT * FROM task_keys WHERE owner=? AND request=?').get(ownerId, requestId);
+      if (row && (row.agent !== agentId || (row.task !== null && taskId != null && row.task !== taskId)))
+        throw new Error('Task key cannot be rebound to another task.');
+      if (!row || (row.task === null && taskId != null)) {
+        let baseline = null;
+        if (taskId != null) {
+          const body = this.db.prepare('SELECT body FROM agents WHERE id=? AND owner=?').get(agentId, ownerId);
+          const record = body ? JSON.parse(body.body) : undefined;
+          const task = record?.task?.taskId === taskId ? record.task : undefined;
+          const primary = task?.requestId === requestId;
+          const questions = record ? captureNativeQuestionHistory(record) : [];
+          baseline = JSON.stringify({ count: primary ? 0 : this.db.prepare('SELECT count(*) AS n FROM submissions WHERE agent=? AND task=?').get(agentId, taskId).n,
+            reportCount: primary ? 0 : (task?.reports ?? []).filter(report => !report.failure && !report.id?.startsWith('submission:')).length,
+            nativeCount: primary ? 0 : questions.length });
+        }
+        if (!row) {
+          this.db.prepare('INSERT INTO task_keys(key,owner,agent,request,task,baseline) VALUES (?,?,?,?,?,?)')
+            .run(randomUUID(), ownerId, agentId, requestId, taskId, baseline);
+          row = this.db.prepare('SELECT * FROM task_keys WHERE owner=? AND request=?').get(ownerId, requestId);
+        } else {
+          this.db.prepare('UPDATE task_keys SET task=?,baseline=? WHERE key=? AND task IS NULL').run(taskId, baseline, row.key);
+        }
+      }
+      this.db.exec('RELEASE task_key_write');
+      return row.key;
+    } catch (error) {
+      this.db.exec('ROLLBACK TO task_key_write');
+      this.db.exec('RELEASE task_key_write');
+      throw error;
     }
-    return row.key;
   }
   // Persist an answer intent and its task key as one fenced write.
   saveAnswerWithTaskKey(record, requestId) {
@@ -301,14 +358,20 @@ export class RosterStore {
       throw error;
     }
   }
+  taskKeyForRequest(ownerId, requestId) {
+    return this.db.prepare('SELECT key FROM task_keys WHERE owner=? AND request=?').get(ownerId, requestId)?.key;
+  }
   resolveTaskKey(ownerId, key) {
-    this.pruneExpiredTaskKeys();
     const row = this.db.prepare('SELECT * FROM task_keys WHERE owner=? AND key=?').get(ownerId, key);
     if (!row) return null;
+    if (row.expiresAt && Date.parse(row.expiresAt) <= Date.now()) {
+      this.db.prepare('DELETE FROM task_keys WHERE owner=? AND key=? AND expiresAt=?').run(ownerId, key, row.expiresAt);
+      return null;
+    }
     const receipt = !row.expiresAt ? null : Date.parse(row.expiresAt) <= Date.now()
       ? { expired: true, expiresAt: row.expiresAt }
       : { finalSubmissionId: row.finalSubmissionId, deliveredAt: row.deliveredAt, expiresAt: row.expiresAt };
-    return { taskKey: row.key, ownerId: row.owner, agentId: row.agent, requestId: row.request, taskId: row.task, receipt };
+    return { taskKey: row.key, ownerId: row.owner, agentId: row.agent, requestId: row.request, taskId: row.task, baseline: row.baseline ? JSON.parse(row.baseline) : null, failureReason: row.failureReason ?? null, receipt };
   }
   appendHistory(agentId, item) {
     const row = this.db.prepare('SELECT coalesce(max(seq),-1)+1 AS seq FROM agent_history WHERE agent=?').get(agentId);
@@ -327,7 +390,12 @@ export class RosterStore {
           AND task=json_extract(agents.body,'$.task.taskId') AND ${submissionDebtSql()})`)
         .get(record.agentId, record.ownerId, record.name, previous.task?.taskId ?? null, previous.state);
       if (ready) {
-        if (snapshot) this.appendHistory(record.agentId, snapshot);
+        if (snapshot) {
+          const current = this.get(record.agentId);
+          const nativeQuestions = captureNativeQuestionHistory(previous, current);
+          if (nativeQuestions.length) snapshot.nativeQuestions = nativeQuestions;
+          this.appendHistory(record.agentId, snapshot);
+        }
         this.save(record);
         if (record.task?.requestId) this.saveTaskKey(record.ownerId, record.agentId, record.task.requestId, record.task.taskId);
       }
@@ -951,6 +1019,10 @@ export class RosterStore {
       .get(record.agentId, record.ownerId, record.name) !== undefined;
   }
   save(record, { dispatch = false } = {}) {
+    if (record.task?.taskId) {
+      const prior = this.get(record.agentId);
+      captureNativeQuestionHistory(record, prior?.ownerId === record.ownerId ? prior : undefined);
+    }
     // Nothing durable changed: this record still serialises to exactly the body we
     // read or wrote last, so this save would rewrite megabytes for nothing. The
     // statement below parses the body once per json() argument and rebuilds the
@@ -1378,9 +1450,9 @@ export class RosterStore {
       .all(agentId, taskId).map(submissionFromRow);
   }
   // Stable insertion order for resumable wait cursors, even when timestamps tie or skew.
-  submissionsInOrder(agentId, taskId) {
+  submissionsInOrder(agentId, taskId, offset = 0) {
     return this.db.prepare(`SELECT id, owner, agent, task, kind, message, final, created, delivery FROM submissions
-      WHERE agent=? AND task=? ORDER BY rowid`).all(agentId, taskId).map(submissionFromRow);
+      WHERE agent=? AND task=? ORDER BY rowid LIMIT -1 OFFSET ?`).all(agentId, taskId, offset).map(submissionFromRow);
   }
   saveAndConsumeSubmissions(record, ids) {
     // A deployment migration can find another process holding the write lock; it

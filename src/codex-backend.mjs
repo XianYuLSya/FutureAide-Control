@@ -477,16 +477,18 @@ export async function createCodexBackend(record, deps = {}) {
   function receiptFrom(value, id) {
     const request = value.requests[id];
     if (!request) return undefined;
+    const confirmed = request.status === 'accepted' && Boolean(request.turnId);
+    const start = confirmed && request.route === 'new-turn';
+    const steer = confirmed && request.route === 'current-turn' && request.turnId === request.intent?.expectedTurnId;
+    const actualEffort = (start ? request.delivery?.effort : steer ? request.intent.actualEffort : null) ?? null;
     return {
       accepted: request.status === 'accepted',
       status: request.status,
       ...(Number.isSafeInteger(request.afterSeq) ? { afterSeq: request.afterSeq } : {}),
       ...(request.route ? { delivery: request.route } : {}),
       ...(request.turnId ? { turnId: request.turnId } : {}),
-      actualEffort: request.status !== 'accepted' || !request.turnId ? null
-        : request.route === 'new-turn' ? request.delivery?.effort ?? null
-          : request.route === 'current-turn' && request.turnId === request.intent?.expectedTurnId
-            ? request.intent.actualEffort ?? null : null,
+      actualEffort,
+      actualEffortSource: actualEffort ? (start ? 'native-turn-start' : request.intent.actualEffortSource ?? null) : null,
       ...(request.afterTurnId ? { afterTurnId: request.afterTurnId } : {}),
       ...(request.mode ? { mode: request.mode } : {}),
       ...(request.intent ? { intent: request.intent } : {}),

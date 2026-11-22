@@ -1440,9 +1440,11 @@ export async function sendCodexTextNative(threadId, text, {
   if (method === 'turn/steer' && verifySelection) requireSameSelection();
   const priorTurnId = method === 'turn/start' ? ((page.data ?? []).find(turn => typeof turn?.id === 'string')?.id ?? null) : undefined;
   if (typeof onIntent === 'function') {
+    const evidence = active && activeSelectionEvidence(thread, active, knownSelections);
     await onIntent({ method, threadId,
       ...(method === 'turn/steer' ? { expectedTurnId: active.id,
-        actualEffort: activeSelectionEvidence(thread, active, knownSelections)?.selection.reasoningEffort ?? null } : { priorTurnId }),
+        actualEffort: evidence?.selection.reasoningEffort ?? null,
+        actualEffortSource: evidence?.source === 'turn-start' ? 'native-turn-start' : 'host-readback' } : { priorTurnId }),
       mode: intendedMode });
   }
   refuse();

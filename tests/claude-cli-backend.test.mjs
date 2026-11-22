@@ -78,6 +78,17 @@ async function harness({ runner, record = {}, submissions = { questions: [], rep
 
 const setup = harness;
 
+test('an exited worker without the input UUID echo cannot confirm the dispatch', async () => {
+  const runner = fakeRunner();
+  const { backend } = await setup({ runner });
+  await backend.deliver({ requestId: 'no-echo', message: 'one input' });
+  runner.setTurn(turnDirectory('no-echo'), { state: 'ended', sessionStarted: true, businessAccepted: false });
+  assert.equal((await backend.receipt({ requestId: 'no-echo' })).status, 'unknown');
+  assert.deepEqual(await backend.turn({ requestId: 'no-echo' }), { state: 'running' });
+  await backend.deliver({ requestId: 'no-echo', message: 'one input' });
+  assert.equal(runner.calls.starts.length, 1);
+});
+
 // P1: the final gate. Refused after preflight and before any claim, so no request row
 // exists, nothing is active and the caller knows for certain that nothing was written.
 test('a dispatch refused before its claim leaves nothing active and no receipt', async () => {

@@ -126,7 +126,7 @@ const errorFields = value => ({
 });
 
 const effortFields = value => Object.fromEntries(
-  ['requestedEffort', 'effortSource', 'selectedEffort', 'actualEffort', 'effortAdjustment']
+  ['requestedEffort', 'effortSource', 'selectedEffort', 'actualEffort', 'actualEffortSource', 'effortAdjustment', 'modelLocked']
     .filter(key => value[key] !== undefined).map(key => [key, value[key]]),
 );
 

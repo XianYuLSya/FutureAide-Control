@@ -60,7 +60,8 @@ export function createClaudeCliBackend(record, deps = {}) {
     // window where the adapter process dies after the runner recorded the refusal and
     // before it could save its own rejected request.
     const refused = native?.notSent === true || native?.error?.notSent === true;
-    const next = refused ? 'rejected' : native.businessAccepted === true || request.status === 'accepted' ? 'accepted' : 'unknown';
+    const accepted = native.businessAccepted === true || request.status === 'accepted';
+    const next = refused ? 'rejected' : accepted ? 'accepted' : native.state === 'failed' ? 'failed' : 'unknown';
     let changed = request.status !== next;
     request.status = next;
     if (native.businessAccepted === true && native.applied?.model) {
@@ -195,7 +196,8 @@ export function createClaudeCliBackend(record, deps = {}) {
         throw fail('request-id-conflict', 'The request id already belongs to a different input.');
       }
       if (prior && prior.status !== 'retryable') {
-        return { accepted: prior.status === 'accepted', status: prior.status, afterSeq: prior.afterSeq };
+        return { accepted: prior.status === 'accepted', status: prior.status, afterSeq: prior.afterSeq,
+          ...(prior.status === 'accepted' ? { actualEffort: prior.modelEvidence?.actualEffort ?? null } : {}) };
       }
       if (value.active) return { accepted: false, status: 'retryable' };
       const cli = await preflight();
@@ -233,6 +235,7 @@ export function createClaudeCliBackend(record, deps = {}) {
       const request = value.requests[requestId];
       return request && { status: request.status, afterSeq: request.afterSeq,
         ...(request.status === 'rejected' ? { notSent: true, error: request.terminal?.failure } : {}),
+        ...(request.status === 'failed' ? { error: request.terminal?.failure } : {}),
         ...(request.status === 'accepted' ? { actualEffort: request.modelEvidence?.actualEffort ?? null,
           ...(request.modelEvidence?.effortAdjustment ? { effortAdjustment: request.modelEvidence.effortAdjustment } : {}),
           result: { accepted: true, requestId } } : {}) };
@@ -241,7 +244,7 @@ export function createClaudeCliBackend(record, deps = {}) {
       const value = state();
       if (value.active === requestId) await refresh(value);
       const request = value.requests[requestId];
-      return request?.terminal ? { state: 'ended', correlation: 'request-id', ...request.terminal }
+      return request?.terminal && request.status !== 'unknown' ? { state: 'ended', correlation: 'request-id', ...request.terminal }
         : { state: 'running', ...(request?.status === 'accepted' ? { correlation: 'request-id' } : {}) };
     },
     async models() {

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { withCodexInstrumentation, getCodexInstrumentation, codexInstrumentationEnabled } from './codex-instrumentation.mjs';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -1292,8 +1293,10 @@ export function createScopedAgents(config, {
 
   /** The record's own backend observation, exactly as its host reported it. */
   async function observeOwn(record) {
-    const backend = await checkHost(record);
-    const observed = await backend.observe();
+    const observed = await withCodexInstrumentation({ agentId: record.agentId }, async () => {
+      const backend = await checkHost(record);
+      return backend.observe();
+    });
     if (observed.sessionId !== record.sessionId || (record.task && observed.taskId !== record.task.taskId)) {
       throw new Error('The host returned a different subagent task.');
     }
@@ -3686,8 +3689,9 @@ export function createScopedAgents(config, {
         await recoverDispatch(record, dispatch);
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
         if (dispatch.state === 'retrying' && dispatch.nextAttemptAt > Date.now()) continue;
-        const result = await (await backendFor(record)).turn({ requestId: dispatch.requestId,
-          ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}), timeoutSeconds: 0, maxMessages: 100 });
+        const result = await withCodexInstrumentation({ currentStage: 'dispatch-turn', agentId: record.agentId,
+          dispatchId: dispatch.requestId }, async () => (await backendFor(record)).turn({ requestId: dispatch.requestId,
+          ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}), timeoutSeconds: 0, maxMessages: 100 }));
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
           Object.assign(dispatch, { state: endedState(result.completionReason), accepted: true, error: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
@@ -4763,6 +4767,20 @@ export function createScopedAgents(config, {
     return { name: record.name, answered: true, state: 'resuming',
       ...(answer.nativeAnswered ? { delivery: 'native-question', ...(answer.turnId ? { turnId: answer.turnId } : {}) } : answer.nativeFallback ? { delivery: 'continuation-queued' } : {}),
       actualModel: actualModelName(answer.modelSelection) ?? actualModelName(record.model) };
+  }
+  // Keep the public entry that caused native reads attached across asynchronous work.
+  // The context carries identifiers only, never task or conversation content.
+  for (const [name, action] of Object.entries(service)) {
+    if (typeof action !== 'function') continue;
+    service[name] = function (...args) {
+      if (!codexInstrumentationEnabled()) return action.apply(this, args);
+      const parent = getCodexInstrumentation();
+      const fields = { source: parent.source ?? name, currentStage: name,
+        initiatorRole: parent.initiatorRole ?? (process.argv[1]?.endsWith('scoped-worker.mjs') ? 'monitor' : 'mcp'),
+        initiatorPid: process.pid, operationId: parent.operationId ?? randomUUID(),
+        ...(name === 'poll' && typeof args[0] === 'string' ? { agentId: args[0] } : {}) };
+      return withCodexInstrumentation(fields, () => action.apply(this, args));
+    };
   }
   return service;
 }

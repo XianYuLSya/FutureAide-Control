@@ -2301,3 +2301,23 @@ test('a locked DSH supplement with uncertain write is never resent after default
     assert.equal(dispatch.delivery, 'unknown');
   } finally { f.service.close(); }
 });
+test('a locked DSH supplement retries its original ID on confirmed pre-write failure', async () => {
+  let attempts = 0;
+  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
+    if (++attempts === 2) throw Object.assign(new Error('default changed'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'supplement', effort: 'high' }, extra(A));
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    const record = f.record();
+    record.task.dispatches.find(item => item.requestId === receipt.requestId).nextAttemptAt = 0;
+    f.store.save(record);
+    await f.service.poll(record.agentId);
+    assert.equal(attempts, 3);
+    assert.equal(f.sends.length, 2);
+    assert.equal(f.sends[1].requestId, receipt.requestId);
+    assert.equal(f.record().task.dispatches.find(item => item.requestId === receipt.requestId).model.provider, 'new-route');
+  } finally { f.service.close(); }
+});

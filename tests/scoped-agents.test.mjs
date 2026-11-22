@@ -10,6 +10,7 @@ import { FINAL_REPORT_REMINDER } from '../src/report-contract.mjs';
 import { monitorSpawn } from '../src/shared-monitor.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
+import { createAuthority, openAuthority } from '../src/cleanup-authority.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const A = '11111111-1111-4111-8111-111111111111';
@@ -690,6 +691,26 @@ test('one-shot asks directly, resumes once, and clears only after confirmed resu
   assert.match(f.notices.at(-1).prompt, /已画好 art.svg/);
   assert.match(f.notices.at(-1).prompt, /art.svg/);
   f.service.close();
+});
+
+for (const enabled of [false,true]) test(`delivered once retains original immediate cleanup with C and switch ${enabled}`, async () => {
+  const f=await fixture({config:{agentAutoCleanup:enabled}});
+  try {
+    await f.service.create({name:'artist',lifetime:'once'},extra(A));
+    await f.service.send({name:'artist',message:'one'},extra(A));
+    const record=f.record();
+    const config={stateDirectory:f.stateDirectory,configFile:path.join(f.stateDirectory,'config.json')};
+    await writeFile(config.configFile,'{}');
+    const key=JSON.stringify(['roster','managed-agent',path.resolve(f.stateDirectory),record.agentId]);
+    const authorityId=await createAuthority(config,false,'test-manifest',[{key,decision:'C',fingerprint:'test'}]);
+    const authority=await openAuthority(config,false,{write:true,binding:authorityId});
+    try { if(enabled) authority.toggle(true); assert.equal(authority.lookup(key).decision,'C'); }
+    finally {authority.close();}
+    await writeFile(path.join(f.stateDirectory,'cleanup-binding.json'),JSON.stringify({approval:'test',ids:{local:authorityId}}));
+    f.finish(); f.report(); await f.service.poll(record.agentId);
+    assert.equal(f.record(),undefined);
+    assert.ok(f.removed.includes(record.sessionId));
+  } finally {f.service.close();}
 });
 
 test('persistent agents reuse one session and retain earlier task changes', async () => {

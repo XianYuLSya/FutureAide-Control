@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { callCodexOwner } from './codex-notify.mjs';
+import { codexDomainForThread } from './codex-domain.mjs';
 
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 
@@ -113,11 +114,14 @@ export async function resolveCallingContext(extra, {
   }
   // The shared owner entry reads over native RPC first and falls back to app-tools
   // only when no debug port exists. A confirmed missing thread is terminal.
-  const thread = threadFromResult(await callCodex(threadId, 'read_thread', {
+  const lookup = await callCodex(threadId, 'read_thread', {
     threadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 100,
-  }, { nativeRequest, ...(codexInvoke ? { invoke: codexInvoke } : {}) }));
+  }, { nativeRequest, ...(codexInvoke ? { invoke: codexInvoke } : {}) });
+  const thread = threadFromResult(lookup);
   if (thread?.id?.toLowerCase() !== threadId || typeof thread.cwd !== 'string' || !path.isAbsolute(thread.cwd)) {
     throw Object.assign(new Error('The calling Codex chat and its local project could not be verified.'), { code: 'calling-context-unavailable' });
   }
-  return { ownerId, source: 'codex-desktop', threadId, workspace: await realpath(thread.cwd), createdAt: new Date().toISOString() };
+  // Only native RPC metadata carries the provenance needed for this domain.
+  const codexDomain = lookup?.via === 'native-rpc' ? await codexDomainForThread(thread) : undefined;
+  return { ownerId, source: 'codex-desktop', threadId, workspace: await realpath(thread.cwd), ...(codexDomain ? {codexDomain} : {}), createdAt: new Date().toISOString() };
 }

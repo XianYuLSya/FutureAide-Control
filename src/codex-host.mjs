@@ -5,6 +5,7 @@ import { stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { codexDomainForThread } from './codex-domain.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
@@ -632,7 +633,9 @@ export function createCodexHost(options = {}) {
       // The title is deliberately not set here: immediately after thread/start the
       // rollout is empty and thread/name/set is rejected. The backend retries it
       // once a projection has a message.
-      return { created: true, nativeSessionId: threadId, turnId: turn.turn.id };
+      let codexDomain;
+      try { codexDomain = await codexDomainForThread(started.thread); } catch { /* no verified domain */ }
+      return { created: true, nativeSessionId: threadId, turnId: turn.turn.id, ...(codexDomain ? {codexDomain} : {}), ...(typeof started.thread?.path === 'string' ? {rolloutPath:started.thread.path} : {}) };
     },
     async setTitle({ nativeSessionId, name }) {
       await nativeRequest('thread/name/set', { threadId: nativeSessionId, name });
@@ -693,7 +696,7 @@ export function createCodexHost(options = {}) {
       const turn = (page.data ?? []).find(entry => entry?.id === turnId);
       return { present: Boolean(turn), status: typeof turn?.status === 'string' ? turn.status : null };
     },
-    async observe({ nativeSessionId, workspace, projections = {}, requests = {} }) {
+    async observe({ nativeSessionId, workspace, projections = {}, requests = {}, rolloutPath }) {
       let root;
       try {
         // Read-only on purpose: ensureCodexThreadNative would resume a cold thread, and
@@ -765,7 +768,8 @@ export function createCodexHost(options = {}) {
       // the thread stopped waiting on a human.
       const activeFlags = Array.isArray(root.status?.activeFlags) ? [...root.status.activeFlags] : null;
       const statusType = typeof root.status?.type === 'string' ? root.status.type : null;
-      const result = { projections: next, histories, hasMore, activeFlags, statusType,
+      const codexDomain = typeof rolloutPath === 'string' && root.path === rolloutPath ? await codexDomainForThread(root) : undefined;
+      const result = { projections: next, histories, hasMore, activeFlags, statusType, ...(codexDomain ? {codexDomain} : {}),
         tree: { nodes, running: nodes.some(node => node.status === 'running'),
           settled: nodes.every(node => node.status === 'idle'), activeFlags, statusType } };
       observeCache.set(nativeSessionId, { updatedAt: root.updatedAt, statusType: root.status?.type,

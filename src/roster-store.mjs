@@ -82,28 +82,38 @@ export function writeDeliveredReceipts(db, record, retentionMs = 7 * 24 * 60 * 6
   if (!row) throw new Error('Cannot create a receipt for a missing agent.');
   const current = JSON.parse(row.body);
   if (current.task?.taskId !== record.task?.taskId) throw new Error('Task changed before cleanup.');
-  const report = (current.task?.reports ?? []).filter(item => item.final && item.delivery?.state === 'delivered' && item.id).at(-1);
-  if (!report) {
-    db.prepare('DELETE FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL').run(record.ownerId, record.agentId);
-    return false;
-  }
-  // Preserve request-specific failure independently of the round's final receipt.
-  for (const answer of current.task?.answers ?? []) {
-    if (answer.undelivered && answer.answerId) db.prepare('UPDATE task_keys SET failureReason=? WHERE owner=? AND agent=? AND request=?')
-      .run(answer.undelivered, record.ownerId, record.agentId, answer.answerId);
-  }
-  for (const dispatch of current.task?.dispatches ?? []) {
-    if (dispatch.state === 'failed' && dispatch.accepted !== true && dispatch.requestId) db.prepare('UPDATE task_keys SET failureReason=? WHERE owner=? AND agent=? AND request=?')
-      .run(dispatch.failure?.code ?? dispatch.error?.code ?? 'dispatch-failed', record.ownerId, record.agentId, dispatch.requestId);
-  }
-  const finalSubmissionId = report.id.startsWith('submission:') ? report.id.slice(11) : report.id;
-  const deliveredAt = report.delivery.deliveredAt ?? null;
   const expiresAt = new Date(Date.now() + retentionMs).toISOString();
-  db.prepare(`UPDATE task_keys SET finalSubmissionId=coalesce(finalSubmissionId,?), deliveredAt=coalesce(deliveredAt,?),
-    expiresAt=coalesce(expiresAt,?) WHERE owner=? AND agent=? AND task=?`)
-    .run(finalSubmissionId, deliveredAt, expiresAt, record.ownerId, record.agentId, record.task.taskId);
+  const rounds = new Map();
+  for (const row of db.prepare('SELECT body FROM agent_history WHERE agent=? ORDER BY seq DESC').all(record.agentId)) {
+    const task = JSON.parse(row.body);
+    if (task.taskId && !rounds.has(task.taskId)) rounds.set(task.taskId, task);
+  }
+  if (current.task?.taskId) rounds.set(current.task.taskId, current.task);
+  const failures = new Map();
+  for (const task of rounds.values()) {
+    for (const answer of task.answers ?? []) if (answer.undelivered && answer.answerId) failures.set(answer.answerId, answer.undelivered);
+    for (const dispatch of task.dispatches ?? []) if (dispatch.state === 'failed' && dispatch.accepted !== true && dispatch.requestId)
+      failures.set(dispatch.requestId, dispatch.failure?.code ?? dispatch.error?.code ?? 'dispatch-failed');
+  }
+  for (const item of db.prepare("SELECT requestId,reason FROM supplements WHERE owner=? AND agent=? AND status='blocked'").all(record.ownerId, record.agentId))
+    failures.set(item.requestId, item.reason ?? 'dispatch-failed');
+  const submissions = new Map();
+  for (const item of db.prepare("SELECT id,task,delivery FROM submissions WHERE owner=? AND agent=? AND kind='report' AND final=1 ORDER BY rowid").all(record.ownerId, record.agentId)) {
+    const delivery = item.delivery ? JSON.parse(item.delivery) : null;
+    if (delivery?.state === 'delivered') submissions.set(item.task, { id: item.id, delivery });
+  }
+  const update = db.prepare(`UPDATE task_keys SET failureReason=?, finalSubmissionId=?, deliveredAt=?, expiresAt=? WHERE key=? AND owner=? AND agent=?`);
+  let retained = false;
+  for (const key of db.prepare('SELECT * FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL').all(record.ownerId, record.agentId)) {
+    const reason = failures.get(key.request) ?? key.failureReason;
+    const report = submissions.get(key.task) ?? (rounds.get(key.task)?.reports ?? []).filter(item => item.final && item.delivery?.state === 'delivered' && item.id).at(-1);
+    if (!reason && !report) continue;
+    const id = !reason && report ? (report.id.startsWith('submission:') ? report.id.slice(11) : report.id) : null;
+    update.run(reason ?? null, id, id ? report.delivery.deliveredAt ?? null : null, expiresAt, key.key, record.ownerId, record.agentId);
+    retained = true;
+  }
   db.prepare('DELETE FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL').run(record.ownerId, record.agentId);
-  return true;
+  return retained;
 }
 
 /** One small local database serializes overlapping MCP and recovery-worker calls. */
@@ -369,7 +379,7 @@ export class RosterStore {
       this.db.prepare('DELETE FROM task_keys WHERE owner=? AND key=? AND expiresAt=?').run(ownerId, key, row.expiresAt);
       return null;
     }
-    const receipt = !row.expiresAt ? null : Date.parse(row.expiresAt) <= Date.now()
+    const receipt = !row.expiresAt || !row.finalSubmissionId ? null : Date.parse(row.expiresAt) <= Date.now()
       ? { expired: true, expiresAt: row.expiresAt }
       : { finalSubmissionId: row.finalSubmissionId, deliveredAt: row.deliveredAt, expiresAt: row.expiresAt };
     return { taskKey: row.key, ownerId: row.owner, agentId: row.agent, requestId: row.request, taskId: row.task, baseline: row.baseline ? JSON.parse(row.baseline) : null, failureReason: row.failureReason ?? null, receipt };
@@ -1524,7 +1534,7 @@ export class RosterStore {
     this.db.exec('BEGIN IMMEDIATE');
     try {
     if (deliveredReceipt) writeDeliveredReceipts(this.db, record);
-    this.db.prepare(`DELETE FROM task_keys WHERE owner=? AND agent=? ${deliveredReceipt || record.state === 'cleanup_failed' ? 'AND expiresAt IS NULL' : ''}`)
+    this.db.prepare('DELETE FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL')
       .run(record.ownerId, record.agentId);
     this.db.prepare('DELETE FROM supplements WHERE agent=? AND owner=?').run(record.agentId, record.ownerId);
     this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(record.agentId);

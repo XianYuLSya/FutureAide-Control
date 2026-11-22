@@ -744,7 +744,8 @@ export class RosterStore {
     return rows.map(row => JSON.parse(row.body));
   }
   transportCandidates({ probe = false } = {}) {
-    return this.db.prepare(`SELECT id FROM agents WHERE json_extract(body,'$.target')='codex-desktop' AND (
+    return this.db.prepare(`SELECT id FROM agents WHERE json_type(body,'$.cleanupRosterTicket') IS NULL
+      AND coalesce(json_extract(body,'$.closed'),0)=0 AND json_extract(body,'$.target')='codex-desktop' AND (
       json_type(body,'$.transportNextAttemptAt') IS NOT NULL OR
       (json_extract(body,'$.state') IN ('reconnecting','delivery_pending') AND coalesce(json_extract(body,'$.transportLegacyCleared'),0)=0 AND json_extract(body,'$.error.code') IN
         ('codex-native-rpc-unavailable','codex-native-rpc-timeout','codex-native-rpc-response-timeout','codex-native-rpc-closed')) OR

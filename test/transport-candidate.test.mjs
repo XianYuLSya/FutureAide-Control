@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { RosterStore } from '../src/roster-store.mjs';
 import { createScopedAgents } from '../src/scoped-agents.mjs';
+import { readRosterTree, claimRosterTree, verifyRosterTicket } from '../src/cleanup-roster-transaction.mjs';
 
 test('real queue head is discovered and mixed business waits survive recovery', async t => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'futureaide-candidate-'));
@@ -72,4 +73,25 @@ test('legacy report delivery releases its transport delay and retains its own re
   assert.deepEqual(wakes, ['a']);
   assert.equal(store.get('a').nextAttemptAt, undefined);
   assert.equal(store.get('a').task.reports[0].delivery.nextAttemptAt, deadline);
+});
+
+test('a cleanup claim between candidate selection and recovery leaves the archived name alone', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'futureaide-claimed-'));
+  const file = path.join(root, 'roster.sqlite');
+  const store = new RosterStore(file);
+  const wakes = [];
+  const service = createScopedAgents({ stateDirectory: root }, { store, onWorkQueued: id => wakes.push(id) });
+  t.after(async () => { service.close(); await rm(root, { recursive: true, force: true }); });
+  store.saveOwner({ ownerId: 'owner', workspace: root });
+  store.insert({ agentId: 'a', ownerId: 'owner', name: 'claimed', sessionId: 's', target: 'codex-desktop',
+    state: 'reconnecting', error: { code: 'codex-native-rpc-closed' }, nextAttemptAt: Date.now() + 300000 });
+  const pending = store.transportCandidates();
+  assert.deepEqual(pending, ['a']);
+  claimRosterTree(file, { rootId: 'a', fingerprint: readRosterTree(file, 'a').fingerprint, ticketId: 'ticket' });
+  assert.deepEqual(store.transportCandidates({ probe: true }), []);
+  assert.deepEqual(store.transportCandidates(), []);
+  await service.transportRecovered({ faultSequence: 1 }, pending);
+  assert.deepEqual(wakes, []);
+  assert.equal(store.get('a').closed, true);
+  assert.equal(verifyRosterTicket(file, 'ticket').valid, true);
 });

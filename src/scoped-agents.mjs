@@ -3935,7 +3935,7 @@ export function createScopedAgents(config, {
       const ids = pendingIds ?? store.transportCandidates();
       const outcomes = await Promise.allSettled(ids.map(id => store.locked(id, async () => {
           const record = store.get(id);
-          if (!record) return;
+          if (!record || record.closed || record.cleanupRosterTicket) return;
           let changed = clearRecoveredWait(record, ['reconnecting', 'delivery_pending'], event.faultSequence);
           for (const dispatch of record.task?.dispatches ?? []) {
             if (dispatch.accepted || !['retrying', 'unknown', 'sending', 'queued'].includes(dispatch.state)) continue;
@@ -3944,12 +3944,14 @@ export function createScopedAgents(config, {
           if (changed) store.save(record);
           announceWork(id);
         }, { waitMs: 0 })));
-      const failed = ids.filter((_, index) => outcomes[index].status === 'rejected');
-      if (failed.length) {
-        for (const id of failed) announceWork(id);
-        const retry = setTimeout(() => { service.transportRecovered(event, failed).catch(error => process.stderr.write(`[futureaide-monitor] recovery retry: ${error?.stack ?? error}\n`)); }, 500);
+      const busy = ids.filter((_, index) => outcomes[index].status === 'rejected' && outcomes[index].reason?.code === 'agent-busy');
+      if (busy.length) {
+        const retry = setTimeout(() => { service.transportRecovered(event, busy).catch(error => process.stderr.write(`[futureaide-monitor] recovery retry: ${error?.stack ?? error}\n`)); }, 500);
         retry.unref?.();
       }
+      const unexpected = outcomes.find(result => result.status === 'rejected' &&
+        !['agent-busy', 'cleanup-claimed'].includes(result.reason?.code));
+      if (unexpected) throw unexpected.reason;
     },
     async status(extra) {
       const status = { toolsLoaded: true, contextVerified: false, dshConnected: false, returnChannel: 'not-checked' };

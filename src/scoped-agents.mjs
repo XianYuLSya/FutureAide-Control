@@ -235,6 +235,7 @@ function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
   const lastDispatch = task?.dispatches?.at(-1);
   const activeDispatch = [...(task?.dispatches ?? [])].reverse().find(item => item.accepted === true);
+  const visibleSelection = activeDispatch?.model ?? (!task ? record.creationSelection : task.modelSelection);
   const error = record.error ?? task?.cancelError ?? (lastDispatch?.state === 'failed' ? lastDispatch.failure : undefined)
     ?? (!['completed', 'cancelled'].includes(lastDispatch?.state) ? lastDispatch?.error : undefined);
   const view = record.observation ?? {};
@@ -242,11 +243,11 @@ function publicResult(record, { fullResult = false } = {}) {
   const explicitReports = (task?.reports ?? []).filter(report => !report.failure);
   return {
     name: record.name, lifetime: record.lifetime, target: targetOf(record), state: record.state,
-    requestedEffort: activeDispatch?.model?.requestedEffort ?? null,
-    effortSource: activeDispatch?.model?.effortSource ?? null,
-    selectedEffort: activeDispatch?.model?.selectedEffort ?? null,
+    requestedEffort: visibleSelection?.requestedEffort ?? null,
+    effortSource: visibleSelection?.effortSource ?? null,
+    selectedEffort: visibleSelection?.selectedEffort ?? null,
     actualEffort: activeDispatch?.actualEffort ?? null,
-    ...(activeDispatch?.model?.effortAdjustment ? { effortAdjustment: activeDispatch.model.effortAdjustment } : {}),
+    ...(visibleSelection?.effortAdjustment ? { effortAdjustment: visibleSelection.effortAdjustment } : {}),
     // The full ID the target actually uses, never the caller's substring. The
     // explicit pin is a separate value and is only reported by a dispatch receipt;
     // list/wait must not present an intended selection as an observed model. An
@@ -3874,6 +3875,7 @@ export function createScopedAgents(config, {
         // Resolve against the live target catalog before the name exists, so a typo
         // creates nothing and a valid pin is part of the first durable record.
         const preview = await resolveRequestedPin(record, { model, effort });
+        record.creationSelection = preview;
         if (model !== undefined && !dshDefaultOnly(record)) record.modelPin = { provider: preview.provider, model: preview.model };
         if (effort !== undefined) record.pendingEffort = effort;
       }

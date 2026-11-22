@@ -2194,3 +2194,28 @@ test('dispatch freezes default effort and confirms DSH receipt', async () => {
     assert.equal(f.selections.at(-1).reasoningEffort, 'high');
   } finally { f.service.close(); }
 });
+test('create effort is consumed once and later inputs use the current default', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent', effort: 'high' }, extra(A));
+    const first = await f.service.send({ name: 'artist', message: 'first' }, extra(A));
+    assert.equal(first.requestedEffort, 'high');
+    assert.equal(first.actualEffort, 'high');
+    const second = await f.service.send({ name: 'artist', message: 'second' }, extra(A));
+    assert.equal(second.requestedEffort, 'max');
+    assert.equal(second.actualEffort, 'max');
+    assert.equal(f.record().modelPin, undefined);
+  } finally { f.service.close(); }
+});
+test('DSH model lock retains the requested effort on the host default', async () => {
+  const f = await fixture({ config: { dshDefaultModelOnly: true } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'first', model: 'other', effort: 'high' }, extra(A));
+    assert.equal(receipt.actualModel, 'test');
+    assert.equal(receipt.actualEffort, 'high');
+    assert.equal(f.selections.at(-1).model, 'test');
+    assert.equal(f.selections.at(-1).reasoningEffort, 'high');
+    assert.equal(f.record().modelPin, undefined);
+  } finally { f.service.close(); }
+});

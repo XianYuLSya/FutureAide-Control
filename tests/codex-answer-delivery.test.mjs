@@ -126,6 +126,7 @@ function codexDesktop(snapshot, { raceAnswer = false, loseStartReply = false, ra
   }
   return {
     request,
+    calls,
     snapshot: () => structuredClone({ threads: [...threads], calls, created, clock }),
     threadIds: () => [...threads.keys()],
     runningTurn: threadId => running(find(threadId))?.id,
@@ -154,7 +155,7 @@ function codexDesktop(snapshot, { raceAnswer = false, loseStartReply = false, ra
   };
 }
 
-async function fixture({ directory, snapshot, raceAnswer = false, loseStartReply = false, raceExternalTurn = false } = {}) {
+async function fixture({ onBackend, host, directory, snapshot, raceAnswer = false, loseStartReply = false, raceExternalTurn = false } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = directory ?? await mkdtemp(path.join(base, 'answer-'));
@@ -170,7 +171,11 @@ async function fixture({ directory, snapshot, raceAnswer = false, loseStartReply
       notices.push(args.prompt);
       return { accepted: true };
     },
-    backendAdapters: { 'codex-desktop': (record, deps) => createCodexBackend(record, { ...deps, hostOptions: { nativeRequest: codex.request } }) },
+    backendAdapters: { 'codex-desktop': async (record, deps) => {
+      const backend = await createCodexBackend(record, { ...deps, ...(host ? { host } : {}), hostOptions: { nativeRequest: codex.request } });
+      onBackend?.(backend);
+      return backend;
+    } },
     codexProbeRegistration: async () => ({ ready: true, registered: true, tools: ['ask_parent', 'report_parent'], sessionVerified: false }),
     startSharedMonitor: () => true,
     removeTree: async () => {},
@@ -198,6 +203,75 @@ async function fixture({ directory, snapshot, raceAnswer = false, loseStartReply
 }
 
 const outcome = promise => promise.then(() => 'accepted', error => error);
+
+for (const hasRecoverableReceipt of [false, true]) {
+  test(`fourteen unknown dispatches share a snapshot; receipt reconciliation ${hasRecoverableReceipt ? 'can settle one' : 'is still attempted'}`, async () => {
+    const receipts = [], reconciled = [];
+    const f = await fixture({
+      onBackend: backend => {
+        const receipt = backend.receipt.bind(backend);
+        backend.receipt = async args => { receipts.push(args.requestId); return receipt(args); };
+      },
+      ...(hasRecoverableReceipt ? { host: { findDispatchInput: async input => {
+        reconciled.push(input.marker);
+        return { status: 'found', turnId: 'recovered-turn', firstUser: true };
+      } } } : {}),
+    });
+    try {
+      const helper = await f.start('unknown-snapshot', 'synthetic task');
+      const record = f.record(helper.name);
+      record.task.dispatches = Array.from({ length: 14 }, (_, i) => ({
+        requestId: `unknown-${i}`, kind: 'supplement', state: 'unknown', accepted: false,
+        message: 'synthetic', startedAt: new Date().toISOString(),
+      }));
+      f.store.save(record);
+      if (hasRecoverableReceipt) {
+        const native = f.store.backendState(helper.agentId);
+        native.requests['unknown-0'] = { requestId: 'unknown-0', status: 'unknown', marker: 'synthetic-marker',
+          intent: { method: 'turn/start', priorTurnId: 'older-turn' } };
+        f.store.saveBackendState(helper.agentId, native);
+      }
+      receipts.length = 0;
+      const before = f.codex.calls.length;
+      await f.poll(helper);
+      const calls = f.codex.calls.slice(before);
+      assert.deepEqual(receipts, Array.from({ length: 14 }, (_, i) => `unknown-${i}`));
+      assert.equal(calls.filter(call => call.method === 'thread/turns/list').length, hasRecoverableReceipt ? 2 : 1);
+      assert.equal(calls.filter(call => ['turn/start', 'turn/steer'].includes(call.method)).length, 0);
+      if (hasRecoverableReceipt) {
+        assert.deepEqual(reconciled, ['synthetic-marker']);
+        assert.equal(f.store.backendState(helper.agentId).requests['unknown-0'].status, 'accepted');
+      }
+    } finally { f.store.close(); }
+  });
+}
+
+test('a recovered dispatch that writes refreshes the shared snapshot before later unknowns', async () => {
+  const receipts = [];
+  const f = await fixture({ onBackend: backend => {
+    const receipt = backend.receipt.bind(backend);
+    backend.receipt = async args => { receipts.push(args.requestId); return receipt(args); };
+  } });
+  try {
+    const helper = await f.start('write-between-snapshots', 'synthetic task');
+    const record = f.record(helper.name);
+    record.task.dispatches = Array.from({ length: 14 }, (_, i) => ({
+      requestId: `unknown-${i}`, kind: 'supplement', state: i === 0 ? 'retrying' : 'unknown',
+      accepted: false, message: 'synthetic', startedAt: new Date().toISOString(),
+    }));
+    f.store.save(record);
+    receipts.length = 0;
+    const before = f.codex.calls.length;
+    await f.poll(helper);
+    const calls = f.codex.calls.slice(before);
+    const write = calls.findIndex(call => call.method === 'turn/steer');
+    assert.ok(write >= 0, 'retry actually writes');
+    assert.ok(calls.slice(write + 1).some(call => call.method === 'thread/turns/list'), 'the post-write view was refreshed');
+    assert.ok(calls.slice(write + 1).filter(call => call.method === 'thread/turns/list').length <= 2,
+      'the later unknowns share the post-write view');
+    assert.deepEqual(receipts, Array.from({ length: 14 }, (_, i) => `unknown-${i}`));
+  } finally { f.store.close(); }
+});
 
 test('a native card reaches the parent once and the answer returns to that same turn', async () => {
   const f = await fixture();
@@ -648,5 +722,92 @@ test('a read-only retryable answer is retried after restart instead of becoming 
     const row = (await f.service.inspect({ name: 'lead' }, extra(BOSS))).inputs
       .find(entry => entry.requestId === seed.requestId);
     assert.equal(row.delivery, 'answered');
+  } finally { f.service.close(); }
+});
+
+test('legacy unknown answer with a native not-sent receipt retries the original request once', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown';
+    f.store.save(record);
+    const request = f.store.backendState(seed.agentId).requests[seed.requestId];
+    assert.equal(request.status, 'retryable');
+    assert.equal(request.reschedule.notSent, true);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).accepted, true);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start']);
+    assert.ok(answerWrites(f).every(input => input.text.includes(seed.requestId)));
+    await pollTimes(f, seed);
+    assert.equal(answerWrites(f).length, 2);
+  } finally { f.service.close(); }
+});
+
+test('legacy unknown answer with a proven pre-write read failure resumes once', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    delete request.intent; delete request.route; delete request.reschedule; delete request.afterTurnId;
+    request.attempted = false; request.status = 'retryable';
+    f.store.saveBackendState(seed.agentId, state);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).accepted, true);
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer', 'turn/start']);
+    assert.ok(answerWrites(f).every(input => input.text.includes(seed.requestId)));
+  } finally { f.service.close(); }
+});
+
+test('legacy unknown answer with no proof of non-write is not replayed', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    request.status = 'retryable'; delete request.reschedule;
+    if (request.intent) delete request.intent.outcome;
+    f.store.saveBackendState(seed.agentId, state);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).accepted, false);
+    assert.equal(answerDispatch(f, seed.requestId).state, 'unknown');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+  } finally { f.service.close(); }
+});
+
+test('expired legacy unknown answer with a not-sent receipt is not replayed', async () => {
+  const seed = await answerRaceSeed({ ageMs: 7 * 60 * 60 * 1000 });
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).accepted, false);
+    assert.equal(answerDispatch(f, seed.requestId).expired, 'dispatch-expired');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
+  } finally { f.service.close(); }
+});
+
+test('legacy unknown answer does not reuse old not-sent evidence over a newer intent', async () => {
+  const seed = await answerRaceSeed();
+  const f = await fixture({ directory: seed.directory, snapshot: seed.desktop });
+  try {
+    const record = f.record('lead');
+    const dispatch = record.task.dispatches.find(entry => entry.kind === 'answer' && entry.requestId === seed.requestId);
+    dispatch.state = 'unknown'; dispatch.delivery = 'unknown'; f.store.save(record);
+    const state = f.store.backendState(seed.agentId), request = state.requests[seed.requestId];
+    assert.equal(request.reschedule.notSent, true);
+    request.status = 'retryable'; request.intent.outcome = 'pending';
+    f.store.saveBackendState(seed.agentId, state);
+    await pollTimes(f, seed);
+    assert.equal(answerDispatch(f, seed.requestId).state, 'unknown');
+    assert.deepEqual(answerWrites(f).map(input => input.method), ['turn/steer']);
   } finally { f.service.close(); }
 });

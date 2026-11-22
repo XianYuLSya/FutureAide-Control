@@ -92,10 +92,19 @@ export function nativeAnswers(card, message) {
 
 export async function createCodexBackend(record, deps = {}) {
   const load = deps.load ?? (() => record);
+  const turnSnapshots = new WeakSet();
+  let lastObservationSnapshot;
+  let snapshotRevision = 0;
+  const snapshotTurns = (value, tree) => {
+    const snapshot = { value: structuredClone(value), tree: structuredClone(tree), revision: snapshotRevision };
+    turnSnapshots.add(snapshot);
+    return snapshot;
+  };
   const releasing = (deps.hostOptions?.idleSessionCleanup ?? deps.idleSessionCleanup) !== false;
   const host = { ...createCodexHost({ ...deps.hostOptions, idleSessionCleanup: releasing }), ...deps.host };
   const state = () => ({ requests: {}, projections: {}, ...deps.readNativeState?.() });
   const save = value => {
+    snapshotRevision++;
     if (!deps.writeNativeState) throw fail('codex-state-unavailable', 'The shared native-state store is required.');
     // A release attempt may have been recorded while this caller was awaiting a native
     // read. It is never part of what a dispatch saves, so the stored copy wins: erasing
@@ -475,12 +484,21 @@ export async function createCodexBackend(record, deps = {}) {
    * (`current-turn` / `new-turn` / `after-current` / `accepted-route-unknown`);
    * the stored wire selection stays on `request.delivery` for old readers.
    */
+  function verifiedNotSent(request) {
+    if (request.status !== 'retryable' || request.native || request.turnId) return false;
+    if (request.intent) return request.intent.outcome === 'not-sent';
+    if (request.attempted === true) return false;
+    if (request.reschedule) return request.reschedule.notSent === true;
+    // Older requests record a pre-write read failure without an intent or route.
+    return request.attempted === false && !request.route;
+  }
   function receiptFrom(value, id) {
     const request = value.requests[id];
     if (!request) return undefined;
     return {
       accepted: request.status === 'accepted',
       status: request.status,
+      ...(verifiedNotSent(request) ? { verifiedNotSent: true } : {}),
       ...(Number.isSafeInteger(request.afterSeq) ? { afterSeq: request.afterSeq } : {}),
       ...(request.route ? { delivery: request.route } : {}),
       ...(request.turnId ? { turnId: request.turnId } : {}),
@@ -615,6 +633,7 @@ export async function createCodexBackend(record, deps = {}) {
       // A native question is only ever read behind the thread's own waiting flag.
       const native = await refreshNativeQuestions(value, tree,
         { explicitWaiting: explicit.questions.some(question => question.state === 'pending') });
+      lastObservationSnapshot = snapshotTurns(value, tree);
       const logical = id => id === value.binding?.sessionId ? current.sessionId : id;
       const nodes = tree.nodes.map(node => ({ ...node, sessionId: logical(node.sessionId),
         parentSessionId: node.parentSessionId ? logical(node.parentSessionId) : null,
@@ -644,6 +663,7 @@ export async function createCodexBackend(record, deps = {}) {
       return { messages: page.messages.slice(-maxMessages), hasMore: page.hasMore || page.messages.length > maxMessages };
     },
     async answer({ answerId, message, canAnswer }) {
+      snapshotRevision++;
       const value = state();
       if (value.answers?.[answerId]) return value.answers[answerId];
       const pending = (await reportState(value)).questions.filter(q => q.state === 'pending');
@@ -657,6 +677,7 @@ export async function createCodexBackend(record, deps = {}) {
     },
     async deliver({ requestId, message, kind, mode, selectionExplicit, model: dispatchModel,
       explicitModel, allowStart = true, writeBlockReason }) {
+      snapshotRevision++;
       // The shared layer's fence for this call. Absent means the caller never gated its
       // dispatch, and then nothing here may behave differently.
       const asksWrite = fenceOf(writeBlockReason);
@@ -734,10 +755,7 @@ export async function createCodexBackend(record, deps = {}) {
             throw error;
           }
           if (isCodexReadRetryable(error)) {
-            throw fail(error.code, error.message, {
-              retryableRead: true,
-              ...(error.rpcMessage ? { rpcMessage: error.rpcMessage } : {}),
-            });
+            throw Object.assign(error, { retryableRead: true });
           }
           throw error;
         }
@@ -909,6 +927,9 @@ export async function createCodexBackend(record, deps = {}) {
             }
           }
         } catch (error) {
+          // The transport has already replaced the read that produced this result.
+          // Preserve both the current backend receipt and the original attempt identity.
+          if (error.transportStale === true) throw error;
           if (error.nativeSessionId) {
             value.binding = { sessionId: error.nativeSessionId, owned: true };
             value.pendingTitle ??= { name: load().name, attempts: 0 };
@@ -929,7 +950,7 @@ export async function createCodexBackend(record, deps = {}) {
           // retryable transport failure rather than an unknown write outcome.
           if (isCodexRpcUnavailable(error)) {
             request.attempted = false; request.status = 'retryable'; delete request.intent; save(value);
-            throw fail(error.code, error.message, { retryableRead: true });
+            throw Object.assign(error, { retryableRead: true });
           }
           // A read-only failure before the write-ahead intent leaves nothing sent; a
           // failure after it is an unknown write and is never replayed. A first
@@ -951,8 +972,8 @@ export async function createCodexBackend(record, deps = {}) {
               request.status = 'failed';
             }
             save(value);
-            throw fail(error.code ?? 'codex-delivery-unconfirmed', error.message,
-              { ...(retryableRead ? { retryableRead: true } : { uncertain: true }) });
+            throw Object.assign(error, { code: error.code ?? 'codex-delivery-unconfirmed' },
+              retryableRead ? { retryableRead: true } : { uncertain: true });
           }
           save(value);
           throw fail(error.code ?? 'codex-delivery-unconfirmed', error.message,
@@ -1047,8 +1068,23 @@ export async function createCodexBackend(record, deps = {}) {
         ...(root.selectionSource ? { source: root.selectionSource } : {}),
         resolved, actual: { ...actual } };
     },
-    async turn({ requestId }) {
-      const { value, tree } = await refresh(), p = projection(value), request = value.requests[requestId];
+    takeObservedTurnSnapshot() {
+      const snapshot = lastObservationSnapshot;
+      lastObservationSnapshot = undefined;
+      return snapshot;
+    },
+    async captureTurnSnapshot() {
+      const { value, tree } = await refresh();
+      return snapshotTurns(value, tree);
+    },
+    turnSnapshotValid(snapshot) {
+      return Boolean(snapshot && turnSnapshots.has(snapshot) && snapshot.revision === snapshotRevision);
+    },
+    async turn({ requestId, observationSnapshot }) {
+      const { value, tree } = observationSnapshot && turnSnapshots.has(observationSnapshot)
+        && observationSnapshot.revision === snapshotRevision
+        ? observationSnapshot : await refresh();
+      const p = projection(value), request = value.requests[requestId];
       const native = request?.turnId && p.turns[request.turnId];
       const correlation = request?.status === 'accepted' && request.turnId ? 'request-id' : undefined;
       if (request?.status !== 'accepted' || !native || tree.running || !tree.settled) return { state: 'running', correlation, turnId: request?.turnId };
@@ -1075,6 +1111,7 @@ export async function createCodexBackend(record, deps = {}) {
         'Codex Desktop applies a model selection to an explicit turn. Wait for the current turn to end, then send the selection with the task.');
     },
     async cancel() {
+      snapshotRevision++;
       const { value, tree } = await refresh();
       if (!value.binding) return { cancelRequested: tree.settled };
       if (tree.settled) return { cancelRequested: true };
@@ -1082,6 +1119,7 @@ export async function createCodexBackend(record, deps = {}) {
       return { cancelRequested: result.interrupted === true };
     },
     async destroy() {
+      snapshotRevision++;
       let value, tree;
       try { ({ value, tree } = await refresh()); }
       catch (error) {

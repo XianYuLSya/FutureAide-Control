@@ -703,13 +703,13 @@ export class RosterStore {
     if (typeof requestId !== 'string' || !requestId) return false;
     let result;
     if (receipt === undefined || receipt === null) {
-      result = this.db.prepare('UPDATE supplements SET status=?,reason=? WHERE requestId=?').run(status, reason, requestId);
+      result = this.db.prepare("UPDATE supplements SET status=?,reason=? WHERE requestId=? AND status<>'accepted'").run(status, reason, requestId);
     } else {
       if (typeof receipt !== 'object' || Array.isArray(receipt)) {
         throw Object.assign(new Error('A receipt must be a plain object.'), { code: 'invalid-receipt' });
       }
       result = this.db.prepare(`UPDATE supplements SET status=?,reason=?,receipt=json_patch(coalesce(receipt,'{}'),?)
-        WHERE requestId=?`).run(status, reason, JSON.stringify(receipt), requestId);
+        WHERE requestId=? AND status<>'accepted'`).run(status, reason, JSON.stringify(receipt), requestId);
     }
     this.dropProjections();
     return result.changes === 1;
@@ -884,6 +884,20 @@ export class RosterStore {
       ? this.db.prepare('SELECT body FROM agents ORDER BY name').all()
       : this.db.prepare('SELECT body FROM agents WHERE owner=? ORDER BY name').all(owner);
     return rows.map(row => JSON.parse(row.body));
+  }
+  transportCandidates({ probe = false } = {}) {
+    return this.db.prepare(`SELECT id FROM agents WHERE json_type(body,'$.cleanupRosterTicket') IS NULL
+      AND coalesce(json_extract(body,'$.closed'),0)=0 AND json_extract(body,'$.target')='codex-desktop' AND (
+      json_type(body,'$.transportNextAttemptAt') IS NOT NULL OR
+      (json_extract(body,'$.state') IN ('reconnecting','delivery_pending') AND coalesce(json_extract(body,'$.transportLegacyCleared'),0)=0 AND json_extract(body,'$.error.code') IN
+        ('codex-native-rpc-unavailable','codex-native-rpc-timeout','codex-native-rpc-response-timeout','codex-native-rpc-closed')) OR
+      EXISTS (SELECT 1 FROM json_each(body,'$.task.dispatches') d WHERE coalesce(json_extract(d.value,'$.accepted'),0)=0 AND (
+        json_type(d.value,'$.transportNextAttemptAt') IS NOT NULL OR
+        (json_extract(d.value,'$.state')='retrying' AND coalesce(json_extract(d.value,'$.transportLegacyCleared'),0)=0 AND json_extract(d.value,'$.error.code') IN
+          ('codex-native-rpc-unavailable','codex-native-rpc-timeout','codex-native-rpc-response-timeout','codex-native-rpc-closed')) OR
+        (?1=0 AND json_extract(d.value,'$.state') IN ('unknown','sending','queued')))) OR
+      (?1=0 AND EXISTS (SELECT 1 FROM supplements q WHERE q.agent=agents.id
+        AND q.task=json_extract(body,'$.task.taskId') AND q.status IN ('queued','sending','unknown'))))`).all(probe ? 1 : 0).map(row => row.id);
   }
   count(owner) {
     return this.db.prepare(owner === undefined ? 'SELECT count(*) AS count FROM agents' : 'SELECT count(*) AS count FROM agents WHERE owner=?')
@@ -1082,7 +1096,14 @@ export class RosterStore {
       AND coalesce(json_extract(body,'$.state'),'') NOT IN ('failed','cancelled','completed')
       AND coalesce(json_extract(body,'$.task.state'),'') NOT IN ('failed','cancelled','completed')
       AND coalesce(json_extract(body,'$.task.treeUnavailable'),'')<>'codex-thread-not-found'
-      AND json_type(body,'$.task.legacyAutomaticResult') IS NULL` : '';
+      AND json_type(body,'$.task.legacyAutomaticResult') IS NULL
+      AND NOT EXISTS (SELECT 1 FROM json_each(body,'$.task.dispatches') AS old
+        WHERE json_extract(old.value,'$.accepted')=1 AND NOT EXISTS
+          (SELECT 1 FROM json_each(?1,'$.task.dispatches') AS incoming
+           WHERE json_extract(incoming.value,'$.requestId')=json_extract(old.value,'$.requestId')
+             AND json_extract(incoming.value,'$.accepted')=1
+             AND (json_extract(old.value,'$.turnId') IS NULL OR json_extract(incoming.value,'$.turnId')=json_extract(old.value,'$.turnId'))
+             AND (json_extract(old.value,'$.delivery') IS NULL OR json_extract(incoming.value,'$.delivery')=json_extract(old.value,'$.delivery'))))` : '';
     const result = this.db.prepare(`UPDATE agents SET body=CASE
       WHEN coalesce(json_extract(body,'$.autoCleanupClosed'),0)=1
       THEN json_set(${merged},'$.closed',json('true'),'$.autoCleanupClosed',json('true'))

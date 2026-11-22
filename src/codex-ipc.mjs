@@ -1,8 +1,9 @@
+import { codexInstrumentationFields, writeCodexMeasurement } from './codex-instrumentation.mjs';
 // Codex Desktop native RPC over the running renderer's local debug endpoint.
 // Nothing here starts an app-server, a CLI, a window, or a model turn by itself.
 import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import path from 'node:path';
+import { discoverCodexRenderer } from './codex-renderer-discovery.mjs';
+export { discoverCodexRenderer };
 
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
 
@@ -34,12 +35,14 @@ export function codexThreadNotFound(threadId) {
 }
 
 export function isCodexThreadMissing(error) {
+  if (error?.transportStale) return false;
   return error?.code === 'codex-thread-not-found'
     || THREAD_MISSING.test(String(error?.rpcMessage ?? error?.message ?? ''));
 }
 
 /** A thread exists but its first rollout content has not been written yet. */
 export function isCodexRolloutEmpty(error) {
+  if (error?.transportStale) return false;
   return error?.code === 'codex-empty-rollout'
     || EMPTY_ROLLOUT.test(String(error?.rpcMessage ?? error?.message ?? ''));
 }
@@ -58,51 +61,6 @@ export function isCodexReadRetryable(error) {
 
 // The running Desktop already opens this local debug endpoint. Never restart it
 // with extra flags or connect to a web/account/browser profile instead.
-const DISCOVER_RENDERER = String.raw`
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$all = @(Get-CimInstance Win32_Process)
-$native = @($all | Where-Object {
-  $_.ExecutablePath -and $_.Name -match '^(ChatGPT|Codex)\.exe$' -and
-  $_.CommandLine -match '--remote-debugging-port=' -and $_.CommandLine -notmatch '--type=' -and
-  # A Store build is recognised by its package folder: after a background update the
-  # installer strips the old folder while that process keeps running, so a bundled file
-  # next to the exe can no longer be the test. Other installs still need the file.
-  (($_.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex_') -or
-   (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $_.ExecutablePath) 'resources\plugins\openai-bundled\plugins\codex-app-tools\server.mjs')))
-})
-@(Get-NetTCPConnection -State Listen | Where-Object {
-  $_.OwningProcess -in $native.ProcessId -and $_.LocalAddress -eq '127.0.0.1'
-} | ForEach-Object { [pscustomobject]@{ port=$_.LocalPort; pid=$_.OwningProcess } }) | ConvertTo-Json -Compress
-`;
-
-export async function discoverCodexRenderer() {
-  if (process.platform !== 'win32') throw fail('codex-native-rpc-unavailable', 'Desktop renderer discovery is currently implemented for Windows.');
-  const powershell = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const endpoints = await new Promise((resolve, reject) => execFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', DISCOVER_RENDERER],
-    { windowsHide: true, timeout: 10000, maxBuffer: 65536, encoding: 'utf8' }, (error, stdout) => {
-      if (error) return reject(fail('codex-native-rpc-unavailable', 'Could not locate the running Desktop native endpoint.'));
-      try { const parsed = stdout.trim() ? JSON.parse(stdout) : []; resolve(Array.isArray(parsed) ? parsed : [parsed]); } catch { reject(fail('codex-native-rpc-unavailable', 'The Desktop native endpoint discovery returned an invalid response.')); }
-    }));
-  const matches = [];
-  for (const endpoint of endpoints) {
-    try {
-      const origin = `http://127.0.0.1:${endpoint.port}`;
-      const targets = await fetch(`${origin}/json/list`, { signal: AbortSignal.timeout(1500) }).then(r => r.json());
-      const pages = targets.filter(t => t.type === 'page' && t.url === 'app://-/index.html');
-      for (const target of pages) {
-        const ws = new URL(target.webSocketDebuggerUrl);
-        if (ws.hostname === '127.0.0.1' && ws.port === String(endpoint.port) && ws.pathname.startsWith('/devtools/page/')) {
-          matches.push({ endpoint, target, webSocketUrl: ws.href });
-        }
-      }
-    } catch { /* An unrelated local listener is never used as a fallback. */ }
-  }
-  if (new Set(matches.map(m => m.endpoint.pid)).size !== 1 || matches.length !== 1) {
-    throw fail('codex-native-rpc-unavailable', 'Exactly one running Codex main renderer must be available.');
-  }
-  return { webSocketUrl: matches[0].webSocketUrl, pid: matches[0].endpoint.pid, targetId: matches[0].target.id };
-}
 
 /** The one place a renderer request is sent and matched, shared by every expression
  * below. `request` is a plain object: the desktop bridge takes an object, not JSON text. */
@@ -122,18 +80,21 @@ export async function pageMcpRequest(win, request, timeoutMs) {
       if (data.message?.id !== request.id) return;
       finish(data.message);
     }
-    const timer = setTimeout(() => finish({ error: { code: 'timeout', message: 'Native Desktop response timed out' } }), timeoutMs);
+    const timer = setTimeout(() => finish({
+      [Symbol.for('futureaide.localResponseTimeout')]: true,
+      error: { code: 'timeout', message: 'Native Desktop response timed out' },
+    }), timeoutMs);
     win.addEventListener('message', listen);
     Promise.resolve(win.electronBridge.sendMessageFromView({ type: 'mcp-request', hostId: 'local', request }))
       .catch(error => finish({ error: { code: 'bridge', message: String(error?.message ?? error) } }));
   });
 }
 
-export function nativeRpcExpression(method, params, timeoutMs) {
+export function nativeRpcExpression(method, params, timeoutMs, requestId = `futureaide-native-${randomUUID()}`) {
   if (!NATIVE_METHODS.has(method)) throw fail('codex-native-rpc-unsupported', 'Unsupported native Desktop method.');
   // Interpolated unquoted: this is an object literal inside the page expression, which
   // is the shape the bridge expects.
-  const request = JSON.stringify({ id: `futureaide-native-${randomUUID()}`, method, params });
+  const request = JSON.stringify({ id: requestId, method, params });
   // The response envelope uses a sentinel for a JSON-RPC error, so its numeric
   // code survives Runtime.evaluate and can be reported as a structured failure.
   // config/read still returns only model fields: auth, provider keys and
@@ -150,7 +111,8 @@ export function nativeRpcExpression(method, params, timeoutMs) {
     ? `(${pageDropReleaseHandoff.toString()})(window, ${JSON.stringify(params.threadId)});`
     : '';
   return `(async()=>{${prelude}const m=await (${pageMcpRequest.toString()})(window,${request},${timeoutMs});`
-    + 'if(m?.error)return {__futureaideRpcError:{code:m.error.code,message:m.error.message,data:m.error.data}};'
+    + 'if(m?.error)return {...(m[Symbol.for("futureaide.localResponseTimeout")]?{__futureaideLocalTimeout:true}:{}),'
+    + '__futureaideRpcError:{code:m.error.code,message:m.error.message,data:m.error.data}};'
     + `${result}})()`;
 }
 
@@ -646,26 +608,69 @@ export async function appPagesOnEndpoint(found) {
  * process is created. A failed mutation is never retried by this transport. */
 export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSocketImpl = WebSocket,
   appPages = appPagesOnEndpoint, targetHandshakeMs = 500, extraProbeTimeoutMs = 1500,
-  idleMs = 30000, timeoutMs = 15000 } = {}) {
-  let connection, timer, sequence = 0, active = 0, failedUntil = 0, failure;
-  function close(target = connection) {
-    clearTimeout(timer);
-    if (connection === target) connection = undefined;
+  idleMs = 30000, timeoutMs = 15000, measure = writeCodexMeasurement, onRecovery, probeTimeoutMs = 1000 } = {}) {
+  let connection, timer, sequence = 0, generation = 0, active = 0, failedUntil = 0, failure;
+  let faultSequence = 0, recoverySequence = 0, fault, probing = false, probeTimer, discoveryInFlight;
+  const listeners = new Set(onRecovery ? [onRecovery] : []);
+  const subscribeRecovery = listener => { listeners.add(listener); return () => listeners.delete(listener); };
+  const emit = measure ? (event, data) => {
+    try {
+      measure({ event, time: new Date().toISOString(), monotonicMs: Number(process.hrtime.bigint()) / 1e6,
+        pid: process.pid, ...data });
+    } catch { /* Diagnostic sinks must not affect the connection. */ }
+  } : null;
+  function endpointInfo(found) {
+    try {
+      const { hostname, port } = new URL(found.webSocketUrl);
+      return { host: hostname, port, targetId: found.targetId, desktopPid: found.pid };
+    } catch { return {}; }
+  }
+  function close(target = connection, reason = 'explicit') {
+    if (target) {
+      target.abandoned = true;
+      target.closeReason ??= reason;
+    }
+    emit?.('close_requested', { generation: target?.generation, reason, inFlight: target?.pending?.size ?? 0 });
+    if (connection === target) { clearTimeout(timer); connection = undefined; }
     target?.socket?.close();
   }
-  async function endpoint() {
+  function closeWhenIdle(target) {
+    if (active || !target || connection !== target) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => close(target, 'idle'), idleMs);
+    timer.unref?.();
+  }
+  async function endpoint(force = false) {
     // A missing debug port is a property of the running application, not of each
     // call; do not spawn a process inspection for every status or fallback attempt.
-    if (failedUntil > Date.now()) throw failure;
-    try { return await discover(); }
+    if (!force && failedUntil > Date.now()) { emit?.('discovery_cache_hit', { code: failure?.code }); throw failure; }
+    if (!discoveryInFlight) {
+      let deadline;
+      const work = Promise.race([Promise.resolve().then(discover), new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(fail('codex-native-rpc-unavailable', 'Desktop discovery timed out.')), 10000);
+      })]).finally(() => { clearTimeout(deadline); if (discoveryInFlight === work) discoveryInFlight = undefined; });
+      discoveryInFlight = work;
+    }
+    try {
+      const found = await discoveryInFlight;
+      failedUntil = 0;
+      failure = undefined;
+      return found;
+    }
     catch (error) { failedUntil = Date.now() + 5000; failure = error; throw error; }
   }
-  async function connect(target) {
+  async function connect(target, recovery = false) {
     // The one renderer discovery per connection; the release window check reads this same
     // `found`, so the page list and the socket can never come from different endpoints.
-    const found = await endpoint();
+    emit?.('discovery_start', { generation: target.generation });
+    let found;
+    try { target.discoveryDone = endpoint(recovery); found = await target.discoveryDone; } catch (error) { emit?.('discovery_error', { generation: target.generation, code: error?.code }); throw error; }
+    if (target.abandoned) throw fail('codex-native-rpc-timeout', 'Native Desktop connection timed out.');
     target.found = found;
-    const socket = target.socket = new WebSocketImpl(found.webSocketUrl);
+    emit?.('discovery_done', { generation: target.generation, ...endpointInfo(found) });
+    let socket;
+    try { socket = target.socket = new WebSocketImpl(found.webSocketUrl); }
+    catch (error) { emit?.('socket_error', { generation: target.generation, ...endpointInfo(found), phase: 'construct' }); throw error; }
     target.pending = new Map();
     socket.addEventListener('message', event => {
       let value;
@@ -677,35 +682,53 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         return;
       }
       const waiter = target.pending.get(value.id);
-      if (!waiter) return;
+      if (!waiter) {
+        if (Number.isSafeInteger(value.id)) emit?.('unmatched_response', {
+          generation: target.generation, commandId: value.id,
+        });
+        return;
+      }
       target.pending.delete(value.id); clearTimeout(waiter.timer);
+      emit?.('response', { ...waiter.diagnostic, generation: target.generation, commandId: value.id, inFlight: target.pending.size, rejected: Boolean(value.error || value.result?.exceptionDetails) });
       if (value.error || value.result?.exceptionDetails) waiter.reject(fail('codex-native-rpc-rejected',
         value.error?.message ?? value.result.exceptionDetails.exception?.description ?? 'Native Desktop request failed.'));
       else waiter.resolve(value.result);
     });
-    socket.addEventListener('close', () => {
+    socket.addEventListener('close', event => {
+      emit?.('socket_close', { generation: target.generation, ...endpointInfo(target.found),
+        code: Number.isInteger(event?.code) ? event.code : undefined,
+        wasClean: typeof event?.wasClean === 'boolean' ? event.wasClean : undefined,
+        localReason: target.closeReason, inFlight: target.pending.size });
       if (connection === target) connection = undefined;
-      for (const waiter of target.pending.values()) { clearTimeout(waiter.timer); waiter.reject(fail('codex-native-rpc-closed', 'Native Desktop connection closed.')); }
+      for (const [commandId, waiter] of target.pending) {
+        emit?.('close_affected', { ...waiter.diagnostic, generation: target.generation, commandId });
+        clearTimeout(waiter.timer);
+        waiter.reject(fail('codex-native-rpc-closed', 'Native Desktop connection closed.'));
+      }
       target.pending.clear();
     });
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { socket.close(); reject(fail('codex-native-rpc-timeout', 'Native Desktop connection timed out.')); }, timeoutMs);
+      const timer = setTimeout(() => { target.closeReason ??= 'connect-timeout'; emit?.('close_requested', { generation: target.generation, reason: 'connect-timeout', inFlight: target.pending.size }); socket.close(); reject(fail('codex-native-rpc-timeout', 'Native Desktop connection timed out.')); }, recovery ? probeTimeoutMs : timeoutMs);
       socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
-      socket.addEventListener('error', () => { clearTimeout(timer); reject(fail('codex-native-rpc-unavailable', 'Native Desktop connection failed.')); }, { once: true });
+      socket.addEventListener('error', () => { emit?.('socket_error', { generation: target.generation, ...endpointInfo(target.found) }); clearTimeout(timer); reject(fail('codex-native-rpc-unavailable', 'Native Desktop connection failed.')); }, { once: true });
     });
     target.watch = null;
     return target;
   }
-  function command(target, method, params, waitMs = timeoutMs + 1000) {
+  function command(target, method, params, waitMs = timeoutMs + 1000, diagnostic = {}) {
     const id = ++sequence;
+    if (emit) diagnostic = !diagnostic.method ? { kind: 'cdp', cdpMethod: method }
+      : { ...diagnostic, kind: diagnostic.requestId ? 'native' : 'cdp', cdpMethod: method };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         target.pending.delete(id);
+        emit?.('timeout', { ...diagnostic, generation: target.generation, commandId: id, inFlight: target.pending.size });
         reject(fail('codex-native-rpc-response-timeout', 'Native Desktop request timed out.'));
       }, waitMs);
-      target.pending.set(id, { resolve, reject, timer });
-      try { target.socket.send(JSON.stringify({ id, method, params })); }
+      target.pending.set(id, { resolve, reject, timer, diagnostic });
+      try { target.socket.send(JSON.stringify({ id, method, params })); emit?.('send', { ...diagnostic, generation: target.generation, ...endpointInfo(target.found), commandId: id, inFlight: target.pending.size }); }
       catch (error) {
+        emit?.('send_error', { ...diagnostic, generation: target.generation, commandId: id });
         clearTimeout(timer);
         target.pending.delete(id);
         reject(error);
@@ -862,17 +885,75 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       try { socket?.close?.(); } catch { /* already gone */ }
     }
   }
-  return { close, async request(method, params, options = {}) {
+  function scheduleProbe(delay = 0) {
+    if (probing || probeTimer || !fault) return;
+    probeTimer = setTimeout(() => { probeTimer = undefined; void probe(); }, delay);
+    probeTimer.unref?.();
+  }
+  function ensureProbe(source = connection) {
+    if (!fault) fault = { id: ++faultSequence, origin: source?.generation, attempts: 0 };
+    if (source) source.faultId = fault.id;
+    scheduleProbe();
+  }
+  async function probe() {
+    if (probing || !fault) return;
+    probing = true;
+    const cycle = fault;
+    let target = connection;
+    try {
+      if (!target) {
+        target = { generation: ++generation };
+        connection = target;
+        target.ready = connect(target, true);
+      }
+      // connect() also rejects its ready promise if discovery fails. Consume the
+      // same connection result even when the first (discovery) stage rejects.
+      await target.discoveryDone.catch(() => target.ready);
+      let deadline;
+      try {
+        await Promise.race([target.ready, new Promise((_, reject) => {
+          deadline = setTimeout(() => reject(fail('codex-native-rpc-timeout', 'Recovery connection timed out.')), probeTimeoutMs);
+        })]);
+      } finally { clearTimeout(deadline); }
+      if (connection !== target || fault !== cycle) return;
+      const requestId = `futureaide-native-${randomUUID()}`;
+      const expression = nativeRpcExpression('thread/list', { limit: 1, useStateDbOnly: true }, probeTimeoutMs, requestId);
+      const reply = await command(target, 'Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, probeTimeoutMs,
+        { method: 'thread/list', requestId, source: 'recovery-probe' });
+      const value = reply?.result?.value;
+      if (!value || value.__futureaideRpcError || !Array.isArray(value.data)) throw fail('codex-native-rpc-invalid-response', 'Recovery probe did not return thread metadata.');
+      if (connection !== target || fault !== cycle) return;
+      fault = undefined;
+      const event = { generation: target.generation, recoverySequence: ++recoverySequence, faultSequence: cycle.id,
+        mode: cycle.origin === target.generation ? 'same' : 'new' };
+      for (const listener of listeners) { try { Promise.resolve(listener(event)).catch(() => {}); } catch { /* notification only */ } }
+      closeWhenIdle(target);
+    } catch {
+      if (connection === target) { target.abandoned = true; close(target, 'recovery-probe-failed'); }
+      cycle.attempts++;
+    } finally {
+      probing = false;
+      if (fault === cycle) scheduleProbe([500, 1000, 2000][Math.min(cycle.attempts - 1, 2)] ?? 500);
+    }
+  }
+  async function request(method, params, options = {}, refreshAllowed = true) {
     const { canRelease, signal } = options ?? {};
     const cleanupDelete = method === 'futureaide/cleanup/delete';
     const release = method === 'thread/unsubscribe' || cleanupDelete;
     const background = options?.background === true && (method === 'thread/read' || method === 'thread/list');
+    const read = ['thread/read', 'thread/list', 'thread/turns/list', 'thread/items/list', 'model/list', 'config/read', 'futureaide/userInput/read'].includes(method);
     const userInputRead = method === 'futureaide/userInput/read';
     const userInputReply = method === 'futureaide/userInput/reply';
+    const requestId = `futureaide-native-${randomUUID()}`;
+    const diagnostic = emit ? { ...codexInstrumentationFields(options?.instrumentation), ...(release || userInputRead || userInputReply ? {} : { requestId }), method } : undefined;
+    emit?.('request', diagnostic);
     const expression = release ? null : userInputRead ? userInputReadExpression(params)
-      : userInputReply ? userInputReplyExpression(params) : nativeRpcExpression(method, params, timeoutMs);
+      : userInputReply ? userInputReplyExpression(params) : nativeRpcExpression(method, params, timeoutMs, requestId);
     clearTimeout(timer); active++;
     let target;
+    const attemptRecovery = recoverySequence;
+    const attemptFault = fault?.id ?? faultSequence + 1;
+    const staleRead = () => target?.generation !== generation || attemptRecovery !== recoverySequence;
     try {
       // A release is the one call that can drop the user's own subscription, so it is the
       // one call with a local permission contract. `canRelease` has to answer a synchronous
@@ -891,7 +972,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         const before = permitted();
         if (!before.go) return { status: 'notSent', reason: before.reason };
       }
-      if (!connection) { connection = {}; connection.ready = connect(connection); }
+      if (!connection) { connection = { generation: ++generation }; connection.ready = connect(connection); }
       target = connection; await target.ready;
       if (GATED_WRITE_METHODS.has(method) && typeof options?.blockReason === 'function') {
         const refused = options.blockReason();
@@ -902,14 +983,26 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         return { status: 'unknown', reason: 'round-finished' };
       }
       const evaluate = async value => {
-        const reply = await command(target, 'Runtime.evaluate', { expression: value, awaitPromise: true, returnByValue: true });
+        const reply = await command(target, 'Runtime.evaluate', { expression: value, awaitPromise: true, returnByValue: true }, timeoutMs + 1000, diagnostic);
         const result = reply?.result?.value;
+        if (read && result?.__futureaideLocalTimeout) {
+          throw fail('codex-native-rpc-response-timeout', 'Native Desktop did not return a response to the page before its deadline.');
+        }
         if (result?.__futureaideRpcError) throw fail('codex-native-rpc-rejected',
           `Native Desktop rejected ${method}: ${result.__futureaideRpcError.message}`,
           { rpcCode: result.__futureaideRpcError.code, rpcMessage: result.__futureaideRpcError.message, rpcData: result.__futureaideRpcError.data });
         return result;
       };
-      if (!release) return await evaluate(expression);
+      if (!release) {
+        const result = await evaluate(expression);
+        if (read && staleRead()) {
+          // Keep a successful independent caller alive, but never apply its pre-recovery
+          // snapshot to the roster. Only a side-effect-free request can be refreshed.
+          if (refreshAllowed) return request(method, params, options, false);
+          throw fail('codex-native-rpc-stale-attempt', 'The Desktop connection recovered while this read was pending.');
+        }
+        return result;
+      }
 
       let cleanupCommitSent=false;
       const releaseOnce = async (currentId = params?.threadId, cleanupRequest) => {
@@ -990,19 +1083,34 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       // JSON-RPC/application rejection (bad params, missing thread, unsupported
       // method) must not tear down another name's in-flight write. Only a real
       // transport failure invalidates the socket.
+      const stale = (target && target.generation !== generation) || attemptRecovery < recoverySequence;
+      if (read && !stale && ['codex-native-rpc-response-timeout', 'codex-native-rpc-unavailable', 'codex-native-rpc-timeout', 'codex-native-rpc-closed'].includes(error?.code)) ensureProbe(target);
+      if (read && target && error && typeof error === 'object') {
+        // A shared failed discovery can reject multiple callers with the same Error.
+        // Stamp each caller's own attempt without modifying that shared exception.
+        error = Object.assign(new Error(error.message, { cause: error }), error, {
+          transportGeneration: target.generation, transportFaultSequence: attemptFault,
+          transportAttemptId: requestId, transportStale: Boolean(stale),
+        });
+        if (stale && error.code === 'codex-native-rpc-rejected') error.code = 'codex-native-rpc-stale-attempt';
+      }
+      if (read && error?.code === 'codex-native-rpc-response-timeout') throw error;
       if ((background || userInputRead || userInputReply) && error?.code === 'codex-native-rpc-response-timeout') throw error;
       if (!error?.code || ['codex-native-rpc-unavailable', 'codex-native-rpc-timeout',
         'codex-native-rpc-response-timeout', 'codex-native-rpc-closed',
-        'codex-native-rpc-invalid-response'].includes(error.code)) close(target);
+        'codex-native-rpc-invalid-response'].includes(error.code)) { if (!stale && target) close(target, error?.code ?? 'transport-error'); }
       throw error;
     }
-    finally { if (!--active) { timer = setTimeout(() => close(), idleMs); timer.unref?.(); } }
-  } };
+    finally { active--; closeWhenIdle(connection); }
+  }
+  return { close, subscribeRecovery, ensureProbe, request };
 }
 
 const nativeRpc = createCodexNativeRpc();
 export const requestCodexNative = (method, params, options) => nativeRpc.request(method, params, options);
 export const closeCodexNative = () => nativeRpc.close();
+export const subscribeCodexRecovery = listener => nativeRpc.subscribeRecovery(listener);
+export const ensureCodexRecoveryProbe = () => nativeRpc.ensureProbe();
 
 /** Read one thread's metadata; a profile switch is surfaced as a terminal error. */
 export async function readCodexThreadNative(threadId, { request = requestCodexNative, includeTurns = false } = {}) {

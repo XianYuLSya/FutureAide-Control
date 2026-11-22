@@ -2180,3 +2180,17 @@ test('a reminder that did arrive keeps the task running while the model works', 
     assert.equal(f.record().task.state, 'running');
   } finally { f.service.close(); }
 });
+test('dispatch freezes default effort and confirms DSH receipt', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const receipt = await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
+    assert.equal(receipt.selectedEffort, 'high');
+    assert.equal(receipt.actualEffort, 'high');
+    const dispatch = f.record().task.dispatches[0];
+    assert.equal(dispatch.model.explicitFields.effort, true);
+    assert.equal(dispatch.model.explicitFields.model, false);
+    assert.equal(dispatch.model.requestedEffort, 'high');
+    assert.equal(f.selections.at(-1).reasoningEffort, 'high');
+  } finally { f.service.close(); }
+});

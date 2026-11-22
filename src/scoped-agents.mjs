@@ -1717,14 +1717,16 @@ export function createScopedAgents(config, {
         if (!current?.model || (fields?.effort && !current.reasoningEffort)) {
           throw Object.assign(new Error('The running DSH turn selection could not be confirmed.'), { code: 'model-selection-unconfirmed', terminal: true, notSent: true });
         }
-        if ((fields?.model && (current.model !== dispatch.model.model || (current.provider ?? '') !== (dispatch.model.provider ?? '')))
-            || (fields?.effort && current.reasoningEffort !== dispatch.model.reasoningEffort)) {
-          throw Object.assign(new Error('The running DSH turn cannot change model or effort.'), { code: 'model-change-while-running', terminal: true, notSent: true });
+        const changesModel = fields?.model && (current.model !== dispatch.model.model || (current.provider ?? '') !== (dispatch.model.provider ?? ''));
+        const changesEffort = fields?.effort && current.reasoningEffort !== dispatch.model.reasoningEffort;
+        if (!changesModel && !changesEffort) {
+          dispatch.deliveryModel = { ...current };
+          dispatch.modelReady = true;
+          saveDispatch(record);
+          return;
         }
-        dispatch.deliveryModel = { ...current };
-        dispatch.modelReady = true;
-        saveDispatch(record);
-        return;
+        // DSH supports a session-local selection for the next model step of an
+        // active turn. Apply an explicit change through its normal host check.
       }
       if (dshDefaultOnly(record) && !dispatch.deliveryIntent && dispatch.model) {
         const catalog = await backend.models();

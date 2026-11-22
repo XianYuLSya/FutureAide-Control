@@ -3635,7 +3635,7 @@ export function createScopedAgents(config, {
     for (const dispatch of dispatched) {
       const answer = dispatch.kind === 'answer';
       if ((!answer && dispatch.kind !== 'supplement') || dispatch.accepted === true || dispatch.expired) continue;
-      if (answer ? store.supplement(dispatch.requestId) : false) continue;
+      if (store.supplement(dispatch.requestId)) continue;
       // A direct answer has no supplement row: its own dispatch is aged from the
       // caller's original requestedAt, never from the later poll that registered it.
       const answerRow = answer ? (task.answers ?? []).find(entry => entry.answerId === dispatch.requestId

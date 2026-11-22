@@ -1690,12 +1690,13 @@ export function createScopedAgents(config, {
     }
     const explicit = dispatch.selectionExplicit === true && dispatch.model !== undefined;
     if (target === 'dsh') {
-      if (dshDefaultOnly(record) && !dispatch.deliveryIntent && dispatch.model?.effortConfig) {
+      if (dshDefaultOnly(record) && !dispatch.deliveryIntent && dispatch.model) {
         const catalog = await backend.models();
         if (catalog?.default?.model && catalog.default.model !== dispatch.model.model) {
           const before = dispatch.model;
           const input = { ...(before.explicitInput?.effort !== undefined ? { effort: before.explicitInput.effort } : {}) };
-          dispatch.model = { ...resolveDispatchSelection(catalog, input, { current: catalog.default, config: before.effortConfig }),
+          const frozenConfig = before.effortConfig ?? config.behavior ?? config;
+          dispatch.model = { ...resolveDispatchSelection(catalog, input, { current: catalog.default, config: frozenConfig }),
             explicitFields: { model: false, effort: before.explicitFields?.effort === true },
             explicitInput: before.explicitInput, effortConfig: before.effortConfig };
           dispatch.modelReselection = { before: before.model, after: dispatch.model.model, reason: 'locked-default-changed-before-write' };
@@ -1969,7 +1970,11 @@ export function createScopedAgents(config, {
       // transient transport failure: retrying it would loop forever and hide the typo.
       const modelError = ['model-required', 'model-required-for-effort', 'model-not-found',
         'effort-not-supported', 'model-default-invalid', 'codex-model-change-while-running'].includes(error.code);
-      const retryable = !modelError && (error.retryableRead === true
+      if (dshDefaultOnly(record) && error?.notSent === true && error?.terminal !== true) {
+        delete dispatch.deliveryIntent;
+        dispatch.modelReady = false;
+      }
+      const retryable = !modelError && (error.notSent === true || error.retryableRead === true
         || (targetOf(record) !== 'dsh' && (!delivering || error.code === 'agent-busy')));
       const state = error.terminal === true || modelError ? 'failed'
         : targetOf(record) !== 'dsh' && !delivering ? 'retrying'

@@ -15,6 +15,22 @@ Do not provide workspace paths, chat/session/agent IDs, profiles, callback targe
 
 A running Claude CLI helper receives queued supplements in order as subsequent turns in the same session. If its final report returns `supplement-undelivered`, end the current turn so the next message can arrive. Submit the final report after applying the queued input.
 
+## Reporting plugin feedback
+
+When a tool fails, stalls, behaves differently from its description, or makes a task awkward, callers can use `futureaide_feedback({kind, message, name?, severity?})`. Managed helpers use their own `feedback({kind, message, severity?})` tool. Choose `problem` for an error and `friction` for a usability issue. Severity can be `low`, `medium` or `high`. Describe the symptom and leave out credentials and private paths. If one of your named helpers is affected, callers can supply its name to attach the related context.
+
+Feedback stays in this installation’s local inbox. The receipt includes the problem ID and count. If delivery is unknown, have the secretary check the inbox before taking further action. Continue the task, use `ask_parent` for a decision and `report_parent` for progress or completion.
+
+The secretary reviews new occurrences on request or during regular triage. From the plugin installation, use its active configuration in all three commands. Read each problem’s ID and count, prepare the proposed action as a UTF-8 text file, and reuse the same short todo key for related problems.
+
+```text
+node src/cli.mjs feedback-pending --config CONFIG
+node src/cli.mjs feedback-organize --config CONFIG --id ID --through COUNT --todo report-timeout --message-file TODO.txt
+node src/cli.mjs feedback-todos --config CONFIG
+```
+
+Use the count you actually reviewed. Later occurrences stay pending. Share the resulting proposed action with the Boss for a decision.
+
 ## Selecting a model
 
 Run, create and send accept a full model ID or a substring such as `astra`. Matching ignores case and checks exact IDs first, then takes the first substring match in catalog order. A missing match returns an error listing available IDs. Set `effort` to a supported level or omit it when selecting a model to use its default effort. DSH applies explicit selections to the managed session only. If the bridge reports that it lacks session-only selection, update the DSH host bridge before retrying. Later sends, answers and reminders keep the name's selection. Pass `model` again to replace it, or `effort` alone to adjust an already selected model. Receipts and list/wait entries show the full ID as `actualModel` once known.

@@ -244,10 +244,12 @@ if (values.help || !positionals.length) {
       case 'codex-status': result = await control.codexStatus(); break;
       default: throw new Error('Unknown command. Use --help.');
     }
-    console.log(boundedOutput(result));
+    console.log(command.startsWith('feedback-') ? JSON.stringify(result, null, 2) : boundedOutput(result));
     if (result?.error || result?.connected === false || result?.ready === false || result?.available === false || (result?.duplicate && !result?.delivered && !result?.accepted)) process.exitCode = 1;
   } catch (error) {
-    console.error(JSON.stringify(errorResult(error), null, 2));
+    const feedbackError = positionals[0]?.startsWith('feedback-');
+    console.error(JSON.stringify(feedbackError ? { code: 'feedback-command-failed',
+      message: 'Check the feedback ID, reviewed count, todo key, summary file and local inbox access.' } : errorResult(error), null, 2));
     process.exitCode = 1;
   }
 }

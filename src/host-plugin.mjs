@@ -223,7 +223,7 @@ function managedFileStore(directory) {
  * DSH 0.2.1-rc.3; unsupported storage refuses cleanup instead of archiving it.
  */
 export function createManagedHost(ctx, { stateDirectory, store, removeDirectory = rm, installDelegation: testInstallDelegation,
-  defaultModelOnly = false, feedbackNode, feedbackConfigFile, feedbackVersion } = {}) {
+  defaultModelOnly = false, feedbackNode, feedbackConfigFile } = {}) {
   const root = ctx.root ?? ctx;
   const runtimeKey = Symbol.for('futureaide-control.managed-runtimes');
   const runtimes = root[runtimeKey] ??= new Map();
@@ -447,7 +447,9 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         if (!path.isAbsolute(feedbackNode || '') || !path.isAbsolute(feedbackConfigFile || '')) return { saved: false, code: 'feedback-unavailable' };
         const recent = binding.feedbackError;
         const error = recent?.taskId === record.taskId && Date.now() - Date.parse(recent.at) <= 900000 ? recent : null;
-        return writeFeedback(feedbackNode, feedbackConfigFile, args, { version: feedbackVersion ?? null, source: 'dsh', caller: record.feedbackCallerHost ?? null, target: 'dsh', name: record.feedbackAgentName ?? null, error: error && { tool: error.tool, code: error.code, httpStatus: error.httpStatus ?? null, at: error.at } }, deadline);
+        return writeFeedback(feedbackNode, feedbackConfigFile, args, { source: 'dsh',
+          caller: record.feedbackCallerHost ?? null, target: 'dsh', name: record.feedbackAgentName ?? null,
+          error: error && { tool: error.tool, code: error.code, httpStatus: error.httpStatus ?? null, at: error.at } }, deadline);
       },
     };
     if (fresh) tools.register({ ...binding.feedbackTool, execute: (args, exec) => binding.feedbackTool.execute(args, exec) });
@@ -1124,13 +1126,11 @@ export function createHostHandler(ctx, token, options = {}) {
 export async function apply(ctx, config) {
   if (typeof config?.credentialFile !== 'string' || !path.isAbsolute(config.credentialFile)) throw new Error('credentialFile must be absolute.');
   const record = JSON.parse(await readFile(config.credentialFile, 'utf8'));
-  let feedbackVersion = null;
-  try { feedbackVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version ?? null; } catch { /* Optional for legacy standalone bridges. */ }
   const handler = createHostHandler(ctx, record.token, {
     stateDirectory: config.managedStateDirectory ?? path.join(path.dirname(config.credentialFile), 'managed-host'),
     revision: new URL(import.meta.url).searchParams.get('v'),
     defaultModelOnly: config.defaultModelOnly === true,
-    feedbackNode: config.feedbackNode, feedbackConfigFile: config.feedbackConfigFile, feedbackVersion,
+    feedbackNode: config.feedbackNode, feedbackConfigFile: config.feedbackConfigFile,
   });
   const key = Symbol.for('futureaide-control.host-handler');
   const current = ctx.root[key];

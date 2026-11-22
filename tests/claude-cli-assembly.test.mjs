@@ -379,7 +379,8 @@ test('a Claude CLI final waits for all three supplements in the same session', a
   assert.match(first.calls[0].error.error.message, /end this turn.*next queued message in this conversation/i);
 
   await pollUntil(f, agentId, record => !record || record.state === 'supplement_blocked' || record.state === 'failed',
-    { message: 'the one-shot final to deliver and clean up' });
+    // Three consecutive resumed CLI processes each perform their own settings handshake.
+    { timeoutMs: 90000, message: 'the one-shot final to deliver and clean up' });
   assert.equal(f.record(name), undefined);
   const turns = f.invocations().filter(invocation => invocation.command === 'print');
   assert.deepEqual(turns.map(invocation => invocation.prompt), ['initial task', ...supplements]);

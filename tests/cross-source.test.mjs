@@ -7,7 +7,8 @@ import { createServer } from 'node:net';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { claudeBindingStale, claudeNoticeReceipt, claudeNoticeRequestId, createScopedAgents } from '../src/scoped-agents.mjs';
+import { CLAUDE_RECEIPT_PARSER, claudeBindingStale, claudeNoticeReceipt, claudeNoticeRequestId,
+  createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore, submissionNoticeId } from '../src/roster-store.mjs';
 import { createCodexBackend } from '../src/codex-backend.mjs';
 import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
@@ -1054,6 +1055,140 @@ test('a notice stranded by the missing pid record resumes, and a written one sta
         treeSettledConfirmed: true, delivery: { id: 'notice-written', state: 'unknown' } }]), result: { state: 'completed', reply: 'sent once' } } }));
     await f.service.poll('written');
     assert.equal(claude.received.length, 1, 'an unknown outcome with no pre-write failure is never sent again');
+  } finally { await claude.close(); f.service.close(); }
+});
+
+const desktopReceipt = (sessionId, noticeId) => {
+  const nativeUuid = '47a1f490-11b6-4685-a1ad-cbdbccac4fdc';
+  const envelope = `<cross-session-message from-name="FutureAide Control">\r\n[FutureAide request ${noticeId}]\r\nReport body\r\n</cross-session-message>`;
+  return JSON.stringify({ sessionId, type: 'attachment', attachment: { type: 'queued_command',
+    prompt: envelope, source_uuid: nativeUuid, delivery_id: 'native-delivery',
+    origin: { kind: 'peer', from: 'FutureAide Control', name: 'FutureAide Control',
+      body: `[FutureAide request ${noticeId}]\r\nReport body` } } }) + '\n'
+    + JSON.stringify({ sessionId, type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn',
+      commandUuid: nativeUuid, deliveryId: 'native-delivery', content: envelope }) + '\n';
+};
+
+test('an old notice rescans past its dead cursor and adopts a Desktop-absorbed receipt without resending', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() }, persist: true });
+  const claude = await restartedClaude();
+  const noticeId = 'notice-old-desktop-shape';
+  try {
+    await claude.come();
+    // The old reader left the cursor beyond the receipt (and beyond the file); the
+    // notice is still inside its existing 30-minute window.
+    pendingReport(f, claude, 'old-desktop', { id: noticeId, state: 'unknown',
+      attemptedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(), cursor: 999999,
+      error: { code: 'operation-failed', message: 'old reader missed the receipt' } });
+    await writeFile(claude.stale.transcriptFile, desktopReceipt(claude.sessionId, noticeId));
+    await f.service.poll('old-desktop');
+    const delivery = f.store.get('old-desktop').task.reports[0].delivery;
+    assert.equal(delivery.state, 'delivered', JSON.stringify(delivery));
+    assert.equal(delivery.receiptParser, CLAUDE_RECEIPT_PARSER);
+    assert.equal(claude.received.length, 0, 'read-back must never resend a written notice');
+
+    f.reopen();
+    const restarted = f.store.get('old-desktop').task.reports[0].delivery;
+    assert.equal(restarted.state, 'delivered', 'the adopted receipt survives a monitor restart');
+    assert.equal(restarted.receiptParser, CLAUDE_RECEIPT_PARSER);
+    assert.equal(claude.received.length, 0);
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('a submission scan misses its first round, resumes after reopen, then lets send proceed without a second parent send', async () => {
+  const pageBytes = 1 << 20;
+  const through = 12 * pageBytes;
+  const receiptAt = 9 * pageBytes;
+  const reads = [];
+  const sends = [];
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() }, persist: true,
+    claudeInbox: {
+      send: async () => { sends.push('sent'); throw new Error('a written notice must not be sent again'); },
+      readEvents: async (binding, { offset }) => {
+        reads.push(offset);
+        return { deliveries: offset === receiptAt ? [{ requestId: 'notice-sub-old-1', stage: 'accepted', seq: 1 }] : [],
+          events: [], taskNotifications: [], badLines: 0, offset: offset + pageBytes, size: through,
+          hasMore: offset + pageBytes < through };
+      },
+    } });
+  const directory = await mkdtemp(path.join(workspace, '.runtime', 'tests', 'submission-scan-'));
+  const transcriptFile = path.join(directory, 'transcript.jsonl');
+  await writeFile(transcriptFile, Buffer.alloc(through, 0x0a));
+  const sessionId = randomUUID();
+  const binding = { pid: process.pid, sessionId, procStart: '1', pidDomain: 'win32:test', workspace, directory,
+    socketPath: `\\\\.\\pipe\\futureaide-submission-scan-${randomUUID()}`, recordFile: path.join(directory, 'record.json'),
+    transcriptFile };
+  try {
+    const ownerId = ownerIdForSource('claude-desktop', sessionId);
+    f.store.saveOwner({ ownerId, source: 'claude-desktop', nativeSessionId: sessionId, workspace, binding });
+    const task = { ...completedInput('sub-old', []), state: 'running', reports: [] };
+    f.store.insert(taskRecord({ agentId: 'sub-old', ownerId, sessionId: 'session-sub-old', name: 'sub-old',
+      target: 'codex-desktop', state: 'delivery_pending', task }));
+    f.store.enqueueSubmission({ id: 'sub-old-1', ownerId, agentId: 'sub-old', taskId: 'task-sub-old',
+      kind: 'report', message: 'old report', final: false, created: new Date().toISOString() });
+    const [item] = f.store.submissionWork('sub-old', 'task-sub-old');
+    assert.equal(f.store.saveSubmissionDelivery(item.id, { id: 'notice-sub-old-1', state: 'unknown',
+      createdAt: item.created, attemptedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(), cursor: 0 },
+    { expected: item.deliveryVersion }), true);
+
+    await f.service.poll('sub-old');
+    const first = f.store.get('sub-old').task.reports[0].delivery;
+    assert.equal(first.state, 'unknown', JSON.stringify(first));
+    assert.equal(first.receiptScan.complete, false);
+    assert.equal(first.cursor, 8 * pageBytes, 'the first poll exhausted its page budget');
+    assert.equal(sends.length, 0);
+
+    f.reopen();
+    const [pending] = f.store.submissionWork('sub-old', 'task-sub-old');
+    assert.equal(f.store.saveSubmissionDelivery(pending.id, { ...pending.delivery, nextAttemptAt: 0 },
+      { expected: pending.deliveryVersion }), true);
+    await f.service.poll('sub-old');
+    const second = f.store.get('sub-old').task.reports[0].delivery;
+    assert.equal(second.state, 'delivered', JSON.stringify(second));
+    assert.equal(reads.includes(receiptAt), true, 'the reopened poll resumes at the saved page cursor');
+    assert.equal(f.store.submissionDebt('sub-old', 'task-sub-old'), 0);
+    assert.equal(sends.length, 0, 'the parent never sends the report a second time');
+
+    const sent = await f.service.send({ name: 'sub-old', message: 'continue after the report' },
+      { [TRUSTED_CALLER]: { source: 'claude-desktop', nativeSessionId: sessionId, workspace } });
+    assert.equal(sent.name, 'sub-old');
+    assert.notEqual(sent.error?.code, 'previous-delivery-pending');
+  } finally { f.service.close(); }
+});
+
+test('an overdue old notice with a receipt gets the one-time scan and is delivered', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() }, persist: true });
+  const claude = await restartedClaude();
+  const noticeId = 'notice-overdue-with-evidence';
+  try {
+    await claude.come();
+    pendingReport(f, claude, 'overdue-evidence', { id: noticeId, state: 'unknown',
+      attemptedAt: new Date(Date.now() - 31 * 60 * 1000).toISOString(), cursor: 999999 });
+    await writeFile(claude.stale.transcriptFile, desktopReceipt(claude.sessionId, noticeId));
+    await f.service.poll('overdue-evidence');
+    const delivery = f.store.get('overdue-evidence').task.reports[0].delivery;
+    assert.equal(delivery.state, 'delivered', JSON.stringify(delivery));
+    assert.equal(delivery.receiptParser, CLAUDE_RECEIPT_PARSER);
+    assert.equal(claude.received.length, 0, 'the rescue scan is read-only');
+    f.reopen();
+    assert.equal(f.store.get('overdue-evidence').task.reports[0].delivery.state, 'delivered');
+  } finally { await claude.close(); f.service.close(); }
+});
+
+test('an overdue old notice without evidence is blocked when the one-time scan reaches its cutoff', async () => {
+  const f = await fixture({ adapters: { 'codex-desktop': fakeBackend() } });
+  const claude = await restartedClaude();
+  try {
+    await claude.come();
+    await writeFile(claude.stale.transcriptFile, '');
+    pendingReport(f, claude, 'overdue-empty', { id: 'notice-overdue-empty', state: 'unknown',
+      attemptedAt: new Date(Date.now() - 31 * 60 * 1000).toISOString(), cursor: 999999 });
+    await f.service.poll('overdue-empty');
+    const delivery = f.store.get('overdue-empty').task.reports[0].delivery;
+    assert.equal(delivery.state, 'blocked', JSON.stringify(delivery));
+    assert.equal(delivery.error.code, 'delivery-unconfirmed');
+    assert.equal(delivery.receiptScan.complete, true);
+    assert.equal(claude.received.length, 0);
   } finally { await claude.close(); f.service.close(); }
 });
 

@@ -73,3 +73,70 @@ test('enqueue acknowledges only the exact transport envelope, before busy insert
   const result = await readClaudeEvents(binding);
   assert.deepEqual(result.deliveries.map(({ requestId: id, stage }) => [id, stage]), [[requestId, 'accepted']]);
 });
+
+const desktopUuid = '47a1f490-11b6-4685-a1ad-cbdbccac4fdc';
+const envelope = id => `<cross-session-message from-name="FutureAide Control">\r\n[FutureAide request ${id}]\r\nReport body\r\n</cross-session-message>`;
+
+test('an explicit FutureAide peer is identified from the bare origin body marker', async () => {
+  const noticeId = 'notice-submission-e11591f0f2cb415a9e747e04b594b167';
+  const binding = await fixture(line({ type: 'attachment', attachment: { type: 'queued_command',
+    source_uuid: desktopUuid, delivery_id: 'native-delivery',
+    origin: { kind: 'peer', from: 'FutureAide Control', name: 'FutureAide Control',
+      body: `[FutureAide request ${noticeId}]\r\nReport body` } } }));
+  const result = await readClaudeEvents(binding);
+  assert.deepEqual(result.deliveries.map(({ requestId: id, stage }) => [id, stage]), [[noticeId, 'accepted']]);
+});
+
+test('an explicit FutureAide peer may also carry the bare marker in prompt', async () => {
+  const noticeId = 'notice-prompt-bare';
+  const binding = await fixture(line({ type: 'attachment', attachment: { type: 'queued_command',
+    prompt: `[FutureAide request ${noticeId}]\r\nReport body`, source_uuid: desktopUuid, delivery_id: 'prompt-bare',
+    origin: { kind: 'peer', from: 'FutureAide Control', name: 'FutureAide Control' } } }));
+  const result = await readClaudeEvents(binding);
+  assert.deepEqual(result.deliveries.map(({ requestId: id, stage }) => [id, stage]), [[noticeId, 'accepted']]);
+});
+
+test('an attachment without sender metadata is identified only by its complete prompt envelope', async () => {
+  const promptOnlyId = 'notice-prompt-only';
+  const bareId = 'notice-bare-no-sender';
+  const binding = await fixture(
+    line({ type: 'attachment', attachment: { type: 'queued_command', prompt: envelope(promptOnlyId),
+      source_uuid: desktopUuid, delivery_id: 'prompt-only', origin: { kind: 'peer' } } })
+    + line({ type: 'attachment', attachment: { type: 'queued_command', source_uuid: desktopUuid,
+      delivery_id: 'bare', origin: { kind: 'peer', body: `[FutureAide request ${bareId}]\r\nReport body` } } }));
+  const result = await readClaudeEvents(binding);
+  assert.equal(result.deliveries.some(({ requestId: id }) => id === promptOnlyId), true);
+  assert.equal(result.deliveries.some(({ requestId: id }) => id === bareId), false);
+});
+
+test('remove is identified only by the complete FutureAide envelope', async () => {
+  const noticeId = 'notice-remove-envelope';
+  const binding = await fixture(line({ type: 'queue-operation', operation: 'remove',
+    reason: 'absorbed_mid_turn', commandUuid: desktopUuid, deliveryId: 'native-delivery',
+    content: envelope(noticeId) }));
+  const result = await readClaudeEvents(binding);
+  assert.deepEqual(result.deliveries.map(({ requestId: id, stage }) => [id, stage]), [[noticeId, 'inserted']]);
+});
+
+test('a bare remove marker, a foreign peer bare body and its prompt envelope are not receipts', async () => {
+  const bareRemoveId = 'notice-bare-remove';
+  const foreignId = 'notice-foreign-peer';
+  const foreignPromptId = 'notice-foreign-prompt';
+  const quotedId = 'notice-quoted';
+  const binding = await fixture(
+    line({ type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn',
+      commandUuid: desktopUuid, deliveryId: 'bare-remove', content: `[FutureAide request ${bareRemoveId}]\r\nReport body` })
+    + line({ type: 'attachment', attachment: { type: 'queued_command', source_uuid: desktopUuid,
+      delivery_id: 'foreign', origin: { kind: 'peer', from: 'Other peer', name: 'Other peer',
+        body: `[FutureAide request ${foreignId}]\r\nReport body` } } })
+    + line({ type: 'attachment', attachment: { type: 'queued_command', prompt: envelope(foreignPromptId),
+      source_uuid: desktopUuid, delivery_id: 'foreign-prompt',
+      origin: { kind: 'peer', from: 'Other peer', name: 'Other peer' } } })
+    + line({ type: 'attachment', attachment: { type: 'queued_command',
+      prompt: 'Quoted: ' + envelope(quotedId), source_uuid: desktopUuid, delivery_id: 'quoted',
+      origin: { kind: 'peer', body: `Quoted: [FutureAide request ${quotedId}]\r\nReport body` } } }));
+  const result = await readClaudeEvents(binding);
+  for (const id of [bareRemoveId, foreignId, foreignPromptId, quotedId]) {
+    assert.equal(result.deliveries.some(item => item.requestId === id), false, `${id} is not a receipt`);
+  }
+});

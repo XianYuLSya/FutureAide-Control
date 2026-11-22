@@ -302,6 +302,10 @@ export const claudeBindingStale = error =>
 const CLAUDE_PAGE_BYTES = 1 << 20;
 const CLAUDE_MAX_PAGE_BYTES = 16 << 20;
 const CLAUDE_PAGES_PER_POLL = 8;
+// Version 2 finds the request marker inside Claude Desktop's absorbed
+// queued_command/remove records. A notice written by an older reader has a cursor
+// that may already have passed its receipt, so that cursor is discarded once.
+export const CLAUDE_RECEIPT_PARSER = 2;
 
 /**
  * Complete-line byte cursor at the current end of a transcript: where a new notice
@@ -320,6 +324,12 @@ export async function transcriptCursor(binding) {
     // A tail with no line break cannot be a cursor; start over rather than misalign.
     return lastBreak === -1 ? 0 : size - window + lastBreak + 1;
   } finally { await handle.close(); }
+}
+
+/** Current byte length: the fixed cutoff for one old notice's upgrade scan. */
+export async function transcriptSize(binding) {
+  const handle = await open(binding.transcriptFile, 'r');
+  try { return (await handle.stat()).size; } finally { await handle.close(); }
 }
 
 /**
@@ -341,19 +351,52 @@ const claudeNeverWritten = notice => notice.error?.code === 'ENOENT'
 
 export async function findClaudeReceipt(binding, notice, readEvents = readClaudeEvents) {
   const requestIds = [notice.id, ...(notice.readbackIds ?? [])].map(claudeNoticeRequestId);
-  let cursor = Number.isSafeInteger(notice.cursor) ? notice.cursor : 0;
+  let cursor;
+  if (notice.receiptParser !== CLAUDE_RECEIPT_PARSER) {
+    // An older reader could advance past a Desktop receipt it did not understand.
+    // Discard that cursor exactly once. The transcript end at this first sight is
+    // the scan's fixed cutoff: pages found there are evidence, while records
+    // appended later belong to a new send and are never made to extend this wait.
+    notice.receiptParser = CLAUDE_RECEIPT_PARSER;
+    notice.cursor = 0;
+    const through = await transcriptSize(binding).catch(() => undefined);
+    notice.receiptScan = { parser: CLAUDE_RECEIPT_PARSER,
+      ...(Number.isSafeInteger(through) ? { through } : {}), complete: false };
+    cursor = 0;
+  } else cursor = Number.isSafeInteger(notice.cursor) ? notice.cursor : 0;
+  const through = Number.isSafeInteger(notice.receiptScan?.through) ? notice.receiptScan.through : undefined;
+  // Once the one-time scan has seen the transcript as it stood at first sight,
+  // drop the cutoff: later polls follow new records from the saved cursor.
+  const scanComplete = () => { if (notice.receiptScan) { notice.receiptScan.complete = true; delete notice.receiptScan.through; } };
   for (let page = 0; page < CLAUDE_PAGES_PER_POLL; page++) {
+    const remaining = through === undefined ? CLAUDE_PAGE_BYTES : through - cursor;
+    if (remaining <= 0) { scanComplete(); return undefined; }
+    const maxBytes = Math.min(CLAUDE_PAGE_BYTES, remaining);
     let read;
-    try { read = await readEvents(binding, { offset: cursor, maxBytes: CLAUDE_PAGE_BYTES }); }
+    const lineExceeds = error => String(error?.message ?? '').includes('line-exceeds-page');
+    try { read = await readEvents(binding, { offset: cursor, maxBytes }); }
     catch (error) {
-      if (!String(error?.message ?? '').includes('line-exceeds-page') || CLAUDE_PAGE_BYTES >= CLAUDE_MAX_PAGE_BYTES) throw error;
-      read = await readEvents(binding, { offset: cursor, maxBytes: CLAUDE_MAX_PAGE_BYTES });
+      if (!lineExceeds(error)) throw error;
+      // No cutoff means an ordinary page: retry at the reader's full ceiling.
+      // A fixed cutoff keeps its remaining bytes and should end on a line boundary.
+      const retryBytes = through === undefined ? CLAUDE_MAX_PAGE_BYTES : Math.min(CLAUDE_MAX_PAGE_BYTES, remaining);
+      // The fixed window ends inside a line that cannot fit in what remains.
+      // This round saw every complete line; keep its cursor for a later ordinary
+      // read instead of failing over a trailing partial record.
+      if (through !== undefined && remaining <= maxBytes) { scanComplete(); return undefined; }
+      try { read = await readEvents(binding, { offset: cursor, maxBytes: retryBytes }); }
+      catch (retryError) {
+        if (!lineExceeds(retryError)) throw retryError;
+        if (through !== undefined && remaining <= retryBytes) { scanComplete(); return undefined; }
+        throw retryError;
+      }
     }
     const matched = requestIds.map(id => claudeNoticeReceipt(read.deliveries, id)).find(Boolean);
     const next = Number.isSafeInteger(read.offset) ? read.offset : cursor;
     notice.cursor = next;
     if (matched) return matched;
-    if (read.hasMore !== true || next <= cursor) return undefined;
+    if (through !== undefined && next >= through) { scanComplete(); return undefined; }
+    if (read.hasMore !== true || next <= cursor) { scanComplete(); return undefined; }
     cursor = next;
   }
   return undefined;
@@ -1701,6 +1744,37 @@ export function createScopedAgents(config, {
     // its task tree was never sent at all; for a notice nobody has tried to deliver,
     // the six-hour expiry above is the only age limit.
     const sent = Boolean(notice.attemptedAt) || awaitingNoticeReceipt(notice);
+    const owner = store.owner(record.ownerId);
+    const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
+    // A notice written by the old reader may already be over thirty minutes old
+    // when this build first sees it. Give that notice one versioned, paginated,
+    // read-only scan of the transcript as it stood at this first sight. Evidence
+    // found there is delivered; reaching that fixed cutoff without evidence falls
+    // back to the existing timeout rule. Already blocked notices returned above.
+    const claudeRescanPending = claude && awaitingNoticeReceipt(notice)
+      && (notice.receiptParser !== CLAUDE_RECEIPT_PARSER
+        || (notice.receiptScan?.parser === CLAUDE_RECEIPT_PARSER && notice.receiptScan.complete !== true));
+    if (sent && attemptAge(notice) >= UNCONFIRMED_AFTER_MS && claudeRescanPending) {
+      notice.id ??= uid('notice');
+      let settled;
+      try { settled = await findClaudeNoticeReceipt(owner, notice); }
+      catch {
+        // The binding may fail before findClaudeReceipt can record a scan. At the
+        // deadline an unreadable channel is no evidence, so settle it on the
+        // existing timeout rule instead of leaving an eternal unknown.
+        notice.receiptScan = { parser: CLAUDE_RECEIPT_PARSER, complete: true };
+      }
+      if (settled) {
+        Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined });
+        persist();
+        return;
+      }
+      if (notice.receiptScan?.complete !== true) {
+        notice.state = 'unknown';
+        persist();
+        return;
+      }
+    }
     if (sent && attemptAge(notice) >= UNCONFIRMED_AFTER_MS) {
       blockUndelivered(notice, 'unconfirmed', 'Delivery could not be confirmed within 30 minutes. Its body is kept.');
       persist();
@@ -1717,7 +1791,6 @@ export function createScopedAgents(config, {
       return;
     }
     if (notice.nextAttemptAt && notice.nextAttemptAt > Date.now()) return;
-    const owner = store.owner(record.ownerId);
     notice.id ??= uid('notice');
     notice.attempts = (notice.attempts ?? 0) + 1;
     notice.nextAttemptAt = Date.now() + retryDelayMs(notice.attempts);
@@ -1727,7 +1800,6 @@ export function createScopedAgents(config, {
       const content = JSON.stringify(value);
       return markers.some(entry => content?.includes(entry));
     };
-    const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
     // These exact legacy failures happened before sendClaude opened a socket. They
     // can resume; other unknown outcomes stay read-only.
     if (!submission && claude && notice.state === 'unknown' && claudeNeverWritten(notice)) notice.state = 'pending';
@@ -1739,7 +1811,7 @@ export function createScopedAgents(config, {
           // so a long report's trailing marker is never reliable — deliveries are.
           // The scan starts at this notice's own cursor, so a long parent chat is
           // never rescanned and a page boundary simply continues on the next poll.
-          const settled = await findClaudeReceipt(await claudeNoticeBinding(owner), notice, claudeReadEvents);
+          const settled = await findClaudeNoticeReceipt(owner, notice);
           Object.assign(notice, settled
             ? { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined }
             : { state: 'unknown' });
@@ -1803,10 +1875,14 @@ export function createScopedAgents(config, {
         const binding = await claudeNoticeBinding(owner);
         // Remember where the transcript ends before writing: the receipt can only
         // appear after this point, so later polls start here instead of rescanning.
+        // The parser version is recorded with that pre-send cursor, so a notice
+        // written by this build is never mistaken for one that needs a backscan.
+        notice.receiptParser = CLAUDE_RECEIPT_PARSER;
         notice.cursor = await transcriptCursor(binding).catch(() => undefined);
         const send = target => claudeSend(target, `${text}\n\n${marker}`, { requestId: claudeNoticeRequestId(notice.id) });
         const resend = async () => {
           const fresh = await refreshClaudeBinding(owner);
+          notice.receiptParser = CLAUDE_RECEIPT_PARSER;
           notice.cursor = await transcriptCursor(fresh).catch(() => undefined);
           return send(fresh);
         };
@@ -1887,6 +1963,22 @@ export function createScopedAgents(config, {
       return binding;
     }
     throw failure;
+  }
+
+  /**
+   * Read one Claude notice's native receipt, refreshing a binding the session has
+   * outgrown once. Used both by the normal read-back and the bounded upgrade scan.
+   */
+  async function findClaudeNoticeReceipt(owner, notice) {
+    let binding;
+    try {
+      binding = await claudeNoticeBinding(owner);
+      return await findClaudeReceipt(binding, notice, claudeReadEvents);
+    } catch (error) {
+      if (!claudeBindingStale(error)) throw error;
+      binding = await refreshClaudeBinding(owner);
+      return findClaudeReceipt(binding, notice, claudeReadEvents);
+    }
   }
 
   /**

@@ -2432,8 +2432,21 @@ test('wait surfaces the requested blocked supplement and undelivered answer', as
   const f = await fixture();
   try {
     await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
-    const sent = await f.service.send({ name: 'artist', message: 'next' }, extra(A));
-    f.store.setSupplement(sent.requestId, 'blocked', 'dispatch-expired');
+    const accepted = await f.service.send({ name: 'artist', message: 'accepted' }, extra(A));
+    assert.equal(f.store.supplement(accepted.requestId).status, 'accepted');
+    assert.equal(f.store.setSupplement(accepted.requestId, 'blocked', 'dispatch-expired'), false);
+    assert.equal(f.store.supplement(accepted.requestId).status, 'accepted');
+    await f.service.wait({ taskKeys: [accepted.taskKey], timeoutSeconds: 0 }, extra(A));
+    const current = f.record(); let release;
+    const held = f.store.locked(current.agentId, () => new Promise(resolve => { release = resolve; }));
+    await new Promise(resolve => setImmediate(resolve));
+    let sent;
+    try { sent = await f.service.send({ name: 'artist', message: 'next' }, extra(A)); }
+    finally { release(); await held; }
+    assert.equal(f.store.supplement(sent.requestId).status, 'queued');
+    f.store.db.prepare('UPDATE supplements SET created=? WHERE requestId=?').run('2020-01-01T00:00:00.000Z', sent.requestId);
+    await f.service.poll(current.agentId);
+    assert.equal(f.store.supplement(sent.requestId).reason, 'dispatch-expired');
     await assert.rejects(f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A)), error => error.code === 'dispatch-expired' && error.requestId === sent.requestId);
     const r = f.record(); r.task.answers = [{ answerId: 'bad-answer', message: 'x', undelivered: 'final-submitted' }];
     assert.equal(f.store.saveAnswerWithTaskKey(r, 'bad-answer'), true);

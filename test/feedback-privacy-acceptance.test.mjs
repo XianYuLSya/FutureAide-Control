@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { inboxPath, pendingFeedback, writeFeedback } from '../src/feedback-inbox.mjs';
+import { inboxPath, pendingFeedback, writeFeedback, organizeFeedback, feedbackTodos } from '../src/feedback-inbox.mjs';
 
 const cli = path.resolve('src/cli.mjs');
 const writer = path.resolve('src/feedback-inbox.mjs');
@@ -34,9 +34,14 @@ function result(command) { assert.equal(command.status, 0, command.stderr); retu
 test('privacy in live WAL, main database, CLI output and receipts', async t => {
   const { root, config } = setup();
   const secret = 'a7'.repeat(32), marker = 'WAL-ordinary-marker-中文';
+  const canaries = ['isolated-cookie-canary', 'isolated-basic-canary', 'isolated-client-secret',
+    'isolated-posix-canary', 'isolated-path-tail', 'isolated-private-key', 'isolated-url-canary'];
   const sensitive = [`C:\\private\\${secret}\\file`, `https://example.invalid/${secret}`,
     `"C:\\with spaces\\${secret}\\file"`, `Cookie: session=${secret}; other=value`,
-    `-----BEGIN PRIVATE KEY-----\n${secret}\n-----END PRIVATE KEY-----`];
+    `-----BEGIN PRIVATE KEY-----\n${canaries[5]}\n-----END PRIVATE KEY-----`,
+    JSON.stringify({ Cookie: `session=${canaries[0]}` }), JSON.stringify({Authorization: `Basic ${canaries[1]}`}),
+    `client_secret=${canaries[2]}`, `路径：/var/data/${canaries[3]}`,
+    `C:\\folder with spaces\\${canaries[4]}`, `https://example.invalid/${canaries[6]}`];
   // Keep a reader connection open before writes, so committed frames remain in WAL.
   writeFeedback({ kind: 'problem', message: '初始化' }, context, config);
   const db = new DatabaseSync(inboxPath(config));
@@ -44,6 +49,10 @@ test('privacy in live WAL, main database, CLI output and receipts', async t => {
   db.exec('PRAGMA wal_autocheckpoint=0');
   db.exec('BEGIN'); db.prepare('SELECT count(*) FROM occurrences').get();
   const receipts = [];
+  const rewrite = await submit(config, { kind: 'problem', message: secret });
+  assert.equal(rewrite.value.saved, false);
+  assert.equal(rewrite.value.code, 'feedback-rewrite');
+  receipts.push(rewrite.stdout, rewrite.stderr);
   for (const value of sensitive) {
     const r = await submit(config, { kind: 'problem', message: `${marker} ${value}` },
       { ...context, name: `助手 ${value}`, error: { tool: 'report_parent', code: secret, at: new Date().toISOString() } });
@@ -67,9 +76,38 @@ test('privacy in live WAL, main database, CLI output and receipts', async t => {
   assert.ok(walBytes.includes(Buffer.from(marker)), 'WAL contains this test’s committed ordinary marker');
   for (const [label, bytes] of [['database', mainBytes], ['WAL', walBytes], ['receipts', Buffer.from(receipts.join('\n'))]]) {
     assert.equal(bytes.includes(Buffer.from(secret)), false, `${label} contains fabricated secret`);
+    for (const canary of canaries) assert.equal(bytes.includes(Buffer.from(canary)), false, `${label} contains a fixture credential or path fragment`);
     for (const value of sensitive) assert.equal(bytes.includes(Buffer.from(value)), false, `${label} contains raw sensitive value`);
   }
   t.diagnostic(`privacy evidence: WAL=${walBytes.length} bytes, marker present, secret matches=0 in database/WAL/receipts; ${root}`);
+});
+
+test('a failed todo link rolls back the summary and the reviewed count', () => {
+  const { config } = setup();
+  const saved = writeFeedback({ kind: 'friction', message: 'pending item' }, context, config);
+  const db = new DatabaseSync(inboxPath(config));
+  try {
+    db.exec("CREATE TRIGGER fail_link BEFORE INSERT ON todo_problems BEGIN SELECT RAISE(ABORT,'fixture link failure'); END");
+    assert.throws(() => organizeFeedback(config, { id: saved.id, through: 1, todo: 'test', message: 'Review' }),
+      /fixture link failure/);
+    assert.deepEqual(feedbackTodos(config), []);
+    assert.equal(pendingFeedback(config)[0].organizedThrough, 0);
+  } finally { db.close(); }
+});
+
+test('pending details stay within their reported count during concurrent submissions', async () => {
+  const { config } = setup();
+  const input = { kind: 'friction', message: 'consistent list' };
+  writeFeedback(input, context, config);
+  const writes = Promise.all(Array.from({ length: 4 }, () => submit(config, input)));
+  for (let index = 0; index < 20; index++) {
+    const [row] = pendingFeedback(config);
+    assert.equal(row.occurrences.length, row.newCount);
+    assert.equal(row.occurrences.at(-1).seq, row.count);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const receipts = await writes;
+  assert.equal(pendingFeedback(config)[0].count, 1 + receipts.filter(r => r.value.saved).length);
 });
 
 test('CLI organization, concurrent recurrence, isolation, and fingerprint cases', async t => {

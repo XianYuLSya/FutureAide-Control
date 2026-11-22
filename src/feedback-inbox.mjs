@@ -15,12 +15,12 @@ export function redact(value) {
     .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-]*PRIVATE KEY-----|$)/gi, '[redacted]')
     .replace(/(["'])(?:[A-Za-z]:[\\/]|\\\\|\/)[\s\S]*?\1/g, '[redacted]')
     .replace(/\b(?:https?|file):\/\/[^\s<>"']+/gi, '[redacted]')
-    .replace(/(?:[A-Za-z]:[\\/]|\\\\)[^\s<>"']+/g, '[redacted]')
-    .replace(/(?:^|(?<=\s))\/(?:[^\s<>"']+)/g, '[redacted]')
-    .replace(/\b(?:authorization|(?:set-)?cookie)\s*[:=]\s*[^\r\n]*/gi, '[redacted]')
-    .replace(/\bbearer\s+[^\s,;]+/gi, '[redacted]')
+    // An unquoted local path may contain spaces. Drop the rest of the pasted line.
+    .replace(/(?:[A-Za-z]:[\\/]|\\\\|(?<![\w./-])\/(?=\S))[^\r\n]*/g, '[redacted]')
+    .replace(/\b(?:authorization|(?:set-)?cookie)["']?\s*[:=：]\s*[^\r\n]*/gi, '[redacted]')
+    .replace(/\b(?:bearer|basic)\s+[^\s,;]+/gi, '[redacted]')
     .replace(
-      /\b(?:api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|secret|password)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      /\b(?:api[_-]?key|(?:access[_-]?|refresh[_-]?)?token|(?:client[_-]?)?secret|password)["']?\s*[:=：]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
       '[redacted]',
     )
     .replace(/\b(?:sk|pk|ghp|github_pat)[-_][A-Za-z0-9_-]{12,}\b/gi, '[redacted]')
@@ -31,7 +31,7 @@ function clean(value, max = 1200) {
     throw new Error('Invalid feedback text.');
   const result = redact(value.trim());
   if (!result.replace(/\[redacted\]/g, '').replace(/[\s\p{P}\p{S}]/gu, ''))
-    throw new Error('Please rewrite without sensitive information.');
+    throw Object.assign(new Error('Please rewrite without sensitive information.'), { code: 'sensitive-text' });
   return result;
 }
 function contextString(value) {
@@ -148,9 +148,9 @@ export function pendingFeedback(configFile) {
         ...p,
         occurrences: db
           .prepare(
-            'SELECT seq,message,version,source,caller,target,name,at,error FROM occurrences WHERE problem_id=? AND seq>? ORDER BY seq',
+            'SELECT seq,message,version,source,caller,target,name,at,error FROM occurrences WHERE problem_id=? AND seq>? AND seq<=? ORDER BY seq',
           )
-          .all(p.id, p.organizedThrough)
+          .all(p.id, p.organizedThrough, p.count)
           .map((o) => ({ ...o, error: o.error ? JSON.parse(o.error) : null })),
       }));
   } finally {
@@ -213,7 +213,10 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const { input, context } = JSON.parse(readFileSync(0, 'utf8'));
     console.log(JSON.stringify(writeFeedback(input, context, process.argv[4])));
   } catch (e) {
-    console.log(
+    if (e.code === 'sensitive-text') {
+      console.log(JSON.stringify({ saved: false, code: 'feedback-rewrite',
+        message: 'Describe the symptom again without credentials or private paths.' }));
+    } else console.log(
       JSON.stringify({
         saved: false,
         code: /(?:SQLITE_BUSY|database is locked)/i.test(`${e.code} ${e.message}`)

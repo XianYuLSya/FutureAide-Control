@@ -1320,6 +1320,14 @@ export function createScopedAgents(config, {
    */
   async function observe(record, { checkingRestoredProfile = false } = {}) {
     const own = await observeOwn(record);
+    const evidence = own.modelEvidence;
+    if (evidence?.businessAccepted === true && evidence.requestId && evidence.actualEffort != null) {
+      const dispatch = record.task?.dispatches?.find(item => item.requestId === evidence.requestId && item.accepted === true);
+      if (dispatch && (!evidence.turnId || !dispatch.turnId || evidence.turnId === dispatch.turnId)) {
+        dispatch.actualEffort = evidence.actualEffort;
+        if (evidence.model) dispatch.actualModel = evidence.model;
+      }
+    }
     const keyOf = (agentId, native) => agentId === record.agentId ? native : `${agentId}:${native}`;
     const nodes = (own.tree?.nodes ?? []).map(node => ({ ...node,
       name: node.sessionId === record.sessionId ? record.name : node.name,
@@ -1614,7 +1622,7 @@ export function createScopedAgents(config, {
     };
   }
 
-  async function resolveRequestedPin(record, input = {}) {
+  async function resolveRequestedPin(record, input = {}, frozenConfig) {
     const backend = await backendFor(record);
     const catalog = await backend.models();
     const current = targetOf(record) === 'dsh' && !record.modelPin ? catalog?.default :
@@ -1622,12 +1630,12 @@ export function createScopedAgents(config, {
     const request = selectionRequest(input);
     if (dshDefaultOnly(record)) delete request.model;
     const selection = resolveDispatchSelection(catalog, request, {
-      pinned: dshDefaultOnly(record) ? undefined : record.modelPin, current, config: config.behavior ?? config,
+      pinned: dshDefaultOnly(record) ? undefined : record.modelPin, current, config: frozenConfig ?? config.behavior ?? config,
     });
     return selection && { ...selection, explicitFields: {
       model: !dshDefaultOnly(record) && input.model !== undefined,
       effort: input.effort !== undefined,
-    }, explicitInput: selectionRequest(input), effortConfig: { defaultEffort: (config.behavior ?? config).defaultEffort, modelDefaultEfforts: { ...((config.behavior ?? config).modelDefaultEfforts ?? {}) } } };
+    }, explicitInput: selectionRequest(input), effortConfig: frozenConfig ?? { defaultEffort: (config.behavior ?? config).defaultEffort, modelDefaultEfforts: { ...((config.behavior ?? config).modelDefaultEfforts ?? {}) } } };
   }
 
   /**
@@ -1674,6 +1682,11 @@ export function createScopedAgents(config, {
     // dispatch belongs to: a stale copy must never overwrite a round that has moved on.
     const backend = await backendFor(record);
     const target = targetOf(record);
+    if (!dispatch.model && dispatch.pendingSelection) {
+      dispatch.model = await resolveRequestedPin(record, dispatch.pendingSelection.input, dispatch.pendingSelection.config);
+      delete dispatch.pendingSelection;
+      saveDispatch(record);
+    }
     const explicit = dispatch.selectionExplicit === true && dispatch.model !== undefined;
     if (target === 'dsh') {
       if (dshDefaultOnly(record) && !dispatch.deliveryIntent && dispatch.model?.effortConfig) {
@@ -1892,7 +1905,7 @@ export function createScopedAgents(config, {
         ...(dispatch.selectionExplicit === undefined ? {}
           : { selectionExplicit: dispatch.selectionExplicit === true }),
         ...(dispatch.model?.explicitFields ? { explicitFields: dispatch.model.explicitFields } : {}),
-        ...(modern
+        ...(modern || target === 'claude-cli'
           ? (dispatch.model ? { model: dispatch.model } : {})
           : (explicit ? { model: dispatch.model, explicitModel: true } : { explicitModel: false })) });
       // A native receipt names the actual route. When it does not, a Codex write is
@@ -2513,7 +2526,8 @@ export function createScopedAgents(config, {
       // later change rewrite an input the caller had already accepted.
       const frozen = Object.prototype.hasOwnProperty.call(record.task, 'modelSelection')
         ? { model: record.task.modelSelection, freezeModel: true,
-          selectionExplicit: record.task.selectionExplicit === true } : {};
+          selectionExplicit: record.task.selectionExplicit === true,
+          ...(record.task.pendingSelection ? { pendingSelection: record.task.pendingSelection } : {}) } : {};
       await sendDispatch(record, record.task.message, 'task', [], record.task.requestId, observed, frozen);
     } finally { trackWorkspaceBaseline(record, baseline); }
   }
@@ -4184,7 +4198,14 @@ export function createScopedAgents(config, {
           request = { ...request, effort: record.pendingEffort };
           wantsSelection = true;
         }
-        const pin = await resolvePin(undefined, undefined);
+        let pin, pendingSelection;
+        try { pin = await resolvePin(undefined, undefined); }
+        catch (error) {
+          if (!error?.retryableRead || wantsSelection) throw error;
+          const behavior = config.behavior ?? config;
+          pendingSelection = { input: selectionRequest(request), config: { defaultEffort: behavior.defaultEffort,
+            modelDefaultEfforts: { ...(behavior.modelDefaultEfforts ?? {}) } } };
+        }
         const snapshot = record.task ? { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
           coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) } : undefined;
         // finalReminder marks this task as one that may be reminded once when a turn
@@ -4201,7 +4222,7 @@ export function createScopedAgents(config, {
           ...(dshDefaultOnly(record) ? { modelPin: undefined } : {}),
           task: { taskId: uid('task'), requestId, message, mode: requestedMode ?? 'steer',
             state: 'starting', startedAt: now(), dispatches: [], answers: [],
-            modelSelection: pin ? { ...pin } : null, selectionExplicit: wantsSelection, finalReminder: 'armed' } };
+            modelSelection: pin ? { ...pin } : null, ...(pendingSelection ? { pendingSelection } : {}), selectionExplicit: wantsSelection, finalReminder: 'armed' } };
         // A task assignment ends the previous round for good: its release attempt loses
         // its ticket here, so the host refuses it at the point where it would unsubscribe
         // and the new turn is free to subscribe the thread again.

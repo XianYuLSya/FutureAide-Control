@@ -694,7 +694,7 @@ test('one-shot asks directly, resumes once, and clears only after confirmed resu
 });
 
 test('persistent agents reuse one session and retain earlier task changes', async () => {
-  const f = await fixture();
+  const f = await fixture({ captureFiles: async () => ({ available: true, workspace, files: {} }) });
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   const id = f.record().sessionId;
   await f.service.send({ name: 'artist', message: 'first' }, extra(A));
@@ -703,9 +703,7 @@ test('persistent agents reuse one session and retain earlier task changes', asyn
   assert.equal(f.record().state, 'idle');
   await f.service.send({ name: 'artist', message: 'second' }, extra(A));
   assert.equal(f.record().sessionId, id);
-  const priorChanges = (await f.service.changes({ name: 'artist', task: 1 }, extra(A))).changes;
-  assert.deepEqual(priorChanges.filter(change => change.source !== 'workspace-diff'),
-    [{ path: 'first.svg', operation: 'write', agentPath: ['artist'] }]);
+  assert.deepEqual((await f.service.changes({ name: 'artist', task: 1 }, extra(A))).changes, [{ path: 'first.svg', operation: 'write', agentPath: ['artist'] }]);
   assert.equal(f.removed.length, 0);
   f.service.close();
 });

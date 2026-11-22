@@ -3262,12 +3262,12 @@ export function createScopedAgents(config, {
       dispatch.afterSeq = receipt?.afterSeq ?? dispatch.afterSeq;
       if (receipt?.status === 'accepted') {
         Object.assign(dispatch, { accepted: true, state: 'running', error: undefined,
-          delivery: receipt.delivery ?? dispatch.delivery ?? 'accepted-route-unknown',
+          delivery: Object.hasOwn(receipt, 'delivery') ? receipt.delivery : 'accepted-route-unknown',
           ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
           ...(Object.hasOwn(receipt, 'actualEffort') ? { actualEffort: receipt.actualEffort } : {}),
           ...(receipt.actualEffort != null && receipt.actualEffortSource ? { actualEffortSource: receipt.actualEffortSource } : {}),
           ...(receipt.effortAdjustment ? { effortAdjustment: receipt.effortAdjustment } : {}),
-          ...(receipt.actualModel ? { actualModel: receipt.actualModel } : {}),
+          ...(Object.hasOwn(receipt, 'actualModel') ? { actualModel: receipt.actualModel } : {}),
           ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}),
           nextAttemptAt: undefined, retryAttempts: undefined });
         if (receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
@@ -4457,7 +4457,7 @@ export function createScopedAgents(config, {
       const sent = result => ({ state: result.state, accepted: result.accepted === true,
         ...(result.requestId ? { requestId: result.requestId } : {}),
         ...(result.mode ? { mode: result.mode } : {}),
-        ...(result.delivery ? { delivery: result.delivery } : {}),
+        ...(Object.hasOwn(result, 'delivery') ? { delivery: result.delivery } : {}),
         ...(result.turnId ? { turnId: result.turnId } : {}),
         ...(result.afterTurnId ? { afterTurnId: result.afterTurnId } : {}),
         actualModel: result.actualModel ?? null,

@@ -2639,3 +2639,40 @@ test('DSH reports a native new turn when the bridge safely writes after A ended'
     assert.equal(f.sends.filter(item => item.requestId === receipt.requestId).length, 1);
   } finally { f.service.close(); }
 });
+test('expired DSH input recovers an accepted null route and model without guessing', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'original' }, extra(A));
+    const record = f.record(); const dispatch = record.task.dispatches[0];
+    record.task.startedAt = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    dispatch.accepted = false; dispatch.state = 'unknown'; dispatch.delivery = 'local-pending';
+    const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
+    await mkdir(directory, { recursive: true });
+    const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, dispatch.requestId])).digest('hex');
+    await writeFile(path.join(directory, key + '.json'), JSON.stringify({ status: 'accepted', result: {
+      delivery: null, actualModel: null, actualEffort: null } }));
+    f.store.save(record);
+    await f.service.poll(record.agentId);
+    const recovered = f.record().task.dispatches[0];
+    assert.equal(recovered.accepted, true);
+    assert.equal(recovered.delivery, null);
+    assert.equal(recovered.actualModel, null);
+    assert.equal(f.sends.length, 1);
+    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === dispatch.requestId);
+    assert.equal(row.accepted, true);
+    assert.equal(row.queued, false);
+    assert.equal(row.delivery, null);
+    assert.equal(row.status, 'accepted');
+  } finally { f.service.close(); }
+});
+
+test('DSH run preserves a confirmed acceptance with unknown delivery as null', async () => {
+  const f = await fixture({ reportedDelivery: null });
+  try {
+    const result = await f.service.run({ name: 'artist', lifetime: 'persistent', message: 'work' }, extra(A));
+    assert.equal(result.accepted, true);
+    assert.equal(Object.hasOwn(result, 'delivery'), true);
+    assert.equal(result.delivery, null);
+  } finally { f.service.close(); }
+});

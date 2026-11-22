@@ -181,3 +181,38 @@ export function actualModelName(value) {
   if (typeof value === 'string') return text(value) || null;
   return text(value?.model) || null;
 }
+
+export const EFFORT_ORDER = Object.freeze(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+export const FACTORY_MODEL_DEFAULT_EFFORTS = Object.freeze({ 'gpt-6.2-astra': 'high' });
+
+/** Resolve a new dispatch without changing the legacy pin resolution contract. */
+export function resolveDispatchSelection(catalog, input = {}, { pinned, current, config = {} } = {}) {
+  const fallback = pinned || current || catalog?.default;
+  const query = input.model ?? fallback?.model ?? (typeof catalog?.defaultModel === 'string' ? catalog.defaultModel : catalog?.defaultModel?.model);
+  if (!entriesOf(catalog).length) throw failure('model-catalog-unavailable', 'The target model catalog is unavailable or empty.');
+  const entry = findCatalogModel(catalog, query);
+  const explicit = input.effort !== undefined && input.effort !== null;
+  const normalized = Object.fromEntries(Object.entries(config.modelDefaultEfforts || FACTORY_MODEL_DEFAULT_EFFORTS).map(([k, v]) => [k.toLowerCase(), v]));
+  const keys = [entry.id, entry.model?.resolvedModel, entry.model?.model].filter(v => text(v)).map(v => text(v).toLowerCase());
+  const key = keys.find(k => Object.hasOwn(normalized, k));
+  const effortSource = explicit ? 'explicit' : key ? 'model-default' : 'global-default';
+  const requestedEffort = text(explicit ? input.effort : key ? normalized[key] : config.defaultEffort ?? 'max');
+  const raw = entry.model?.reasoning?.efforts ?? entry.model?.reasoningEfforts;
+  if (!Array.isArray(raw)) throw failure('effort-capability-unknown', 'Model "' + entry.id + '" does not declare reasoning effort capabilities.');
+  const available = modelEfforts(entry.model).map(item => text(item.id));
+  if (!available.length) {
+    if (explicit) throw failure('effort-not-supported', 'Model "' + entry.id + '" does not support selectable reasoning effort.', { availableEfforts: [] });
+    return { provider: entry.provider, model: entry.id, requestedEffort: null, effortSource: null, selectedEffort: null };
+  }
+  let selected = available.find(v => v.toLowerCase() === requestedEffort.toLowerCase());
+  if (!selected) {
+    const index = EFFORT_ORDER.indexOf(requestedEffort.toLowerCase());
+    if (index < 0) throw failure('effort-not-supported', 'Unknown reasoning effort "' + requestedEffort + '". Supported efforts: ' + available.join(', ') + '.', { availableEfforts: available });
+    const ranked = available.map(v => ({ value: v, index: EFFORT_ORDER.indexOf(v.toLowerCase()) })).filter(v => v.index >= 0)
+      .sort((a, b) => Math.abs(a.index - index) - Math.abs(b.index - index) || a.index - b.index);
+    if (!ranked.length) throw failure('effort-capability-unknown', 'Model "' + entry.id + '" exposes no comparable reasoning effort.', { availableEfforts: available });
+    selected = ranked[0].value;
+  }
+  return { provider: entry.provider, model: entry.id, reasoningEffort: selected, requestedEffort, effortSource, selectedEffort: selected,
+    ...(selected.toLowerCase() !== requestedEffort.toLowerCase() ? { effortAdjustment: { supportedEfforts: available, reason: 'nearest-supported-effort' } } : {}) };
+}

@@ -145,8 +145,7 @@ test('a bridge locked to the default model refuses every other session selection
   await host.managedCreate(input);
   await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'other', model: 'alpha' } }),
     error => error.controlCode === 'managed-model-locked');
-  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } }),
-    error => error.controlCode === 'managed-model-locked', 'the default model with another effort is another choice');
+
   assert.deepEqual(f.modelSelections, [], 'no refused choice reached the Agent');
   const same = await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model' } });
   assert.equal(same.accepted, true, 'the default itself stays selectable');
@@ -156,8 +155,7 @@ test('a bridge locked to the default model refuses every other session selection
   assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'high' } })).accepted, true);
   assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model' } })).accepted, true,
     'a pin saved without an effort is still the default model');
-  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } }),
-    error => error.controlCode === 'managed-model-locked');
+  assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } })).accepted, true);
   assert.equal(f.defaultSaves.length, 0);
 });
 

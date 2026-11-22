@@ -4,6 +4,7 @@ import {
   actualModelName,
   modelCatalogSummary,
   resolveModelSelection,
+  resolveDispatchSelection,
   sameModelSelection,
 } from '../src/model-selection.mjs';
 
@@ -91,4 +92,23 @@ test('actualModelName reports only a full model ID', () => {
   assert.equal(sameModelSelection({ provider: 'p', model: 'm' }, { provider: 'p', model: 'm' }), true);
   assert.equal(sameModelSelection({ provider: 'p', model: 'm', reasoningEffort: 'low' },
     { provider: 'p', model: 'm', reasoningEffort: 'high' }), false);
+});
+
+
+test('dispatch defaults, explicit effort and nearest supported effort', () => {
+  const c = { default: { provider: 'p', model: 'gpt-6.2-astra' }, groups: [{ id: 'p', models: [
+    { id: 'gpt-6.2-astra', reasoningEfforts: ['medium', 'high', 'max'] },
+    { id: 'other', reasoningEfforts: ['medium', 'xhigh'] },
+    { id: 'none', reasoningEfforts: [] }, { id: 'unknown' },
+  ] }] };
+  assert.equal(resolveDispatchSelection(c).selectedEffort, 'high');
+  assert.equal(resolveDispatchSelection(c, { effort: 'medium' }).effortSource, 'explicit');
+  const nearest = resolveDispatchSelection(c, { model: 'other', effort: 'high' });
+  assert.equal(nearest.selectedEffort, 'medium');
+  assert.equal(nearest.effortAdjustment.reason, 'nearest-supported-effort');
+  assert.equal(resolveDispatchSelection(c, { model: 'other' }).requestedEffort, 'max');
+  assert.equal(resolveDispatchSelection(c, { model: 'none' }).selectedEffort, null);
+  assert.throws(() => resolveDispatchSelection(c, { model: 'none', effort: 'high' }), { code: 'effort-not-supported' });
+  assert.throws(() => resolveDispatchSelection(c, { model: 'unknown' }), { code: 'effort-capability-unknown' });
+  assert.throws(() => resolveDispatchSelection({}), { code: 'model-catalog-unavailable' });
 });

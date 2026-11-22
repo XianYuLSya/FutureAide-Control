@@ -681,10 +681,8 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       if (defaultModelOnly) {
         const current = service('agentDefaultModel')?.currentSelection();
         const fallback = current ? modelValue(current) : undefined;
-        // The default model with no effort named is still the default: older pins were
-        // saved that way. Any other model, or another effort, is refused.
-        const allowed = fallback && selection.provider === fallback.provider && selection.model === fallback.model
-          && (selection.reasoningEffort === undefined || selection.reasoningEffort === fallback.reasoningEffort);
+        // Lock the model only; the host validates the effort below.
+        const allowed = fallback && selection.provider === fallback.provider && selection.model === fallback.model;
         if (!allowed) reject('managed-model-locked');
       }
       const agent = await activate(record);

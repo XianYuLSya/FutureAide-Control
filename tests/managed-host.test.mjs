@@ -5,6 +5,7 @@ import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { apply, createHostHandler, createManagedHost, CHILD_QUESTION_REFUSAL, ROOT_QUESTION_REFUSAL } from '../src/host-plugin.mjs';
 import { pendingFeedback } from '../src/feedback-inbox.mjs';
+import { installDesktopHostBridge, installHostBridge } from '../src/host-install.mjs';
 import manifest from '../package.json' with { type: 'json' };
 
 // Fixtures remain in the project's clean directory. No test deletes or moves files.
@@ -220,6 +221,83 @@ test('legacy managed bridge returns feedback unavailable without affecting repor
   const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
   assert.deepEqual(await agent.definitions.get('feedback').execute({ kind: 'problem', message: '问题' }, exec), { saved: false, code: 'feedback-unavailable' });
   assert.equal((await agent.definitions.get('report_parent').execute({ message: '正常报告' }, exec)).accepted, true);
+});
+
+test('installed Desktop and preset bridge configurations actually load and write feedback through the host route', async () => {
+  for (const mode of ['desktop', 'preset']) {
+    const f = await fixture(), configFile = path.join(f.root, 'config.json');
+    const config = { hostBridgeFile: path.join(f.root, 'private', 'bridge.json'), configFile, dataRoot: path.join(f.root, 'dsh') };
+    await writeFile(configFile, '{}');
+    let entry;
+    if (mode === 'desktop') {
+      const profile = path.join(f.root, 'desktop'); await mkdir(profile);
+      await writeFile(path.join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-web-app'] } } }));
+      await writeFile(path.join(profile, 'cordis.patch.yml'), '[]\n');
+      await installDesktopHostBridge(config, profile);
+      const patch = await readFile(path.join(profile, 'cordis.patch.yml'), 'utf8');
+      const scalar = key => JSON.parse(patch.match(new RegExp(`^\\s+${key}:\\s*("[^\\r\\n]+")$`, 'm'))[1]);
+      entry = { name: scalar('name'), config: { credentialFile: scalar('credentialFile'), feedbackNode: scalar('feedbackNode'), feedbackConfigFile: scalar('feedbackConfigFile') } };
+    } else {
+      const installed = await installHostBridge(config);
+      [entry] = JSON.parse(await readFile(path.join(installed.presetDirectory, 'agent.cordis.yml'), 'utf8'));
+    }
+    const module = await import(entry.name);
+    assert.equal(new URL(entry.name).protocol, 'file:');
+    const delegationEntry = { options: { name: '@deepseek-ai/dsh-tool-subagent' }, moduleNamespace: {}, fiber: { config: { provider: 'fixture' } } };
+    f.services.agentPresets = { generationFor: () => ({ mount: { tree: { entries: () => [delegationEntry] } } }) };
+    f.services.loader = { unwrapExports: value => value };
+    f.services.sessionController.agents.composeAgent = async () => ({ agentPreset: 'fixture', setup: async agentCtx => { agentCtx.plugin = () => ({ await: async () => {} }); } });
+    let handler;
+    const ctx = { ...f.ctx, root: f.ctx, effect() {}, connection: { register(_owner, _route, fn) { handler = fn; return () => {}; } } };
+    await module.apply(ctx, entry.config);
+    const { token } = JSON.parse(await readFile(entry.config.credentialFile, 'utf8'));
+    const input = identity(f.workspace), call = async (method, args) => {
+      const response = await handler(method, { args: { ...args, token } });
+      assert.equal(response.ok, true, JSON.stringify(response)); return response.value;
+    };
+    await call('managedCreate', input);
+    await call('managedBeginTask', { ...input, taskId: 'task-installed', feedbackAgentName: `安装-${mode}`, feedbackCallerHost: 'codex' });
+    const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
+    const receipt = await agent.definitions.get('feedback').execute({ kind: 'friction', message: `安装桥 ${mode}` }, exec);
+    assert.equal(receipt.saved, true);
+    const [row] = pendingFeedback(configFile);
+    assert.equal(row.id, receipt.id); assert.equal(row.occurrences[0].name, `安装-${mode}`);
+    assert.equal(row.occurrences[0].caller, 'codex');
+  }
+});
+
+test('bridge reload adds feedback to a preexisting binding and respects task lifecycle', async () => {
+  const f = await fixture(), input = identity(f.workspace), configFile = path.join(f.root, 'config.json');
+  await writeFile(configFile, '{}');
+  const first = f.create();
+  await first.managedCreate(input); await first.managedBeginTask({ ...input, taskId: 'old-task' });
+  const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
+  const runtime = [...f.ctx[Symbol.for('futureaide-control.managed-runtimes')].values()][0];
+  const binding = [...runtime.bindings.values()][0];
+  // Emulate a live agent created by the previous bridge revision.
+  delete binding.feedbackRegistered; delete binding.feedbackTool; agent.definitions.delete('feedback');
+  const reloaded = f.create(f.ctx, { feedbackNode: process.execPath, feedbackConfigFile: configFile });
+  assert.ok(agent.definitions.has('feedback'));
+  assert.equal(f.creations.length, 1);
+  await reloaded.managedBeginTask({ ...input, taskId: 'old-task', feedbackAgentName: '热载助手', feedbackCallerHost: 'codex' });
+  await assert.rejects(agent.definitions.get('report_parent').execute({ message: '  ' }, exec), e => e.controlCode === 'invalid-report');
+  await agent.definitions.get('ask_parent').execute({ message: '等答复' }, exec);
+  assert.equal(agent.guards.map(fn => fn({ agent, name: 'feedback' })).find(Boolean), undefined);
+  const feedback = agent.definitions.get('feedback');
+  assert.equal((await feedback.execute({ kind: 'problem', message: '热载后的问题' }, exec)).saved, true);
+  let rows = pendingFeedback(configFile);
+  assert.equal(rows[0].occurrences[0].name, '热载助手');
+  assert.equal(rows[0].occurrences[0].error.code, 'invalid-report');
+  await reloaded.managedAnswer({ ...input, taskId: 'old-task', answerId: 'answer', message: '继续' });
+  await reloaded.managedBeginTask({ ...input, taskId: 'new-task' });
+  assert.equal((await feedback.execute({ kind: 'problem', message: '新任务问题' }, exec)).saved, true);
+  rows = pendingFeedback(configFile);
+  assert.equal(rows.find(row => row.occurrences[0].message === '新任务问题').occurrences[0].error, null);
+  await agent.definitions.get('report_parent').execute({ message: '完成', final: true }, exec);
+  await assert.rejects(feedback.execute({ kind: 'problem', message: '完成之后' }, exec), e => e.controlCode === 'managed-task-required');
+  await reloaded.managedCancel({ ...input, taskId: 'new-task' });
+  await assert.rejects(feedback.execute({ kind: 'problem', message: '取消之后' }, exec), e => e.controlCode === 'managed-task-closed');
+  assert.equal(pendingFeedback(configFile).length, 2);
 });
 
 test('a final is refused while a steer input still waits for the model’s next step', async () => {

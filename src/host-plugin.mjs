@@ -452,7 +452,10 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
           error: error && { tool: error.tool, code: error.code, httpStatus: error.httpStatus ?? null, at: error.at } }, deadline);
       },
     };
-    if (fresh) tools.register({ ...binding.feedbackTool, execute: (args, exec) => binding.feedbackTool.execute(args, exec) });
+    if (!binding.feedbackRegistered) {
+      tools.register({ ...binding.feedbackTool, execute: (args, exec) => binding.feedbackTool.execute(args, exec) });
+      binding.feedbackRegistered = true;
+    }
     binding.questionTool = {
       name: 'ask_parent',
       description: 'Ask the controlling agent a question needed for your current task. Provide the question directly. This ends the current turn; the answer will resume this same task. Do not create a file or run a command to communicate. '
@@ -522,7 +525,14 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         record.activity = `tool: ${exec.name}`;
         observeWrite(record);
       }
-      return next();
+      try { return await next(); }
+      catch (error) {
+        if (exec.agent === agent && record.taskId && ['ask_parent', 'report_parent', 'managed_subagent'].includes(exec.name)
+            && typeof error?.controlCode === 'string' && /^[a-z][a-z0-9-]{0,79}$/.test(error.controlCode)) {
+          binding.feedbackError = { taskId: record.taskId, tool: exec.name, code: error.controlCode, at: new Date().toISOString() };
+        }
+        throw error;
+      }
     };
     if (fresh) agentCtx.on('tools/pre-execute', (...args) => binding.preExecute(...args));
     binding.result = (exec, result) => {
@@ -688,6 +698,8 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       let agent = await activate(record);
       if (record.taskId === input.taskId) {
         record.reportProtocol = 1;
+        if (typeof input.feedbackAgentName === 'string') record.feedbackAgentName = input.feedbackAgentName;
+        if (typeof input.feedbackCallerHost === 'string') record.feedbackCallerHost = input.feedbackCallerHost;
         if (treeProtocol && record.treeProtocol !== 1) {
           record.treeProtocol = 1;
           if (!Number.isSafeInteger(record.taskStartSeq) && Number.isSafeInteger(input.taskStartSeq) && input.taskStartSeq >= -1) record.taskStartSeq = input.taskStartSeq;

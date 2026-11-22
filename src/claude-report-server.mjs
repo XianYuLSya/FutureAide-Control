@@ -43,7 +43,7 @@ export const DEFAULT_KEEP_ALIVE_MS = 600000;
 
 export const INSTRUCTIONS = `FutureAide Control management tools.
 
-The caller is identified from the connection: no session id, chat id, name or route is accepted as an argument. After dispatch, call futureaide_wait_agents once with taskKeys and omit timeout_seconds. Handle the event and use nextCursor when waiting for a later one. Host time limits apply. A timeout leaves the original task running.`;
+The caller is identified from this connection itself: no session id, chat id, name or route is accepted as an argument, so never look for one. After dispatch, wait once with futureaide_wait_agents and taskKeys. Omit timeout_seconds. To wait after an event, pass nextCursor as after. Host limits apply; timeout leaves the task running.`;
 
 /**
  * The trusted caller record the shared service reads from `calling-context`

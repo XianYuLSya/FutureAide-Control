@@ -3843,6 +3843,7 @@ export function createScopedAgents(config, {
         record.modelPin = await resolveRequestedPin(record, { model, effort });
       }
       store.insert(record, { requireOpenParent: Boolean(parent) });
+      if (extra) extra[Symbol.for('futureaide.feedbackDispatchScope')] = { agentId: record.agentId, taskId: null };
       return store.locked(record.agentId, async () => {
         if (!store.get(record.agentId)) throw new Error('This subagent was removed while it was being created.');
         try {
@@ -4185,6 +4186,7 @@ export function createScopedAgents(config, {
           return operation(latest);
         }
         record = next;
+        if (extra) extra[Symbol.for('futureaide.feedbackDispatchScope')] = { agentId: record.agentId, taskId: record.task.taskId };
         if (targetOf(record) !== 'dsh') {
           await ensureWorker(record, { wake: true });
           return { ...queued(record, pin, { requestId, mode: effectiveMode(record, { start: true }),

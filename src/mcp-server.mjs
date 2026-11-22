@@ -87,7 +87,11 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
         result = await Promise.race([work, new Promise(done => { timer = setTimeout(() => done(started ? { saved: null, code: 'feedback-outcome-unknown' } : { saved: false, code: 'feedback-unavailable' }), Math.max(0, deadline - Date.now())); })]);
         clearTimeout(timer);
       } else { const resolved = await resolve(); trusted.feedbackScope = resolved.feedbackScope?.(tool, args, trusted) ?? ''; result = await action(resolved, args, trusted); }
-      if (!['feedback', 'futureaide_feedback'].includes(tool) && result?.error) rememberError(trusted, args?.name, tool, result.error);
+      if (!['feedback', 'futureaide_feedback'].includes(tool) && result?.error) {
+        const binding = trusted[Symbol.for('futureaide.feedbackDispatchScope')];
+        if (binding) trusted.feedbackScope = [binding.agentId, binding.taskId ?? ''].join(':');
+        rememberError(trusted, args?.name ?? result?.name, tool, result.error);
+      }
       // isError is read from the full result: a compact view must never hide a real failure.
       // A view may also shape the detail answer (inspect's node filter lives there),
       // so both paths receive the arguments.
@@ -98,7 +102,11 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
       return { content: [{ type: 'text', text }],
         ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
-      if (trusted && !['feedback', 'futureaide_feedback'].includes(tool)) rememberError(trusted, args?.name, tool, { code: error?.code ?? 'operation-failed', httpStatus: error?.httpStatus });
+      if (trusted && !['feedback', 'futureaide_feedback'].includes(tool)) {
+        const binding = trusted[Symbol.for('futureaide.feedbackDispatchScope')];
+        if (binding) trusted.feedbackScope = [binding.agentId, binding.taskId ?? ''].join(':');
+        rememberError(trusted, args?.name, tool, { code: error?.code ?? 'operation-failed', httpStatus: error?.httpStatus });
+      }
       return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: error.code ?? 'operation-failed', message: ['feedback', 'futureaide_feedback'].includes(tool) ? 'Feedback could not be submitted.' : error.message } }) }] };
     } finally { finished?.(); }
   });
@@ -119,7 +127,7 @@ export function registerScopedTools(server, options = {}) {
   // own annotations, or a host might auto-approve a write as a read.
   const registerView = (tool, description, inputSchema, action, view) =>
     register(tool, description, inputSchema, action, true, false, view);
-  register('futureaide_feedback', 'Record a plugin problem or friction in the local feedback inbox.', { ...feedbackSchema, name: name.optional() }, (s, a, e) => s.submitCallerFeedback(a, e, recentError(e, a.name), e.feedbackDeadline));
+  register('futureaide_feedback', 'Record a plugin problem or friction in the local feedback inbox. Use ask_parent for decisions and report_parent for deliverables.', { ...feedbackSchema, name: name.optional() }, (s, a, e) => s.submitCallerFeedback(a, e, recentError(e, a.name), e.feedbackDeadline));
   registerView('futureaide_status', 'Check this chat context and target readiness. Each backend lists its available model IDs in catalog order and its defaultModel. An unavailable backend or catalog includes the reason. Pass detail: true for the full diagnostics.', { detail }, (s, _a, e) => s.status(e), compactStatus);
   register('futureaide_run_agent', 'Start a subagent’s work in one call: create the name if it does not exist, then send the task; an existing name simply receives the message. Use model and effort to select what runs this and later inputs for the name. The receipt gives the resolved ID as actualModel. Omit name to have one generated. Results return to this chat through the subagent’s own ask_parent questions and report_parent reports, so do not poll; accepted or queued is a receipt, not completion. lifetime is once (the default) or persistent, and target picks the application for a new name: dsh (the default), codex-desktop or claude-cli. An existing name keeps its own target and lifetime; a conflicting explicit value is refused rather than running on another application. mode applies to an existing working name: omit it for the target’s native behavior, steer to insert into its active turn, or queue to start the next turn after the current one ends. A new name starts its first turn either way. DSH refuses explicit queue while busy; Claude CLI refuses explicit steer while busy. An explicit mode the target cannot honor returns mode-unsupported with target and supportedModes, and stores nothing. A supplement receipt carries requestId, mode, delivery and, once proven, turnId or afterTurnId; accepted alone never proves which turn received it. A new name whose first send fails still returns created:true with that name and its error: the name exists, so call list before deciding whether to send again, and never rename and rerun the task. queued:true means locally saved — do not resend; retrying:true means the original request awaits background recovery, so the caller need not resend; unknown means inspect the original receipt and recipient before deciding whether a retry is safe.', {
     name: name.optional(), message, ...modelOptions, lifetime: z.enum(['once', 'persistent']).optional()

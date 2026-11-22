@@ -103,6 +103,14 @@ export function wakeHintName(filename) {
   return match ? match[1].toLowerCase() : null;
 }
 
+/** Select pending names and the sweep deadline for one monitor round. */
+export function planMonitorRound(hints, service, lastSweepAt, { now = Date.now(), sweepMs = 5000 } = {}) {
+  const taken = hints.take();
+  const fast = service.fastPollNames();
+  const only = fast.length ? [...new Set([...taken.names, ...fast])] : taken.names;
+  return { taken, only, sweepDue: taken.sweep || now - lastSweepAt >= sweepMs };
+}
+
 /**
  * Hints a file event leaves for the next round: the names to poll, whether the
  * whole roster has to be swept, and whether the sweep may ignore the per-name

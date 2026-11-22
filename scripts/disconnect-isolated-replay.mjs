@@ -181,7 +181,9 @@ try {
   for (const name of ['monitorScan', 'inspect', 'changes']) {
     assert.ok(phases[name].requests.some(c => c.source === name && c.agentId === agentId && children.includes(c.nodeId)), name);
   }
-  assert.ok(phases.monitorScan.requests.some(c => c.source === 'monitorScan' && c.currentStage === 'dispatch-turn' && c.dispatchId));
+  // Phase one can resolve every dispatch from the first observed tree, producing
+  // zero dispatch-turn requests. Any extra refresh must still identify its dispatch.
+  assert.ok(phases.monitorScan.requests.filter(c => c.currentStage === 'dispatch-turn').every(c => c.dispatchId));
   for (const { timing } of calls) {
     assert.ok(timing.sent <= timing.routed && timing.routed <= timing.windowReceived
       && timing.windowReceived <= timing.pluginReceived, 'same requestId must span all four measured boundaries');

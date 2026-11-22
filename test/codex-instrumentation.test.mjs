@@ -27,6 +27,7 @@ test('measurements correlate real native ID and never include params', async () 
     close() { this.emit('close', {}); }
   }
   const rpc = createCodexNativeRpc({ discover: async () => ({ webSocketUrl: 'fake:', pid: 7, targetId: 'target' }), WebSocketImpl: Socket, measure: e => events.push(e) });
+  process.env.FUTUREAIDE_CODEX_INSTRUMENTATION = '1';
   const result = await withCodexInstrumentation({ source: 'inspect', currentStage: 'poll', operationId: 'op-1', agentId: 'agent-1', secret: 'hidden' }, () => rpc.request('thread/read', { threadId: 'secret-body' }));
   assert.deepEqual(result, { ok: true });
   const send = events.find(e => e.event === 'send');
@@ -48,7 +49,7 @@ test('timeout records active close and affected pending request', async () => {
     send() {} close() { this.emit('close', {}); }
   }
   const rpc = createCodexNativeRpc({ discover: async () => ({ webSocketUrl: 'fake:' }), WebSocketImpl: Socket, timeoutMs: 5, measure: e => events.push(e) });
-  const a = rpc.request('thread/read', {}).catch(e => e.code);
+  const a = rpc.request('turn/start', {}).catch(e => e.code);
   await new Promise(resolve => setTimeout(resolve, 30));
   const b = rpc.request('thread/read', {}).catch(e => e.code);
   assert.deepEqual(await Promise.all([a, b]), ['codex-native-rpc-response-timeout', 'codex-native-rpc-closed']);

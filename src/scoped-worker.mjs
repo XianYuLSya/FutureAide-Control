@@ -22,10 +22,11 @@
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
+import { subscribeCodexRecovery, ensureCodexRecoveryProbe } from './codex-ipc.mjs';
 import { scopedManagement } from './mcp-server.mjs';
 import { backgroundBatch, pollSleeping, scanSleeping } from './idle-monitor.mjs';
 import { createDirectoryWatchers, createWakeQueue, ensureSharedMonitor, monitorDirectories, monitorSelfHeld, monitorWaitMs,
-  recordMonitorPid, renewMonitorPid, throttledSignal, waitForCommit, wakeHintName, MONITOR_LEASE, MONITOR_PROCESS_LEASE,
+  recordMonitorPid, renewMonitorPid, throttledSignal, waitForCommit, wakeHintName, planMonitorRound, MONITOR_LEASE, MONITOR_PROCESS_LEASE,
   MONITOR_READY_LEASE } from './shared-monitor.mjs';
 import { closeReportService, ensureReportService, reportPort, rosterIdentity } from './report-endpoint.mjs';
 import { processStartTime } from './claude-caller-identity.mjs';
@@ -77,6 +78,8 @@ const service = createScopedAgents(config, {
   // instead of serving it up to a sweep later.
   onWorkQueued: agentId => { trace("wake= queued " + agentId); if (hints.queued(agentId)) signal(); },
 }), store = service.store, holder = values['--lease'];
+
+subscribeCodexRecovery(event => { service.transportRecovered(event).catch(error => { process.stderr.write(`[futureaide-monitor] recovery: ${error?.stack ?? error}\n`); }); });
 
 let wake, heartbeat, running = true, signalled = false, lastDelivery = 0, identity;
 let idleSince, lastVersion = store.dataVersion(), rounds = 0, lastSweepAt = 0;
@@ -186,14 +189,7 @@ try {
   while (running && store.leaseHeld(MONITOR_LEASE, holder)) {
     if (!store.leaseHeld(MONITOR_READY_LEASE, holder)) break;
     const roundStarted = Date.now();
-    const taken = hints.take();
-    // Names that owe something time-critical — an undelivered report, an unconfirmed
-    // receipt, a dispatch retry, an attempt about to become due — are polled every
-    // second without sweeping the roster. Ordinary running work is driven by its own
-    // file events and by the five-second sweep.
-    const fast = service.fastPollNames();
-    const only = fast.length ? [...new Set([...taken.names, ...fast])] : taken.names;
-    const sweepDue = taken.sweep || Date.now() - lastSweepAt >= SWEEP_MS;
+    const { taken, only, sweepDue } = planMonitorRound(hints, service, lastSweepAt, { sweepMs: SWEEP_MS });
     attach(monitorDirectories(config));
     // Sleeping agents keep their existing DSH host-state path unchanged.
     await scanSleeping(store, hostDirectory, (agentId, taskId) => {
@@ -213,7 +209,12 @@ try {
       busy = true;
       trace(`scan= ${error?.code ?? error?.message ?? 'error'}`);
     }
-    if (sweepDue) lastSweepAt = Date.now();
+    if (sweepDue) {
+      // A restarted listener has no in-memory fault cycle. Persisted transport waits
+      // trigger a real read probe so legacy long delays can be released immediately.
+      if (store.transportCandidates({ probe: true }).length) ensureCodexRecoveryProbe();
+      lastSweepAt = Date.now();
+    }
     // A finished round waiting on its release confirmation is not work: the listener
     // sleeps to that exact moment, and a pending re-check keeps the process from ending
     // as idle before it can happen.

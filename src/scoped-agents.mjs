@@ -679,6 +679,12 @@ export function createScopedAgents(config, {
   const clients = new Map();
   const operationBackends = new WeakMap();
   const inflight = new Map(), monitorInflight = new Map();
+  let recoveredFaultSequence = 0;
+  const transportWaitOwner = randomUUID();
+  function supersededRead(error) {
+    return error?.transportStale === true ||
+      (error?.transportFaultSequence > 0 && error.transportFaultSequence <= recoveredFaultSequence);
+  }
   // A release attempt is deliberately NOT in `inflight`: it belongs to a round that is
   // already over, and putting it there would make the next round's poll wait for an
   // unload instead of running.
@@ -1535,6 +1541,7 @@ export function createScopedAgents(config, {
     if (!dispatch) return {};
     return {
       ...(dispatch.delivery ? { delivery: dispatch.delivery } : {}),
+      ...(dispatch.accepted === true ? { accepted: true, queued: false } : {}),
       ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
       ...(dispatch.delivery !== 'current-turn' && dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
       ...(dispatch.deliveryIntent?.method ? { method: dispatch.deliveryIntent.method } : {}),
@@ -1791,7 +1798,7 @@ export function createScopedAgents(config, {
     const current = store.get(record.agentId);
     if (roundMovedOn(record, current)) throw dispatchRefused();
     if (current.task.cancelRequested) return;
-    if (dispatch.nextAttemptAt > Date.now()) return;
+    if (Math.max(dispatch.nextAttemptAt ?? 0, dispatch.transportNextAttemptAt ?? 0) > Date.now()) return;
     let delivering = false;
     try {
       await followHostModel(record, dispatch, observed);
@@ -1910,6 +1917,8 @@ export function createScopedAgents(config, {
         dispatch.state = 'retrying'; deferRetry(dispatch);
       }
     } catch (error) {
+      // This attempt began before a confirmed recovery; it cannot overwrite newer state.
+      if (supersededRead(error)) { announceWork(record.agentId); return; }
       // The adapter refused at its own last moment and proved nothing was written. A round
       // that moved on, closed or ended must not have this copy saved back over it; a round
       // that is merely too old seals this one input and keeps everything else.
@@ -1935,7 +1944,12 @@ export function createScopedAgents(config, {
         : targetOf(record) !== 'dsh' && !delivering ? 'retrying'
           : error.uncertain ? 'unknown' : retryable ? 'retrying' : 'failed';
       Object.assign(dispatch, { state, afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
-      if (dispatch.state === 'retrying' && targetOf(record) !== 'dsh') deferRetry(dispatch);
+      if (dispatch.state === 'retrying' && targetOf(record) !== 'dsh') {
+        if (targetOf(record) === 'codex-desktop' && /^codex-native-rpc-(unavailable|timeout|response-timeout|closed)$/.test(error.code ?? '')) {
+          deferTransportRetry(dispatch, error);
+        }
+        else deferRetry(dispatch);
+      }
     }
     saveDispatch(record);
     const latest = store.get(record.agentId);
@@ -1954,6 +1968,30 @@ export function createScopedAgents(config, {
     }
   }
 
+  function deferTransportRetry(value, error) {
+    value.transportRetryAttempts = (value.transportRetryAttempts ?? 0) + 1;
+    value.transportNextAttemptAt = Date.now() + Math.min(2000, 500 * 2 ** Math.min(value.transportRetryAttempts - 1, 2));
+    value.transportWaitFault = error.transportFaultSequence ? { owner: transportWaitOwner, sequence: error.transportFaultSequence } : undefined;
+  }
+
+  function clearRecoveredWait(value, legacyStates, sequence) {
+    // Sequences only compare inside the service that recorded them. A restarted
+    // monitor can release prior-process waits on its own first confirmed read.
+    if (value.transportWaitFault?.owner === transportWaitOwner && value.transportWaitFault.sequence > sequence) return false;
+    if (value.transportNextAttemptAt !== undefined) {
+      delete value.transportNextAttemptAt;
+      delete value.transportRetryAttempts;
+      delete value.transportWaitFault;
+      if (value.nextAttemptAt !== undefined) value.transportLegacyCleared = true;
+      return true;
+    }
+    if (value.transportLegacyCleared || !legacyStates.includes(value.state) || value.nextAttemptAt === undefined ||
+        !/^codex-native-rpc-(unavailable|timeout|response-timeout|closed)$/.test(value.error?.code ?? '')) return false;
+    delete value.nextAttemptAt;
+    delete value.retryAttempts;
+    return true;
+  }
+
   function deferRetry(value) {
     value.retryAttempts = (value.retryAttempts ?? 0) + 1;
     value.nextAttemptAt = Date.now() + retryDelayMs(value.retryAttempts);
@@ -1965,7 +2003,7 @@ export function createScopedAgents(config, {
     // A supplementary input's backoff must never stop observation or delivery
     // for work already admitted by the native session.
     return !record.task?.cancelRequested && dispatches.length === 1 && first.kind === 'task'
-      && !first.accepted && first.state === 'retrying' && first.nextAttemptAt > Date.now();
+      && !first.accepted && first.state === 'retrying' && Math.max(first.nextAttemptAt ?? 0, first.transportNextAttemptAt ?? 0) > Date.now();
   }
 
   // A native refusal is often a normal return value, not an exception. Keep its
@@ -3071,7 +3109,7 @@ export function createScopedAgents(config, {
 
   async function recoverDispatch(record, dispatch, { allowResend = true } = {}) {
     if (dispatch.accepted || !['sending', 'retrying', 'unknown', 'queued'].includes(dispatch.state)) return;
-    if (dispatch.nextAttemptAt > Date.now()) return;
+    if (Math.max(dispatch.nextAttemptAt ?? 0, dispatch.transportNextAttemptAt ?? 0) > Date.now()) return;
     // The backend owns its own receipt format; undefined means this saved intent
     // never reached a native write.
     const receipt = await (await backendFor(record)).receipt({ requestId: dispatch.requestId });
@@ -3098,6 +3136,7 @@ export function createScopedAgents(config, {
     if (receipt.status === 'accepted' && receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
     if (receipt.status === 'rejected') dispatch.state = 'failed';
     if (receipt.status === 'retryable') {
+      if (dispatch.state === 'unknown') return;
       if (!allowResend) return 'not-sent';
       await dispatchOnce(record, dispatch);
     }
@@ -3581,7 +3620,7 @@ export function createScopedAgents(config, {
   async function pollLocked(record) {
     if (readOnlyTarget(record)) return publicResult(record);
     if (record.state === 'cleaning') {
-      return record.nextAttemptAt > Date.now() ? publicResult(record) : clearRecord(record);
+      return Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now() ? publicResult(record) : clearRecord(record);
     }
     if (record.closed || record.state === 'cleanup_failed') return publicResult(record);
     const missingTree = retainMissingTreeFailure(record);
@@ -3629,7 +3668,7 @@ export function createScopedAgents(config, {
       const stopping = task?.cancelRequested && (!task.cancelVerified || task.cancelPending || !task.cancelTreeSettled);
       if (terminalRound(record) && !stopping) return await settleFinishedRound(record);
       if (!task?.cancelRequested && await expireStaleWork(record)) return await settleFinishedRound(record);
-      if (record.nextAttemptAt > Date.now() || firstDispatchDeferred(record)) return publicResult(record);
+      if (Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now() || firstDispatchDeferred(record)) return publicResult(record);
       if (record.state === 'idle') {
         if (!hasPendingDelivery(record)) return publicResult(record);
         await deliverReports(record);
@@ -3660,7 +3699,7 @@ export function createScopedAgents(config, {
       if (!task.dispatches.length && !task.cancelRequested && !task.legacyAutomaticResult) {
         await beginTask(record);
         record.nextAttemptAt = undefined; record.retryAttempts = 0;
-        if (task.dispatches[0]?.state === 'retrying' && task.dispatches[0].nextAttemptAt > Date.now()) return publicResult(record);
+        if (task.dispatches[0]?.state === 'retrying' && Math.max(task.dispatches[0].nextAttemptAt ?? 0, task.dispatches[0].transportNextAttemptAt ?? 0) > Date.now()) return publicResult(record);
       }
       else await negotiateTree(record);
       for (const answer of task.answers ?? []) {
@@ -3670,6 +3709,8 @@ export function createScopedAgents(config, {
         }
       }
       const view = await observe(record);
+      const turnBackend = await backendFor(record);
+      let turnSnapshot = turnBackend.takeObservedTurnSnapshot?.();
       if (task.cancelRequested && task.cancelVerified && !view.running && treeSettled(record, view)) {
         task.cancelTreeSettled = true;
         task.cancelError = undefined;
@@ -3677,20 +3718,32 @@ export function createScopedAgents(config, {
       }
       // Persist and deliver explicit reports before inspecting older dispatches:
       // an ordinary history/read failure must not suppress an accepted report.
+      // A callback, an answer or a cancellation can write after observation. Do not
+      // use the earlier native view when any of those paths may have been entered.
+      if (task.cancelRequested || task.reports?.length || view.reports?.length
+          || (view.questions ?? []).some(question => question.state === 'pending')) turnSnapshot = undefined;
       const reported = await finishReports(record, view);
       if ((task.reports ?? []).some(report => report.final && report.treeSettledConfirmed)) return reported;
       // The helper that asked is still working: its answer must not wait for that turn
       // to end, or for a later question, before it is written into the conversation.
-      if (answersMidTurn(record) && !(task.reports ?? []).some(report => report.final)) await dispatchAnswers(record, view);
+      if (answersMidTurn(record) && !(task.reports ?? []).some(report => report.final)) {
+        if ((task.answers ?? []).some(answer => !answer.dispatched && answer.questionIds)) turnSnapshot = undefined;
+        await dispatchAnswers(record, view);
+      }
       const unanswered = (view.questions ?? []).filter(question => question.state === 'pending');
       await deliverQuestions(record, unanswered);
       for (const dispatch of task.dispatches) {
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
         await recoverDispatch(record, dispatch);
         if (['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)) continue;
-        if (dispatch.state === 'retrying' && dispatch.nextAttemptAt > Date.now()) continue;
+        if (dispatch.state === 'retrying' && Math.max(dispatch.nextAttemptAt ?? 0, dispatch.transportNextAttemptAt ?? 0) > Date.now()) continue;
+        // Every unconfirmed receipt still gets reconciled. A read-only miss leaves
+        // the snapshot usable; a state change or attempted native write invalidates it.
+        if (turnSnapshot && turnBackend.turnSnapshotValid && !turnBackend.turnSnapshotValid(turnSnapshot)) turnSnapshot = undefined;
+        if (!turnSnapshot && turnBackend.captureTurnSnapshot) turnSnapshot = await turnBackend.captureTurnSnapshot();
         const result = await withCodexInstrumentation({ currentStage: 'dispatch-turn', agentId: record.agentId,
-          dispatchId: dispatch.requestId }, async () => (await backendFor(record)).turn({ requestId: dispatch.requestId,
+          dispatchId: dispatch.requestId }, async () => turnBackend.turn({ requestId: dispatch.requestId,
+          ...(turnSnapshot ? { observationSnapshot: turnSnapshot } : {}),
           ...(Number.isSafeInteger(dispatch.afterSeq) ? { afterSeq: dispatch.afterSeq } : {}), timeoutSeconds: 0, maxMessages: 100 }));
         dispatch.afterSeq ??= result.afterSeq;
         if (result.state === 'ended' && (dispatch.accepted || result.correlation === 'request-id')) {
@@ -3742,6 +3795,7 @@ export function createScopedAgents(config, {
       if (terminal === 'failed' && !task.cancelRequested) await notifyFailure(record, terminal, view, finalDispatch);
       return await finishReports(record, view);
     } catch (error) {
+      if (supersededRead(error)) { announceWork(record.agentId); return publicResult(store.get(record.agentId) ?? record); }
       // A write that refused at its own last moment and proved it was never sent: this copy
       // is stale by definition, so none of it is saved. The newer round keeps what it has.
       if (error?.notSent === true && error?.terminal === true) {
@@ -3762,7 +3816,11 @@ export function createScopedAgents(config, {
       }
       record.observation = { ...record.observation, stale: true };
       if (terminal) record.nextAttemptAt = undefined;
-      else if (targetOf(record) !== 'dsh') deferRetry(record);
+      else if (targetOf(record) !== 'dsh') {
+        if (targetOf(record) === 'codex-desktop' && /^codex-native-rpc-(unavailable|timeout|response-timeout|closed)$/.test(error.code ?? '')) {
+          deferTransportRetry(record, error);
+        } else deferRetry(record);
+      }
       forgetBackend(record);
       store.save(record);
       if (terminal && record.task && !store.get(record.agentId)?.task?.cancelRequested) {
@@ -3776,6 +3834,28 @@ export function createScopedAgents(config, {
 
   const service = {
     store,
+    async transportRecovered(event = {}, pendingIds) {
+      if (event.faultSequence < recoveredFaultSequence) return;
+      recoveredFaultSequence = Math.max(recoveredFaultSequence, event.faultSequence ?? 0);
+      const ids = pendingIds ?? store.transportCandidates();
+      const outcomes = await Promise.allSettled(ids.map(id => store.locked(id, async () => {
+          const record = store.get(id);
+          if (!record) return;
+          let changed = clearRecoveredWait(record, ['reconnecting', 'delivery_pending'], event.faultSequence);
+          for (const dispatch of record.task?.dispatches ?? []) {
+            if (dispatch.accepted || !['retrying', 'unknown', 'sending', 'queued'].includes(dispatch.state)) continue;
+            if (clearRecoveredWait(dispatch, ['retrying'], event.faultSequence)) changed = true;
+          }
+          if (changed) store.save(record);
+          announceWork(id);
+        }, { waitMs: 0 })));
+      const failed = ids.filter((_, index) => outcomes[index].status === 'rejected');
+      if (failed.length) {
+        for (const id of failed) announceWork(id);
+        const retry = setTimeout(() => { service.transportRecovered(event, failed).catch(error => process.stderr.write(`[futureaide-monitor] recovery retry: ${error?.stack ?? error}\n`)); }, 500);
+        retry.unref?.();
+      }
+    },
     async status(extra) {
       const status = { toolsLoaded: true, contextVerified: false, dshConnected: false, returnChannel: 'not-checked' };
       let owner;
@@ -4630,7 +4710,7 @@ export function createScopedAgents(config, {
         const urgent = urgentPoll.delete(record.agentId);
         if (!hinted && !urgent && !force && nextPollAt.get(record.agentId) > Date.now()) continue;
         if (!hasSubmission && firstDispatchDeferred(record)) continue;
-        if (!hinted && !urgent && !force && record.nextAttemptAt > Date.now()) continue;
+        if (!hinted && !urgent && !force && Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now()) continue;
         let becameFast = false;
         const work = service.poll(record.agentId)
           // The record this poll was scheduled from is already stale: the poll is what

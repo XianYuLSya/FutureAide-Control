@@ -63,3 +63,21 @@ export async function submitFeedback(input, context, { configFile, deadline = Da
     }
   });
 }
+
+/** Use only a recent error that can be tied to this record's current task. */
+export function feedbackRecordError(record, candidate) {
+  if (candidate) return candidate;
+  const error = record?.error;
+  const at = Date.parse(error?.at);
+  const started = Date.parse(record?.task?.startedAt);
+  const now = Date.now();
+  if (!error || typeof error.tool !== 'string' || typeof error.code !== 'string'
+      || !Number.isFinite(at) || !Number.isFinite(started)
+      || at < started || at > now || now - at > 900000) return null;
+  return {
+    tool: error.tool,
+    code: error.code,
+    ...(Number.isInteger(error.httpStatus) ? { httpStatus: error.httpStatus } : {}),
+    at: new Date(at).toISOString(),
+  };
+}

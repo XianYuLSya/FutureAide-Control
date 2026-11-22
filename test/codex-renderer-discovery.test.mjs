@@ -51,6 +51,22 @@ test('concurrent discoveries share one process and listener check', async () => 
   assert.equal(lookups, 1);
 });
 
+test('warm discovery reads only the verified renderer port until a listener changes', async () => {
+  const reads = [];
+  let sibling = { ...endpoint, port: 3344, listenerStarted: 'first' };
+  const find = createRendererDiscovery({
+    query: async () => [endpoint, sibling],
+    pages: async port => { reads.push(port); return port === endpoint.port ? [page('main', port)] : []; },
+  });
+  await find();
+  assert.deepEqual(reads.splice(0), [endpoint.port, 3344]);
+  await find();
+  assert.deepEqual(reads.splice(0), [endpoint.port]);
+  sibling = { ...sibling, listenerStarted: 'rebound' };
+  await find();
+  assert.deepEqual(reads, [endpoint.port, 3344]);
+});
+
 test('a competing main process or second renderer port invalidates a previously good cache', async () => {
   for (const competitor of [{ ...endpoint, pid: 43, port: 45679 }, { ...endpoint, port: 45679 }]) {
     let rows = [endpoint];

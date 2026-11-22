@@ -30,7 +30,7 @@ $rows = foreach ($candidate in $candidates) {
   $started = $candidate.CreationDate.ToUniversalTime().Ticks.ToString()
   $listeners = Get-NetTCPConnection -State Listen -LocalAddress '127.0.0.1' -OwningProcess $candidate.ProcessId -ErrorAction SilentlyContinue
   foreach ($listener in $listeners) {
-    [pscustomobject]@{ pid = $candidate.ProcessId; port = $listener.LocalPort; started = $started }
+    [pscustomobject]@{ pid = $candidate.ProcessId; port = $listener.LocalPort; started = $started; listenerStarted = [string]$listener.CreationTime.Ticks }
   }
 }
 ConvertTo-Json -InputObject @($rows) -Compress`;
@@ -68,11 +68,14 @@ export function createRendererDiscovery({ query = queryEndpoints, pages = readPa
     async function matches(hint) {
       const rows = await query(hint, remaining());
       if (!Array.isArray(rows)) throw unavailable('Invalid Desktop native endpoint discovery result.');
+      const valid = rows.filter(row => Number.isSafeInteger(row?.pid) && row.pid > 0 && Number.isSafeInteger(row.port)
+        && row.port >= 1 && row.port <= 65535 && typeof row.started === 'string' && row.started);
+      const listeners = valid.filter(row => !hint || row.pid === hint.pid);
+      const identity = row => [row.pid, row.started, row.port, row.listenerStarted ?? ''].join('/');
+      const listenerSet = listeners.map(identity).sort().join(',');
+      if (hint && (listeners.length !== valid.length || listenerSet !== hint.listenerSet)) return [];
       const found = [];
-      for (const row of rows) {
-        if (!Number.isSafeInteger(row?.pid) || row.pid <= 0 || !Number.isSafeInteger(row.port)
-          || row.port < 1 || row.port > 65535 || typeof row.started !== 'string' || !row.started) continue;
-        if (hint && (row.pid !== hint.pid || row.started !== hint.started)) return [];
+      for (const row of hint ? listeners.filter(row => row.port === hint.port) : valid) {
         const timeout = Math.min(1500, remaining());
         try {
           for (const page of await pages(row.port, timeout)) {
@@ -80,7 +83,8 @@ export function createRendererDiscovery({ query = queryEndpoints, pages = readPa
             const ws = new URL(page.webSocketDebuggerUrl);
             if (ws.protocol === 'ws:' && ws.hostname === '127.0.0.1' && ws.port === String(row.port)
               && ws.pathname === '/devtools/page/' + page.id && !ws.username && !ws.password && !ws.search && !ws.hash) {
-              found.push({ ...row, targetId: page.id, webSocketUrl: ws.href });
+              found.push({ ...row, targetId: page.id, webSocketUrl: ws.href,
+                listenerSet: hint ? hint.listenerSet : valid.filter(item => item.pid === row.pid).map(identity).sort().join(',') });
             }
           }
         } catch { /* A listener that does not expose DevTools is not a renderer. */ }

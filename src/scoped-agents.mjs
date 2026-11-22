@@ -4511,7 +4511,7 @@ export function createScopedAgents(config, {
     async submitManagedFeedback(input, extra, error, deadline) {
       const bound = store.agentForCodexThread(callingThread(extra));
       const record = bound && store.get(bound.agentId);
-      if (!record || record.closed || !record.task || ['idle', 'failed'].includes(record.state) || record.task.cancelRequested || record.task.reports?.some(report => report.final) || store.submissions(record.agentId, record.task.taskId).some(report => report.final)) throw Object.assign(new Error('This caller has no active managed task.'), { code: 'submission-not-owned' });
+      if (!record || record.closed || !record.task || ['idle', 'failed'].includes(record.state) || isCancelledRound(record) || record.task.reports?.some(report => report.final) || store.submissions(record.agentId, record.task.taskId).some(report => report.final)) throw Object.assign(new Error('This caller has no active managed task.'), { code: 'submission-not-owned' });
       return submitFeedback(input, { source: 'codex-desktop', caller: store.owner(record.ownerId)?.source ?? null, target: 'codex-desktop', name: record.name ?? null, error: feedbackRecordError(record, error && record.task.startedAt && Date.parse(error.at) >= Date.parse(record.task.startedAt) ? error : null) }, { configFile: config.configFile, deadline });
     },
     async submitToParent({ kind, message, final = false }, extra) {

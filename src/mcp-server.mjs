@@ -16,7 +16,7 @@ import { exitWhenInputCloses } from './stdio-exit.mjs';
 import { compactChanges, compactCreate, compactInspect, compactList, compactStatus, compactWait } from './tool-view.mjs';
 import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
 import { TARGETS } from './agent-backend.mjs';
-import { RosterStore } from './roster-store.mjs';
+import { RosterStore, isCancelledRound } from './roster-store.mjs';
 
 const recentErrors = new Map();
 
@@ -397,7 +397,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId }),
       submitManagedFeedback: (input, _extra, error, deadline) => {
         const record = store.get(agentId);
-        if (!record || record.closed || record.target !== 'claude-cli' || record.task?.taskId !== taskId || record.task?.dispatches?.at(-1)?.requestId !== requestId || ['idle', 'failed'].includes(record.state) || record.task.cancelRequested || record.task.reports?.some(report => report.final) || store.submissions(agentId, taskId).some(report => report.final)) throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
+        if (!record || record.closed || record.target !== 'claude-cli' || record.task?.taskId !== taskId || record.task?.dispatches?.at(-1)?.requestId !== requestId || ['idle', 'failed'].includes(record.state) || isCancelledRound(record) || record.task.reports?.some(report => report.final) || store.submissions(agentId, taskId).some(report => report.final)) throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
         return submitFeedback(input, { source: 'claude-cli', caller: store.owner(record.ownerId)?.source ?? null, target: 'claude-cli', name: record.name ?? null, error: feedbackRecordError(record, error) }, { configFile, deadline });
       },
     } });

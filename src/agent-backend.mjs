@@ -130,7 +130,8 @@ export function hostLabel(record) {
   return TARGET_LABELS[target] ?? target;
 }
 
-const reason = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 400) });
+const reason = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 400),
+  ...(error?.discoveryReason ? { discoveryReason: error.discoveryReason } : {}) });
 
 // Catalog reads are diagnostic: an unavailable catalog must not hide the
 // registration evidence or substitute a default from the other application.

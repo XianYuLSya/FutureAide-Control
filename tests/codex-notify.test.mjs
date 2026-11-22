@@ -14,6 +14,33 @@ test('an owner read of a not-loaded thread becomes a terminal missing thread', a
   }), { code: 'codex-thread-not-found', terminal: true });
 });
 
+test('an owner write stays pending after incomplete discovery, ambiguity, or failed recovery admission', async () => {
+  const stopped = ['timeout', 'list-failed', 'multiple-main-targets'].map(discoveryReason => ({ discoveryReason }));
+  for (const details of [...stopped, { transportAdmissionFailed: true }]) {
+    await assert.rejects(callCodexOwner(randomUUID(), 'send_message_to_thread', { prompt: 'hold' }, {
+      nativeRequest: async () => { throw Object.assign(new Error('discovery guard'), { code: 'codex-native-rpc-unavailable', ...details }); },
+      invoke: async () => assert.fail('no app-tools write is allowed'),
+    }), details);
+  }
+});
+
+test('an owner write can use app-tools after discovery completes with zero renderer matches', async () => {
+  const threadId = randomUUID();
+  const args = { prompt: 'hold' };
+  const answer = { content: [{ type: 'text', text: 'accepted' }] };
+  for (const transportAdmissionFailed of [undefined, true]) {
+    assert.deepEqual(await callCodexOwner(threadId, 'send_message_to_thread', args, {
+      nativeRequest: async () => { throw Object.assign(new Error('No running Codex main renderer was found.'), {
+        code: 'codex-native-rpc-unavailable', discoveryReason: 'no-match', transportAdmissionFailed,
+      }); },
+      invoke: async (id, tool, input) => {
+        assert.deepEqual([id, tool, input], [threadId, 'send_message_to_thread', args]);
+        return answer;
+      },
+    }), answer);
+  }
+});
+
 const testRoot = path.dirname(fileURLToPath(import.meta.url));
 const windows = process.platform === 'win32';
 const entryPoint = String.raw`C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0.0_x64__test\app\resources\plugins\openai-bundled\plugins\codex-app-tools\server.mjs`;

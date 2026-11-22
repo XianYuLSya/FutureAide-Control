@@ -9,8 +9,14 @@
 // receipt always wins over a fence.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { ownerIdFor } from '../src/calling-context.mjs';
 import { createCodexBackend } from '../src/codex-backend.mjs';
 import { createCodexNativeRpc } from '../src/codex-ipc.mjs';
+import { RosterStore } from '../src/roster-store.mjs';
+import { createScopedAgents } from '../src/scoped-agents.mjs';
 import { livePage, liveThread, liveTurn } from './live-thread-fixture.mjs';
 import { CODEX_MODELS } from './assembly/renderer.mjs';
 
@@ -51,7 +57,11 @@ function desktop() {
         hooks.afterThreadStart?.(id);
         return { thread: view(find(id)) };
       }
-      case 'thread/read': return { thread: view(find(params.threadId)) };
+      case 'thread/read': {
+        const thread = find(params.threadId);
+        hooks.beforeThreadRead?.(thread);
+        return { thread: view(thread) };
+      }
       case 'thread/resume': {
         const thread = find(params.threadId);
         thread.loaded = true;
@@ -73,6 +83,7 @@ function desktop() {
         const turn = { id: `turn-${++clock}`, status: 'inProgress', startedAt: ++clock,
           items: [{ id: `item-${++clock}`, type: 'userMessage', content: [{ type: 'text', text: '' }] }] };
         thread.turns.push(turn); thread.active = true;
+        hooks.afterTurnStart?.();
         return { turn: liveTurn({ id: turn.id, rootTurnId: turn.id, status: 'inProgress', items: [] }) };
       }
       case 'turn/steer': {
@@ -94,7 +105,7 @@ function desktop() {
 }
 
 /** A managed name with one saved binding (or none), plus the fence the shared layer hands in. */
-async function fixture({ binding, thread = {}, onWrite, lock } = {}) {
+async function fixture({ binding, thread = {}, onWrite, lock, nativeRequest } = {}) {
   const native = desktop();
   let saved, reason, writes = 0;
   const record = { name: 'helper', agentId: 'a', sessionId: 'logical', workspace: WORKSPACE,
@@ -107,7 +118,7 @@ async function fixture({ binding, thread = {}, onWrite, lock } = {}) {
     ensureCodexReports: async () => ({ ready: true }),
     readCodexReportStatus: async () => ({ ready: true }),
     readCodexReportState: async () => ({ questions: [], reports: [] }),
-    hostOptions: { nativeRequest: native.request },
+    hostOptions: { nativeRequest: nativeRequest ?? native.request },
     withHostLock: lock ?? (async action => action()),
   });
   if (binding) {
@@ -116,6 +127,31 @@ async function fixture({ binding, thread = {}, onWrite, lock } = {}) {
   }
   return { backend, native, record, state: () => saved, writes: () => writes,
     block: value => { reason = value; }, fence: () => reason };
+}
+
+function memoryTransport({ failOpen = () => false, reply }) {
+  const wire = [];
+  let socketCount = 0;
+  class Socket extends EventTarget {
+    constructor() {
+      super();
+      const type = failOpen(++socketCount) ? 'error' : 'open';
+      queueMicrotask(() => this.dispatchEvent(new Event(type)));
+    }
+    send(frame) {
+      const { id, params } = JSON.parse(frame);
+      const method = params.expression.match(/"method":"([^"]+)"/)?.[1];
+      wire.push(method);
+      const value = reply(method);
+      if (value === undefined) { this.close(); return; }
+      const data = JSON.stringify({ id, result: { result: { value } } });
+      queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data })));
+    }
+    close() { this.dispatchEvent(new Event('close')); }
+  }
+  const rpc = createCodexNativeRpc({ discover: async () => ({ webSocketUrl: 'memory:test' }),
+    WebSocketImpl: Socket, measure: null, timeoutMs: 200 });
+  return { rpc, wire };
 }
 
 test('a round that ended while the lock was queued is refused before the attempt is recorded', async () => {
@@ -185,6 +221,113 @@ test('a thread created before the round ended stays owned and never gets a turn'
   assert.equal(binding.owned, true, 'the thread that exists is still this name\'s');
   assert.equal(binding.sessionId, 'thread-0001');
   assert.equal(f.state().requests.r1.status, 'rejected', 'not unknown: nothing was written');
+});
+
+test('the monitor retries a first turn held before transport admission on the existing thread', async t => {
+  const stateDirectory = await mkdtemp(path.join(os.tmpdir(), 'futureaide-first-turn-'));
+  const store = new RosterStore(path.join(stateDirectory, 'roster.sqlite'));
+  const native = desktop();
+  const boss = '11111111-1111-4111-8111-111111111111';
+  const workspace = process.cwd();
+  const extra = { _meta: { threadId: boss } };
+  const service = createScopedAgents({ stateDirectory, workspace, target: 'dsh' }, {
+    store, clientFactory: () => { throw new Error('no DSH host'); },
+    callCodex: async threadId => ({ thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } }),
+    backendAdapters: { 'codex-desktop': (record, deps) => createCodexBackend(record, { ...deps,
+      hostOptions: { nativeRequest: native.request } }) },
+    codexProbeRegistration: async () => ({ ready: true, registered: true, tools: ['ask_parent', 'report_parent'] }),
+    startSharedMonitor: () => true,
+  });
+  t.after(async () => { service.close(); await rm(stateDirectory, { recursive: true, force: true }); });
+  let beforeRecovery = true;
+  native.hooks.beforeThreadRead = thread => {
+    if (!thread.turns.length) {
+      const message = 'rollout at C:/fixture/rollout.jsonl is empty';
+      throw Object.assign(new Error(message), { code: 'codex-native-rpc-rejected', rpcMessage: message });
+    }
+  };
+  native.hooks.beforeRequestGate = method => {
+    if (method === 'turn/start' && beforeRecovery) {
+      throw Object.assign(new Error('Waiting for transport admission timed out.'), { code: 'codex-native-rpc-timeout',
+        transportAdmissionFailed: true, notSent: true, transportGeneration: 2, transportFaultSequence: 1,
+        transportAttemptId: 'first-turn-attempt' });
+    }
+  };
+  const name = 'wait-first-turn';
+  await service.create({ name, target: 'codex-desktop', lifetime: 'persistent' }, extra);
+  const { requestId } = await service.send({ name, message: 'work' }, extra);
+  const { agentId } = store.named(ownerIdFor(boss), name);
+  await service.poll(agentId);
+  assert.equal(native.count('thread/start'), 1);
+  assert.equal(native.count('turn/start'), 0);
+  const before = store.backendState(agentId);
+  assert.equal(before.binding.sessionId, 'thread-0001');
+  assert.equal(before.requests[requestId].status, 'retryable');
+  assert.equal(store.get(agentId).task.dispatches[0].transportWaitFault.sequence, 1);
+  beforeRecovery = false;
+  await service.transportRecovered({ generation: 2, faultSequence: 1 });
+  await service.poll(agentId);
+  const after = store.backendState(agentId);
+  assert.equal(after.requests[requestId].status, 'accepted');
+  assert.equal(native.count('thread/start'), 1);
+  assert.equal(native.count('turn/start'), 1);
+  assert.equal(native.count('turn/steer'), 0);
+  const [sent] = native.paramsOf('turn/start');
+  assert.equal(sent.threadId, before.binding.sessionId);
+  assert.match(sent.input[0].text, /FutureAide managed helper "wait-first-turn"/);
+  assert.ok(sent.input[0].text.endsWith(before.requests[requestId].marker));
+});
+
+test('a lost first-turn reply from an attempted write remains uncertain', async () => {
+  const f = await fixture();
+  f.native.hooks.afterTurnStart = () => {
+    throw Object.assign(new Error('Reply was lost after the write.'), { code: 'codex-native-rpc-timeout' });
+  };
+  const input = { requestId: 'r1', message: 'work', kind: 'task', writeBlockReason: f.fence };
+  await assert.rejects(f.backend.deliver(input), { uncertain: true });
+  assert.equal(f.state().requests.r1.status, 'unknown');
+  assert.equal((await f.backend.deliver(input)).status, 'unknown');
+  assert.equal(f.native.count('thread/start'), 1);
+  assert.equal(f.native.count('turn/start'), 1);
+});
+
+test('a lost thread/start reply never lets the same request create a second thread', async t => {
+  const { rpc, wire } = memoryTransport({ reply: method => {
+    if (method === 'thread/start') return undefined;
+    assert.equal(method, 'thread/list');
+    return livePage();
+  } });
+  t.after(() => rpc.close());
+  const f = await fixture({ nativeRequest: rpc.request });
+  const input = { requestId: 'r1', message: 'work', kind: 'task', writeBlockReason: f.fence };
+  await assert.rejects(f.backend.deliver(input), { code: 'codex-native-rpc-closed', uncertain: true });
+  const receipt = await f.backend.receipt({ requestId: input.requestId });
+  assert.equal(receipt.status, 'unknown');
+  assert.equal(receipt.verifiedNotSent, undefined);
+  assert.equal((await f.backend.deliver(input)).status, 'unknown');
+  assert.equal(wire.filter(method => method === 'thread/start').length, 1);
+});
+
+test('a failed socket handshake after thread/start leaves the known thread and a retryable first turn', async t => {
+  const { rpc, wire } = memoryTransport({ failOpen: number => number === 2, reply: method => {
+    assert.equal(method, 'thread/start');
+    return { thread: { id: 'known-thread' } };
+  } });
+  t.after(() => rpc.close());
+  let f, swapSocket = true;
+  f = await fixture({ nativeRequest: rpc.request, onWrite: () => {
+    if (swapSocket && f.state().requests.r1?.intent) {
+      swapSocket = false;
+      rpc.close();
+    }
+  } });
+  const input = { requestId: 'r1', message: 'work', kind: 'task', writeBlockReason: f.fence };
+  await assert.rejects(f.backend.deliver(input), { code: 'codex-native-rpc-unavailable',
+    notSent: true, transportAdmissionFailed: true, retryableRead: true, nativeSessionId: 'known-thread' });
+  assert.deepEqual(wire, ['thread/start']);
+  assert.equal(f.state().binding.sessionId, 'known-thread');
+  const receipt = await f.backend.receipt({ requestId: input.requestId });
+  assert.deepEqual([receipt.status, receipt.verifiedNotSent, receipt.pendingFirstTurn], ['retryable', true, true]);
 });
 
 test('a round that ends while the active turn is being read is refused before the steer', async () => {

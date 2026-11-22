@@ -144,7 +144,8 @@ test('a pre-send missing debug port stays retryable instead of unknown', async (
   const f = await setup(); await f.adapter.create(); await f.adapter.beginTask();
   const lost = await createCodexBackend(f.record, { ...f.deps,
     host: { ...f.deps.host, createFirstTurn: async () => {
-      throw Object.assign(new Error('Open Codex from FAswitch, then retry.'), { code: 'codex-native-rpc-unavailable' });
+      throw Object.assign(new Error('Open Codex from FAswitch, then retry.'), { code: 'codex-native-rpc-unavailable',
+        transportAdmissionFailed: true, notSent: true });
     } } });
   await assert.rejects(lost.deliver({ requestId: 'r', message: 'work' }), { retryableRead: true });
   assert.equal(f.state().requests.r.status, 'retryable');

@@ -1,4 +1,4 @@
-// Synthetic replay only: in-memory roster, fake native RPC, no Desktop discovery.
+// Synthetic replay only: in-memory roster, fake native RPC and discovery input.
 import assert from 'node:assert/strict';
 import { createContext, runInContext } from 'node:vm';
 import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
@@ -27,12 +27,15 @@ const { RosterStore } = await import('../src/roster-store.mjs');
 const { ownerIdFor } = await import('../src/calling-context.mjs');
 const { getCodexInstrumentation } = await import('../src/codex-instrumentation.mjs');
 const { createCodexNativeRpc } = await import('../src/codex-ipc.mjs');
+const { createRendererDiscovery } = await import('../src/codex-renderer-discovery.mjs');
 
 const root = '11111111-1111-4111-8111-111111111112';
 const boss = '11111111-1111-4111-8111-111111111111';
+const fiveOverlayStalled = process.argv.includes('--five-overlay-stalled');
+const nameCount = fiveOverlayStalled ? 5 : 9;
 const children = [];
-const roots = Array.from({ length: 9 }, (_, i) => `33333333-3333-4333-8333-${String(i + 1).padStart(12, '0')}`);
-let nextRoot = 0; const activeRoots = new Set(); let offline = false;
+const roots = Array.from({ length: nameCount }, (_, i) => `33333333-3333-4333-8333-${String(i + 1).padStart(12, '0')}`);
+let nextRoot = 0; const activeRoots = new Set(), rootTurns = new Map(); let offline = false;
 const base = await mkdtemp(path.join(os.tmpdir(), 'futureaide-isolated-replay-'));
 const workspace = base;
 const store = new RosterStore(':memory:');
@@ -51,6 +54,7 @@ const makeThread = id => liveThread({ id, cwd: workspace, updatedAt: clock,
   status: activeRoots.has(id) ? { type: 'active', activeFlags: [] } : { type: 'idle' } });
 const monotonic = () => Number(process.hrtime.bigint()) / 1e6;
 const timings = new Map();
+const turnFor = id => rootTurns.get(id) ?? `turn-${id}`;
 function receiveNative({ method, params = {}, id: requestId }) {
   if (phaseClock !== undefined && firstWrite === undefined && ['turn/start', 'turn/steer'].includes(method)) firstWrite = performance.now() - phaseClock;
   const context = { ...getCodexInstrumentation() };
@@ -64,9 +68,15 @@ function receiveNative({ method, params = {}, id: requestId }) {
       assert.ok([root, ...roots, ...children].includes(params.threadId)); value = { thread: makeThread(params.threadId) }; break;
     case 'thread/list': value = livePage(params.parentThreadId === root ? children.map(makeThread) : []); break;
     case 'thread/turns/list': value = livePage(activeRoots.has(params.threadId)
-      ? [liveTurn({ id: `turn-${params.threadId}`, rootTurnId: `turn-${params.threadId}`, status: 'inProgress', items: [] })] : [liveTurn({ id: `turn-${params.threadId}`, rootTurnId: `turn-${params.threadId}`, status: 'completed', items: [] })]); break;
-    case 'turn/start': activeRoots.add(params.threadId); clock++; value = { turn: liveTurn({ id: `turn-${params.threadId}`, rootTurnId: `turn-${params.threadId}`, status: 'inProgress', items: [] }) }; break;
-    case 'turn/steer': value = { turnId: `turn-${params.threadId}` }; break;
+      ? [liveTurn({ id: turnFor(params.threadId), rootTurnId: turnFor(params.threadId), status: 'inProgress', items: [] })] : [liveTurn({ id: turnFor(params.threadId), rootTurnId: turnFor(params.threadId), status: 'completed', items: [] })]); break;
+    case 'turn/start': {
+      activeRoots.add(params.threadId);
+      const turnId = `turn-${params.threadId}-${++clock}`;
+      rootTurns.set(params.threadId, turnId);
+      value = { turn: liveTurn({ id: turnId, rootTurnId: turnId, status: 'inProgress', items: [] }) };
+      break;
+    }
+    case 'turn/steer': value = { turnId: turnFor(params.threadId) }; break;
     case 'model/list': value = livePage(CODEX_MODELS); break;
     case 'config/read': value = { config: { model: 'gpt-6-astra', model_provider: 'openai', model_reasoning_effort: 'high' } }; break;
     default: throw new Error(`Forbidden synthetic RPC: ${method}`);
@@ -95,10 +105,27 @@ window.electronBridge = {
   },
 };
 const renderer = createContext({ window, setTimeout, clearTimeout });
+const sockets = [], transportEvents = [], discoveryTrace = [];
+const mainUrl = 'ws://127.0.0.1:9345/devtools/page/fixture-page';
+const fixturePages = [
+  { type: 'page', id: 'fixture-overlay', url: 'app://-/index.html?initialRoute=%2Favatar-overlay',
+    webSocketDebuggerUrl: 'ws://127.0.0.1:9345/devtools/page/fixture-overlay' },
+  { type: 'page', id: 'fixture-page', url: 'app://-/index.html', webSocketDebuggerUrl: mainUrl },
+];
+const discoverWithOverlay = createRendererDiscovery({
+  query: async hint => {
+    discoveryTrace.push({ cached: Boolean(hint), targetId: hint?.targetId });
+    return [{ pid: 17, port: 9345, started: 'fixture-process', listenerStarted: 'fixture-listener' }];
+  },
+  pages: async port => { assert.equal(port, 9345); return fixturePages; },
+});
+let replacementReadable = false;
 class MemorySocket extends EventTarget {
   constructor(url) {
     super();
-    assert.equal(url, 'memory:isolated');
+    assert.equal(url, fiveOverlayStalled ? mainUrl : 'memory:isolated');
+    sockets.push(this);
+    this.url = url;
     queueMicrotask(() => this.dispatchEvent(new Event('open')));
   }
   send(frame) {
@@ -110,15 +137,18 @@ class MemorySocket extends EventTarget {
         const value = await runInContext(params.expression, renderer);
         reply = { id, result: { result: { value } } };
       } catch (error) { reply = { id, error: { message: error.message } }; }
+      if (fiveOverlayStalled && (this.freezeReplies || (this !== sockets[0] && !replacementReadable))) return;
       this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(reply) }));
     });
   }
   close() { this.dispatchEvent(new Event('close')); }
 }
 const rpc = createCodexNativeRpc({
-  discover: async () => ({ webSocketUrl: 'memory:isolated', targetId: 'fixture-page', pid: 1 }),
+  discover: fiveOverlayStalled ? discoverWithOverlay
+    : async () => ({ webSocketUrl: 'memory:isolated', targetId: 'fixture-page', pid: 1 }),
   WebSocketImpl: MemorySocket, timeoutMs: 700, probeTimeoutMs: 400,
   measure(event) {
+    if (fiveOverlayStalled) transportEvents.push(event);
     if (!event.requestId) return;
     if (event.event === 'send') timings.set(event.requestId, { sent: event.monotonicMs });
     if (event.event === 'response') timings.get(event.requestId).pluginReceived = event.monotonicMs;
@@ -152,7 +182,7 @@ const service = createScopedAgents({ stateDirectory: base, workspace, configFile
     return { thread: { id: boss, kind: 'codex', hostId: 'local', cwd: workspace } };
   },
   backendAdapters: { 'codex-desktop': (record, deps) => createCodexBackend(record,
-    { ...deps, hostOptions: { nativeRequest: fakeRequest } }) },
+    { ...deps, hostOptions: { nativeRequest: fakeRequest, readRecoveredFaultSequence: () => rpc.recoveredFaultSequence } }) },
   codexProbeRegistration: async () => ({ ready: true, registered: true, tools: ['ask_parent', 'report_parent'], sessionVerified: false }),
   startSharedMonitor: () => true, removeTree: async () => {},
 });
@@ -170,7 +200,7 @@ async function waitUntil(fn, limit = 15000) {
   while (!fn()) { if (performance.now() > until) throw new Error('Recovery deadline exceeded'); await new Promise(r => setTimeout(r, 50)); }
 }
 try {
-  for (let i = 0; i < 9; i++) {
+  for (let i = 0; i < nameCount; i++) {
     const name = `agent-${i}`;
     await service.create({ name, lifetime: 'persistent', target: 'codex-desktop' }, extra);
     await service.send({ name, message: `initial-${i}` }, extra);
@@ -201,29 +231,53 @@ try {
     }
   })();
   const results = [];
-  for (const mode of ['same', 'new']) {
-    offline = true;
-    if (mode === 'new') rpc.close();
-    await rpc.request('thread/list', { limit: 1 }).catch(() => {});
-    if (mode === 'new') rpc.close();
-    const before = recoveryEvents.length;
-    for (const id of ids) {
-      const record = store.get(id); record.state = 'reconnecting';
-      record.error = { code: 'codex-native-rpc-timeout', message: 'fixture disconnect' };
-      record.nextAttemptAt = Date.now() + 300000; store.save(record);
+  for (const mode of fiveOverlayStalled ? ['new'] : ['same', 'new']) {
+    let before = recoveryEvents.length;
+    let outage;
+    if (fiveOverlayStalled) {
+      assert.equal(sockets.length, 1, 'the outage starts on a live connection');
+      assert.ok(ids.every(id => store.get(id).state !== 'reconnecting'));
+      const frozenAt = performance.now();
+      const oldGeneration = transportEvents.find(event => event.event === 'discovery_done').generation;
+      const startOutageCalls = calls.length;
+      sockets[0].freezeReplies = true;
+      await waitUntil(() => ids.every(id => store.get(id).state === 'reconnecting'));
+      const reconnecting = ids.map(id => {
+        const { name, state, error } = store.get(id);
+        return { name, state, code: error?.code };
+      });
+      assert.ok(reconnecting.every(agent => /^codex-native-rpc-/.test(agent.code)));
+      assert.ok(requestIds.every(id => store.supplement(id).status !== 'accepted'));
+      await waitUntil(() => transportEvents.some(event => event.event === 'socket_close'
+        && event.generation === oldGeneration && event.localReason === 'recovery-probe-failed'));
+      assert.ok(transportEvents.some(event => event.event === 'timeout'
+        && event.generation === oldGeneration && event.source === 'recovery-probe'));
+      assert.equal(calls.slice(startOutageCalls).filter(call => ['turn/start', 'turn/steer'].includes(call.method)).length, 0);
+      outage = { oldGeneration, reconnecting, seededRoster: false, frozenMs: performance.now() - frozenAt };
+    } else {
+      offline = true;
+      if (mode === 'new') rpc.close();
+      await rpc.request('thread/list', { limit: 1 }).catch(() => {});
+      if (mode === 'new') rpc.close();
+      before = recoveryEvents.length;
+      for (const id of ids) {
+        const record = store.get(id); record.state = 'reconnecting';
+        record.error = { code: 'codex-native-rpc-timeout', message: 'fixture disconnect' };
+        record.nextAttemptAt = Date.now() + 300000; store.save(record);
+      }
     }
     activeRoots.clear();
     const startCalls = calls.length;
     const messages = requestIds.map(id => store.supplement(id).message);
     acceptedAt.clear(); rootReads.clear(); firstRead = undefined; firstWrite = undefined;
-    const t0 = performance.now(); phaseClock = t0; offline = false;
+    const t0 = performance.now(); phaseClock = t0; offline = false; replacementReadable = true;
     await waitUntil(() => recoveryEvents.length > before && wake); wake = false;
     const event = recoveryEvents.at(-1);
     await waitUntil(() => rootReads.size === roots.length && requestIds.every(id => store.supplement(id)?.status === 'accepted'), 15000);
     const accepted = requestIds.filter(id => store.supplement(id)?.status === 'accepted').length;
     const elapsedMs = performance.now() - t0; phaseClock = undefined;
     assert.equal(event.mode, mode);
-    assert.equal(accepted, 9, JSON.stringify({ mode, accepted, elapsedMs, counts: calls.slice(startCalls).reduce((a,c)=>(a[c.method]=(a[c.method]??0)+1,a),{}), sample: store.get(ids[0]), supplements: store.supplements(ids[0]) }));
+    assert.equal(accepted, nameCount, JSON.stringify({ mode, accepted, elapsedMs, counts: calls.slice(startCalls).reduce((a,c)=>(a[c.method]=(a[c.method]??0)+1,a),{}), sample: store.get(ids[0]), supplements: store.supplements(ids[0]) }));
     assert.ok(firstRead <= 5000, JSON.stringify({ firstRead }));
     const reads = roots.map((id, i) => ({ name: `agent-${i}`, ...rootReads.get(id) }));
     assert.ok(reads.every(x => x.threadId && x.readMs <= 15000 && x.status), JSON.stringify(reads));
@@ -234,10 +288,27 @@ try {
       const writes = calls.slice(startCalls).filter(c => ['turn/start','turn/steer'].includes(c.method) && JSON.stringify(c.params).includes(message));
       assert.equal(writes.length, 1, JSON.stringify({ mode, message, count: writes.length }));
     }
-    for (const id of requestIds) { const receipt = store.supplement(id).receipt; assert.equal(receipt.accepted, true); assert.equal(receipt.queued, false); }
-    results.push({ mode, elapsedMs, firstReadMs: firstRead, rootReads: reads, firstQueueMs: firstWrite, perName, acceptedAt5s: perName.filter(x => x.acceptedMs <= 5000).length, acceptedAt10s: perName.filter(x => x.acceptedMs <= 10000).length, acceptedAt15s: perName.filter(x => x.acceptedMs <= 15000).length, uniqueWrites: messages.length, receipts: requestIds.map(id => store.supplement(id)?.receipt) });
+    for (const id of requestIds) {
+      const receipt = store.supplement(id).receipt;
+      assert.equal(receipt.accepted, true);
+      assert.equal(receipt.queued, false);
+      assert.ok(receipt.turnId && receipt.afterTurnId && receipt.turnId !== receipt.afterTurnId);
+    }
+    if (outage) {
+      assert.ok(event.generation > outage.oldGeneration);
+      assert.equal(recoveryEvents.length, before + 1);
+      assert.ok(ids.every(id => store.get(id).state !== 'reconnecting'));
+      assert.ok(discoveryTrace.some(entry => entry.cached && entry.targetId === 'fixture-page'));
+      assert.ok(sockets.every(socket => socket.url === mainUrl));
+      const sends = transportEvents.filter(item => item.event === 'send' && item.generation === event.generation);
+      assert.equal(sends[0].source, 'recovery-probe');
+      Object.assign(outage, { recovery: event, fixturePages: fixturePages.map(page => page.url),
+        socketUrls: sockets.map(socket => socket.url), discoveryTrace,
+        queueHeads: requestIds.map((requestId, i) => ({ name: `agent-${i}`, requestId })) });
+    }
+    results.push({ mode, elapsedMs, firstReadMs: firstRead, rootReads: reads, firstQueueMs: firstWrite, perName, acceptedAt5s: perName.filter(x => x.acceptedMs <= 5000).length, acceptedAt10s: perName.filter(x => x.acceptedMs <= 10000).length, acceptedAt15s: perName.filter(x => x.acceptedMs <= 15000).length, uniqueWrites: messages.length, receipts: requestIds.map(id => store.supplement(id)?.receipt), ...(outage ? { outage } : {}) });
     if (mode === 'same') {
-      for (let i = 0; i < 9; i++) {
+      for (let i = 0; i < nameCount; i++) {
         await service.send({ name: `agent-${i}`, message: `queued-again-${i}`, mode: 'queue' }, extra);
         requestIds[i] = store.supplements(ids[i]).at(-1).requestId;
       }
@@ -245,7 +316,9 @@ try {
     }
   }
   monitorRunning = false; signal(); await monitor;
-  const output = path.resolve(import.meta.dirname, '../.runtime/verification/disconnect-recovery-nine.json');
+  const output = path.resolve(import.meta.dirname, fiveOverlayStalled
+    ? '../.runtime/verification/disconnect-recovery-five-overlay-stalled.json'
+    : '../.runtime/verification/disconnect-recovery-nine.json');
   await mkdir(path.dirname(output), { recursive: true });
   await writeFile(output, JSON.stringify({ recordedAt: new Date().toISOString(), results }, null, 2));
   console.log(JSON.stringify({ output, results }));

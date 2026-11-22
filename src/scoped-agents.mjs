@@ -103,7 +103,8 @@ function defaultCodexProbe() {
 }
 const reportProtocolError = (host = 'DSH') => Object.assign(new Error(`Update the ${host} plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting ${host} is not required.`), { code: 'report-protocol-required' });
 const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host} bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting ${host} is not required.`), { code: 'tree-protocol-required' });
-const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200) });
+const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200),
+  ...(error?.discoveryReason ? { discoveryReason: error.discoveryReason } : {}) });
 const readOnlyTarget = record => REMOVED_TARGETS.includes(record?.target);
 function requireWritableTarget(record) {
   if (readOnlyTarget(record)) throw removedTarget(record.target);
@@ -1808,7 +1809,7 @@ export function createScopedAgents(config, {
       { delivery: 'blocked', accepted: false, queued: false });
   }
 
-  async function dispatchOnce(record, dispatch, observed) {
+  async function dispatchOnce(record, dispatch, observed, { pendingFirstTurn = false } = {}) {
     const current = store.get(record.agentId);
     if (roundMovedOn(record, current)) throw dispatchRefused();
     if (current.task.cancelRequested) return;
@@ -1849,7 +1850,7 @@ export function createScopedAgents(config, {
           saveDispatch(record);
           return;
         }
-        if (root?.known === false) {
+        if (root?.known === false && !(pendingFirstTurn && root.reason === 'empty-rollout')) {
           // No write happened. Keep the same request in the local queue; a later poll
           // re-reads the root and starts it under this same request id.
           Object.assign(dispatch, { state: 'queued', accepted: false, delivery: 'local-pending' });
@@ -3198,7 +3199,10 @@ export function createScopedAgents(config, {
       // remain read-only; a retryable label alone is not that proof.
       if (dispatch.state === 'unknown' && !(answer && receipt.verifiedNotSent === true)) return;
       if (!allowResend) return 'not-sent';
-      await dispatchOnce(record, dispatch);
+      // The acknowledged thread may have an empty rollout until its first turn starts.
+      // The adapter retries that exact start only after a receipt proves it was not sent.
+      await dispatchOnce(record, dispatch, undefined,
+        { pendingFirstTurn: receipt.verifiedNotSent === true && receipt.pendingFirstTurn === true });
     }
   }
 

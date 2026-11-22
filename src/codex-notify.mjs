@@ -379,8 +379,10 @@ export async function callCodexOwner(threadId, toolName, args, options = {}) {
       await sendCodexTextNative(threadId, args.prompt, { request: nativeRequest });
       return { accepted: true, threadId, via: 'native-rpc' };
     } catch (error) {
-      if (!isCodexRpcUnavailable(error)) throw error;
-      // No debug port: the ordinary app-tools bridge is the supported fallback.
+      const { discoveryReason, transportAdmissionFailed } = error ?? {};
+      const canFallBack = discoveryReason === 'no-match' || (discoveryReason === undefined && transportAdmissionFailed !== true);
+      if (!isCodexRpcUnavailable(error) || !canFallBack) throw error;
+      // A complete search without a native renderer can use the app-tools bridge.
     }
   }
   const invoke = settings.invoke ?? invokeCodexTool;

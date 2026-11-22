@@ -8,6 +8,8 @@ import {
   createCodexHost, emptyProjection, projectCodexTurns, readDefaultModel, readCodexMcpRegistration, markerLine,
   sharedCodexCatalog, codexDeliverySelection,
 } from '../src/codex-host.mjs';
+import { createCodexBackend } from '../src/codex-backend.mjs';
+import { createCodexNativeRpc } from '../src/codex-ipc.mjs';
 import { liveThread, livePage, liveTurn } from './live-thread-fixture.mjs';
 
 const directory = () => fileURLToPath(new URL(`../clean/validation/codex/${randomUUID()}/`, import.meta.url));
@@ -145,12 +147,67 @@ test('status uses one real read RPC and keeps each default-model read live', asy
 });
 
 test('a missing debug port is reported with the FAswitch instruction', async () => {
+  const transport = { transportGeneration: 2, transportFaultSequence: 1,
+    transportAttemptId: 'probe-attempt', transportStale: false };
   const host = createCodexHost({ nativeRequest: async () => {
     throw Object.assign(new Error('Exactly one running Codex main renderer must be available.'),
-      { code: 'codex-native-rpc-unavailable' });
+      { code: 'codex-native-rpc-unavailable', ...transport });
   } });
-  await assert.rejects(host.probe(), error => error.code === 'codex-native-rpc-unavailable'
-    && /Open Codex from FAswitch/.test(error.message));
+  await assert.rejects(host.probe(), { code: 'codex-native-rpc-unavailable',
+    message: /Open Codex from FAswitch/, ...transport });
+});
+
+test('a confirmed transport recovery rechecks backend readiness once and leaves another transport cached', {
+  timeout: 4000,
+}, async () => {
+  const discoveryGate = Promise.withResolvers();
+  let discoveries = 0, reads = 0, otherReads = 0;
+  class Socket extends EventTarget {
+    constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
+    send(frame) {
+      reads++;
+      const { id } = JSON.parse(frame);
+      const data = JSON.stringify({ id, result: { result: { value: { data: [] } } } });
+      queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data })));
+    }
+    close() { this.dispatchEvent(new Event('close')); }
+  }
+  const rpc = createCodexNativeRpc({ WebSocketImpl: Socket, discover: async () => {
+    if (++discoveries === 1) throw Object.assign(new Error('fixture unavailable'),
+      { code: 'codex-native-rpc-unavailable' });
+    await discoveryGate.promise;
+    return { webSocketUrl: 'memory:isolated' };
+  } });
+  const backend = await createCodexBackend({}, { hostOptions: { nativeRequest: rpc.request,
+    readRecoveredFaultSequence: () => rpc.recoveredFaultSequence } });
+  const other = await createCodexBackend({}, { hostOptions: { nativeRequest: async () => {
+    otherReads++;
+    throw Object.assign(new Error('other fixture unavailable'),
+      { code: 'codex-native-rpc-unavailable', transportFaultSequence: 1 });
+  } } });
+  const recovered = Promise.withResolvers();
+  const unsubscribe = rpc.subscribeRecovery(recovered.resolve);
+  const unavailable = { code: 'codex-native-rpc-unavailable' };
+  try {
+    await Promise.all([assert.rejects(backend.probe(), unavailable), assert.rejects(backend.probe(), unavailable),
+      assert.rejects(other.probe(), unavailable)]);
+    await assert.rejects(backend.probe(), unavailable);
+    assert.equal(discoveries, 1);
+    discoveryGate.resolve();
+    assert.equal((await recovered.promise).faultSequence, 1);
+    assert.equal(reads, 1, 'only the transport recovery probe has read');
+    const results = await Promise.all([backend.probe(), backend.probe()]);
+    assert.equal(results[0].identity.application, 'codex-desktop');
+    assert.equal(reads, 2, 'both callers share one fresh capability read');
+    await backend.probe();
+    assert.equal(reads, 2, 'successful readiness stays cached');
+    await assert.rejects(other.probe(), unavailable);
+    assert.equal(otherReads, 1, 'another transport with the same fault sequence keeps its failed cache');
+  } finally {
+    unsubscribe();
+    discoveryGate.resolve();
+    rpc.close();
+  }
 });
 
 test('schema-shaped turns project marker, messages and file changes incrementally', () => {

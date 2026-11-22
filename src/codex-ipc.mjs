@@ -2,7 +2,7 @@ import { codexInstrumentationFields, writeCodexMeasurement } from './codex-instr
 // Codex Desktop native RPC over the running renderer's local debug endpoint.
 // Nothing here starts an app-server, a CLI, a window, or a model turn by itself.
 import { randomUUID } from 'node:crypto';
-import { discoverCodexRenderer } from './codex-renderer-discovery.mjs';
+import { discoverCodexRenderer, rendererDiscoveryError, RENDERER_DISCOVERY_BUDGET_MS } from './codex-renderer-discovery.mjs';
 export { discoverCodexRenderer };
 
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
@@ -610,7 +610,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
   appPages = appPagesOnEndpoint, targetHandshakeMs = 500, extraProbeTimeoutMs = 1500,
   idleMs = 30000, timeoutMs = 15000, measure = writeCodexMeasurement, onRecovery, probeTimeoutMs = 1000 } = {}) {
   let connection, timer, sequence = 0, generation = 0, active = 0, failedUntil = 0, failure;
-  let faultSequence = 0, recoverySequence = 0, fault, probing = false, probeTimer, discoveryInFlight;
+  let faultSequence = 0, recoverySequence = 0, recoveredFaultSequence = 0, fault, probing = false, probeTimer, discoveryInFlight;
   const listeners = new Set(onRecovery ? [onRecovery] : []);
   const subscribeRecovery = listener => { listeners.add(listener); return () => listeners.delete(listener); };
   const emit = measure ? (event, data) => {
@@ -631,11 +631,16 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       target.closeReason ??= reason;
     }
     emit?.('close_requested', { generation: target?.generation, reason, inFlight: target?.pending?.size ?? 0 });
-    if (connection === target) { clearTimeout(timer); connection = undefined; }
+    if (connection === target) {
+      if (target && reason !== 'explicit' && reason !== 'idle') recordFault(target);
+      clearTimeout(timer);
+      connection = undefined;
+    }
+    target?.verification?.resolve(false);
     target?.socket?.close();
   }
   function closeWhenIdle(target) {
-    if (active || !target || connection !== target) return;
+    if (active || !target || connection !== target || target.verification) return;
     clearTimeout(timer);
     timer = setTimeout(() => close(target, 'idle'), idleMs);
     timer.unref?.();
@@ -643,11 +648,14 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
   async function endpoint(force = false) {
     // A missing debug port is a property of the running application, not of each
     // call; do not spawn a process inspection for every status or fallback attempt.
-    if (!force && failedUntil > Date.now()) { emit?.('discovery_cache_hit', { code: failure?.code }); throw failure; }
+    if (!force && failedUntil > Date.now()) {
+      emit?.('discovery_cache_hit', { code: failure?.code, discoveryReason: failure?.discoveryReason });
+      throw failure;
+    }
     if (!discoveryInFlight) {
       let deadline;
       const work = Promise.race([Promise.resolve().then(discover), new Promise((_, reject) => {
-        deadline = setTimeout(() => reject(fail('codex-native-rpc-unavailable', 'Desktop discovery timed out.')), 10000);
+        deadline = setTimeout(() => reject(rendererDiscoveryError('timeout')), RENDERER_DISCOVERY_BUDGET_MS);
       })]).finally(() => { clearTimeout(deadline); if (discoveryInFlight === work) discoveryInFlight = undefined; });
       discoveryInFlight = work;
     }
@@ -664,7 +672,12 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     // `found`, so the page list and the socket can never come from different endpoints.
     emit?.('discovery_start', { generation: target.generation });
     let found;
-    try { target.discoveryDone = endpoint(recovery); found = await target.discoveryDone; } catch (error) { emit?.('discovery_error', { generation: target.generation, code: error?.code }); throw error; }
+    try { target.discoveryDone = endpoint(recovery); found = await target.discoveryDone; }
+    catch (error) {
+      target.discoveryError = error;
+      emit?.('discovery_error', { generation: target.generation, code: error?.code, discoveryReason: error?.discoveryReason });
+      throw error;
+    }
     if (target.abandoned) throw fail('codex-native-rpc-timeout', 'Native Desktop connection timed out.');
     target.found = found;
     emit?.('discovery_done', { generation: target.generation, ...endpointInfo(found) });
@@ -699,7 +712,14 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         code: Number.isInteger(event?.code) ? event.code : undefined,
         wasClean: typeof event?.wasClean === 'boolean' ? event.wasClean : undefined,
         localReason: target.closeReason, inFlight: target.pending.size });
-      if (connection === target) connection = undefined;
+      if (connection === target) {
+        // The peer may close between requests. Remember that the next socket
+        // needs verification, even when no pending reader saw this close.
+        recordFault(target);
+        clearTimeout(timer);
+        connection = undefined;
+      }
+      target.verification?.resolve(false);
       for (const [commandId, waiter] of target.pending) {
         emit?.('close_affected', { ...waiter.diagnostic, generation: target.generation, commandId });
         clearTimeout(waiter.timer);
@@ -890,22 +910,43 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     probeTimer = setTimeout(() => { probeTimer = undefined; void probe(); }, delay);
     probeTimer.unref?.();
   }
-  function ensureProbe(source = connection) {
+  function recordFault(source) {
     if (!fault) fault = { id: ++faultSequence, origin: source?.generation, attempts: 0 };
     if (source) source.faultId = fault.id;
+  }
+  function ensureProbe(source = connection) {
+    recordFault(source);
     scheduleProbe();
+  }
+  function createConnection() {
+    const target = { generation: ++generation };
+    connection = target;
+    if (fault) {
+      // During recovery, only the probe can open and validate a replacement.
+      // Requests arriving during backoff join the same candidate as the next probe.
+      target.faultId = fault.id;
+      target.verification = Promise.withResolvers();
+      scheduleProbe();
+    } else {
+      target.ready = connect(target);
+    }
+    return target;
+  }
+  async function waitForVerification(target) {
+    let deadline;
+    try {
+      return await Promise.race([target.verification.promise, new Promise(resolve => {
+        deadline = setTimeout(() => resolve(null), timeoutMs);
+      })]);
+    } finally { clearTimeout(deadline); }
   }
   async function probe() {
     if (probing || !fault) return;
     probing = true;
     const cycle = fault;
-    let target = connection;
+    const target = connection ?? createConnection();
     try {
-      if (!target) {
-        target = { generation: ++generation };
-        connection = target;
-        target.ready = connect(target, true);
-      }
+      target.ready ??= connect(target, true);
       // connect() also rejects its ready promise if discovery fails. Consume the
       // same connection result even when the first (discovery) stage rejects.
       await target.discoveryDone.catch(() => target.ready);
@@ -924,12 +965,15 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       if (!value || value.__futureaideRpcError || !Array.isArray(value.data)) throw fail('codex-native-rpc-invalid-response', 'Recovery probe did not return thread metadata.');
       if (connection !== target || fault !== cycle) return;
       fault = undefined;
+      recoveredFaultSequence = cycle.id;
+      target.verification?.resolve(true);
+      target.verification = undefined;
       const event = { generation: target.generation, recoverySequence: ++recoverySequence, faultSequence: cycle.id,
         mode: cycle.origin === target.generation ? 'same' : 'new' };
       for (const listener of listeners) { try { Promise.resolve(listener(event)).catch(() => {}); } catch { /* notification only */ } }
       closeWhenIdle(target);
     } catch {
-      if (connection === target) { target.abandoned = true; close(target, 'recovery-probe-failed'); }
+      if (connection === target) close(target, 'recovery-probe-failed');
       cycle.attempts++;
     } finally {
       probing = false;
@@ -950,9 +994,9 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     const expression = release ? null : userInputRead ? userInputReadExpression(params)
       : userInputReply ? userInputReplyExpression(params) : nativeRpcExpression(method, params, timeoutMs, requestId);
     clearTimeout(timer); active++;
-    let target;
-    const attemptRecovery = recoverySequence;
-    const attemptFault = fault?.id ?? faultSequence + 1;
+    let target, awaitingConnection = false;
+    let attemptRecovery = recoverySequence;
+    let attemptFault = fault?.id ?? faultSequence + 1;
     const staleRead = () => target?.generation !== generation || attemptRecovery !== recoverySequence;
     try {
       // A release is the one call that can drop the user's own subscription, so it is the
@@ -972,8 +1016,24 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         const before = permitted();
         if (!before.go) return { status: 'notSent', reason: before.reason };
       }
-      if (!connection) { connection = { generation: ++generation }; connection.ready = connect(connection); }
-      target = connection; await target.ready;
+      target = connection ?? createConnection();
+      awaitingConnection = true;
+      if (target.verification) {
+        const verified = await waitForVerification(target);
+        if (!verified || connection !== target) {
+          const discovery = target.discoveryError?.discoveryReason ? target.discoveryError : undefined;
+          throw fail(discovery?.code ?? (verified === null ? 'codex-native-rpc-timeout' : 'codex-native-rpc-unavailable'),
+            discovery?.message ?? (verified === null ? 'Native Desktop recovery timed out before sending the request.'
+              : 'Native Desktop connection could not be verified before sending the request.'),
+            { notSent: true, transportAdmissionFailed: true, transportGeneration: target.generation,
+              transportFaultSequence: target.faultId, transportAttemptId: requestId,
+              ...(discovery ? { discoveryReason: discovery.discoveryReason } : {}) });
+        }
+        // This is the first send for this attempt, after the recovery that admitted it.
+        attemptRecovery = recoverySequence;
+        attemptFault = fault?.id ?? faultSequence + 1;
+      } else await target.ready;
+      awaitingConnection = false;
       if (GATED_WRITE_METHODS.has(method) && typeof options?.blockReason === 'function') {
         const refused = options.blockReason();
         if (refused) throw fail(refused, 'The round ended before this request was written; nothing was sent.',
@@ -1079,18 +1139,25 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         return { status: 'unverified', reason: `release-failed:${error?.code ?? 'unknown'}`, ...(cleanupDelete && !cleanupCommitSent?{notSent:true}:{}) };
       }
     } catch (error) {
+      // Admission failed before any business command used the socket. Its own deadline
+      // must leave the shared probe and every other waiter alone.
+      if (error?.transportAdmissionFailed) throw error;
       // This socket is shared by every managed name in the monitor process. A
       // JSON-RPC/application rejection (bad params, missing thread, unsupported
       // method) must not tear down another name's in-flight write. Only a real
       // transport failure invalidates the socket.
       const stale = (target && target.generation !== generation) || attemptRecovery < recoverySequence;
-      if (read && !stale && ['codex-native-rpc-response-timeout', 'codex-native-rpc-unavailable', 'codex-native-rpc-timeout', 'codex-native-rpc-closed'].includes(error?.code)) ensureProbe(target);
-      if (read && target && error && typeof error === 'object') {
+      const connectionAdmission = !read && awaitingConnection;
+      if (!stale && (connectionAdmission || (read && ['codex-native-rpc-response-timeout', 'codex-native-rpc-unavailable',
+        'codex-native-rpc-timeout', 'codex-native-rpc-closed'].includes(error?.code)))) ensureProbe(target);
+      if ((read || connectionAdmission) && target && error && typeof error === 'object') {
         // A shared failed discovery can reject multiple callers with the same Error.
         // Stamp each caller's own attempt without modifying that shared exception.
         error = Object.assign(new Error(error.message, { cause: error }), error, {
           transportGeneration: target.generation, transportFaultSequence: attemptFault,
           transportAttemptId: requestId, transportStale: Boolean(stale),
+          ...(connectionAdmission ? { code: error.code ?? 'codex-native-rpc-unavailable',
+            transportAdmissionFailed: true, notSent: true } : {}),
         });
         if (stale && error.code === 'codex-native-rpc-rejected') error.code = 'codex-native-rpc-stale-attempt';
       }
@@ -1103,7 +1170,8 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     }
     finally { active--; closeWhenIdle(connection); }
   }
-  return { close, subscribeRecovery, ensureProbe, request };
+  return { close, subscribeRecovery, ensureProbe, request,
+    get recoveredFaultSequence() { return recoveredFaultSequence; } };
 }
 
 const nativeRpc = createCodexNativeRpc();
@@ -1111,6 +1179,7 @@ export const requestCodexNative = (method, params, options) => nativeRpc.request
 export const closeCodexNative = () => nativeRpc.close();
 export const subscribeCodexRecovery = listener => nativeRpc.subscribeRecovery(listener);
 export const ensureCodexRecoveryProbe = () => nativeRpc.ensureProbe();
+export const readCodexRecoveredFaultSequence = () => nativeRpc.recoveredFaultSequence ?? 0;
 
 /** Read one thread's metadata; a profile switch is surfaced as a terminal error. */
 export async function readCodexThreadNative(threadId, { request = requestCodexNative, includeTurns = false } = {}) {

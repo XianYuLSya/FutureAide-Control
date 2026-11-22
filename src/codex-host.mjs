@@ -13,7 +13,7 @@ import {
   requestCodexNative, readCodexThreadNative, ensureCodexThreadNative, listCodexTurnsNative,
   listCodexItemsNative, listCodexModelsNative, sendCodexTextNative, releaseCodexThreadNative,
   readCodexUserInput, replyCodexUserInput, findCodexDispatchInput, hasExactDispatchMarker,
-  RELEASE_STATUSES,
+  readCodexRecoveredFaultSequence, RELEASE_STATUSES,
 } from './codex-ipc.mjs';
 
 const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code }, extra);
@@ -399,7 +399,10 @@ const capabilityProbes = new Map();
 export function createCodexHost(options = {}) {
   const home = options.home ?? process.env.CODEX_HOME ?? path.join(homedir(), '.codex');
   const nativeRequest = options.nativeRequest ?? requestCodexNative;
+  // Only the default request uses the process-wide transport.
   const probes = options.nativeRequest ? new Map() : capabilityProbes;
+  const readRecoveredFaultSequence = options.nativeRequest
+    ? options.readRecoveredFaultSequence : readCodexRecoveredFaultSequence;
   const observeCache = new Map();
   const readEffectiveConfig = options.readEffectiveConfig
     ?? (({ workspace }) => nativeRequest('config/read', { includeLayers: false, cwd: workspace }));
@@ -473,11 +476,9 @@ export function createCodexHost(options = {}) {
     const { status } = await releaseCodexThreadNative(threadId, { request: exchange });
     return { status: UNSUBSCRIBE_ACCEPTED.has(status) ? status : 'unverified' };
   };
-  async function probeCapabilities() {
-    const workspace = options.workspace ?? process.cwd();
-    const key = JSON.stringify([home, workspace]);
+  function capabilityProbe(key) {
     const cached = probes.get(key);
-    if (cached && cached.expires > Date.now()) return cached.promise;
+    if (cached && cached.expires > Date.now()) return cached;
     const entry = { expires: Infinity };
     entry.promise = nativeRequest('thread/list', { limit: 1, useStateDbOnly: true }).then(result => {
       if (!Array.isArray(result?.data)) throw fail('codex-native-rpc-invalid-response', 'Codex returned no thread list.');
@@ -488,18 +489,31 @@ export function createCodexHost(options = {}) {
       return { nativeAvailable: false, reason: error };
     });
     probes.set(key, entry);
-    return entry.promise;
+    return entry;
+  }
+  async function probeCapabilities() {
+    const key = JSON.stringify([home, options.workspace ?? process.cwd()]);
+    let retriedFault = 0;
+    while (true) {
+      const entry = capabilityProbe(key);
+      const result = await entry.promise;
+      const failedFault = result.reason?.transportFaultSequence;
+      // Recheck after awaiting in case recovery finished while this read was in flight.
+      if (!(failedFault > retriedFault && failedFault <= (readRecoveredFaultSequence?.() ?? 0))) return result;
+      retriedFault = failedFault;
+      if (probes.get(key) === entry) probes.delete(key);
+    }
   }
   return {
     async probe() {
       const { nativeAvailable, reason } = await probeCapabilities();
       if (!nativeAvailable) {
         const code = reason?.code ?? 'codex-native-rpc-unavailable';
-        if (code === 'codex-native-rpc-unavailable' || code === 'codex-native-rpc-timeout') {
-          throw fail(code, 'Codex Desktop is not reachable over its local debug port. Open Codex from FAswitch, then retry.'
-            + (reason?.message ? ` (${reason.message})` : ''));
-        }
-        throw fail(code, reason?.message ?? 'The Codex Desktop readiness read failed.');
+        const message = code === 'codex-native-rpc-unavailable' || code === 'codex-native-rpc-timeout'
+          ? 'Codex Desktop is not reachable over its local debug port. Open Codex from FAswitch, then retry.'
+            + (reason?.message ? ` (${reason.message})` : '')
+          : reason?.message ?? 'The Codex Desktop readiness read failed.';
+        throw Object.assign(new Error(message, { cause: reason }), reason, { code, message });
       }
       return { identity: { application: 'codex-desktop', home }, missing: [] };
     },
@@ -588,10 +602,17 @@ export function createCodexHost(options = {}) {
       // the first turn itself, never to the user's global defaults.
       // The fence travels with the request too: a cold page is opened first, and the round
       // can end before the page commits the thread.
-      const started = await nativeRequest('thread/start', { cwd: path.resolve(input.workspace), threadSource: 'user' },
-        typeof input.blockReason === 'function' ? { blockReason: input.blockReason } : undefined);
-      const threadId = started?.thread?.id;
+      const started = input.nativeSessionId ? undefined
+        : await nativeRequest('thread/start', { cwd: path.resolve(input.workspace), threadSource: 'user' },
+          typeof input.blockReason === 'function' ? { blockReason: input.blockReason } : undefined);
+      const threadId = input.nativeSessionId ?? started?.thread?.id;
       if (typeof threadId !== 'string') throw fail('codex-native-rpc-invalid-response', 'Codex did not return a new thread id.');
+      if (input.nativeSessionId) {
+        // The previous thread/start was acknowledged. Reattach to that thread if needed
+        // and issue its original turn/start, without steering into a turn that opened meanwhile.
+        try { await ensureCodexThreadNative(threadId, { request: nativeRequest }); }
+        catch (error) { if (error.code !== 'codex-empty-rollout') throw error; }
+      }
       // The round can end while the thread is being created. The thread that exists stays
       // this name's (the caller keeps the binding) but its first turn is not started, and
       // that refusal is "never sent", never an unknown write.
@@ -622,6 +643,10 @@ export function createCodexHost(options = {}) {
       } catch (error) {
         // The thread exists even when the first turn was not confirmed. Keep the
         // binding so a later read can reconcile instead of creating a second chat.
+        if (error.transportAdmissionFailed === true && error.notSent === true) {
+          throw Object.assign(error, { nativeSessionId: threadId,
+            ...(typeof started?.thread?.path === 'string' ? { nativeRolloutPath: started.thread.path } : {}) });
+        }
         // A refused fence is not an unconfirmed write: the turn provably never left,
         // so the typed answer survives with the thread it did create.
         if (error.notSent === true || error.terminal === true) {
@@ -635,8 +660,10 @@ export function createCodexHost(options = {}) {
       // rollout is empty and thread/name/set is rejected. The backend retries it
       // once a projection has a message.
       let codexDomain;
-      try { codexDomain = await codexDomainForThread(started.thread); } catch { /* no verified domain */ }
-      return { created: true, nativeSessionId: threadId, turnId: turn.turn.id, ...(codexDomain ? {codexDomain} : {}), ...(typeof started.thread?.path === 'string' ? {rolloutPath:started.thread.path} : {}) };
+      if (started) {
+        try { codexDomain = await codexDomainForThread(started.thread); } catch { /* no verified domain */ }
+      }
+      return { created: true, nativeSessionId: threadId, turnId: turn.turn.id, ...(codexDomain ? {codexDomain} : {}), ...(typeof started?.thread?.path === 'string' ? {rolloutPath:started.thread.path} : {}) };
     },
     async setTitle({ nativeSessionId, name }) {
       await nativeRequest('thread/name/set', { threadId: nativeSessionId, name });

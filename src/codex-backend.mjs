@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { createCodexHost, emptyProjection, markerLine, CODEX_FILE_COVERAGE } from './codex-host.mjs';
-import { isCodexReadRetryable, isCodexRpcUnavailable, isCodexThreadMissing } from './codex-ipc.mjs';
+import { isCodexReadRetryable, isCodexThreadMissing } from './codex-ipc.mjs';
 import { CODEX_ASK_PARENT_INSTRUCTION, presentedNativeQuestion } from './report-contract.mjs';
 
 const METHODS = ['probe', 'create', 'beginTask', 'observe', 'history', 'answer', 'deliver', 'receipt',
@@ -498,7 +498,8 @@ export async function createCodexBackend(record, deps = {}) {
     return {
       accepted: request.status === 'accepted',
       status: request.status,
-      ...(verifiedNotSent(request) ? { verifiedNotSent: true } : {}),
+      ...(verifiedNotSent(request) ? { verifiedNotSent: true,
+        ...(request.pendingFirstTurn ? { pendingFirstTurn: true } : {}) } : {}),
       ...(Number.isSafeInteger(request.afterSeq) ? { afterSeq: request.afterSeq } : {}),
       ...(request.route ? { delivery: request.route } : {}),
       ...(request.turnId ? { turnId: request.turnId } : {}),
@@ -828,9 +829,10 @@ export async function createCodexBackend(record, deps = {}) {
         try {
           let turnId;
           let acceptedWrite = false;
-          const taskMessage = !value.binding || kind === 'task'
+          const startingFirstTurn = !value.binding || request.pendingFirstTurn === true;
+          const taskMessage = startingFirstTurn || kind === 'task'
             ? `${message}\n\n${CODEX_ASK_PARENT_INSTRUCTION}` : message;
-          if (!value.binding) {
+          if (startingFirstTurn) {
             if (allowStart === false) {
               Object.assign(request, { status: 'retryable', route: 'local-pending', attempted: false,
                 reschedule: { reason: 'queue-head-pending', notSent: true, afterTurnId: null,
@@ -852,6 +854,7 @@ export async function createCodexBackend(record, deps = {}) {
             // defaults. The caller's task stays first; the marker moves to the last
             // line so the user sees the original request at the top.
             const first = await host.createFirstTurn({ workspace: load().workspace, title: load().name,
+              ...(value.binding ? { nativeSessionId: value.binding.sessionId } : {}),
               requestId, message: `${taskMessage}\n\nYou are FutureAide managed helper ${JSON.stringify(load().name)}. `
                 + 'Deliver the final result with '
                 + 'report_parent(message, final=true). Ordinary replies do not report to your parent.\n\n'
@@ -865,11 +868,12 @@ export async function createCodexBackend(record, deps = {}) {
             turnId = first?.turnId;
             acceptedWrite = first?.created === true || Boolean(turnId);
             if (first?.nativeSessionId) {
-              value.binding = { sessionId: first.nativeSessionId, owned: true, ...(first.codexDomain ? {codexDomain:first.codexDomain} : {}), ...(first.rolloutPath ? {rolloutPath:first.rolloutPath} : {}) };
+              value.binding = { ...value.binding, sessionId: first.nativeSessionId, owned: true, ...(first.codexDomain ? {codexDomain:first.codexDomain} : {}), ...(first.rolloutPath ? {rolloutPath:first.rolloutPath} : {}) };
               value.pendingTitle ??= { name: load().name, attempts: 0 };
               save(value);
             }
             if (acceptedWrite) {
+              delete request.pendingFirstTurn;
               Object.assign(request, { status: 'accepted', turnId, route: 'new-turn',
                 native: { method: 'turn/start', turnId, priorTurnId: null, at: new Date().toISOString() } });
               save(value);
@@ -927,13 +931,16 @@ export async function createCodexBackend(record, deps = {}) {
             }
           }
         } catch (error) {
-          // The transport has already replaced the read that produced this result.
-          // Preserve both the current backend receipt and the original attempt identity.
-          if (error.transportStale === true) throw error;
+          const notAdmitted = error.transportAdmissionFailed === true && error.notSent === true;
+          // A stale read cannot update the receipt. A confirmed pre-send failure still
+          // has to leave a retryable receipt even if the connection recovered by now.
+          if (!notAdmitted && error.transportStale === true) throw error;
           if (error.nativeSessionId) {
-            value.binding = { sessionId: error.nativeSessionId, owned: true };
+            value.binding = { ...value.binding, sessionId: error.nativeSessionId, owned: true,
+              ...(error.nativeRolloutPath ? { rolloutPath: error.nativeRolloutPath } : {}) };
             value.pendingTitle ??= { name: load().name, attempts: 0 };
-            save(value);
+            if (notAdmitted) request.pendingFirstTurn = true;
+            else save(value);
           }
           // A terminal refusal happened before the native write (an ended round, a
           // model change, or a selection that could not be proven). It is not an
@@ -946,9 +953,8 @@ export async function createCodexBackend(record, deps = {}) {
             throw fail(error.code ?? 'codex-delivery-refused', error.message,
               { terminal: true, ...(error.notSent === true ? { notSent: true } : {}) });
           }
-          // No debug port means the write never reached Codex, so this is a
-          // retryable transport failure rather than an unknown write outcome.
-          if (isCodexRpcUnavailable(error)) {
+          // Only the transport can prove that an attempted write never left the socket.
+          if (notAdmitted) {
             request.attempted = false; request.status = 'retryable'; delete request.intent; save(value);
             throw Object.assign(error, { retryableRead: true });
           }
@@ -956,14 +962,10 @@ export async function createCodexBackend(record, deps = {}) {
           // failure after it is an unknown write and is never replayed. A first
           // dispatch whose thread/start may have left the page is also unknown.
           if (!request.intent) {
-            // A read that never reached a write (thread/read, turns/list, a cold
-            // resume) is local-pending: the same request id may be attempted again.
-            // The root check also runs between those two reads and before onIntent;
-            // its stale 'active' metadata is the same read gap when this attempt
-            // wrote nothing and no earlier attempt left an intent behind.
-            // Only a write that might have left but has no intent is unknown/failed.
-            const retryableRead = error.retryableRead === true || isCodexReadRetryable(error)
-              || (error.code === 'codex-root-turn-unconfirmed' && request.attempted !== true);
+            // The attempt flag is set before thread/start, even though its lack of
+            // a known thread ID means there is no turn/start intent yet.
+            const retryableRead = request.attempted !== true && (error.retryableRead === true
+              || isCodexReadRetryable(error) || error.code === 'codex-root-turn-unconfirmed');
             if (retryableRead) {
               request.status = 'retryable'; request.attempted = false;
             } else if (request.attempted === true) {

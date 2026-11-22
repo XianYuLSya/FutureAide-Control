@@ -2363,7 +2363,7 @@ test('native questions survive disappearance, pagination beyond 128 and task arc
   try {
     const sent = await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
     let old = f.record();
-    old.observation = { questions: Array.from({ length: 129 }, (_, i) => ({ id: 'historical-' + i, state: 'pending', message: 'question ' + i + ' '.repeat(300) })) };
+    old.observation = { questions: Array.from({ length: 129 }, (_, i) => ({ id: 'historical-' + i, state: 'pending', message: 'question ' + i + ' ' + 'x'.repeat(3900) })) };
     f.store.save(old);
     old = f.record(); old.observation = { questions: [] }; old.state = 'failed'; old.task.state = 'failed'; f.store.save(old);
     const next = { ...old, state: 'running', task: { taskId: 'next-round', requestId: 'next-request', message: 'next', state: 'running', reports: [] } };
@@ -2378,8 +2378,8 @@ test('native questions survive disappearance, pagination beyond 128 and task arc
     } while (true);
     assert.equal(all.length, 129);
     assert.equal(new Set(all.map(event => event.id)).size, 129);
-    assert.equal(all[0].message.trim(), 'question 0');
-    assert.equal(all[128].message.trim(), 'question 128');
+    assert.match(all[0].message, /^question 0 /);
+    assert.match(all[128].message, /^question 128 /);
   } finally { f.service.close(); }
 });
 

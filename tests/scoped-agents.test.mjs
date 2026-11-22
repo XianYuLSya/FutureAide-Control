@@ -179,7 +179,7 @@ test('default model follows live host for new tasks, supplements and answers wit
   const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    assert.equal(f.catalogCalls(), 0, 'empty creation does not fetch the model catalog');
+    assert.equal(f.catalogCalls(), 1, 'empty creation previews the current model');
     const newModel = { provider: 'new-route', model: 'new-model', reasoningEffort: 'max' };
     const record = f.record(); record.model = newModel; f.store.save(record);
     f.defaultModel(newModel);
@@ -194,7 +194,7 @@ test('default model follows live host for new tasks, supplements and answers wit
     await f.service.send({ name: 'artist', message: 'switch again' }, extra(A));
     assert.equal(f.selections.length, 3);
     assert.equal(new Set(f.selections.map(item => item.requestId)).size, 3, 'each input owns its model receipt');
-    assert.equal(f.catalogCalls(), 4);
+    assert.equal(f.catalogCalls(), 5);
     assert.equal(f.cursorCalls(), 0, 'begin/status observations supply the cursor');
     f.finish();
     const session = f.sessions.get(record.sessionId);
@@ -1970,7 +1970,7 @@ test('create resolves a model substring and keeps it across sends, effort change
     assert.deepEqual(f.record().modelPin,
       { provider: 'fixture', model: 'alpha-pro' });
     assert.deepEqual(f.selections.map(item => [item.model, item.reasoningEffort, item.sessionOnly]),
-      [['alpha-pro', undefined, true]], 'an explicit DSH pin is session-only');
+      [['alpha-pro', 'max', true]], 'an explicit DSH pin is session-only');
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'alpha-pro');
 
     const first = await f.service.send({ name: 'artist', message: 'go' }, extra(A));
@@ -1987,7 +1987,7 @@ test('create resolves a model substring and keeps it across sends, effort change
     assert.equal(lastSelection.model, 'alpha-pro');
     assert.equal(lastSelection.reasoningEffort, 'max');
     assert.equal(lastSelection.sessionOnly, true);
-    assert.equal(lastSelection.requestId.endsWith('-model'), true);
+    assert.match(lastSelection.requestId, /-model(?:-[a-f0-9]{12})?$/);
     assert.equal(f.record().task.dispatches.at(-1).model.reasoningEffort, 'max');
   } finally { f.service.close(); }
 });
@@ -2217,5 +2217,53 @@ test('DSH model lock retains the requested effort on the host default', async ()
     assert.equal(f.selections.at(-1).model, 'test');
     assert.equal(f.selections.at(-1).reasoningEffort, 'high');
     assert.equal(f.record().modelPin, undefined);
+  } finally { f.service.close(); }
+});
+test('locked DSH reselects a changed provider only after confirmed pre-write failure', async () => {
+  let attempts = 0;
+  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
+    if (attempts++ === 0) throw Object.assign(new Error('host default changed'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const first = await f.service.send({ name: 'artist', message: 'only once', effort: 'high' }, extra(A));
+    const requestId = first.requestId;
+    assert.equal(f.sends.length, 0);
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    const saved = f.record(); saved.task.dispatches[0].nextAttemptAt = 0; f.store.save(saved);
+    await f.service.poll(saved.agentId);
+    assert.equal(f.sends.length, 1);
+    assert.equal(f.sends[0].requestId, requestId);
+    assert.deepEqual(f.selections.map(s => [s.provider, s.model, s.reasoningEffort]),
+      [['fixture', 'test', 'high'], ['new-route', 'test', 'high']]);
+    assert.notEqual(f.selections[0].requestId, f.selections[1].requestId);
+    assert.equal(f.record().task.dispatches[0].modelReselection.after.provider, 'new-route');
+  } finally { f.service.close(); }
+});
+test('locked DSH with an unknown write never reselects or resends after default change', async () => {
+  let attempts = 0;
+  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
+    attempts++; throw Object.assign(new Error('write acknowledgement lost'), { uncertain: true });
+  } });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    const first = await f.service.send({ name: 'artist', message: 'unknown write', effort: 'high' }, extra(A));
+    f.defaultModel({ provider: 'new-route', model: 'test' });
+    await f.service.poll(f.record().agentId);
+    await f.service.poll(f.record().agentId);
+    assert.equal(attempts, 1);
+    assert.equal(f.selections.length, 1);
+    assert.equal(f.record().task.dispatches[0].requestId, first.requestId);
+    assert.equal(f.record().task.dispatches[0].state, 'unknown');
+  } finally { f.service.close(); }
+});
+test('create previews the default effort without claiming it is actual', async () => {
+  const f = await fixture();
+  try {
+    const preview = await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    assert.equal(preview.requestedEffort, 'max');
+    assert.equal(preview.selectedEffort, 'max');
+    assert.equal(preview.actualEffort, null);
+    assert.equal(f.sends.length, 0);
   } finally { f.service.close(); }
 });

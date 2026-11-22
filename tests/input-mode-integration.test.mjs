@@ -19,13 +19,13 @@ const THREAD = '11111111-1111-4111-8111-111111111111';
 const extra = threadId => ({ _meta: { threadId } });
 const MODEL = { provider: 'fixture', model: 'fixture-model', reasoningEffort: 'high' };
 
-async function fixture({ adapters = {}, clientFactory, controlFactory } = {}) {
+async function fixture({ adapters = {}, clientFactory, controlFactory, behavior = {} } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'input-mode-'));
   const store = new RosterStore(':memory:');
-  const service = createScopedAgents({ stateDirectory, workspace,
-    configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
+  const runtimeConfig = { stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh', ...behavior };
+  const dependencies = {
     store,
     clientFactory: clientFactory ?? (() => { throw new Error('no DSH host is needed for this case'); }),
     ...(controlFactory ? { controlFactory } : {}),
@@ -37,9 +37,11 @@ async function fixture({ adapters = {}, clientFactory, controlFactory } = {}) {
       tools: ['ask_parent', 'report_parent'], sessionVerified: false }),
     startSharedMonitor: () => true,
     removeTree: async () => {},
-  });
+  };
+  const service = createScopedAgents(runtimeConfig, dependencies);
+  const reopen = () => createScopedAgents(runtimeConfig, dependencies);
   const record = name => store.named(ownerIdFor(THREAD), name);
-  return { service, store, stateDirectory, record };
+  return { service, store, stateDirectory, record, runtimeConfig, reopen };
 }
 
 const inputsOf = inspected => inspected.inputs ?? [];
@@ -417,12 +419,13 @@ test('DSH idle: send and same-name run start a turn in both modes', async () => 
 function fakeCodex() {
   const state = { running: false, descendantRunning: false, turnId: undefined, turnSeq: 0, question: undefined };
   const calls = { deliver: [], answer: [], root: 0 };
+  const receipts = new Map();
   const factory = record => ({
     labels: { host: 'Codex Desktop', bridge: 'Codex Desktop fixture' },
     probe: async () => ({ identity: { workspace }, methods: [], treeProtocol: 1, reportProtocol: 1 }),
     create: async () => ({ sessionId: record.sessionId, modelRequestsStarted: 0 }),
     beginTask: async () => ({ treeProtocol: 1, reportProtocol: 1, throughSeq: 0 }),
-    observe: async () => ({ sessionId: record.sessionId, taskId: record.task?.taskId,
+    observe: async () => { if (state.observeFailure) throw new Error('native read unavailable'); return ({ sessionId: record.sessionId, taskId: record.task?.taskId,
       running: state.running || state.descendantRunning,
       questions: state.question ? [{ ...state.question }] : [], reports: [], changes: [], throughSeq: 0,
       tree: { settled: !state.running && !state.descendantRunning, running: state.running || state.descendantRunning,
@@ -430,7 +433,7 @@ function fakeCodex() {
           status: state.running ? 'running' : 'idle', activity: state.running ? 'running' : 'idle',
           changes: [], coverage: 'root' },
         ...(state.descendantRunning ? [{ sessionId: 'child-thread', parentSessionId: record.sessionId,
-          name: 'helper child', status: 'running', activity: 'running', changes: [], coverage: 'child' }] : [])] } }),
+          name: 'helper child', status: 'running', activity: 'running', changes: [], coverage: 'child' }] : [])] } }); },
     history: async () => ({ messages: [], hasMore: false }),
     answer: async ({ answerId, message }) => {
       calls.answer.push({ answerId, message });
@@ -440,11 +443,14 @@ function fakeCodex() {
     },
     deliver: async input => {
       calls.deliver.push({ ...input });
-      if (state.running) return { accepted: true, delivery: 'current-turn', turnId: state.turnId };
-      state.running = true; state.turnId = `turn-${++state.turnSeq}`;
-      return { accepted: true, delivery: 'new-turn', turnId: state.turnId };
+      const delivery = state.running ? 'current-turn' : 'new-turn';
+      if (!state.running) { state.running = true; state.turnId = `turn-${++state.turnSeq}`; state.actualEffort = input.model?.reasoningEffort ?? null; }
+      const receipt = { status: 'accepted', accepted: true, delivery, turnId: state.turnId, actualEffort: state.actualEffort };
+      receipts.set(input.requestId, receipt);
+      if (state.loseNext) { state.loseNext = false; throw Object.assign(new Error('lost response after native write'), { uncertain: true }); }
+      return receipt;
     },
-    receipt: async () => undefined,
+    receipt: async ({ requestId }) => receipts.get(requestId),
     turn: async () => (state.running ? { state: 'running' } : { state: 'ended', completionReason: { kind: 'completed' } }),
     models: async () => claudeModel(),
     model: async () => MODEL,
@@ -666,5 +672,45 @@ test('Codex answer R and queued Q ready in one poll: R opens B alone, Q opens C 
     assert.equal(f.codex.calls.deliver.filter(call => call.message.includes('R is the answer')).length, 1);
     assert.equal(f.codex.calls.deliver.filter(call => call.message.includes('R is the answer'))[0].message.includes('Q after'), false,
       'B never contained Q');
+  } finally { f.service.close(); }
+});
+
+for (const route of ['steer', 'start']) test(`Codex answer after a lost ${route} response recovers the original native receipt`, async () => {
+  const f = await codexFixture();
+  try {
+    const name = `recover-${route}`;
+    await f.service.create({ name, lifetime: 'persistent', target: 'codex-desktop' }, extra(THREAD));
+    await f.service.send({ name, message: 'begin', effort: 'high' }, extra(THREAD));
+    await f.service.poll(f.record(name).agentId);
+    const turnA = f.codex.state.turnId;
+    f.codex.state.question = { id: 'q-recovery', state: 'pending', message: 'Continue?' };
+    const answer = await f.service.send({ name, message: 'yes' }, extra(THREAD));
+    assert.equal(answer.delivery, 'answer-pending');
+    if (route === 'start') f.codex.state.running = false;
+    f.codex.state.loseNext = true;
+    await f.service.poll(f.record(name).agentId);
+    const restarted = f.reopen();
+    await restarted.poll(f.record(name).agentId);
+    const writes = f.codex.calls.deliver.filter(item => item.kind === 'answer');
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].requestId, answer.requestId);
+    assert.equal(writes[0].model.requestedEffort, 'max');
+    const row = inputFor(await restarted.inspect({ name }, extra(THREAD)), answer.requestId);
+    assert.equal(row.actualEffort, route === 'steer' ? 'high' : 'max');
+    assert.equal(row.turnId, route === 'steer' ? turnA : f.codex.state.turnId);
+    assert.equal((await restarted.list(extra(THREAD))).items[0].actualEffort, row.actualEffort);
+  } finally { f.service.close(); }
+});
+
+test('Codex explicit selection is not queued if active observation fails', async () => {
+  const f = await codexFixture();
+  try {
+    const helper = await startCodex(f);
+    const before = f.store.supplementInputs(helper.agentId).length;
+    f.codex.state.observeFailure = true;
+    await assert.rejects(f.service.send({ name: helper.name, message: 'do not queue', effort: 'high' }, extra(THREAD)),
+      error => error.code === 'model-selection-unconfirmed' && error.notSent === true);
+    assert.equal(f.store.supplementInputs(helper.agentId).length, before);
+    assert.equal(f.codex.calls.deliver.length, 1);
   } finally { f.service.close(); }
 });

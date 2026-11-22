@@ -54,7 +54,7 @@ async function fixture(records = [legacyRecord()]) {
     store,
     clientFactory: () => api,
     controlFactory: () => ({ async send() { calls.push('send'); return { accepted: true, afterSeq: 1 }; },
-      async wait() { return { state: 'running' }; }, async models() { return { default: {}, groups: [] }; },
+      async wait() { return { state: 'running' }; }, async models() { return { default: { provider: 'fixture', model: 'dsh-model' }, groups: [{ id: 'fixture', models: [{ id: 'dsh-model', reasoningEfforts: ['max'] }] }] }; },
       async selectModel() { return { accepted: true }; } }),
     callCodex: async (threadId, tool) => (tool === 'read_thread'
       ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } } : { accepted: true }),

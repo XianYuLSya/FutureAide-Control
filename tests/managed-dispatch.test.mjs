@@ -29,11 +29,11 @@ async function fixture({ modern = false, changeInstance = false } = {}) {
     const reply = value => new Response(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value } }));
     const reject = code => new Response(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: false, error: { code } } }));
     if (method === 'managedPromptReceipt') return reply(state.nativeReceipt ?? { status: 'unknown' });
-    if (method === 'ping') return reply({ methods: state.oldBridge ? ['managedSelectModel'] : ['managedPrompt', 'managedPromptReceipt'], ...(state.lockPolicy ? { modelPolicy: 'default-only' } : {}) });
-    if (method === 'managedPrompt') {
+    if (method === 'ping') return reply({ methods: state.oldBridge ? ['managedSelectModel'] : ['managedPromptV2', 'managedPromptReceipt'], ...(state.lockPolicy ? { modelPolicy: 'default-only' } : {}) });
+    if (method === 'managedPromptV2') {
       const args = body.payload.args;
       if (state.oldBridge) return reject('unknown-method');
-      if (state.changedModel) return reply({ accepted: false, status: 'retryable', notSent: true, code: 'managed-model-changed' });
+      if (state.changedModel) return reply({ accepted: false, status: 'retryable', notSent: true, code: state.changedCode ?? 'managed-model-changed' });
       state.prompts++;
       if (state.losePromptReply) return stalled(init.signal);
       return reply({ accepted: true, requestId: args.requestId, selected: args.selection });
@@ -261,10 +261,22 @@ test('verified model lock changes during selection: same business request writes
   assert.equal((await backend.selectModel({ requestId: 'selection-b', ...model, sessionOnly: true })).accepted, true);
   assert.equal((await backend.deliver({ requestId, message: 'one business input', model })).accepted, true);
   assert.equal(f.state.prompts, 1);
-  assert.equal(f.state.calls.filter(c => c.method === 'managedPrompt')[0].payload.args.requestId, requestId);
+  assert.equal(f.state.calls.filter(c => c.method === 'managedPromptV2')[0].payload.args.requestId, requestId);
   const other = await fixture(); other.state.selectionError = 'managed-model-locked';
   const unlocked = createDshBackend({ client: other.client, control: () => other.control, hostArgs: () => other.binding });
   await assert.rejects(unlocked.selectModel({ requestId: 'other', ...model, sessionOnly: true }), e => e.code === 'managed-model-locked' && !e.retryableRead);
   f.state.selectionError = 'managed-model-unavailable';
   await assert.rejects(backend.selectModel({ requestId: 'different-error', ...model, sessionOnly: true }), e => e.code === 'managed-model-unavailable' && !e.retryableRead);
+});
+
+
+test('DSH persists the distinct no-write turn refusal for cold recovery', async () => {
+  const f = await fixture(); f.state.changedModel = true; f.state.changedCode = 'managed-turn-ended';
+  const backend = createDshBackend({ client: f.client, control: () => f.control, hostArgs: () => f.binding, requestDirectory: () => f.config.stateDirectory });
+  const high = { provider: 'fixture', model: 'm', reasoningEffort: 'high' }, max = { ...high, reasoningEffort: 'max' };
+  await assert.rejects(backend.deliver({ requestId: 'turn-race', message: 'work', kind: 'supplement', model: high, startModel: max, expectedTurn: { throughSeq: 4 } }),
+    error => error.code === 'managed-turn-ended' && error.notSent && error.retryableRead);
+  const receipt = await backend.receipt({ requestId: 'turn-race' });
+  assert.equal(receipt.status, 'retryable'); assert.equal(receipt.code, 'managed-turn-ended'); assert.equal(receipt.notSent, true);
+  assert.equal(f.state.prompts, 0);
 });

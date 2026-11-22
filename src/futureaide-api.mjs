@@ -674,7 +674,7 @@ export class FutureAideClient {
     return { sessionId: view.sessionId, cwd: view.workspace, running: view.running,
       projections: { asOfSeq: view.throughSeq, values: { modelSelection: { next: view.currentModel } } } };
   }
-  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID(), writeBlockReason, selection } = {}) {
+  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID(), writeBlockReason, selection, startSelection, expectedTurn } = {}) {
     validId(requestId, 'requestId');
     if (typeof text !== 'string' || text.trim().length === 0 || Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES
         || !['queue', 'steer'].includes(mode)) fail('invalid-input', 'A nonempty message up to 128 KiB and queue or steer mode are required.');
@@ -692,13 +692,13 @@ export class FutureAideClient {
     if (gate) gate();
     if (selection) {
       let value;
-      try { value = await this.#managedCall('managedPrompt', { ...input, message: text, mode, requestId, selection }, true, gate, expectedInstance); }
+      try { value = await this.#managedCall('managedPromptV2', { ...input, message: text, mode, requestId, selection, ...(startSelection ? { startSelection } : {}), ...(expectedTurn !== undefined ? { expectedTurn } : {}) }, true, gate, expectedInstance); }
       catch (error) {
         if (['unknown-method', 'remote-not-found', 'not-found', 'managed-prompt-unsupported'].includes(error.code)) fail('managed-prompt-unsupported', 'This DSH host bridge cannot atomically validate model selection before sending. Update and reinstall the host bridge.');
         if (!error.notSent && !['authentication-required', 'instance-changed'].includes(error.code)) error.uncertain = true;
         throw error;
       }
-      if (value?.status === 'retryable' && value.notSent === true) throw Object.assign(new Error('DSH default model or session selection changed before writing.'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
+      if (value?.status === 'retryable' && value.notSent === true) throw Object.assign(new Error('DSH turn or model changed before writing.'), { code: value.code ?? 'managed-model-changed', notSent: true, retryableRead: true });
       if (value?.accepted !== true || value.requestId !== requestId || !Object.hasOwn(value, 'selected')) fail('invalid-response', 'DSH did not confirm the managed prompt.', { uncertain: true });
       return { ...value, accepted: true, requestId, actualEffort: value.selected?.reasoningEffort ?? null, ...(value.selected?.reasoningEffort ? { actualEffortSource: 'host-readback' } : {}), actualModel: value.selected?.model ?? null };
     }

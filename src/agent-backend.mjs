@@ -260,7 +260,7 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
         ...(history.note ? { note: history.note } : {}), ...(failure ? { failure } : {}) };
     },
     async answer({ answerId, message } = {}) { return client.managedAnswer({ ...args(), answerId, message }); },
-    async deliver({ requestId, message, kind, writeBlockReason, model } = {}) {
+    async deliver({ requestId, message, kind, writeBlockReason, model, startModel, expectedTurn } = {}) {
       // A supplement has to be read on the model's next step. A queued input waits for
       // the current turn to end, and by then the model has usually submitted its final
       // report already, which seals the task and strands the input forever.
@@ -268,7 +268,7 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
       // receipt checkpoint exists and before the native write, so a task that finished
       // while this call was preparing is refused with nothing sent.
       return control().send({ sessionId: args().sessionId, message, requestId,
-        background: false, suppressCallback: true, mode: kind === 'supplement' ? 'steer' : 'queue', ...(model ? { selection: model } : {}),
+        background: false, suppressCallback: true, mode: kind === 'supplement' ? 'steer' : 'queue', ...(model ? { selection: model } : {}), ...(startModel ? { startSelection: startModel } : {}), ...(expectedTurn !== undefined ? { expectedTurn } : {}),
         ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) });
     },
     async receipt({ requestId } = {}) {
@@ -282,10 +282,12 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
             if (!value.instance || identity(value.instance) !== identity(currentHost)) return { status: 'unknown', afterSeq: value.afterSeq };
             const native = await client.managedPromptReceipt(args(), requestId);
             if (native?.status === 'accepted' && Object.hasOwn(native, 'selected')) return { status: 'accepted', afterSeq: value.afterSeq,
-              actualModel: native.selected?.model ?? null, actualEffort: native.selected?.reasoningEffort ?? null, ...(native.selected?.reasoningEffort ? { actualEffortSource: 'host-readback' } : {}) };
+              delivery: native.delivery ?? null, actualModel: native.selected?.model ?? null, actualEffort: native.selected?.reasoningEffort ?? null, ...(native.selected?.reasoningEffort ? { actualEffortSource: 'host-readback' } : {}) };
           } catch { /* A read failure never authorizes another write. */ }
         }
         return { status: value.status ?? 'unknown', afterSeq: value.result?.afterSeq ?? value.afterSeq,
+          ...(value.code ? { code: value.code } : {}), ...(value.notSent === true ? { notSent: true } : {}),
+          ...(value.result && Object.hasOwn(value.result, 'delivery') ? { delivery: value.result.delivery } : {}),
           ...(value.result && Object.hasOwn(value.result, 'actualEffort') ? { actualEffort: value.result.actualEffort } : {}),
           ...(value.result && Object.hasOwn(value.result, 'actualEffortSource') ? { actualEffortSource: value.result.actualEffortSource } : {}),
           ...(value.result && Object.hasOwn(value.result, 'actualModel') ? { actualModel: value.result.actualModel } : {}),
@@ -305,7 +307,7 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
       let host;
       if (sessionOnly === true) {
         host = await client.hostStatus();
-        if (!host?.methods?.includes('managedPrompt') || !host.methods.includes('managedPromptReceipt')) throw Object.assign(new Error('This DSH host bridge cannot safely validate model changes and recover prompt receipts. Update and reinstall the host bridge.'), { code: 'managed-prompt-unsupported', terminal: true });
+        if (!host?.methods?.includes('managedPromptV2') || !host.methods.includes('managedPromptReceipt')) throw Object.assign(new Error('This DSH host bridge cannot safely validate model changes and recover prompt receipts. Update and reinstall the host bridge.'), { code: 'managed-prompt-unsupported', terminal: true });
       }
       try {
         return await control().selectModel({ sessionId: args().sessionId, provider, model,

@@ -82,7 +82,7 @@ export const name = 'futureaide-control-host';
 export const inject = ['connection', 'webServer', 'agents', 'sessions'];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedSelectModel',
-  'managedPrompt', 'managedPromptReceipt', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
+  'managedPromptV2', 'managedPromptReceipt', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'];
 
 // DSH's own question tool opens a prompt in the DSH window, which the chat that
 // dispatched the task never sees: the agent waits and the caller is never asked.
@@ -724,10 +724,11 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       });
     }); },
     // Use the host's text-prompt admission and fence its synchronous inbox write.
-    managedPrompt(input) { return serial(input, async () => {
+    managedPromptV2(input) { return serial(input, async () => {
       managedId(input.sessionId); managedId(input.requestId);
       if (typeof input.message !== 'string' || !input.message.trim() || Buffer.byteLength(input.message, 'utf8') > 131072 || !['queue', 'steer'].includes(input.mode)) reject('invalid-input');
       const selection = modelValue(input.selection);
+      const startSelection = input.startSelection ? modelValue(input.startSelection) : selection;
       const record = await load(input);
       if (record.closing || record.cancelled) reject('managed-task-closed');
       const agent = await activate(record);
@@ -738,17 +739,47 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       const prior = record.promptSelections[input.requestId];
       if (prior && (prior.messageHash !== messageHash || prior.mode !== input.mode)) reject('managed-prompt-conflict');
       if (commands.hasPromptRequest(agent.session, input.requestId)) {
-        return { accepted: true, requestId: input.requestId, selected: prior?.confirmedSelection ?? null, duplicate: true };
+        return { accepted: true, requestId: input.requestId, selected: prior?.confirmedSelection ?? null, delivery: prior?.confirmedDelivery ?? null, duplicate: true };
       }
       record.promptSelections[input.requestId] = { messageHash, mode: input.mode, selection };
       await persist(record);
       return agents.serializeImageAdmission(agent, async () => {
-        let mismatch = false, intercepted = false;
+        let mismatch = false, turnRefusal, intercepted = false, delivery = null;
         const originals = { steer: agent.steer, followup: agent.followup };
         if (typeof originals.steer !== 'function' || typeof originals.followup !== 'function') reject('managed-prompt-unsupported');
         for (const method of ['steer', 'followup']) agent[method] = function(message, ...args) {
           if (message?.source?.rpcId === input.requestId) {
             intercepted = true;
+            if (input.expectedTurn !== undefined) {
+              const through = input.expectedTurn?.throughSeq;
+              const phase = agent.phase;
+              if (!Number.isSafeInteger(through) || through < -1 || through > sessionCursor(agent.session) || !phase || typeof phase.kind !== 'string') {
+                turnRefusal = 'managed-turn-unknown'; throw new Error(turnRefusal);
+              }
+              const ended = phase.kind === 'idle' || phase.kind === 'maintenance' || phase.abort?.signal?.aborted === true;
+              if (ended) {
+                delivery = 'new-turn';
+                if (!sameSelectionValue(startSelection, selection)) { turnRefusal = 'managed-turn-ended'; throw new Error(turnRefusal); }
+              } else {
+                let events;
+                if (typeof agent.session?.snapshotEvents === 'function') events = agent.session.snapshotEvents(through + 1);
+                else if (Array.isArray(agent.session?.events)) events = agent.session.events.filter(event => Number.isSafeInteger(event.seq) && event.seq > through);
+                if (!Array.isArray(events) || events.some(event => !Number.isSafeInteger(event.seq)) || !phase.abort?.signal) {
+                  turnRefusal = 'managed-turn-unknown'; throw new Error(turnRefusal);
+                }
+                if (events.some(event => event.type === 'turn/start' || event.type === 'turn/end')) {
+                  turnRefusal = 'managed-turn-changed'; throw new Error(turnRefusal);
+                }
+                delivery = 'current-turn';
+              }
+            } else if (input.mode === 'steer') {
+              const phase = agent.phase;
+              if (!phase || typeof phase.kind !== 'string') { turnRefusal = 'managed-turn-unknown'; throw new Error(turnRefusal); }
+              if (phase.kind !== 'idle' && phase.kind !== 'maintenance' && phase.abort?.signal?.aborted !== true) {
+                turnRefusal = 'managed-turn-changed'; throw new Error(turnRefusal);
+              }
+              delivery = 'new-turn';
+            } else delivery = 'new-turn';
             const current = typeof agent.model?.current === 'function' ? agent.model.current() : undefined;
             const fallback = service('agentDefaultModel')?.currentSelection();
             if (!sameSelectionValue(current, selection) || (defaultModelOnly && (!fallback || fallback.provider !== selection.provider || fallback.model !== selection.model))) {
@@ -761,11 +792,13 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
           const request = { sessionId: input.sessionId, requestId: input.requestId, mode: input.mode, content: [{ type: 'text', text: input.message }], clientTimeZone: 'Asia/Shanghai' };
           const result = await commands.prompt(request, { kind: 'user', rpcId: input.requestId, clientTimeZone: 'Asia/Shanghai' });
           if (result?.accepted !== true || (!intercepted && !commands.hasPromptRequest(agent.session, input.requestId))) reject('managed-prompt-unconfirmed');
-          if (!intercepted) return { accepted: true, requestId: input.requestId, selected: null };
+          if (!intercepted) return { accepted: true, requestId: input.requestId, selected: null, delivery: null };
           record.promptSelections[input.requestId].confirmedSelection = selection;
-          try { await persist(record); } catch (error) { delete record.promptSelections[input.requestId].confirmedSelection; throw error; }
-          return { accepted: true, requestId: input.requestId, selected: selection };
+          record.promptSelections[input.requestId].confirmedDelivery = delivery;
+          try { await persist(record); } catch (error) { delete record.promptSelections[input.requestId].confirmedSelection; delete record.promptSelections[input.requestId].confirmedDelivery; throw error; }
+          return { accepted: true, requestId: input.requestId, selected: selection, delivery };
         } catch (error) {
+          if (turnRefusal && !commands.hasPromptRequest(agent.session, input.requestId)) return { accepted: false, status: 'retryable', notSent: true, code: turnRefusal };
           if (mismatch && !commands.hasPromptRequest(agent.session, input.requestId)) return { accepted: false, status: 'retryable', notSent: true, code: 'managed-model-changed' };
           throw error;
         } finally { agent.steer = originals.steer; agent.followup = originals.followup; }
@@ -778,7 +811,7 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       const commands = service('sessionController')?.commands;
       if (typeof commands?.hasPromptRequest !== 'function') reject('managed-prompt-unsupported');
       if (!commands.hasPromptRequest(agent.session, input.requestId)) return { status: 'unknown', requestId: input.requestId };
-      return { status: 'accepted', requestId: input.requestId, selected: prior?.confirmedSelection ?? null };
+      return { status: 'accepted', requestId: input.requestId, selected: prior?.confirmedSelection ?? null, delivery: prior?.confirmedDelivery ?? null };
     }); },
     managedHistory(input) { return serial(input, async () => {
       const record = await load(input);

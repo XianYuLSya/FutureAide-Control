@@ -324,7 +324,9 @@ function taskInputs(store, record) {
       accepted: item.accepted === true,
       queued: item.queued === true,
       ...(item.turnId ? { turnId: item.turnId } : {}),
-      ...(item.afterTurnId ? { afterTurnId: item.afterTurnId } : {}),
+      // A current-turn write has only that turnId. Any afterTurnId on it is the
+      // queued-wait route the input never took; every other row keeps its history.
+      ...(item.delivery !== 'current-turn' && item.afterTurnId ? { afterTurnId: item.afterTurnId } : {}),
       ...(item.reason ? { reason: item.reason } : {}),
       ...(status ? { status } : {}),
       ...(item.createdAt ? { createdAt: item.createdAt } : {}),
@@ -349,7 +351,7 @@ function taskInputs(store, record) {
       accepted: dispatch.accepted === true,
       queued: dispatch.accepted !== true && (waitingRoute(delivery) || ['sending', 'queued', 'retrying'].includes(dispatch.state)),
       ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
-      ...(dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
+      ...(delivery !== 'current-turn' && dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
       ...(dispatch.error?.code ? { reason: dispatch.error.code } : {}),
       ...(status ? { status } : {}),
       ...(existing?.createdAt ? {} : dispatch.startedAt ? { createdAt: dispatch.startedAt } : {}),
@@ -1531,7 +1533,7 @@ export function createScopedAgents(config, {
     return {
       ...(dispatch.delivery ? { delivery: dispatch.delivery } : {}),
       ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
-      ...(dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
+      ...(dispatch.delivery !== 'current-turn' && dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
       ...(dispatch.deliveryIntent?.method ? { method: dispatch.deliveryIntent.method } : {}),
       ...(dispatch.deliveryIntent?.expectedTurnId ? { expectedTurnId: dispatch.deliveryIntent.expectedTurnId } : {}),
       ...(dispatch.mode ? { mode: dispatch.mode } : {}),
@@ -1573,7 +1575,10 @@ export function createScopedAgents(config, {
     const queued = !accepted && item?.status !== 'blocked' && (deliveryQueued(delivery)
       || ['queued', 'sending'].includes(item?.status ?? 'queued'));
     const turnId = stored.turnId ?? dispatch?.turnId ?? fallback.turnId;
-    const afterTurnId = stored.afterTurnId ?? dispatch?.afterTurnId ?? fallback.afterTurnId;
+    // A current-turn write has only that turnId. Every other delivery keeps any
+    // known queued-turn history, including a queue row that has since opened B.
+    const afterTurnId = delivery === 'current-turn' ? undefined
+      : stored.afterTurnId ?? dispatch?.afterTurnId ?? fallback.afterTurnId;
     const reason = item?.reason ?? dispatch?.error?.code ?? fallback.reason;
     return {
       name: current.name, state: current.state, accepted, queued,
@@ -1882,6 +1887,10 @@ export function createScopedAgents(config, {
           ? { afterTurnId: sent.afterTurnId ?? sent.turnId ?? root?.turnId } : {}),
         ...(sent.afterSeq !== undefined ? { afterSeq: sent.afterSeq } : {}),
         ...(accepted ? { error: undefined, nextAttemptAt: undefined } : {}) });
+      // A steer into the current turn has only that turnId; an afterTurnId here is
+      // the queued-wait route it never took. A queue row that opened B keeps its
+      // known A as history.
+      if (delivery === 'current-turn') delete dispatch.afterTurnId;
       if (accepted && explicit && target === 'codex-desktop') {
         // The native turn now runs with the pinned model; record the real display value
         // and only now make it the name's intended selection. A refused or still
@@ -3083,6 +3092,7 @@ export function createScopedAgents(config, {
       delivery: receipt.delivery ?? dispatch.delivery ?? 'accepted-route-unknown',
       ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
       ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}) });
+    if (receipt.status === 'accepted' && receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
     if (receipt.status === 'rejected') dispatch.state = 'failed';
     if (receipt.status === 'retryable') {
       if (!allowResend) return 'not-sent';
@@ -3103,6 +3113,7 @@ export function createScopedAgents(config, {
           ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
           ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}),
           nextAttemptAt: undefined, retryAttempts: undefined });
+        if (receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
         return 'accepted';
       }
       if (['rejected', 'retryable', 'failed'].includes(receipt?.status)
@@ -3896,17 +3907,21 @@ export function createScopedAgents(config, {
         }
         await ensureWorker(store.get(record.agentId) ?? record, { wake: true });
         const current = store.get(record.agentId) ?? record;
+        const queuedMode = mode ?? 'steer';
+        // A steer is never registered behind a turn. Only an explicit queue may carry
+        // the afterTurnId it waits behind, even if a caller passes one by mistake.
+        const waitTurnId = queuedMode === 'queue' ? afterTurnId : undefined;
         // A queue that the caller can already place behind a named turn persists that
         // route now, so the first inspect after this receipt says the same thing.
-        if (afterTurnId) saveSupplementReceipt(requestId, 'queued', null,
-          { delivery: 'after-current', afterTurnId, mode: mode ?? 'queue',
+        if (waitTurnId) saveSupplementReceipt(requestId, 'queued', null,
+          { delivery: 'after-current', afterTurnId: waitTurnId, mode: queuedMode,
             accepted: false, queued: true, selectionExplicit: selectionExplicit === true });
         // The INSERT SELECT may have captured a newer live pin than this caller
         // read; report the selection actually frozen on the queued row.
         const frozen = (store.supplements(record.agentId) ?? []).find(item => item.requestId === requestId)?.selection;
         return queued(current, pin ?? frozen ?? current.modelPin,
-          { requestId, mode: mode ?? 'steer', delivery: afterTurnId ? 'after-current' : 'local-pending',
-            ...(afterTurnId ? { afterTurnId } : {}) });
+          { requestId, mode: queuedMode, delivery: waitTurnId ? 'after-current' : 'local-pending',
+            ...(waitTurnId ? { afterTurnId: waitTurnId } : {}) });
       };
       // The no-wait path is only for a supplement that changes no selection: the
       // INSERT SELECT itself freezes the current pin. An explicit model/effort must
@@ -4108,15 +4123,19 @@ export function createScopedAgents(config, {
           const pin = await resolvePin(root, view);
           const mode = effectiveMode(record);
           const ahead = queuedAhead();
+          // Only an explicit queue is registered behind the running turn. A steer is
+          // written into that turn; until a native receipt proves it, the input is a
+          // local pending write and must not claim a wait it is not in.
+          const waitTurnId = mode === 'queue' && root.running && root.turnId ? root.turnId : undefined;
           const receipt = await queue(record, pin, { ...(wantsSelection ? {} : { usePinnedModel: true }),
             mode, selectionExplicit: wantsSelection,
-            ...(root.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
+            ...(waitTurnId ? { afterTurnId: waitTurnId } : {}) });
           // A running root can take a steer even when earlier queue rows wait; only an
           // idle root with rows ahead must leave the new input at the tail.
           if (!ahead || root.running) await drainSupplements(record, { view });
           return supplementReceipt(store.get(record.agentId) ?? record, receipt.requestId,
-            { pin, mode, delivery: root.running ? 'local-pending' : 'local-pending',
-              ...(root.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
+            { pin, mode, delivery: waitTurnId ? 'after-current' : 'local-pending',
+              ...(waitTurnId ? { afterTurnId: waitTurnId } : {}) });
         }
         // No live task: a new name/round starts normally. This is the one path where
         // both modes mean the same thing.
@@ -4216,9 +4235,11 @@ export function createScopedAgents(config, {
           if (root.running) {
             await assertExplicitSelectionForRunning(record, pin, root);
             // The same selection needs no pin write: queue it directly under the lock-
-            // free durable path. The worker will steer or start it.
-            return queue(record, pin, { mode: effectiveMode(record), selectionExplicit: true,
-              afterTurnId: root.running && root.turnId ? root.turnId : undefined });
+            // free durable path. The worker will steer or start it. Only a queue is
+            // placed behind the running turn; a steer stays local until it is written.
+            const busyMode = effectiveMode(record);
+            return queue(record, pin, { mode: busyMode, selectionExplicit: true,
+              ...(busyMode === 'queue' && root.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
           }
         }
         if (wantsSelection) {
@@ -4234,8 +4255,9 @@ export function createScopedAgents(config, {
         if (record.state === 'delivery_pending' || !supplementStates.has(record.state)) {
           return withName(extra, name, operation);
         }
-        return enqueueWithoutWait(record, { mode: effectiveMode(record),
-          ...(root?.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
+        const busyMode = effectiveMode(record);
+        return enqueueWithoutWait(record, { mode: busyMode,
+          ...(busyMode === 'queue' && root?.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
       }
     },
     /**

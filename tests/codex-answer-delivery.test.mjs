@@ -1259,3 +1259,39 @@ test('a delivered report keeps a temporary registration failure out of the publi
     assert.equal(quiet.error, undefined, 'a delivered report makes the registration preflight noise disappear');
   } finally { f.service.close(); }
 });
+
+test('a delivered report does not hide a supplement actually blocked by the registration preflight', async () => {
+  const f = await fixture();
+  try {
+    const lead = await f.start('lead', 'Fix the ten places.');
+    assert.equal((await f.report(lead, 'Progress: half fixed.')).accepted, true);
+    await f.poll(lead); await f.poll(lead);
+    const before = (await f.service.list(extra(BOSS))).items.find(item => item.name === 'lead');
+    assert.equal(before.reports.latest.delivery, 'delivered', 'the progress report actually reached the parent');
+
+    // The report path already worked, but the registration probe is now closed. A
+    // supplement is a real input, not report-preflight noise: it was not written and
+    // every read surface must say why.
+    f.registration.ready = false;
+    const writesBefore = f.codex.inputs().length;
+    const sent = await f.service.send({ name: 'lead', message: 'Supplement after progress.' }, extra(BOSS));
+    assert.equal(sent.accepted, false);
+    assert.equal(sent.delivery, 'blocked');
+    assert.equal(sent.error?.code, 'codex-report-not-ready');
+    assert.equal(f.codex.inputs().length, writesBefore, 'nothing was written to the helper');
+
+    const dispatch = f.record('lead').task.dispatches.find(entry => entry.message === 'Supplement after progress.');
+    assert.equal(dispatch.state, 'failed');
+    assert.notEqual(dispatch.accepted, true);
+    assert.equal(dispatch.error?.code, 'codex-report-not-ready');
+
+    const listed = (await f.service.list(extra(BOSS))).items.find(item => item.name === 'lead');
+    assert.equal(listed.error?.code, 'codex-report-not-ready', 'list keeps the blocked input visible');
+    const inspected = await f.service.inspect({ name: 'lead' }, extra(BOSS));
+    const inspectedInput = inspected.inputs.find(row => row.requestId === sent.requestId);
+    assert.equal(inspectedInput.delivery, 'blocked', 'inspect keeps the blocked input state visible');
+    assert.equal(inspectedInput.reason, 'codex-report-not-ready');
+    const ran = await f.service.run({ name: 'lead', message: 'Another supplement.' }, extra(BOSS));
+    assert.equal(ran.error?.code, 'codex-report-not-ready', 'run keeps the blocked input visible');
+  } finally { f.service.close(); }
+});

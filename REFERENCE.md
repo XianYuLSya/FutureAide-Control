@@ -128,4 +128,4 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.
 
 原生会话清理支持上述 DSH 版本的 JSONL 会话、项目索引和派生缓存，不支持的存储后端会返回清理失败。整树清理支持本机原生 one-shot 和 continuable 下属，外部托管的下属会明确报告不支持自动清理。
 
-显式 ID 的 CLI 仍可用于 DSH 维护，查看 `node src/cli.mjs --help`。需要这套 MCP 管理面时，在维护环境设置 `FUTUREAIDE_LEGACY_TOOLS=1`，它和默认名字工具面二选一。这里的 legacy 指维护接口，不表示仍支持旧 FutureAide 宿主。详见[旧版 CLI 与显式接口](skills/futureaide-control/references/legacy-workflows.md)。DSH 版本用的 slash 和 dot HTTP API 适配都保留，status 里的 `apiDialect: legacy` 只表示 slash 协议。
+显式 ID 的 CLI 仍可用于 DSH 维护，查看 `node src/cli.mjs --help`。需要这套 MCP 管理面时，在维护环境设置 `FUTUREAIDE_LEGACY_TOOLS=1`，它和默认名字工具面二选一。这里的 legacy 指维护接口，不表示仍支持旧 FutureAide 宿主。`src/cli.mjs list-agents` 也属于这套显式 ID 维护接口：它只按 workspace 走旧 DSH 会话 API，不接受 name/state 过滤，不是 MCP/stdio/Claude 的 `futureaide_list_agents`（后者走受管名单并提供轻量 name/state 过滤）。详见[旧版 CLI 与显式接口](skills/futureaide-control/references/legacy-workflows.md)。DSH 版本用的 slash 和 dot HTTP API 适配都保留，status 里的 `apiDialect: legacy` 只表示 slash 协议。

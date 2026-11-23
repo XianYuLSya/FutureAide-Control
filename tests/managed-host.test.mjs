@@ -445,6 +445,54 @@ test('question and answer carry text directly, conclude the waiting turn, and an
   assert.equal((await host.managedStatus(input)).questions.length, 0);
 });
 
+test('a native answer consumes only the question identity it was given', async () => {
+  const f = await fixture(), host = f.create(), input = identity(f.workspace);
+  await host.managedCreate(input);
+  await host.managedBeginTask({ ...input, taskId: 'task-a' });
+  const agent = f.live.get(input.sessionId);
+  const ask = async message => {
+    await agent.definitions.get('ask_parent').execute({ message }, { agent, concludeTurn() {} });
+    return (await host.managedStatus(input)).questions.find(question => question.message === message);
+  };
+
+  // unchanged: the same question is still pending when the write is checked.
+  const first = await ask('Unchanged question?');
+  const unchanged = await host.managedAnswer({ ...input, taskId: 'task-a', answerId: 'answer-unchanged',
+    message: 'yes', questionIds: [first.id] });
+  assert.equal(unchanged.accepted, true);
+  assert.deepEqual(unchanged.consumedQuestionIds, [first.id]);
+  assert.equal((await host.managedStatus(input)).questions.find(question => question.id === first.id).state, 'answered');
+
+  // replaced: q2 was seen by the caller, but another answer consumed it and q3 is
+  // pending at write time. q3 stays pending and never receives q2's answer text.
+  await host.managedBeginTask({ ...input, taskId: 'task-b' });
+  const second = await ask('Original question?');
+  const other = await host.managedAnswer({ ...input, taskId: 'task-b', answerId: 'answer-other',
+    message: 'another answer', questionIds: [second.id] });
+  assert.equal(other.accepted, true);
+  const third = await ask('Replacement question?');
+  const replaced = await host.managedAnswer({ ...input, taskId: 'task-b', answerId: 'answer-replaced',
+    message: 'old answer text', questionIds: [second.id] });
+  assert.equal(replaced.accepted, false);
+  assert.equal(replaced.notSent, true);
+  assert.deepEqual(replaced.consumedQuestionIds, []);
+  assert.deepEqual(replaced.pendingQuestions, ['Replacement question?']);
+  const afterReplaced = (await host.managedStatus(input)).questions.find(question => question.id === third.id);
+  assert.equal(afterReplaced.state, 'pending');
+  assert.equal(afterReplaced.answer, undefined, 'the replacement never receives the old answer');
+
+  // gone: the named question is no longer pending and nothing is pending now.
+  const thirdAnswer = await host.managedAnswer({ ...input, taskId: 'task-b', answerId: 'answer-third',
+    message: 'third answer', questionIds: [third.id] });
+  assert.equal(thirdAnswer.accepted, true);
+  const gone = await host.managedAnswer({ ...input, taskId: 'task-b', answerId: 'answer-gone',
+    message: 'late answer', questionIds: [third.id] });
+  assert.equal(gone.accepted, false);
+  assert.equal(gone.notSent, true);
+  assert.deepEqual(gone.consumedQuestionIds, []);
+  assert.deepEqual(gone.pendingQuestions, []);
+});
+
 test('native sequence cursors do not require reading a public full events array', async () => {
   const f = await fixture(), host = f.create(), input = identity(f.workspace);
   await host.managedCreate(input);

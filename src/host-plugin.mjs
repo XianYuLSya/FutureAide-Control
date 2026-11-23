@@ -1734,12 +1734,35 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
         return { accepted: true, ...prior };
       }
       const pending = record.questions.filter(question => question.taskId === record.taskId && question.state === 'pending');
-      if (!pending.length) reject('managed-no-pending-question');
+      // The caller may name the question(s) it actually saw. The identity check and
+      // the state change happen here, in one serialized turn on the live record, so
+      // a question that was consumed or replaced after the caller's preflight is
+      // never filled with this answer. A missing identity keeps the old bridge
+      // contract for callers that have not been updated.
+      const asked = input.questionIds === undefined ? undefined
+        : (Array.isArray(input.questionIds) && input.questionIds.length
+          && input.questionIds.every(id => typeof id === 'string' && id.length > 0 && id.length <= 200)
+          ? [...new Set(input.questionIds)] : undefined);
+      if (input.questionIds !== undefined && !asked) reject('invalid-answer-question');
+      if (asked) {
+        const live = new Set(pending.map(question => question.id));
+        if (!asked.every(id => live.has(id))) {
+          return { accepted: false, notSent: true, consumedQuestionIds: [],
+            pendingQuestionIds: pending.map(question => question.id),
+            pendingQuestions: pending.map(question => question.message) };
+        }
+      }
+      const answering = asked ? pending.filter(question => asked.includes(question.id)) : pending;
+      if (!answering.length) {
+        if (asked) return { accepted: false, notSent: true, consumedQuestionIds: [],
+          pendingQuestionIds: [], pendingQuestions: [] };
+        reject('managed-no-pending-question');
+      }
       const answeredAt = new Date().toISOString();
-      for (const question of pending) Object.assign(question, { state: 'answered', answer: input.message, answeredAt });
+      for (const question of answering) Object.assign(question, { state: 'answered', answer: input.message, answeredAt });
       const answer = { answerId: input.answerId ?? `answer-${randomUUID()}`, message: input.message,
-        consumedQuestionIds: pending.map(question => question.id),
-        continuation: `The controlling agent answered your question(s):\n${pending.map(question => `- ${question.message}`).join('\n')}\n\nAnswer:\n${input.message}\n\nContinue the original task. If complete, provide the final result normally.` };
+        consumedQuestionIds: answering.map(question => question.id),
+        continuation: `The controlling agent answered your question(s):\n${answering.map(question => `- ${question.message}`).join('\n')}\n\nAnswer:\n${input.message}\n\nContinue the original task. If complete, provide the final result normally.` };
       record.answers ??= [];
       record.answers.push(answer);
       record.activity = 'answer-ready';

@@ -66,7 +66,7 @@ test('a failed recovery probe never sends the waiting write', async t => {
   assert.equal(events.some(event => event.event === 'close_affected' && event.method === 'turn/start'), false);
 });
 
-test('a request joining a recovery retry sends once after the replacement passes the probe', async t => {
+test('a read joining a recovery retry reads on the replacement before the probe, while a write waits', async t => {
   const { rpc, sockets, events, nextEvent } = recoveryFixture(t);
   const recovered = [];
   rpc.subscribeRecovery(event => recovered.push(event));
@@ -77,28 +77,31 @@ test('a request joining a recovery retry sends once after the replacement passes
 
   const write = rpc.request('turn/start', {});
   const read = rpc.request('thread/read', {});
+  const readFrame = await nextEvent(event => event.event === 'send' && event.method === 'thread/read');
+  const probe = await nextEvent(event => event.event === 'send' && event.source === 'recovery-probe'
+    && event.generation !== missed.generation);
+  assert.equal(readFrame.generation, probe.generation);
+  assert.equal(sockets[1].frames.length, 2, 'the read uses the replacement candidate while only the probe is pending');
+  assert.equal(events.some(event => event.event === 'send' && event.method === 'turn/start'), false,
+    'the write stays fenced until the probe verifies this generation');
+  const readIndex = sockets[1].frames.findIndex(frame => frame.id === readFrame.commandId);
+  sockets[1].reply(readIndex, { thread: { id: 'thread-1' } });
+  assert.deepEqual(await read, { thread: { id: 'thread-1' } });
+
   let roundOpen = true;
   const stoppedWrite = rpc.request('turn/steer', {}, { blockReason: () => roundOpen ? undefined : 'round-finished' });
   const stopped = assert.rejects(stoppedWrite, { code: 'round-finished', terminal: true, notSent: true });
-  const probe = await nextEvent(event => event.event === 'send' && event.source === 'recovery-probe'
-    && event.generation !== missed.generation);
-  assert.equal(sockets[1].frames.length, 1);
   roundOpen = false;
-  sockets[1].reply(0, { data: [] });
-
+  const probeIndex = sockets[1].frames.findIndex(frame => frame.id === probe.commandId);
+  sockets[1].reply(probeIndex, { data: [] });
   const writeFrame = await nextEvent(event => event.event === 'send' && event.method === 'turn/start');
-  const readFrame = await nextEvent(event => event.event === 'send' && event.method === 'thread/read');
   assert.equal(writeFrame.generation, probe.generation);
-  assert.equal(readFrame.generation, probe.generation);
-  assert.deepEqual(recovered.map(event => event.mode), ['new']);
-  const socket = sockets[1];
-  socket.reply(socket.frames.findIndex(frame => frame.id === writeFrame.commandId), { turn: { id: 'turn-1' } });
-  socket.reply(socket.frames.findIndex(frame => frame.id === readFrame.commandId), { thread: { id: 'thread-1' } });
+  sockets[1].reply(sockets[1].frames.findIndex(frame => frame.id === writeFrame.commandId), { turn: { id: 'turn-1' } });
   assert.deepEqual(await write, { turn: { id: 'turn-1' } });
-  assert.deepEqual(await read, { thread: { id: 'thread-1' } });
   await stopped;
+  assert.deepEqual(recovered.map(event => event.mode), ['new']);
   assert.deepEqual(events.filter(event => event.event === 'send').map(event => event.method),
-    ['thread/list', 'thread/list', 'turn/start', 'thread/read']);
+    ['thread/list', 'thread/read', 'thread/list', 'turn/start']);
 });
 
 test('an admission timeout leaves the probe alone to recover and close when idle', async t => {

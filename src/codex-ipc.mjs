@@ -667,12 +667,12 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     }
     catch (error) { failedUntil = Date.now() + 5000; failure = error; throw error; }
   }
-  async function connect(target, recovery = false) {
+  async function connect(target, recovery = false, forceDiscovery = recovery) {
     // The one renderer discovery per connection; the release window check reads this same
     // `found`, so the page list and the socket can never come from different endpoints.
     emit?.('discovery_start', { generation: target.generation });
     let found;
-    try { target.discoveryDone = endpoint(recovery); found = await target.discoveryDone; }
+    try { target.discoveryDone = endpoint(forceDiscovery); found = await target.discoveryDone; }
     catch (error) {
       target.discoveryError = error;
       emit?.('discovery_error', { generation: target.generation, code: error?.code, discoveryReason: error?.discoveryReason });
@@ -985,6 +985,9 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     const cleanupDelete = method === 'futureaide/cleanup/delete';
     const release = method === 'thread/unsubscribe' || cleanupDelete;
     const background = options?.background === true && (method === 'thread/read' || method === 'thread/list');
+    // Production read-only methods: only these may use a replacement connection before
+    // the write-admission probe. Anything else, including releases and gated writes,
+    // still waits for the same-generation probe.
     const read = ['thread/read', 'thread/list', 'thread/turns/list', 'thread/items/list', 'model/list', 'config/read', 'futureaide/userInput/read'].includes(method);
     const userInputRead = method === 'futureaide/userInput/read';
     const userInputReply = method === 'futureaide/userInput/reply';
@@ -1018,7 +1021,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       }
       target = connection ?? createConnection();
       awaitingConnection = true;
-      if (target.verification) {
+      if (target.verification && !read) {
         const verified = await waitForVerification(target);
         if (!verified || connection !== target) {
           const discovery = target.discoveryError?.discoveryReason ? target.discoveryError : undefined;
@@ -1032,6 +1035,13 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         // This is the first send for this attempt, after the recovery that admitted it.
         attemptRecovery = recoverySequence;
         attemptFault = fault?.id ?? faultSequence + 1;
+      } else if (target.verification) {
+        // Read-only status must not wait behind the write-admission probe. It opens
+        // the same candidate with the normal request deadline; a failing probe still
+        // fences every write until it is verified. Discovery is forced past a cached
+        // failed probe call, which belongs to the write-admission path, not to this read.
+        target.ready ??= connect(target, false, true);
+        await target.ready;
       } else await target.ready;
       awaitingConnection = false;
       if (GATED_WRITE_METHODS.has(method) && typeof options?.blockReason === 'function') {

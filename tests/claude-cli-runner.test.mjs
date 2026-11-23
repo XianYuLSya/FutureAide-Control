@@ -209,7 +209,7 @@ test('claudeTurnArguments builds the print-mode argv and widens nothing', () => 
   assert.equal(args.includes('--model'), false);
   assert.equal(args.includes('--effort'), false);
   // Exactly the two callback tools are pre-allowed, and no bypass flag is anywhere.
-  assert.equal(args[args.indexOf('--allowedTools') + 1], 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent');
+  assert.equal(args[args.indexOf('--allowedTools') + 1], 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent,mcp__futureaide__feedback');
   for (const forbidden of ['--dangerously-skip-permissions', '--allow-dangerously-skip-permissions', '--bare']) {
     assert.equal(args.includes(forbidden), false, forbidden + ' must never be passed');
   }
@@ -229,7 +229,7 @@ test('an MCP config must declare exactly one server, and only its callbacks are 
   assert.throws(() => mcpServerFromConfig({ mcpServers: { a: {}, b: {} } }), error => error.code === 'invalid-mcp-config');
   assert.throws(() => mcpServerFromConfig({}), error => error.code === 'invalid-mcp-config');
   assert.deepEqual(allowedCallbackTools('futureaide'),
-    ['mcp__futureaide__ask_parent', 'mcp__futureaide__report_parent']);
+    ['mcp__futureaide__ask_parent', 'mcp__futureaide__report_parent', 'mcp__futureaide__feedback']);
 });
 
 test('the system prompt names both parent callbacks and the final report flag', () => {
@@ -494,7 +494,7 @@ test('the CLI receives exactly the documented argv, prompt and MCP config', { ti
   assert.equal(receipt.sessionId, SESSION);
   assert.equal(receipt.permissionMode, 'auto');
   assert.equal(receipt.permissionPrompts, 'none');
-  assert.equal(receipt.allowedTools, 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent');
+  assert.equal(receipt.allowedTools, 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent,mcp__futureaide__feedback');
   assert.deepEqual(receipt.mcpServerNames, ['futureaide']);
   assert.equal(receipt.prompt, 'Do the task.');
   assert.equal(receipt.model, 'claude-fixture-default', 'no --model was passed, so the CLI default is reported');

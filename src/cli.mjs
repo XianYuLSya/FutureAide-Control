@@ -29,6 +29,7 @@ const { values, positionals } = parseArgs({
     'from-peer-id': { type: 'string' }, 'to-peer-id': { type: 'string' }, 'exchange-id': { type: 'string' },
     'parent-exchange-id': { type: 'string' },
     'timeout-minutes': { type: 'string' },
+    id: { type: 'string' }, through: { type: 'string' }, todo: { type: 'string' },
     help: { type: 'boolean', short: 'h' },
     output: {type:'string'}, manifest: {type:'string'}, decisions: {type:'string'}, approval: {type:'string'}, ticket:{type:'string'}, 'original-id':{type:'string'},
     scopes: {type:'string'}, key: {type:'string'}, name: {type:'string'}, owner: {type:'string'}, from: {type:'string'},
@@ -37,6 +38,9 @@ const { values, positionals } = parseArgs({
 });
 
 const usage = `futureaide-control <connect|status|sessions|read|send|wait|watch|cancel|models|notify|codex-status|profiles|profile-create|create-session|select-model|capabilities|host-install|host-status>
+  feedback-pending
+  feedback-organize --id ID --through N --todo KEY --message-file FILE
+  feedback-todos
   spawn-agent --workspace ABSOLUTE_PATH --message TEXT [--task-name NAME] [--request-id ID]
               [--project-workspace PROJECT_ROOT] [--project-name TITLE]
               [--codex-thread-id UUID]   Bind THIS agent's completion notice to that chat; omit for report-only
@@ -102,8 +106,10 @@ if (values.help || !positionals.length) {
 } else {
   try {
     const command = positionals[0];
+    const feedback = command.startsWith('feedback-') ? await import('./feedback-inbox.mjs') : null;
     values.config = await maintenanceConfigPath(values.config, path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
-    const control = ['profiles', 'profile-create','cleanup'].includes(command) ? undefined : createControl(await loadConfig(values.config, values.profile));
+    const control = feedback || ['profiles', 'profile-create', 'cleanup'].includes(command)
+      ? undefined : createControl(await loadConfig(values.config, values.profile));
     const sessionId = values['session-id'];
     const number = name => {
       if (values[name] === undefined) return undefined;
@@ -199,6 +205,18 @@ if (values.help || !positionals.length) {
       }
     };
     switch (command) {
+      case 'feedback-pending':
+        result = feedback.pendingFeedback((await loadConfig(values.config)).configFile);
+        break;
+      case 'feedback-organize':
+        result = feedback.organizeFeedback((await loadConfig(values.config)).configFile, {
+          id: values.id, through: number('through'), todo: values.todo,
+          message: values['message-file'] ? await readFile(values['message-file'], 'utf8') : undefined,
+        });
+        break;
+      case 'feedback-todos':
+        result = feedback.feedbackTodos((await loadConfig(values.config)).configFile);
+        break;
       case 'cleanup': result = await (await import('./cleanup-command.mjs')).cleanupCommand(positionals[1],values); break;
       case 'register-peer': result = await (await peers()).register({ peerId: values['peer-id'], kind: values.kind, workspace: values.workspace, threadId: values['codex-thread-id'], agentId: values['agent-id'], label: values.label }); break;
       case 'list-peers': result = await (await peers()).list({ workspace: values.workspace }); break;
@@ -248,10 +266,12 @@ if (values.help || !positionals.length) {
       case 'codex-status': result = await control.codexStatus(); break;
       default: throw new Error('Unknown command. Use --help.');
     }
-    console.log(boundedOutput(result));
+    console.log(command.startsWith('feedback-') ? JSON.stringify(result, null, 2) : boundedOutput(result));
     if (result?.error || result?.connected === false || result?.ready === false || result?.available === false || (result?.duplicate && !result?.delivered && !result?.accepted)) process.exitCode = 1;
   } catch (error) {
-    console.error(JSON.stringify(errorResult(error), null, 2));
+    const feedbackError = positionals[0]?.startsWith('feedback-');
+    console.error(JSON.stringify(feedbackError ? { code: 'feedback-command-failed',
+      message: 'Check the feedback ID, reviewed count, todo key, summary file and local inbox access.' } : errorResult(error), null, 2));
     process.exitCode = 1;
   }
 }

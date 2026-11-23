@@ -2201,3 +2201,27 @@ test('a reminder that did arrive keeps the task running while the model works', 
     assert.equal(f.record().task.state, 'running');
   } finally { f.service.close(); }
 });
+
+test('created run failure follows its generated name and never a replacement round', async () => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
+  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
+  const { registerScopedTools } = await import('../src/mcp-server.mjs');
+  const { pendingFeedback } = await import('../src/feedback-inbox.mjs');
+  const f = await fixture(); const original = f.api.hostStatus; let probes = 0;
+  f.api.hostStatus = async () => { if (++probes > 1) throw Object.assign(new Error('fixture probe'), {code:'host-probe-failed'}); return original(); };
+  const server = new McpServer({name:'feedback-test',version:'1'}); registerScopedTools(server,{service:f.service});
+  const client = new Client({name:'feedback-test',version:'1'}); const [a,b] = InMemoryTransport.createLinkedPair(); await server.connect(b); await client.connect(a);
+  try {
+    const run = JSON.parse((await client.callTool({name:'futureaide_run_agent',arguments:{message:'x'},_meta:{threadId:A}})).content[0].text);
+    assert.equal(run.created,true); assert.equal(run.error.code,'host-probe-failed');
+    const first = JSON.parse((await client.callTool({name:'futureaide_feedback',arguments:{name:run.name,kind:'problem',message:'creation dispatch failed'},_meta:{threadId:A}})).content[0].text);
+    assert.equal(first.saved,true);
+    let rows = pendingFeedback(path.join(f.stateDirectory,'config.json')).flatMap(x=>x.occurrences);
+    assert.equal(rows.find(x=>x.message==='creation dispatch failed').error.code,'host-probe-failed');
+    const record = f.record(run.name); record.task = {taskId:'replacement-task',startedAt:new Date().toISOString(),dispatches:[],reports:[]}; f.store.save(record);
+    await client.callTool({name:'futureaide_feedback',arguments:{name:run.name,kind:'problem',message:'new round'},_meta:{threadId:A}});
+    rows = pendingFeedback(path.join(f.stateDirectory,'config.json')).flatMap(x=>x.occurrences);
+    assert.equal(rows.find(x=>x.message==='new round').error,null);
+  } finally { await client.close(); await server.close(); f.service.close(); }
+});

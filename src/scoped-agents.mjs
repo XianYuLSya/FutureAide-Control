@@ -1,3 +1,4 @@
+
 import { createHash, randomUUID } from 'node:crypto';
 import { withCodexInstrumentation, getCodexInstrumentation, codexInstrumentationEnabled } from './codex-instrumentation.mjs';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
@@ -5,6 +6,7 @@ import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/p
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createControl, endedState, modelTurnError } from './control.mjs';
+import { feedbackRecordError, submitFeedback } from './feedback-client.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { actualModelName, resolveModelSelection, sameModelSelection } from './model-selection.mjs';
@@ -803,7 +805,7 @@ export function createScopedAgents(config, {
   const settings = record => ({ ...config, target: targetOf(record), workspace: record.workspace,
     stateDirectory: agentDirectory(record), codexThreadId: undefined, futureaideSessionId: undefined });
   const hostArgs = record => ({ ownerId: record.ownerId, agentId: record.agentId,
-    sessionId: record.sessionId, workspace: record.workspace, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
+    sessionId: record.sessionId, workspace: record.workspace, feedbackAgentName: record.name ?? null, feedbackCallerHost: store.owner(record.ownerId)?.source ?? null, treeProtocol: TREE_PROTOCOL, reportProtocol: REPORT_PROTOCOL,
     ...(record.task ? { taskId: record.task.taskId } : {}) });
   // Handles an adapter needs on the shared side: the target's own state in its own
   // row (never inside the record the shared layer will save again) and one host
@@ -834,7 +836,7 @@ export function createScopedAgents(config, {
         readParentSubmissions: () => readParentSubmissions(load()),
         claudeReportConfig: requestId => ({ mcpServers: { futureaide: { type: 'stdio', command: process.execPath,
           args: [fileURLToPath(new URL('./mcp-server.mjs', import.meta.url)), '--claude-cli-reports',
-            store.location, record.agentId, load().task.taskId, requestId,
+            store.location, record.agentId, load().task.taskId, requestId, config.configFile ?? '',
             ...(config.idleSessionCleanup === false ? ['--no-idle-session-cleanup'] : [])] } } }),
       } : {}),
       // The Codex probe reads its protocol readiness only; this must never start a
@@ -4078,6 +4080,7 @@ export function createScopedAgents(config, {
         record.modelPin = await resolveRequestedPin(record, { model, effort });
       }
       store.insert(record, { requireOpenParent: Boolean(parent) });
+      if (extra) extra[Symbol.for('futureaide.feedbackDispatchScope')] = { agentId: record.agentId, taskId: null };
       return store.locked(record.agentId, async () => {
         if (!store.get(record.agentId)) throw new Error('This subagent was removed while it was being created.');
         try {
@@ -4420,6 +4423,7 @@ export function createScopedAgents(config, {
           return operation(latest);
         }
         record = next;
+        if (extra) extra[Symbol.for('futureaide.feedbackDispatchScope')] = { agentId: record.agentId, taskId: record.task.taskId };
         if (targetOf(record) !== 'dsh') {
           await ensureWorker(record, { wake: true });
           return { ...queued(record, pin, { requestId, mode: effectiveMode(record, { start: true }),
@@ -4725,6 +4729,49 @@ export function createScopedAgents(config, {
      * argument) through the binding its backend recorded, and the submission joins
      * the same task so the one state machine delivers it to the parent.
      */
+    feedbackScope(tool, args, extra) {
+      const caller = trustedCaller(extra);
+      if (tool === 'feedback' || tool === 'report_parent' || tool === 'ask_parent') {
+        if (caller) return '';
+        const bound = store.agentForCodexThread(callingThread(extra));
+        const record = bound && store.get(bound.agentId);
+        return record ? [record.agentId, record.task?.taskId ?? ''].join(':') : '';
+      }
+      if (!args?.name) return '';
+      const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+      const record = store.named(ownerId, args.name);
+      return record ? [record.agentId, record.task?.taskId ?? ''].join(':') : 'unbound';
+    },
+    async submitCallerFeedback({ name, ...input }, extra, error, deadline) {
+      const caller = trustedCaller(extra);
+      const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+      const record = name ? store.named(ownerId, name) : null;
+      return submitFeedback(input, {
+        source: caller?.source ?? 'codex-desktop',
+        caller: caller?.source ?? 'codex-desktop',
+        target: name ? (record ? targetOf(record) : null) : 'plugin',
+        name: record?.name ?? null,
+        error: feedbackRecordError(record, error),
+      }, { configFile: config.configFile, deadline });
+    },
+    async submitManagedFeedback(input, extra, error, deadline) {
+      const bound = store.agentForCodexThread(callingThread(extra));
+      const record = bound && store.get(bound.agentId);
+      if (!record || record.closed || !record.task || ['idle', 'failed'].includes(record.state)
+          || isCancelledRound(record) || record.task.reports?.some(report => report.final)
+          || store.submissions(record.agentId, record.task.taskId).some(report => report.final)) {
+        throw Object.assign(new Error('This caller has no active managed task.'), { code: 'submission-not-owned' });
+      }
+      const currentError = error && record.task.startedAt && Date.parse(error.at) >= Date.parse(record.task.startedAt)
+        ? error : null;
+      return submitFeedback(input, {
+        source: 'codex-desktop',
+        caller: store.owner(record.ownerId)?.source ?? null,
+        target: 'codex-desktop',
+        name: record.name ?? null,
+        error: feedbackRecordError(record, currentError),
+      }, { configFile: config.configFile, deadline });
+    },
     async submitToParent({ kind, message, final = false }, extra) {
       textMessage(message);
       if (!['ask', 'report'].includes(kind)) throw new Error('kind must be ask or report.');

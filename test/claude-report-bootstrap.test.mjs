@@ -317,3 +317,62 @@ test('a bridge without configuration reports that instead of serving silence', a
     assert.equal(JSON.parse(result.content[0].text).error.code, 'configuration-unavailable');
   } finally { await close(); await bridge.close(); }
 });
+
+test('feedback lost reply is never replayed and tells secretary to check inbox', async () => {
+  const dead = remote({ tools: [{ name: 'futureaide_feedback', inputSchema: { type: 'object' } }], onCall: async () => { throw Error('lost after write'); } });
+  const { bridge } = await bridgeWith({ remotes: [dead] });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    const result = await client.callTool({ name: 'futureaide_feedback', arguments: { kind: 'problem', message: 'lost receipt' } });
+    assert.equal(dead.calls.length, 1);
+    assert.match(result.content[0].text, /write-outcome-unknown/);
+    assert.match(result.content[0].text, /secretary.*inbox.*do not resend/i);
+  } finally { await close(); await bridge.close(); }
+});
+import { mkdtemp } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { submitFeedback } from '../src/feedback-client.mjs';
+import { pendingFeedback } from '../src/feedback-inbox.mjs';
+
+test('feedback actually saved before reply loss remains one write', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'feedback-bootstrap-'));
+  const configFile = path.join(root, 'config.json');
+  const dead = remote({ tools: [{ name: 'futureaide_feedback', inputSchema: { type: 'object' } }], onCall: async () => {
+    const saved = await submitFeedback({kind:'problem',message:'response lost after successful save'}, {source:'claude-desktop',caller:'claude-desktop',target:'plugin',name:null,error:null}, {configFile});
+    assert.equal(saved.saved, true);
+    throw Error('connection closed after commit');
+  } });
+  const { bridge } = await bridgeWith({ remotes: [dead] });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    const response = await client.callTool({name:'futureaide_feedback',arguments:{kind:'problem',message:'response lost after successful save'}});
+    assert.equal(dead.calls.length, 1);
+    assert.match(response.content[0].text, /write-outcome-unknown/);
+    assert.match(response.content[0].text, /secretary.*inbox.*do not resend/i);
+    const rows = pendingFeedback(configFile); assert.equal(rows.length,1); assert.equal(rows[0].count,1); assert.equal(rows[0].occurrences.length,1);
+    assert.equal(pendingFeedback(configFile)[0].count,1);
+  } finally { await close(); await bridge.close(); }
+});
+
+test('a timed out feedback does not close the shared client or interrupt another write', async () => {
+  let completeFeedback;
+  const slow = new Promise(resolve => { completeFeedback = resolve; });
+  let closed = 0;
+  const remoteServer = remote({ tools: [{name:'futureaide_feedback',inputSchema:{type:'object'}},{name:'futureaide_run_agent',inputSchema:{type:'object'}}], onCall: async request => request.name === 'futureaide_feedback' ? slow : {content:[{type:'text',text:'{"accepted":true}'}]} });
+  remoteServer.client.close = async () => { closed++; };
+  const { bridge } = await bridgeWith({remotes:[remoteServer]});
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    const pending = client.callTool({name:'futureaide_feedback',arguments:{kind:'problem',message:'wait'}});
+    await new Promise(resolve => setTimeout(resolve,30));
+    const dispatch = await client.callTool({name:'futureaide_run_agent',arguments:{}});
+    assert.equal(JSON.parse(dispatch.content[0].text).accepted,true);
+    const reply = await pending;
+    assert.match(reply.content[0].text,/write-outcome-unknown/); assert.equal(closed,0);
+    completeFeedback({content:[{type:'text',text:'{"saved":true}'}]});
+    await new Promise(resolve => setTimeout(resolve,20)); assert.equal(closed,0);
+    const again = await client.callTool({name:'futureaide_run_agent',arguments:{}});
+    assert.equal(JSON.parse(again.content[0].text).accepted,true);
+  } finally { completeFeedback({}); await close(); await bridge.close(); }
+});

@@ -2099,7 +2099,8 @@ export function createScopedAgents(config, {
           : delivery === 'blocked' ? 'blocked' : delivery === 'unknown' ? 'unknown' : 'queued',
         accepted ? null : dispatch.error?.code ?? sent.reason ?? null, dispatchReceipt(dispatch));
       }
-      if (!accepted && (['retryable', 'retrying'].includes(dispatch.state) || sent.status === 'retryable')) {
+      if (!accepted && (['retryable', 'retrying'].includes(dispatch.state)
+          || (sent.status === 'retryable' && dispatch.state !== 'queued'))) {
         if (target === 'dsh' && sent.notSent === true && (['managed-turn-ended', 'managed-turn-changed', 'managed-turn-unknown'].includes(sent.code) || dshDefaultOnly(record))) {
           delete dispatch.deliveryIntent; delete dispatch.deliveryModel; delete dispatch.deliverySelection; dispatch.modelReady = false;
         }

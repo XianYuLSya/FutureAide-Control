@@ -3384,13 +3384,13 @@ export function createScopedAgents(config, {
       delete dispatch.deliverySelection; delete dispatch.deliveryModel;
     }
     if (receipt.status === 'rejected') {
-      dispatch.state = 'failed'; dispatch.accepted = false;
+      dispatch.state = 'failed'; dispatch.accepted = false; dispatch.delivery = 'blocked';
       if (answer) dispatch.error ??= { code: 'codex-delivery-refused',
         message: 'The native side rejected this answer; it was not written.' };
       else dispatch.error = receipt.error ?? { code: receipt.code ?? 'send-rejected', message: receipt.message ?? 'The input was not accepted.' };
     }
     if (receipt.status === 'failed') {
-      dispatch.state = 'failed'; dispatch.accepted = false;
+      dispatch.state = 'failed'; dispatch.accepted = false; dispatch.delivery = 'blocked';
       dispatch.error = receipt.error ?? { code: receipt.code ?? 'send-rejected', message: receipt.message ?? 'The input was not accepted.' };
     }
     if (receipt.status === 'retryable') {

@@ -171,6 +171,30 @@ test('list and wait answer compactly and return the full structure only for deta
   } finally { await close(); }
 });
 
+test('event wait preserves dispatch keys, response cursor and request-scoped progress', async () => {
+  const events = [{ id: 'report-1', type: 'report', message: 'answer' }];
+  const progress = [];
+  const { client, close } = await connected({
+    async resume() {},
+    async wait(options) {
+      assert.deepEqual(options.taskKeys, ['dispatch-1']);
+      assert.equal(options.after, 'previous');
+      assert.equal(options.timeoutSeconds, undefined);
+      return { events, nextCursor: 'next', reason: 'event' };
+    },
+  });
+  try {
+    const response = await client.callTool({ name: 'futureaide_wait_agents',
+      arguments: { taskKeys: ['dispatch-1'], after: 'previous' } }, undefined,
+    { onprogress: value => progress.push(value) });
+    const value = JSON.parse(response.content[0].text);
+    assert.deepEqual(value.events, events);
+    assert.equal(value.nextCursor, 'next');
+    assert.equal(value.reason, 'event');
+    assert.equal(progress.length, 1);
+  } finally { await close(); }
+});
+
 test('a compact view still reports a failed status as an error', async () => {
   let response = { ready: true, contextVerified: true, dshConnected: true,
     backends: { dsh: { ready: true, connected: true }, 'codex-desktop': { ready: true, present: true, methods: ['probe', 'create'], treeProtocol: 1 } } };

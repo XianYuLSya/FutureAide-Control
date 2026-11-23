@@ -11,6 +11,7 @@ import { monitorSpawn } from '../src/shared-monitor.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
 import { createAuthority, openAuthority } from '../src/cleanup-authority.mjs';
+import { readRosterTree, claimRosterTree, recordRosterStep, completeRosterTicket } from '../src/cleanup-roster-transaction.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const A = '11111111-1111-4111-8111-111111111111';
@@ -20,11 +21,11 @@ const extra = threadId => ({ _meta: { threadId } });
 const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
 async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles,
-  callCodex: callCodexOverride, config: extraConfig = {} } = {}) {
+  callCodex: callCodexOverride, store: injectedStore, config: extraConfig = {} } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
-  const store = new RosterStore(':memory:');
+  const store = injectedStore ?? new RosterStore(':memory:');
   const sessions = new Map();
   const sends = [], notices = [], removed = [], workers = [], reads = [], cancellations = [], beginnings = [], historyRequests = [];
   let offline = false, notificationMode = 'ok', statusCalls = 0, catalogCalls = 0, cursorCalls = 0;
@@ -1601,7 +1602,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   ];
   f.store.save(record);
   const result = await f.service.send({ name: 'artist', message: 'private supplement' }, extra(A));
-  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'delivery', 'mode', 'name', 'queued', 'requestId', 'state']);
+  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'delivery', 'mode', 'name', 'queued', 'requestId', 'state', 'taskKey']);
   assert.equal(result.accepted, true);
   assert.equal(result.callbackError.code, 'native-callback-unavailable');
   assert.doesNotMatch(JSON.stringify(result), /private|deep child|coverage/);
@@ -2224,4 +2225,333 @@ test('created run failure follows its generated name and never a replacement rou
     rows = pendingFeedback(path.join(f.stateDirectory,'config.json')).flatMap(x=>x.occurrences);
     assert.equal(rows.find(x=>x.message==='new round').error,null);
   } finally { await client.close(); await server.close(); f.service.close(); }
+});
+
+test('task-key wait replays reports, isolates owners and respects cursors and cancellation', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
+    assert.ok(sent.taskKey);
+    const r = f.record();
+    const controller = new AbortController();
+    const pending = f.service.wait({ taskKeys: [sent.taskKey] }, { ...extra(A), signal: controller.signal });
+    f.store.enqueueSubmission({ id: 'wait-stage', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId,
+      kind: 'report', message: 'stage ready', final: false });
+    const first = await pending;
+    assert.equal(first.events[0].type, 'report');
+    assert.equal(first.events[0].message, 'stage ready');
+    const replay = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.equal(replay.events[0].id, first.events[0].id);
+    const next = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(next.events.length, 0);
+    f.store.enqueueSubmission({ id: 'wait-skew', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId,
+      kind: 'report', message: 'later insert', created: '2000-01-01T00:00:00.000Z' });
+    const skew = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(skew.events[0].message, 'later insert');
+    await assert.rejects(f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(B)), { code: 'task-receipt-unavailable' });
+    const cancel = new AbortController();
+    const blocked = f.service.wait({ taskKeys: [sent.taskKey], after: skew.nextCursor }, { ...extra(A), signal: cancel.signal });
+    cancel.abort();
+    await assert.rejects(blocked, { name: 'AbortError' });
+  } finally { f.service.close(); }
+});
+
+
+test('task-key wait reads the original archived round after a new round', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'old', lifetime: 'persistent' }, extra(A));
+    const previous = f.record();
+    previous.state = 'failed'; previous.task.state = 'failed';
+    previous.task.error = { code: 'old-failure' };
+    f.store.save(previous);
+    const replacement = { ...previous, state: 'running', error: undefined,
+      task: { taskId: 'new-task', requestId: 'new-request', message: 'new', state: 'running', dispatches: [] } };
+    assert.equal(f.store.replaceTask(replacement, previous, { ...previous.task }), true);
+    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.equal(result.items[0].task.text, 'old');
+    assert.equal(result.events[0].type, 'failed');
+    assert.equal(result.events[0].reason.code, 'old-failure');
+  } finally { f.service.close(); }
+});
+
+
+test('task-key wait returns native questions and task reports once', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
+    const record = f.record();
+    record.task.reports = [{ id: 'native-report', message: 'checkpoint', final: false, delivery: { state: 'pending' } }];
+    record.observation = { questions: [{ id: 'native-question', state: 'pending', message: 'Which option?' }] };
+    f.store.save(record);
+    const first = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.deepEqual(first.events.map(event => event.type), ['report', 'question']);
+    const next = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(next.events.length, 0);
+  } finally { f.service.close(); }
+});
+
+
+test('native question cursor does not repeat survivors and pages without loss', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
+    const r = f.record();
+    r.observation = { questions: Array.from({ length: 6 }, (_, i) => ({ id: 'q' + i, state: 'pending', message: String(i).repeat(4000) })) };
+    f.store.save(r);
+    const first = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.ok(first.events.length < 6);
+    const second = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(first.events.length + second.events.length, 6);
+    const current = f.record(); current.observation.questions = [current.observation.questions[0]]; f.store.save(current);
+    const third = await f.service.wait({ taskKeys: [sent.taskKey], after: second.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(third.events.length, 0);
+  } finally { f.service.close(); }
+});
+
+test('supplement key begins after existing reports and does not duplicate submissions', async () => {
+  const f = await fixture();
+  try {
+    await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
+    const r = f.record();
+    f.store.enqueueSubmission({ id: 'old', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId, kind: 'report', message: 'old' });
+    const sent = await f.service.send({ name: 'artist', message: 'continue' }, extra(A));
+    f.store.enqueueSubmission({ id: 'new', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId, kind: 'report', message: 'new' });
+    const latest = f.record(); latest.task.reports = [{ id: 'submission:new', message: 'new', final: false, delivery: { state: 'pending' } }]; f.store.save(latest);
+    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.deepEqual(result.events.map(event => event.message), ['new']);
+  } finally { f.service.close(); }
+});
+
+for (const automatic of [true, false]) test(`${automatic ? 'automatic' : 'manual'} tree cleanup handles child receipt`, async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: automatic ? 'once' : 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'parent' }, extra(A));
+    await f.service.create({ name: 'child', lifetime: 'persistent' }, extra(A));
+    const parent = f.record(), child = f.record('child');
+    child.parentAgentId = parent.agentId;
+    child.task = { taskId: 'child-task', state: 'completed', reports: [{ id: 'submission:child-final', final: true, delivery: { state: 'delivered' } }], dispatches: [] };
+    child.observation = { tree: { settled: true, running: false }, questions: [] };
+    f.store.save(child);
+    const key = f.store.saveTaskKey(child.ownerId, child.agentId, 'child-request', 'child-task');
+    if (automatic) {
+      const ready = f.store.get(parent.agentId);
+      ready.task.reports = [{ id: 'parent-final', final: true, delivery: { state: 'delivered' } }];
+      f.store.save(ready);
+      assert.equal(f.store.claimAutoCleanup(ready), true);
+      await f.service.poll(parent.agentId);
+    }
+    else await f.service.delete({ name: 'artist' }, extra(A));
+    assert.equal(f.store.get(child.agentId), undefined, JSON.stringify(f.store.get(parent.agentId)));
+    const mapping = f.store.resolveTaskKey(child.ownerId, key);
+    if (automatic) assert.equal(mapping.receipt.finalSubmissionId, 'child-final');
+    else assert.equal(mapping, null);
+  } finally { f.service.close(); }
+});
+
+test('public delete retry after a busy automatic cleanup retains the confirmed receipt', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    const sent = await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    const parent = f.record();
+    parent.task.reports = [{ id: 'submission:busy-final', final: true, delivery: { state: 'delivered' } }]; f.store.save(parent);
+    assert.equal(f.store.claimAutoCleanup(parent), true);
+    const prepare = f.store.db.prepare.bind(f.store.db);
+    f.store.db.prepare = sql => /wal_checkpoint/i.test(sql) ? { get: () => ({ busy: 1 }) } : prepare(sql);
+    try { await f.service.poll(parent.agentId); } finally { f.store.db.prepare = prepare; }
+    assert.equal(f.record().state, 'cleanup_failed');
+    await f.service.delete({ name: 'artist' }, extra(A));
+    assert.equal(f.store.resolveTaskKey(parent.ownerId, sent.taskKey).receipt.finalSubmissionId, 'busy-final');
+  } finally { f.service.close(); }
+});
+
+test('automatic child cleanup retries an uncertain destroy with its original source', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'parent' }, extra(A));
+    await f.service.create({ name: 'child', lifetime: 'persistent' }, extra(A));
+    const parent = f.record(), child = f.record('child'); child.parentAgentId = parent.agentId;
+    child.task = { taskId: 'child-task', state: 'completed', reports: [{ id: 'child-final', final: true, delivery: { state: 'delivered' } }], dispatches: [] };
+    f.store.save(child);
+    const key = f.store.saveTaskKey(child.ownerId, child.agentId, 'child-request', 'child-task');
+    parent.task.reports = [{ id: 'parent-final', final: true, delivery: { state: 'delivered' } }]; f.store.save(parent);
+    assert.equal(f.store.claimAutoCleanup(parent), true);
+    const destroy = f.api.managedDestroy; let failed = false;
+    f.api.managedDestroy = async input => {
+      if (!failed && input.sessionId === child.sessionId) { failed = true; throw Object.assign(new Error('unknown'), { uncertain: true }); }
+      return destroy(input);
+    };
+    await f.service.poll(parent.agentId);
+    const retry = f.store.get(child.agentId);
+    assert.equal(retry.autoCleanupClosed, true);
+    retry.nextAttemptAt = 0; f.store.save(retry);
+    await f.service.poll(child.agentId);
+    assert.equal(f.store.resolveTaskKey(child.ownerId, key).receipt.finalSubmissionId, 'child-final');
+  } finally { f.service.close(); }
+});
+
+test('cleanup ticket preserves the old wait receipt across same-name replacement', async () => {
+  const dir = await mkdtemp(path.join(workspace, 'clean', 'scoped-tests', 'ticket-wait-'));
+  const file = path.join(dir, 'roster.sqlite');
+  const store = new RosterStore(file); const f = await fixture({ store });
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'old', lifetime: 'once' }, extra(A));
+    const old = f.record();
+    old.task.reports = [{ id: 'submission:ticket-final', final: true, message: 'private', delivery: { state: 'delivered' } }];
+    store.save(old);
+    const tree = readRosterTree(file, old.agentId);
+    claimRosterTree(file, { rootId: old.agentId, fingerprint: tree.fingerprint, ticketId: 'ticket-wait' });
+    recordRosterStep(file, 'ticket-wait', old.agentId, 'native-complete', { removed: true });
+    recordRosterStep(file, 'ticket-wait', old.agentId, 'private-complete', { removed: true });
+    completeRosterTicket(file, 'ticket-wait');
+    const replacement = await f.service.run({ name: 'artist', message: 'new', lifetime: 'persistent' }, extra(A));
+    const oldWait = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    const newWait = await f.service.wait({ taskKeys: [replacement.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.notEqual(replacement.taskKey, sent.taskKey);
+    assert.equal(oldWait.events[0].type, 'delivered');
+    assert.equal(oldWait.events[0].id, `${sent.taskKey}:delivered:ticket-final`);
+    assert.equal(newWait.events.some(event => event.type === 'delivered'), false);
+  } finally { f.service.close(); }
+});
+
+test('send returns its original key without rechecking a reused name', async () => {
+  const f = await fixture();
+  try {
+    await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
+    const send = f.service.sendUnkeyed; let originalAgent;
+    f.service.sendUnkeyed = async (...args) => {
+      const result = await send(...args); const old = f.record(); originalAgent = old.agentId;
+      old.task.reports = [{ id: 'submission:cleanup-final', final: true, message: 'done', delivery: { state: 'delivered' } }];
+      f.store.save(old); f.store.remove(old, { deliveredReceipt: true });
+      f.store.insert({ ...old, agentId: 'replacement-agent', sessionId: 'replacement-session',
+        task: { taskId: 'replacement-task', requestId: 'replacement-request', state: 'running', reports: [] } });
+      return result;
+    };
+    const sent = await f.service.send({ name: 'artist', message: 'next' }, extra(A));
+    const mapping = f.store.resolveTaskKey(ownerIdFor(A), sent.taskKey);
+    assert.equal(mapping.requestId, sent.requestId);
+    assert.equal(mapping.agentId, originalAgent);
+    assert.equal(mapping.receipt.finalSubmissionId, 'cleanup-final');
+  } finally { f.service.close(); }
+});
+
+test('wait rechecks the receipt when cleanup commits between mapping and record reads', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
+    const r = f.record(); r.task.reports = [{ id: 'submission:done', final: true, message: 'done', delivery: { state: 'delivered' } }]; f.store.save(r);
+    const get = f.store.get.bind(f.store); let fired = false;
+    f.store.get = id => { if (!fired && id === r.agentId) { fired = true; f.store.remove(r, { deliveredReceipt: true }); return undefined; } return get(id); };
+    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.equal(result.events[0].type, 'delivered');
+  } finally { f.service.close(); }
+});
+
+
+test('wait surfaces the requested blocked supplement and undelivered answer', async () => {
+  const f = await fixture();
+  try {
+    await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
+    const accepted = await f.service.send({ name: 'artist', message: 'accepted' }, extra(A));
+    assert.equal(f.store.supplement(accepted.requestId).status, 'accepted');
+    assert.equal(f.store.setSupplement(accepted.requestId, 'blocked', 'dispatch-expired'), false);
+    assert.equal(f.store.supplement(accepted.requestId).status, 'accepted');
+    await f.service.wait({ taskKeys: [accepted.taskKey], timeoutSeconds: 0 }, extra(A));
+    const current = f.record(); let release;
+    const held = f.store.locked(current.agentId, () => new Promise(resolve => { release = resolve; }));
+    await new Promise(resolve => setImmediate(resolve));
+    let sent;
+    try { sent = await f.service.send({ name: 'artist', message: 'next' }, extra(A)); }
+    finally { release(); await held; }
+    assert.equal(f.store.supplement(sent.requestId).status, 'queued');
+    f.store.db.prepare('UPDATE supplements SET created=? WHERE requestId=?').run('2020-01-01T00:00:00.000Z', sent.requestId);
+    await f.service.poll(current.agentId);
+    assert.equal(f.store.supplement(sent.requestId).reason, 'dispatch-expired');
+    await assert.rejects(f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A)), error => error.code === 'dispatch-expired' && error.requestId === sent.requestId);
+    const r = f.record(); r.task.answers = [{ answerId: 'bad-answer', message: 'x', undelivered: 'final-submitted' }];
+    assert.equal(f.store.saveAnswerWithTaskKey(r, 'bad-answer'), true);
+    const key = f.store.taskKeyForRequest(r.ownerId, 'bad-answer');
+    await assert.rejects(f.service.wait({ taskKeys: [key], timeoutSeconds: 0 }, extra(A)), error => error.code === 'final-submitted' && error.requestId === 'bad-answer');
+  } finally { f.service.close(); }
+});
+
+
+test('task-key wait reads under a concurrent WAL writer lock', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const dir = await mkdtemp(path.join(workspace, 'clean', 'scoped-tests', 'wal-'));
+  const file = path.join(dir, 'roster.sqlite');
+  const store = new RosterStore(file); const f = await fixture({ store });
+  const writer = new DatabaseSync(file);
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
+    store.db.exec('PRAGMA busy_timeout=50'); writer.exec('BEGIN IMMEDIATE');
+    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.equal(result.reason, 'timeout');
+    writer.exec('ROLLBACK');
+  } finally { writer.close(); f.service.close(); }
+});
+
+
+test('old task key keeps the original terminal reason after poll and a new send', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
+    f.finish(); const r = f.record(), session = f.sessions.get(r.sessionId);
+    Object.assign(session.turns.get(r.task.dispatches[0].requestId), { messages: [], completionReason: { kind: 'error', error: { code: 'SERVER', message: '503: {"code":"no_healthy_account"}' } } });
+    const failed = await f.service.poll(r.agentId);
+    assert.equal(failed.state, 'failed');
+    await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
+    const old = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.equal(old.events.find(event => event.type === 'failed')?.reason?.code, 'no_healthy_account');
+  } finally { f.service.close(); }
+});
+
+
+test('native questions survive disappearance, pagination beyond 128 and task archive', async () => {
+  const f = await fixture();
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
+    let old = f.record();
+    old.observation = { questions: Array.from({ length: 129 }, (_, i) => ({ id: 'historical-' + i, state: 'pending', message: 'question ' + i + ' ' + 'x'.repeat(3900) })) };
+    f.store.save(old);
+    old = f.record(); old.observation = { questions: [] }; old.state = 'failed'; old.task.state = 'failed'; f.store.save(old);
+    const next = { ...old, state: 'running', task: { taskId: 'next-round', requestId: 'next-request', message: 'next', state: 'running', reports: [] } };
+    assert.equal(f.store.replaceTask(next, old, { ...old.task }), true);
+    let after, all = [];
+    do {
+      const result = await f.service.wait({ taskKeys: [sent.taskKey], ...(after ? { after } : {}), timeoutSeconds: 0 }, extra(A));
+      all.push(...result.events.filter(event => event.type === 'question'));
+      after = result.nextCursor;
+      assert.ok(after.length < 1500);
+      if (!result.events.length) break;
+    } while (true);
+    assert.equal(all.length, 129);
+    assert.equal(new Set(all.map(event => event.id)).size, 129);
+    assert.match(all[0].message, /^question 0 /);
+    assert.match(all[128].message, /^question 128 /);
+  } finally { f.service.close(); }
+});
+
+
+test('unselected wait returns a report with 161 selected tasks and a compact cursor', async () => {
+  const f = await fixture();
+  try {
+    await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
+    const root = f.record();
+    for (let i = 0; i < 160; i++) {
+      const record = { ...root, agentId: 'many-agent-' + i, name: 'many-' + i, sessionId: 'many-session-' + i,
+        task: { taskId: 'many-task-' + i, requestId: 'many-request-' + i, message: 'work', state: 'running', reports: [] } };
+      f.store.insert(record);
+    }
+    f.store.enqueueSubmission({ id: 'many-report', ownerId: root.ownerId, agentId: root.agentId, taskId: root.task.taskId, kind: 'report', message: 'only report' });
+    const result = await f.service.wait({}, extra(A));
+    assert.equal(result.events.length, 1);
+    assert.equal(result.events[0].message, 'only report');
+    assert.ok(result.nextCursor.length < 500);
+    const replay = await f.service.wait({ after: result.nextCursor, timeoutSeconds: 0 }, extra(A));
+    assert.equal(replay.events.length, 0);
+  } finally { f.service.close(); }
 });

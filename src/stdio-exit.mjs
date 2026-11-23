@@ -109,3 +109,18 @@ export function exitWhenInputCloses({ transport, close = async () => {}, graceMs
     else throw error;
   });
 }
+// Event waits belong to the input connection even when idle-process cleanup is off.
+export function stdioWaitSignal(input = process.stdin) {
+  const controller = new AbortController();
+  const abort = () => {
+    input.removeListener('end', abort);
+    input.removeListener('close', abort);
+    controller.abort(new Error('The calling MCP input closed.'));
+  };
+  if (input.readableEnded || input.destroyed) abort();
+  else {
+    input.once('end', abort);
+    input.once('close', abort);
+  }
+  return controller.signal;
+}

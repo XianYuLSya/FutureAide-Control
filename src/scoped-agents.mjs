@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { withCodexInstrumentation, getCodexInstrumentation, codexInstrumentationEnabled } from './codex-instrumentation.mjs';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
 import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { watch } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createControl, endedState, modelTurnError } from './control.mjs';
@@ -14,7 +15,7 @@ import { callCodexOwner, readCodexOwnerTurns, readCodexOwnerItems } from './code
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-sessions.mjs';
-import { isCancelledRound, RosterStore, submissionNoticeId, submissionRef } from './roster-store.mjs';
+import { captureNativeQuestionHistory, isCancelledRound, RosterStore, submissionNoticeId, submissionRef } from './roster-store.mjs';
 import { canReleaseThreads, canSleep, hasPendingDelivery, RELEASE_RECHECK_MS, releaseDue,
   releaseRetryDelay } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
@@ -695,6 +696,36 @@ export function createScopedAgents(config, {
   notifyDesktop = undefined,
 } = {}) {
   const notify = notifyDesktop ?? createDesktopToastNotifier();
+  const waitListeners = new Set();
+  let waitWatcher, waitTimer, waitVersion, waitChanges, waitsClosed = false;
+  const wakeWaiters = () => { for (const wake of [...waitListeners]) wake(); };
+  function subscribeWait(wake) {
+    waitListeners.add(wake);
+    if (waitListeners.size === 1) {
+      waitVersion = store.dataVersion();
+      waitChanges = store.changed();
+      if (store.location !== ':memory:') {
+        try {
+          const base = path.basename(store.location);
+          waitWatcher = watch(path.dirname(store.location), { persistent: false }, (_, filename) => {
+            if (!filename || String(filename).startsWith(base)) wakeWaiters();
+          });
+          waitWatcher.on('error', () => {});
+        } catch {}
+      }
+      waitTimer = setInterval(() => {
+        try {
+          const version = store.dataVersion(), changes = store.changed();
+          if (version !== waitVersion || changes !== waitChanges) {
+            waitVersion = version; waitChanges = changes; wakeWaiters();
+          }
+        } catch { wakeWaiters(); }
+      }, 1000);
+      waitTimer.unref?.();
+    }
+    return () => { waitListeners.delete(wake); if (!waitListeners.size) { waitWatcher?.close(); waitWatcher = undefined; clearInterval(waitTimer); waitTimer = undefined; } };
+  }
+
   // One reminder is due once this notice has found its session gone for this long.
   const callbackReminderWait = claudeCallbackReminderMs(config.claudeCallbackReminderMs);
   const claudeSend = claudeInbox.send ?? sendClaude;
@@ -1297,7 +1328,7 @@ export function createScopedAgents(config, {
   // One monitor serves every name: this only makes sure it exists and, for a
   // sleeping name, clears the marker so the same durable task is polled again.
   /** Tell a listener in this process that a name now owes work. */
-  function announceWork(agentId) { try { if (agentId) onWorkQueued(agentId); } catch { /* a hint is never worth failing a call for */ } }
+  function announceWork(agentId) { wakeWaiters(); try { if (agentId) onWorkQueued(agentId); } catch { /* a hint is never worth failing a call for */ } }
 
   async function ensureWorker(record, { wake = false, hasSubmission = false, ensure = ensureMonitor } = {}) {
     if (!record || readOnlyTarget(record)) return false;
@@ -1617,7 +1648,7 @@ export function createScopedAgents(config, {
     const reason = item?.reason ?? dispatch?.error?.code ?? fallback.reason;
     return {
       name: current.name, state: current.state, accepted, queued,
-      requestId,
+      requestId, taskKey: store.taskKeyForRequest(record.ownerId, requestId),
       mode: item?.mode ?? stored.mode ?? fallback.mode ?? 'steer',
       delivery,
       ...(turnId ? { turnId } : {}),
@@ -2696,9 +2727,10 @@ export function createScopedAgents(config, {
    * instead of vanishing from the roster while its session survives. A child already in
    * cleanup_failed is retried too — closed is not the same as cleaned.
    */
-  async function clearRecord(record, { autoClaimed = false } = {}) {
+  async function clearRecord(record, { autoClaimed = false, autoRetry = false } = {}) {
     requireWritableTarget(record);
     record.state = 'cleaning'; record.closed = true;
+    if (autoClaimed || autoRetry) record.autoCleanupClosed = true;
     if (!autoClaimed) store.save(record);
     try {
       for (const child of store.childrenOf(record.agentId)) {
@@ -2706,7 +2738,7 @@ export function createScopedAgents(config, {
         if (!current || current.agentId === record.agentId) continue;
         const verdict = await store.locked(current.agentId, async () => {
           const fresh = store.get(current.agentId);
-          return fresh ? clearRecord(fresh) : { deleted: true };
+          return fresh ? clearRecord(fresh, { autoRetry: autoClaimed || autoRetry }) : { deleted: true };
         }, { waitMs: 0 });
         if (verdict?.deleted !== true) {
           throw Object.assign(new Error(`The managed subagent “${current.name}” could not be cleaned; this name stays listed so cleanup can be retried.`),
@@ -2734,7 +2766,7 @@ export function createScopedAgents(config, {
         if (!actualRelative || actualRelative.startsWith('..') || path.isAbsolute(actualRelative)) throw new Error('The state directory resolves outside its owned root.');
         await removeTree(directory, { recursive: true, force: true });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      store.remove(record);
+      store.remove(record, { deliveredReceipt: autoClaimed || autoRetry });
       forgetBackend(record);
       return { name: record.name, deleted: true, sessionDataRemoved: !record.nativeSessionRetained,
         ...(record.nativeSessionRetained !== undefined ? { nativeSessionRetained: record.nativeSessionRetained } : {}) };
@@ -3332,6 +3364,7 @@ export function createScopedAgents(config, {
       // Mutate the record this poll is saving, not a second copy: a later save of the
       // poll's own record would otherwise erase the dispatch this start just wrote.
       const targetRecord = record.task?.taskId === task.taskId ? record : current;
+      store.saveTaskKey(record.ownerId, record.agentId, item.requestId, task.taskId);
       const dispatch = await sendDispatch(targetRecord, item.message, 'supplement', [], item.requestId, view,
         { model: item.selection, freezeModel: true, mode,
           ...(item.selectionExplicit === undefined ? {}
@@ -3757,7 +3790,9 @@ export function createScopedAgents(config, {
   async function pollLocked(record) {
     if (readOnlyTarget(record)) return publicResult(record);
     if (record.state === 'cleaning') {
-      return Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now() ? publicResult(record) : clearRecord(record);
+      const nextAttempt = Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0);
+      if (nextAttempt > Date.now()) return publicResult(record);
+      return clearRecord(record, { autoRetry: record.autoCleanupClosed === true });
     }
     if (record.closed || record.state === 'cleanup_failed') return publicResult(record);
     const missingTree = retainMissingTreeFailure(record);
@@ -4096,7 +4131,7 @@ export function createScopedAgents(config, {
         }
       });
     },
-    async send({ name, message, model, effort, mode }, extra) {
+    async sendUnkeyed({ name, message, model, effort, mode }, extra) {
       textMessage(message);
       const requestedMode = normalizeRequestedMode(mode);
       let request = { model, effort };
@@ -4119,6 +4154,7 @@ export function createScopedAgents(config, {
       const queued = (record, pin, extraReceipt = {}) => ({
         name: record.name, accepted: false, queued: true, state: record.state,
         requestId: extraReceipt.requestId,
+        ...(extraReceipt.taskKey ? { taskKey: extraReceipt.taskKey } : {}),
         mode: extraReceipt.mode ?? 'steer',
         delivery: extraReceipt.delivery ?? 'local-pending',
         ...(extraReceipt.afterTurnId ? { afterTurnId: extraReceipt.afterTurnId } : {}),
@@ -4152,6 +4188,7 @@ export function createScopedAgents(config, {
           if (savePin) record.modelPin = previous;
           throw Object.assign(new Error('The task changed, stopped or is no longer accepting supplements.'), { code: 'supplement-unavailable' });
         }
+        const taskKey = store.saveTaskKey(record.ownerId, record.agentId, requestId, mode === 'queue' ? null : record.task?.taskId);
         await ensureWorker(store.get(record.agentId) ?? record, { wake: true });
         const current = store.get(record.agentId) ?? record;
         const queuedMode = mode ?? 'steer';
@@ -4167,7 +4204,7 @@ export function createScopedAgents(config, {
         // read; report the selection actually frozen on the queued row.
         const frozen = (store.supplements(record.agentId) ?? []).find(item => item.requestId === requestId)?.selection;
         return queued(current, pin ?? frozen ?? current.modelPin,
-          { requestId, mode: queuedMode, delivery: waitTurnId ? 'after-current' : 'local-pending',
+          { requestId, taskKey, mode: queuedMode, delivery: waitTurnId ? 'after-current' : 'local-pending',
             ...(waitTurnId ? { afterTurnId: waitTurnId } : {}) });
       };
       // The no-wait path is only for a supplement that changes no selection: the
@@ -4183,7 +4220,8 @@ export function createScopedAgents(config, {
         const delivery = result.error?.code === 'answer-not-delivered' ? 'blocked'
           : result.answered !== true ? 'answer-pending'
             : result.delivery === 'native-question' ? 'answered' : 'answer-pending';
-        return { ...result, requestId, mode: 'steer', delivery,
+        const taskKey = store.saveTaskKey(record.ownerId, record.agentId, requestId, record.task.taskId);
+        return { ...result, requestId, taskKey, mode: 'steer', delivery,
           accepted: delivery === 'answered', queued: delivery === 'answer-pending' };
       };
       // Named so the busy retry below runs exactly this body against a fresh record.
@@ -4397,7 +4435,8 @@ export function createScopedAgents(config, {
           }
         }
         const pin = await resolvePin(undefined, undefined);
-        const snapshot = record.task ? { ...record.task, changes: attributedChanges(record, record.observation ?? {}),
+        const snapshot = record.task ? { ...record.task, ...(publicResult(record).error ? { error: publicResult(record).error } : {}),
+          changes: attributedChanges(record, record.observation ?? {}),
           coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) } : undefined;
         // finalReminder marks this task as one that may be reminded once when a turn
         // ends without a final report. Tasks created before this rule carry no marker,
@@ -4424,9 +4463,10 @@ export function createScopedAgents(config, {
         }
         record = next;
         if (extra) extra[Symbol.for('futureaide.feedbackDispatchScope')] = { agentId: record.agentId, taskId: record.task.taskId };
+        const taskKey = store.saveTaskKey(record.ownerId, record.agentId, requestId, record.task.taskId);
         if (targetOf(record) !== 'dsh') {
           await ensureWorker(record, { wake: true });
-          return { ...queued(record, pin, { requestId, mode: effectiveMode(record, { start: true }),
+          return { ...queued(record, pin, { requestId, taskKey, mode: effectiveMode(record, { start: true }),
             delivery: 'local-pending' }), ...(previousReport ? { previousReport } : {}) };
         }
         try { await beginTask(record); }
@@ -4442,7 +4482,7 @@ export function createScopedAgents(config, {
         const dispatch = record.task.dispatches.at(-1);
         const error = current.error ?? dispatch?.error;
         return { name: current.name, accepted: dispatch?.accepted === true, state: current.state,
-          requestId, mode: effectiveMode(record, { start: true }), delivery: dispatch?.delivery,
+          requestId, taskKey, mode: effectiveMode(record, { start: true }), delivery: dispatch?.delivery,
           ...(dispatch?.turnId ? { turnId: dispatch.turnId } : {}),
           ...(dispatch?.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
           actualModel: actualModelName(current.model) ?? actualModelName(current.modelPin),
@@ -4508,6 +4548,12 @@ export function createScopedAgents(config, {
           ...(busyMode === 'queue' && root?.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
       }
     },
+    async send(args, extra) {
+      const result = await service.sendUnkeyed(args, extra);
+      if (result.requestId && !result.taskKey) throw Object.assign(new Error('The original dispatch receipt is unavailable.'), { code: 'task-receipt-unavailable' });
+      return result;
+    },
+
     /**
      * Create the name if it is new and send the task, in one call. An existing name
      * keeps its own application and lifetime, so a conflicting explicit value is
@@ -4522,6 +4568,7 @@ export function createScopedAgents(config, {
       if (!['once', 'persistent'].includes(createdLifetime)) throw new Error('lifetime must be once or persistent.');
       const sent = result => ({ state: result.state, accepted: result.accepted === true,
         ...(result.requestId ? { requestId: result.requestId } : {}),
+        ...(result.taskKey ? { taskKey: result.taskKey } : {}),
         ...(result.mode ? { mode: result.mode } : {}),
         ...(result.delivery ? { delivery: result.delivery } : {}),
         ...(result.turnId ? { turnId: result.turnId } : {}),
@@ -4782,30 +4829,160 @@ export function createScopedAgents(config, {
       await ensureWorker(record, { wake: true, hasSubmission: record?.task?.taskId === receipt.taskId });
       return receipt;
     },
-    async wait({ names, timeoutSeconds = 0 } = {}, extra) {
-      if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 45) throw new Error('Wait between 0 and 45 seconds.');
+    async wait({ names, taskKeys, after, timeoutSeconds } = {}, extra) {
+      if (timeoutSeconds !== undefined && (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 45)) throw new Error('Wait between 0 and 45 seconds.');
+      if (names && taskKeys) throw new Error('Use names or taskKeys, not both.');
       const owner = await context(extra);
       if (names) names.forEach(assertName);
-      const available = store.list(owner.ownerId);
+      if (taskKeys && (!Array.isArray(taskKeys) || taskKeys.some(key => typeof key !== 'string'))) throw new Error('taskKeys must be an array of task keys.');
+      const available = taskKeys ? [] : store.list(owner.ownerId);
       const selected = available.filter(record => !names || names.includes(record.name));
-      const selectedIds = selected.map(record => record.agentId);
       const notListed = new Set((names ?? []).filter(name => !available.some(record => record.name === name)));
-      const deadline = Date.now() + timeoutSeconds * 1000;
-      let items;
-      do {
-        items = [];
-        for (const id of selectedIds) {
-          const record = store.get(id);
-          if (!record) { notListed.add(selected.find(item => item.agentId === id).name); continue; }
-          items.push(publicResult(record, { fullResult: true }));
+      // Legacy name snapshots retain their old bounded state-query behaviour.
+      if (timeoutSeconds !== undefined && taskKeys === undefined && after === undefined) {
+        const selectedIds = selected.map(record => record.agentId);
+        const deadline = Date.now() + timeoutSeconds * 1000;
+        let items;
+        do {
+          items = [];
+          for (const id of selectedIds) {
+            const record = store.get(id);
+            if (!record) { notListed.add(selected.find(item => item.agentId === id).name); continue; }
+            items.push(publicResult(record, { fullResult: true }));
+          }
+          if (!selectedIds.length || notListed.size || items.some(item => item.error ||
+              ['awaiting_input', 'awaiting_report', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
+          if (Date.now() >= deadline) break;
+          if (extra?.signal?.aborted) throw extra.signal.reason ?? new DOMException('Aborted', 'AbortError');
+          await new Promise((resolve, reject) => {
+            const signal = extra?.signal;
+            const timer = setTimeout(done, Math.min(250, deadline - Date.now()));
+            function done() { signal?.removeEventListener('abort', aborted); resolve(); }
+            function aborted() { clearTimeout(timer); signal.removeEventListener('abort', aborted); reject(signal.reason ?? new DOMException('Aborted', 'AbortError')); }
+            signal?.addEventListener('abort', aborted, { once: true });
+          });
+        } while (true);
+        return { items, notListed: [...notListed],
+          ...(notListed.size ? { note: 'These names are not in this chat’s current list. Absence alone does not prove task completion; use the delivered result.' } : {}),
+          timedOut: Date.now() >= deadline && items.some(item => item.state === 'running') };
+      }
+      const keys = taskKeys ?? selected.filter(record => record.task?.requestId).map(record =>
+        store.taskKeyForRequest(owner.ownerId, record.task.requestId)
+        ?? store.saveTaskKey(owner.ownerId, record.agentId, record.task.requestId, record.task.taskId));
+      const selection = [...new Set(keys)].sort();
+      const selectionHash = createHash('sha256').update(JSON.stringify([owner.ownerId, selection])).digest('base64url');
+      const keyIndexes = new Map(selection.map((key, index) => [key, String(index)]));
+      let positions = {};
+      if (after !== undefined) {
+        try {
+          const parsed = JSON.parse(Buffer.from(after, 'base64url').toString('utf8'));
+          if (parsed.selection !== selectionHash || !parsed.positions || typeof parsed.positions !== 'object'
+              || Array.isArray(parsed.positions)) throw new Error();
+          positions = parsed.positions;
+        } catch {
+          throw Object.assign(new Error('The wait cursor does not match this owner and task selection.'), { code: 'invalid-cursor' });
         }
-        if (!selectedIds.length || notListed.size || items.some(item => item.error || ['awaiting_input', 'awaiting_report', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
-        if (Date.now() >= deadline) break;
-        await wait(Math.min(250, deadline - Date.now()));
-      } while (true);
-      return { items, notListed: [...notListed],
-        ...(notListed.size ? { note: 'These names are not in this chat’s current list. Absence alone does not prove task completion; use the delivered result.' } : {}),
-        timedOut: Date.now() >= deadline && items.some(item => item.state === 'running') };
+      }
+      const cursor = value => Buffer.from(JSON.stringify({ selection: selectionHash, positions: value ?? positions })).toString('base64url');
+      const deadline = timeoutSeconds === undefined ? Infinity : Date.now() + timeoutSeconds * 1000;
+      const signal = extra?.signal;
+      if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+      let timer, wake;
+      let pending = new Promise(resolve => { wake = resolve; });
+      const notify = () => { const resolve = wake; pending = new Promise(next => { wake = next; }); resolve(); };
+      const unsubscribe = subscribeWait(notify);
+      signal?.addEventListener('abort', notify, { once: true });
+      try {
+        while (true) {
+          if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+          if (waitsClosed) throw Object.assign(new Error('The service closed while waiting.'), { code: 'transport-lost' });
+          const events = [], items = [], initialPositions = new Map();
+          for (const key of selection) {
+            const cursorIndex = keyIndexes.get(key);
+            let mapping = store.resolveTaskKey(owner.ownerId, key);
+            if (!mapping) throw Object.assign(new Error('Task receipt is unavailable for this owner.'), { code: 'task-receipt-unavailable' });
+            if (mapping.receipt?.expired) throw Object.assign(new Error('Task receipt has expired.'), { code: 'task-receipt-expired' });
+            if (mapping.failureReason) throw Object.assign(new Error('The dispatched input failed.'), { code: mapping.failureReason, requestId: mapping.requestId });
+            const record = store.get(mapping.agentId);
+            const supplement = store.supplement(mapping.requestId);
+            if (supplement?.status === 'blocked') throw Object.assign(new Error('The dispatched input failed.'), { code: supplement.reason ?? 'dispatch-failed', requestId: mapping.requestId });
+            if (!mapping.taskId) {
+              if (supplement?.status === 'accepted' && supplement.task) {
+                store.saveTaskKey(owner.ownerId, mapping.agentId, mapping.requestId, supplement.task);
+                mapping = store.resolveTaskKey(owner.ownerId, key);
+              }
+            }
+            if (record && record.ownerId !== owner.ownerId) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
+            if (!record && !mapping.receipt) mapping = store.resolveTaskKey(owner.ownerId, key);
+            if (!mapping) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
+            if (mapping.failureReason) throw Object.assign(new Error('The dispatched input failed.'), { code: mapping.failureReason, requestId: mapping.requestId });
+            if (mapping.receipt) { if (!positions[cursorIndex]?.delivered) events.push({ id: key + ':delivered:' + mapping.receipt.finalSubmissionId, taskKey: key, type: 'delivered', final: true, createdAt: mapping.receipt.deliveredAt }); continue; }
+            if (!record) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
+            if (!mapping.taskId) { items.push({ name: record.name, state: 'queued', task: null }); continue; }
+            const task = record.task?.taskId === mapping.taskId ? record.task : store.historyTask(mapping.agentId, mapping.taskId);
+            if (!task) throw Object.assign(new Error('The original task is unavailable.'), { code: 'task-receipt-unavailable' });
+            const answer = (task.answers ?? []).find(item => item.answerId === mapping.requestId);
+            if (answer?.undelivered) throw Object.assign(new Error('The answer was not delivered.'), { code: answer.undelivered, requestId: mapping.requestId });
+            const dispatch = (task.dispatches ?? []).find(item => item.requestId === mapping.requestId);
+            if (dispatch?.state === 'failed' && dispatch.accepted !== true) {
+              throw Object.assign(new Error('The dispatched task failed to send.'), { code: dispatch.failure?.code ?? dispatch.error?.code ?? 'dispatch-failed', requestId: mapping.requestId, detail: dispatch.failure ?? dispatch.error });
+            }
+            const taskRecord = task === record.task ? record : { ...record, task, state: task.state, observation: undefined, error: undefined };
+            items.push(publicResult(taskRecord));
+            const baseline = mapping.baseline ?? { count: 0, reportCount: 0, nativeCount: 0 };
+            const position = positions[cursorIndex] ?? { count: baseline.count ?? 0, reportCount: baseline.reportCount ?? 0, nativeCount: baseline.nativeCount ?? 0 };
+            initialPositions.set(cursorIndex, position);
+            const submissions = store.submissionsInOrder(mapping.agentId, mapping.taskId, position.count);
+            for (let index = 0; index < submissions.length; index++) {
+              const submission = submissions[index];
+              events.push({ id: key + ':submission:' + submission.id, taskKey: key, name: record.name,
+                type: submission.kind === 'ask' ? 'question' : submission.final ? 'final' : 'report',
+                message: compactText(submission.message, 4000), ...(submission.message?.length > 4000 ? { truncated: true } : {}),
+                final: submission.final === true, createdAt: submission.created });
+            }
+            const reports = (task.reports ?? []).filter(report => !report.failure && !report.id?.startsWith('submission:'));
+            for (let index = position.reportCount ?? 0; index < reports.length; index++) {
+              const report = reports[index];
+              events.push({ id: key + ':report:' + (report.id ?? index), taskKey: key, name: record.name,
+                type: report.final ? 'final' : 'report', source: 'task-report',
+                message: compactText(report.message, 4000), ...(report.message?.length > 4000 ? { truncated: true } : {}),
+                final: report.final === true, createdAt: report.createdAt });
+            }
+            // Old rosters may have only the last observation; read it without a write.
+            const nativeQuestions = task === record.task ? captureNativeQuestionHistory(taskRecord) : (task.nativeQuestions ?? []);
+            for (let index = position.nativeCount ?? 0; index < nativeQuestions.length; index++) {
+              const question = nativeQuestions[index];
+              events.push({ id: key + ':native:' + question.id, taskKey: key, name: record.name,
+                type: 'question', source: 'native', message: compactText(question.message, 4000), createdAt: question.createdAt });
+            }
+            const state = task === record.task ? terminalRound(record) : (['completed', 'failed', 'cancelled'].includes(task?.state) ? task.state : undefined);
+            if (state && !positions[cursorIndex]?.terminal) events.push({ id: key + ':terminal:' + state, taskKey: key, name: record.name, type: state, source: 'task', ...((task === record.task ? record.error ?? task.cancelError : task.error ?? task.cancelError) ? { reason: task === record.task ? record.error ?? task.cancelError : task.error ?? task.cancelError } : {}), createdAt: task?.finishedAt });
+          }
+          const batch = []; let size = 0;
+          for (const event of events) {
+            const length = JSON.stringify(event).length;
+            if (batch.length && size + length > 20000) break;
+            const index = keyIndexes.get(event.taskKey);
+            const position = { ...(positions[index] ?? initialPositions.get(index) ?? { count: 0, reportCount: 0, nativeCount: 0 }) };
+            if (event.type === 'delivered') position.delivered = true;
+            else if (['completed', 'failed', 'cancelled'].includes(event.type)) position.terminal = true;
+            else if (event.source === 'native') position.nativeCount = (position.nativeCount ?? 0) + 1;
+            else if (event.source === 'task-report') position.reportCount = (position.reportCount ?? 0) + 1;
+            else position.count++;
+            const nextPositions = { ...positions, [index]: position };
+            if (cursor(nextPositions).length > 20000 && batch.length) break;
+            if (cursor(nextPositions).length > 20000) throw Object.assign(new Error('Wait cursor exceeds its size limit; select fewer tasks.'), { code: 'wait-cursor-limit' });
+            positions = nextPositions;
+            batch.push(event); size += length;
+          }
+          const timedOut = Date.now() >= deadline;
+          if (batch.length || timedOut || notListed.size || !selection.length) return { items, notListed: [...notListed], events: batch, nextCursor: cursor(), reason: batch.length ? 'event' : notListed.size ? 'not-listed' : timedOut ? 'timeout' : 'empty', timedOut: timedOut && !batch.length };
+          const current = pending;
+          if (Number.isFinite(deadline)) timer = setTimeout(notify, Math.max(0, deadline - Date.now()));
+          await current;
+          clearTimeout(timer); timer = undefined;
+        }
+      } finally { clearTimeout(timer); signal?.removeEventListener('abort', notify); unsubscribe(); }
     },
     poll(agentId) {
       if (inflight.has(agentId)) return inflight.get(agentId);
@@ -4997,6 +5174,8 @@ export function createScopedAgents(config, {
       });
     },
     close() {
+      waitsClosed = true;
+      wakeWaiters();
       for (const controller of releaseSignals.values()) controller.abort();
       releaseSignals.clear();
       store.close();
@@ -5028,7 +5207,7 @@ export function createScopedAgents(config, {
       answer.selectionExplicit = selectionExplicit === true;
     }
     if (!existing) record.task.answers.push(answer);
-    saveDispatch(record);
+    if (!store.saveAnswerWithTaskKey(record, answer.answerId)) throw dispatchRefused();
     try {
       if (!(await resolveAnswer(record, answer))) {
         return { name: record.name, answered: false, state: record.state, error: safeError(dispatchRefused('dispatch-expired')) };

@@ -398,7 +398,7 @@ test('an unpinned Codex name reports actualModel from the live observation, neve
     // must read the observation rather than presenting null.
     observed.model = undefined; f.store.save(observed);
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'desktop-model');
-    assert.equal((await f.service.wait({ names: ['partner'] }, extra(A))).items[0].actualModel, 'desktop-model');
+    assert.equal((await f.service.wait({ names: ['partner'], timeoutSeconds: 0 }, extra(A))).items[0].actualModel, 'desktop-model');
   } finally { f.service.close(); }
 });
 

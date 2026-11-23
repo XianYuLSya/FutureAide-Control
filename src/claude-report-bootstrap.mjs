@@ -23,7 +23,7 @@ import { loadConfig } from './config.mjs';
 import { readReportStatus, reportPort, reportUrl, rosterIdentity } from './report-endpoint.mjs';
 import { ensureSharedMonitor } from './shared-monitor.mjs';
 import { RosterStore } from './roster-store.mjs';
-import { exitWhenInputCloses } from './stdio-exit.mjs';
+import { exitWhenInputCloses, stdioWaitSignal } from './stdio-exit.mjs';
 
 export const BOOTSTRAP_NAME = 'futureaide-report';
 export const BOOTSTRAP_VERSION = '1.0.0';
@@ -43,7 +43,7 @@ const failure = (code, message, extra = {}) => ({ isError: true,
  * service nor honoured by it.
  */
 export const READ_ONLY_TOOLS = Object.freeze(['futureaide_status', 'futureaide_list_agents',
-  'futureaide_wait_agents', 'futureaide_agent_changes', 'futureaide_inspect_agent']);
+  'futureaide_agent_changes', 'futureaide_inspect_agent']);
 
 export function mayRetry(name) {
   return READ_ONLY_TOOLS.includes(name);
@@ -62,8 +62,8 @@ export function createForwardServer({ fetchTools, callTool, instructions, listCh
     { capabilities: { tools: listChanged ? { listChanged: true } : {} },
       ...(typeof instructions === 'string' && instructions ? { instructions } : {}) });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await fetchTools() }));
-  server.setRequestHandler(CallToolRequestSchema, async request => {
-    const result = await callTool(request.params.name, request.params.arguments ?? {});
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const result = await callTool(request.params.name, request.params.arguments ?? {}, extra);
     return {
       content: Array.isArray(result?.content) ? result.content : [],
       ...(result?.isError ? { isError: true } : {}),
@@ -78,13 +78,22 @@ export function createForwardServer({ fetchTools, callTool, instructions, listCh
  * loopback service could not be reached and the session is served no tools instead
  * of tools that always fail.
  */
-export async function startColdStartBridge({ configPath = process.env.DSH_CONTROL_CONFIG, env = process.env,
+export async function startColdStartBridge({ configPath = process.env.DSH_CONTROL_CONFIG, env = process.env, inputSignal,
   waitMs = 10000, pollMs = 250, toolCheckMs = 45000, log = message => process.stderr.write(`[futureaide-report] ${message}\n`),
   load = loadConfig, status = readReportStatus, ensure = ensureSharedMonitor,
   storeFor = config => new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
-  connect = async url => {
+  connect = async (url, { signal, onStreamEnd } = {}) => {
     const client = new Client({ name: 'futureaide-report-bootstrap', version: '1.0.0' });
-    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    await client.connect(new StreamableHTTPClientTransport(new URL(url), signal ? {
+      fetch: async (input, init = {}) => {
+        const response = await fetch(input, { ...init, signal: init.signal ? AbortSignal.any([signal, init.signal]) : signal });
+        let isWait = false;
+        try { const body = JSON.parse(init.body); isWait = body?.method === 'tools/call' && body?.params?.name === 'futureaide_wait_agents'; } catch { /* not a wait */ }
+        if (!isWait || !response.body || !response.headers.get('content-type')?.includes('text/event-stream')) return response;
+        const body = response.body.pipeThrough(new TransformStream({ flush() { setTimeout(() => onStreamEnd?.(), 0); } }));
+        return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+      },
+    } : undefined));
     return client;
   } } = {}) {
   const state = { config: undefined, store: undefined, client: undefined, port: undefined, url: undefined };
@@ -166,7 +175,8 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
       }
     }
   };
-  const callTool = async (name, args) => {
+  const activeWaits = new Set();
+  const callTool = async (name, args, extra = {}) => {
     if (name === 'futureaide_feedback') {
       let sent = false;
       let expired = false;
@@ -199,6 +209,45 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     }
     try { await prepare(); }
     catch (error) { return failure(error?.code ?? 'report-service-unavailable', error?.message ?? String(error)); }
+    if (name === 'futureaide_wait_agents') {
+      const controller = new AbortController();
+      activeWaits.add(controller);
+      const callerSignal = AbortSignal.any([extra.signal, inputSignal].filter(Boolean));
+      const abort = () => controller.abort(callerSignal.reason);
+      if (callerSignal.aborted) abort();
+      else callerSignal.addEventListener('abort', abort, { once: true });
+      let client;
+      try {
+        if (controller.signal.aborted) throw controller.signal.reason ?? new Error('Cancelled');
+        let streamEnded;
+        const ended = new Promise((_, reject) => { streamEnded = () => reject(new Error('Loopback response stream ended')); });
+        client = await connect(state.url, { signal: controller.signal, onStreamEnd: streamEnded });
+        const lost = new Promise((_, reject) => {
+          client.onerror = error => reject(error);
+          client.onclose = () => reject(new Error('Loopback transport closed'));
+        });
+        const token = extra._meta?.progressToken;
+        return await Promise.race([client.callTool({ name, arguments: args }, undefined, {
+          signal: controller.signal, timeout: 100000000, maxTotalTimeout: 100000000,
+          resetTimeoutOnProgress: true,
+          onprogress: progress => {
+            if (token !== undefined && !controller.signal.aborted) {
+              void extra.sendNotification?.({ method: 'notifications/progress', params: { ...progress, progressToken: token } }).catch(() => {});
+            }
+          },
+        }), lost, ended]);
+      } catch (error) {
+        if (callerSignal.aborted) throw error;
+        if (error?.code === -32001) throw error;
+        return failure('transport-lost', 'The wait transport was lost. Do not resend the task; check the original task reference.',
+          { operation: name, taskKeys: args.taskKeys, names: args.names, cause: error?.message ?? String(error) });
+      } finally {
+        callerSignal.removeEventListener('abort', abort);
+        controller.abort();
+        activeWaits.delete(controller);
+        try { await client?.close(); } catch { /* already closed */ }
+      }
+    }
     try {
       return await state.client.callTool({ name, arguments: args });
     } catch (error) {
@@ -277,6 +326,7 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
   if (ready) log(`bridging ${tools} tool(s) to ${state.url}`);
   const close = async () => {
     clearInterval(timer);
+    for (const controller of activeWaits) controller.abort();
     const client = state.client; state.client = undefined;
     try { await client?.close(); } catch { /* ignore */ }
     const store = state.store; state.store = undefined;
@@ -292,7 +342,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const index = argv.indexOf('--config');
   const configPath = index === -1 ? process.env.DSH_CONTROL_CONFIG : argv[index + 1];
-  const bridge = await startColdStartBridge({ configPath });
+  const bridge = await startColdStartBridge({ configPath, inputSignal: stdioWaitSignal() });
   const transport = new StdioServerTransport();
   // Installed before connect() so the protocol's handler is wrapped from the first
   // message. A forwarded call that is already being answered still goes out before the

@@ -1607,6 +1607,7 @@ function activeSelectionEvidence(thread, active, knownSelections) {
 export async function sendCodexTextNative(threadId, text, {
   request = requestCodexNative, model, effort, blockReason, mode, selection,
   selectionExplicit, legacySelection = false, knownSelections, onIntent, allowStart = true,
+  startOnly = false,
 } = {}) {
   const intendedMode = mode === undefined ? 'steer' : mode;
   if (!['steer', 'queue'].includes(intendedMode)) {
@@ -1669,6 +1670,15 @@ export async function sendCodexTextNative(threadId, text, {
     // Queue only opens a new turn. A selection may not be changed through it.
     if (verifySelection) requireSameSelection();
     return { waiting: true, delivery: 'after-current', afterTurnId: active.id };
+  }
+  if (startOnly && active) {
+    // A recovered answer whose previous turn provably ended may only open a new
+    // turn. If another turn appeared before this write, it is not steered: report
+    // a definite not-sent wait behind that turn and let the scheduler retry later.
+    return { waiting: true, delivery: 'after-current', afterTurnId: active.id,
+      reschedule: true, notSent: true, reason: 'turn-started-before-write',
+      notSentIntent: { method: 'turn/start', threadId, priorTurnId: active.id,
+        mode: intendedMode, outcome: 'not-sent' } };
   }
   if (!active && thread?.status?.type === 'active') {
     // The thread claims to be running but the turn page cannot name the turn. Starting

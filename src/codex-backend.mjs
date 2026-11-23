@@ -485,7 +485,12 @@ export async function createCodexBackend(record, deps = {}) {
    * the stored wire selection stays on `request.delivery` for old readers.
    */
   function verifiedNotSent(request) {
-    if (request.status !== 'retryable' || request.native || request.turnId) return false;
+    if (request.native || request.turnId) return false;
+    if (request.status === 'waiting') {
+      return request.attempted === false && request.reschedule?.notSent === true
+        && (!request.intent || request.intent.outcome === 'not-sent');
+    }
+    if (request.status !== 'retryable') return false;
     if (request.intent) return request.intent.outcome === 'not-sent';
     if (request.attempted === true) return false;
     if (request.reschedule) return request.reschedule.notSent === true;
@@ -677,7 +682,7 @@ export async function createCodexBackend(record, deps = {}) {
       return result;
     },
     async deliver({ requestId, message, kind, mode, selectionExplicit, model: dispatchModel,
-      explicitModel, allowStart = true, writeBlockReason }) {
+      explicitModel, allowStart = true, startOnly = false, writeBlockReason }) {
       snapshotRevision++;
       // The shared layer's fence for this call. Absent means the caller never gated its
       // dispatch, and then nothing here may behave differently.
@@ -892,11 +897,19 @@ export async function createCodexBackend(record, deps = {}) {
               ...(selectionExplicit === undefined && request.model?.model && !explicitNow ? { legacySelection: true } : {}),
               knownSelections: knownSelectionsFor(value),
               ...(allowStart === false ? { allowStart: false } : {}),
+              ...(startOnly ? { startOnly: true } : {}),
               onIntent });
             if (sent?.waiting === true) {
-              // Queue met an active root turn: durable "after A", no native write.
+              // The active root kept this input waiting. Save the current no-write
+              // intent with the receipt so a later cancellation can identify it.
               Object.assign(request, { status: 'waiting', route: 'after-current',
                 afterTurnId: sent.afterTurnId, attempted: false });
+              if (sent.reschedule === true && sent.notSent === true) {
+                const at = new Date().toISOString();
+                request.reschedule = { reason: sent.reason ?? 'turn-started-before-write',
+                  notSent: true, afterTurnId: sent.afterTurnId ?? null, at };
+                if (sent.notSentIntent) request.intent = { ...sent.notSentIntent, at };
+              }
               save(value);
               waiting = true;
               return;
@@ -992,10 +1005,11 @@ export async function createCodexBackend(record, deps = {}) {
       }
       return receiptFrom(state(), requestId);
     },
-    async receipt({ requestId }) {
+    async receipt({ requestId, reconcile = true }) {
       const value = state();
       const request = value.requests[requestId];
       if (!request) return undefined;
+      if (!reconcile) return receiptFrom(value, requestId);
       await reconcileRequest(value, request);
       return receiptFrom(state(), requestId);
     },

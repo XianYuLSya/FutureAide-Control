@@ -743,6 +743,19 @@ export class RosterStore {
       : this.db.prepare('SELECT body FROM agents WHERE owner=? ORDER BY name').all(owner);
     return rows.map(row => JSON.parse(row.body));
   }
+  /**
+   * Name and lifecycle only for one owner, read from the covering lifecycle index:
+   * a list filter must not load a record body (or its observation tree) to decide
+   * whether that name belongs in the answer. `closed` is kept because a
+   * `cleanup_failed` name is closed but still must be found by a state query.
+   */
+  listNames(owner) {
+    return this.db.prepare(`SELECT id, name, json_extract(body,'$.state') AS state,
+      coalesce(json_extract(body,'$.closed'),0) AS closed
+      FROM agents INDEXED BY agents_lifecycle_v2
+      WHERE owner=? ORDER BY name`).all(owner).map(row => ({ id: row.id, name: row.name,
+        state: row.state ?? undefined, closed: row.closed === 1 }));
+  }
   transportCandidates({ probe = false } = {}) {
     return this.db.prepare(`SELECT id FROM agents WHERE json_type(body,'$.cleanupRosterTicket') IS NULL
       AND coalesce(json_extract(body,'$.closed'),0)=0 AND json_extract(body,'$.target')='codex-desktop' AND (

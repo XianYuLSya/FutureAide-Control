@@ -783,7 +783,7 @@ test('queued Desktop cleanup survives an old poll save and native failure is vis
     await f.service.monitorScan();
     await f.service.poll('delete');
     assert.equal(f.store.get('delete').state, 'cleanup_failed');
-    assert.match((await f.service.list(extra(THREAD))).items[0].error.message, /native deletion refused/);
+    assert.match((await f.service.list(extra(THREAD), { name: 'delete' })).items[0].error.message, /native deletion refused/);
     await f.service.delete({ name: 'delete' }, extra(THREAD));
     assert.equal((await f.service.poll('delete')).deleted, true);
     assert.equal(destroys, 2);
@@ -837,7 +837,7 @@ test('a returned stop refusal remains visible through observation until native c
     await f.service.cancel({ name: 'refusal' }, extra(THREAD));
     await f.service.poll('refusal');
     assert.equal(f.store.get('refusal').error, undefined, 'observe completed normally');
-    const listed = (await f.service.list(extra(THREAD))).items[0];
+    const listed = (await f.service.list(extra(THREAD), { name: 'refusal' })).items[0];
     assert.equal(listed.error.code, 'native-cancel-unconfirmed');
     assert.equal(listed.error.detail.rounds[0].rows[0].error.code, 'task-stop-click-unavailable');
     assert.equal(JSON.stringify(listed).includes('private-id'), false);
@@ -848,12 +848,12 @@ test('a returned stop refusal remains visible through observation until native c
     assert.equal(cancels, 1, 'normal-return refusals also back off');
     let r = f.store.get('refusal'); r.nextAttemptAt = 0; f.store.save(r);
     await f.service.poll('refusal');
-    assert.equal((await f.service.list(extra(THREAD))).items[0].error.code, 'native-cancel-partial');
+    assert.equal((await f.service.list(extra(THREAD), { name: 'refusal' })).items[0].error.code, 'native-cancel-partial');
     assert.equal(f.store.get('refusal').task.cancelPending, true);
     r = f.store.get('refusal'); r.nextAttemptAt = 0; f.store.save(r);
     await f.service.poll('refusal');
     assert.equal(f.store.get('refusal').state, 'cancelled');
-    assert.equal((await f.service.list(extra(THREAD))).items[0].error, undefined);
+    assert.equal((await f.service.list(extra(THREAD), { name: 'refusal' })).items[0].error, undefined);
   } finally { f.service.close(); }
 });
 

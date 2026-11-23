@@ -80,7 +80,7 @@ test('a closed record for the removed target stays listed with its own bytes', a
   const f = await fixture();
   try {
     const before = f.body(LEGACY_ID);
-    const listed = await f.service.list(extra(A));
+    const listed = await f.service.list(extra(A), { state: 'cleanup_failed' });
     const entry = listed.items.find(item => item.name === LEGACY);
     assert.equal(entry.target, 'claude-desktop', 'the stored target is reported as stored');
     assert.equal(entry.state, 'cleanup_failed');
@@ -123,9 +123,12 @@ test('another assistant in the same roster is unaffected', async () => {
       lifetime: 'persistent', target: 'dsh', workspace, created: true, state: 'idle',
       createdAt: '2026-11-04T00:00:00.000Z', updatedAt: '2026-11-04T00:00:00.000Z', history: [] }]);
   try {
-    const listed = await f.service.list(extra(A));
-    assert.deepEqual(listed.items.map(item => [item.name, item.target]).sort(),
-      [['正式双向验收', 'claude-desktop'], ['画图助手', 'dsh']].sort());
+    const active = await f.service.list(extra(A));
+    assert.deepEqual(active.items.map(item => [item.name, item.target]), [['画图助手', 'dsh']],
+      'the inactive legacy name is not in the default list');
+    const listed = await f.service.list(extra(A), { name: '正式双向验收' });
+    assert.deepEqual(listed.items.map(item => [item.name, item.target]), [['正式双向验收', 'claude-desktop']],
+      'the inactive name is still reachable by name');
     const receipt = await f.service.send({ name: '画图助手', message: '继续' }, extra(A));
     assert.notEqual(receipt.error?.code, 'backend-not-ready', 'its failure, if any, is its own and not the removed target');
     assert.equal(f.store.get('agent-' + 'a'.repeat(32)).target, 'dsh');

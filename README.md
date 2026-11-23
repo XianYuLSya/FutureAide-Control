@@ -169,7 +169,7 @@ futureaide_send_agent({name: "审稿", message: "接着检查刚才提到的第�
 | `futureaide_create_agent` | 预留名字，可选 `target`、`model`、`effort` |
 | `futureaide_send_agent` | 派单或补充，也可以更新模型和强度；`mode` 可选插话或排队 |
 | `futureaide_answer_agent` | 回答助手的问题 |
-| `futureaide_list_agents` | 看本聊天的名单，有下属时一人一行列出整棵树 |
+| `futureaide_list_agents` | 看本聊天的名单；默认只列活跃名字，可按 `name` 或 `state` 查历史，有下属时一人一行列出整棵树 |
 | `futureaide_wait_agents` | 等一个或多个名字，单次最多 45 秒 |
 | `futureaide_agent_changes` | 看改了哪些文件 |
 | `futureaide_inspect_agent` | 看对话、工具调用和任务历史 |

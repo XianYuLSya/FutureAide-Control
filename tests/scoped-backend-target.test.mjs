@@ -904,7 +904,7 @@ test('a final notice to a missing Codex profile becomes a visible terminal failu
     assert.equal(after.task.reports.at(-1).delivery.state, 'blocked');
     assert.equal(after.task.reports.at(-1).delivery.error.code, 'codex-thread-not-found');
     assert.match(after.task.reports.at(-1).delivery.error.message, /当前 Codex 档案里看不到这个对话/);
-    const listed = (await f.service.list(extra(A))).items.find(item => item.name === 'helper');
+    const listed = (await f.service.list(extra(A), { name: 'helper' })).items.find(item => item.name === 'helper');
     assert.equal(listed.reports.latest.error.code, 'codex-thread-not-found');
     const readsAfter = reads;
     await f.service.poll(record.agentId);

@@ -75,8 +75,21 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
       s.answers ??= new Map();
       if (s.answers.has(input.answerId)) return s.answers.get(input.answerId);
       const pending = s.questions.filter(question => question.state === 'pending');
-      pending.forEach(question => { question.state = 'answered'; });
-      const result = { consumedQuestionIds: pending.map(question => question.id), continuation: `Answer: ${input.message}` };
+      // The real bridge is given the question identity the caller saw and refuses
+      // to consume any other question. The fixture must enforce the same contract,
+      // otherwise a wrong caller would still pass here.
+      if (Array.isArray(input.questionIds) && input.questionIds.length) {
+        const live = new Set(pending.map(question => question.id));
+        if (!input.questionIds.every(id => live.has(id))) {
+          return { accepted: false, notSent: true, consumedQuestionIds: [],
+            pendingQuestionIds: pending.map(question => question.id),
+            pendingQuestions: pending.map(question => question.message) };
+        }
+      }
+      const answering = Array.isArray(input.questionIds) && input.questionIds.length
+        ? pending.filter(question => input.questionIds.includes(question.id)) : pending;
+      answering.forEach(question => { question.state = 'answered'; });
+      const result = { consumedQuestionIds: answering.map(question => question.id), continuation: `Answer: ${input.message}` };
       s.answers.set(input.answerId, result);
       return result;
     },
@@ -2251,6 +2264,53 @@ test('an answer for a consumed question is a no-send receipt, not the old error'
       assert.deepEqual(raced.pendingQuestions, [], 'the consumed question is not reported as still pending');
       assert.equal(f.sends.filter(item => item.message.includes('raced answer')).length, 0);
     } finally { f.api.managedAnswer = nativeAnswer; }
+
+    // The preflight sees q4 and the bridge is asked for q4, but q4 is replaced by
+    // q5 before the bridge's own atomic check. The replacement must stay pending
+    // and must never receive the old answer text.
+    const replacedRecord = f.record();
+    replacedRecord.observation = { ...(replacedRecord.observation ?? {}),
+      questions: [{ id: 'q4', message: 'Which fourth?', state: 'pending' }] };
+    f.store.save(replacedRecord);
+    session.questions = [{ id: 'q4', message: 'Which fourth?', state: 'pending' }];
+    let bridgeQuestionIds;
+    const nativeAnswerReplaced = f.api.managedAnswer;
+    f.api.managedAnswer = async input => {
+      bridgeQuestionIds = input.questionIds;
+      session.questions = [{ id: 'q5', message: 'A replacement?', state: 'pending' }];
+      return nativeAnswerReplaced(input);
+    };
+    try {
+      const replaced = await f.service.answer({ name: 'artist', message: 'fourth answer' }, extra(A));
+      assert.deepEqual(bridgeQuestionIds, ['q4'], 'the bridge receives the question the caller saw');
+      assert.equal(replaced.answered, false);
+      assert.equal(replaced.delivered, false);
+      assert.equal(replaced.reason, 'question-changed');
+      assert.deepEqual(replaced.pendingQuestions, ['A replacement?']);
+      assert.equal(session.questions[0].state, 'pending', 'the replacement is not consumed');
+      assert.equal(f.sends.filter(item => item.message.includes('fourth answer')).length, 0);
+    } finally { f.api.managedAnswer = nativeAnswerReplaced; }
+
+    // The same identity check with no question left: an explicit no-send with no
+    // pending question at all, not the old native error.
+    const goneRecord = f.record();
+    goneRecord.observation = { ...(goneRecord.observation ?? {}),
+      questions: [{ id: 'q6', message: 'Which sixth?', state: 'pending' }] };
+    f.store.save(goneRecord);
+    session.questions = [{ id: 'q6', message: 'Which sixth?', state: 'pending' }];
+    const nativeAnswerGone = f.api.managedAnswer;
+    f.api.managedAnswer = async input => {
+      assert.deepEqual(input.questionIds, ['q6']);
+      session.questions = [];
+      return nativeAnswerGone(input);
+    };
+    try {
+      const gone = await f.service.answer({ name: 'artist', message: 'sixth answer' }, extra(A));
+      assert.equal(gone.answered, false);
+      assert.equal(gone.reason, 'question-not-pending');
+      assert.deepEqual(gone.pendingQuestions, []);
+      assert.equal(f.sends.filter(item => item.message.includes('sixth answer')).length, 0);
+    } finally { f.api.managedAnswer = nativeAnswerGone; }
   } finally { f.service.close(); }
 });
 
@@ -2281,5 +2341,24 @@ test('list defaults to active names and finds inactive ones by name or state wit
     const mismatch = await f.service.list(extra(A), { name: 'failed-one', state: 'cleanup_failed' });
     assert.equal(mismatch.items.length, 0);
     assert.equal((await f.service.list(extra(B))).items.length, 0, 'another caller never sees these names');
+  } finally { f.service.close(); }
+});
+
+test('list carries a monitor-unavailable error recorded while starting its first listener', async () => {
+  let ready = true;
+  const f = await fixture({ startSharedMonitor: async () => ready, monitorFailureGraceMs: 60000 });
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    const record = f.record();
+    // A running name with no earlier error: this list call is the first one that
+    // starts the listener, and that listener is now unavailable.
+    record.state = 'running'; record.task.state = 'running'; record.error = undefined;
+    f.store.save(record);
+    ready = false;
+    const listed = await f.service.list(extra(A));
+    assert.equal(listed.items[0].error?.code, 'monitor-unavailable',
+      'the first list answer reflects the durable error written while it started the listener');
+    assert.equal(f.record().error.code, 'monitor-unavailable');
   } finally { f.service.close(); }
 });

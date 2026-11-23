@@ -259,7 +259,8 @@ export function createDshBackend({ client, control, hostArgs = () => ({}), reque
         hasMore: history.hasMore || history.messages.length > maxMessages,
         ...(history.note ? { note: history.note } : {}), ...(failure ? { failure } : {}) };
     },
-    async answer({ answerId, message } = {}) { return client.managedAnswer({ ...args(), answerId, message }); },
+    async answer({ answerId, message, questionIds } = {}) { return client.managedAnswer({ ...args(), answerId, message,
+      ...(Array.isArray(questionIds) && questionIds.length ? { questionIds } : {}) }); },
     async deliver({ requestId, message, kind, writeBlockReason } = {}) {
       // A supplement has to be read on the model's next step. A queued input waits for
       // the current turn to end, and by then the model has usually submitted its final

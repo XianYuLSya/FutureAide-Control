@@ -249,9 +249,15 @@ function publicResult(record, { fullResult = false } = {}) {
   const explicitReports = (task?.reports ?? []).filter(report => !report.failure);
   // `codex-report-not-ready` comes from a read-only registration preflight on a
   // dispatch, not from report delivery. Once this task has a delivered report, the
-  // cross-session report path is demonstrably working; keeping the preflight code as
-  // the agent's public error would only be noise. With no delivered report it stays.
-  const publicError = error?.code === 'codex-report-not-ready' && hasDeliveredReport(record) ? undefined : error;
+  // cross-session report path is demonstrably working; a leftover preflight code is
+  // noise only when no real task/supplement input is still blocked by it. A blocked
+  // input keeps its own error: its body was never written.
+  const blockedInputPreflight = (task?.dispatches ?? []).some(dispatch =>
+    dispatch && dispatch.accepted !== true
+    && (dispatch.kind === 'supplement' || dispatch.kind === 'task')
+    && dispatch.error?.code === 'codex-report-not-ready');
+  const publicError = error?.code === 'codex-report-not-ready'
+    && hasDeliveredReport(record) && !blockedInputPreflight ? undefined : error;
   return {
     name: record.name, lifetime: record.lifetime, target: targetOf(record), state: record.state,
     // The full ID the target actually uses, never the caller's substring. The
@@ -1623,10 +1629,10 @@ export function createScopedAgents(config, {
     // known queued-turn history, including a queue row that has since opened B.
     const afterTurnId = delivery === 'current-turn' ? undefined
       : stored.afterTurnId ?? dispatch?.afterTurnId ?? fallback.afterTurnId;
+    // The reason on a supplement row describes this input's own delivery, so it is
+    // never suppressed as report-preflight noise: a blocked input must stay visible
+    // even on a task whose report path already worked.
     const reason = item?.reason ?? dispatch?.error?.code ?? fallback.reason;
-    // The same preflight code is noise on a send receipt once a report from this task
-    // has been delivered; the input's own queued/accepted state still stands.
-    const publicReason = reason === 'codex-report-not-ready' && hasDeliveredReport(current) ? undefined : reason;
     return {
       name: current.name, state: current.state, accepted, queued,
       requestId,
@@ -1634,7 +1640,7 @@ export function createScopedAgents(config, {
       delivery,
       ...(turnId ? { turnId } : {}),
       ...(afterTurnId ? { afterTurnId } : {}),
-      ...(publicReason ? { error: { code: publicReason, message: publicReason === 'dispatch-expired'
+      ...(reason ? { error: { code: reason, message: reason === 'dispatch-expired'
         ? 'This input passed its six hours before it could be sent.'
         : 'This input could not be delivered; its body is kept.' } } : {}),
       actualModel: actualModelName(item?.selection) ?? actualModelName(fallback.pin)
@@ -2581,7 +2587,7 @@ export function createScopedAgents(config, {
     } finally { trackWorkspaceBaseline(record, baseline); }
   }
 
-  async function resolveAnswer(record, answer) {
+  async function resolveAnswer(record, answer, { questionIds } = {}) {
     if (answer.questionIds) return true;
     const backend = await backendFor(record);
     if (roundMovedOn(record)) throw dispatchRefused();
@@ -2598,6 +2604,7 @@ export function createScopedAgents(config, {
         return !roundMovedOn(record, latest) && !latest.task.cancelRequested && (!item || !dispatchExpired(item.created));
       };
       result = await backend.answer({ answerId: answer.answerId, message: answer.message,
+        ...(Array.isArray(questionIds) && questionIds.length ? { questionIds } : {}),
         ...(targetOf(record) === 'codex-desktop' ? { canAnswer } : {}) });
     } catch (error) {
       if (targetOf(record) === 'codex-desktop' && NATIVE_ANSWER_REFUSALS.has(error.code)) {
@@ -2607,14 +2614,21 @@ export function createScopedAgents(config, {
       }
       throw error;
     }
-    if (!result.consumedQuestionIds?.length) {
-      // A backend that found nothing pending is a settled no-send. Mark the intent so
-      // the scheduler never retries it, and let answerLocked return the public receipt.
-      Object.assign(answer, { dispatched: true, undelivered: 'question-not-pending' });
-      if (item) store.setSupplement(item.requestId, 'blocked', 'question-not-pending');
+    if (result?.notSent === true || !result?.consumedQuestionIds?.length) {
+      // A backend that found the named question gone (or found nothing pending at all)
+      // is a settled no-send. A different question that appeared meanwhile is reported
+      // as `question-changed` with its actual text; it was never given this answer.
+      // Mark the intent so the scheduler never retries it, and let answerLocked
+      // return the public receipt.
+      const reported = Array.isArray(result?.pendingQuestions) ? result.pendingQuestions : undefined;
+      const code = result?.notSent === true && reported?.length ? 'question-changed' : 'question-not-pending';
+      Object.assign(answer, { dispatched: true, undelivered: code });
+      if (item) store.setSupplement(item.requestId, 'blocked', code);
       saveDispatch(record);
-      throw Object.assign(new Error('This subagent has no unanswered question; nothing was sent.'),
-        { code: 'question-not-pending', notSent: true });
+      throw Object.assign(new Error(code === 'question-changed'
+        ? 'The question this answer belonged to is no longer pending; a different question is pending now, so nothing was sent.'
+        : 'This subagent has no unanswered question; nothing was sent.'),
+      { code, notSent: true, ...(reported ? { pendingQuestions: reported } : {}) });
     }
     answer.questionIds = result.consumedQuestionIds;
     if (result.nativeAnswered === true) {
@@ -4612,12 +4626,17 @@ export function createScopedAgents(config, {
       let ensured;
       const ensure = () => ensured ??= ensureMonitor();
       for (const record of records) await ensureWorker(record, { ensure });
-      const running = records.some(record => !record.sleep)
+      // ensureWorker can persist a monitor-unavailable error (or wake a sleeping
+      // name) while starting the shared listener. Read the selected rows again so
+      // the first list answer carries that newer durable metadata instead of the
+      // snapshot taken before the listener was started.
+      const current = selected.map(row => store.get(row.id)).filter(Boolean);
+      const running = current.some(record => !record.sleep)
         && await monitorAlive(store, Date.now(), { idleSessionCleanup: config.idleSessionCleanup !== false });
-      return { items: records.map(record => ({ ...publicResult(record),
+      return { items: current.map(record => ({ ...publicResult(record),
         monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping')
           : (running ? 'running' : 'stopped'),
-        supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: records.length };
+        supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: current.length };
     },
     async changes({ name, task = 0 }, extra) {
       return withName(extra, name, async record => {
@@ -5024,14 +5043,32 @@ export function createScopedAgents(config, {
     const pending = pendingIn(view);
     const existing = (record.task.answers ?? []).find(answer => queuedAnswerId ? answer.answerId === queuedAnswerId
       : !answer.dispatched && !answer.questionIds && answer.message === message);
+    // A supplement already queued under this id may be the input that was captured
+    // before the question changed. Closing it here keeps its receipt honest instead
+    // of leaving it "sending" for the scheduler to treat as accepted.
+    const noSend = (reason, actual) => {
+      const item = queuedAnswerId ? store.supplement(queuedAnswerId) : undefined;
+      if (item && item.status !== 'blocked') store.setSupplement(item.requestId, 'blocked', reason);
+      return consumedAnswer(record, actual, reason);
+    };
+    const existingQuestionIds = Array.isArray(existing?.questionIdsSeen) && existing.questionIdsSeen.length
+      ? existing.questionIdsSeen : undefined;
     if (!existing) {
-      if (!pending.length) return consumedAnswer(record, view);
+      if (!pending.length) return noSend('question-not-pending', view);
       const pendingIds = new Set(pending.map(question => question.id));
       if (seenPending.length && !seenPending.some(question => pendingIds.has(question.id)))
-        return consumedAnswer(record, view, 'question-changed');
+        return noSend('question-changed', view);
+    } else {
+      if (!pending.length) return noSend('question-not-pending', view);
+      if (existingQuestionIds && !existingQuestionIds.every(id => pending.some(question => question.id === id)))
+        return noSend('question-changed', view);
     }
     record.task.answers ??= [];
     const answer = existing ?? { answerId: queuedAnswerId ?? uid('answer'), message, dispatched: false };
+    // Remember the exact question identity this intent was created for. A later
+    // retry may only consume those ids; a replacement question is never written with
+    // this text.
+    answer.questionIdsSeen ??= pending.map(question => question.id);
     // The six-hour clock belongs to the caller's original input, not to the later poll
     // that happens to dispatch the continuation. Keep the supplement's enqueue time.
     answer.created ??= created ?? now();
@@ -5046,14 +5083,15 @@ export function createScopedAgents(config, {
     if (!existing) record.task.answers.push(answer);
     saveDispatch(record);
     try {
-      if (!(await resolveAnswer(record, answer))) {
+      if (!(await resolveAnswer(record, answer, { questionIds: answer.questionIdsSeen }))) {
         return { name: record.name, answered: false, state: record.state, error: safeError(dispatchRefused('dispatch-expired')) };
       }
     } catch (error) {
       // The backend may lose the same race after the preflight: its question was
       // consumed between observe() and the native write. That is a settled no-send,
       // not a failed answer, so keep its intent from being retried and report it.
-      if (error?.code === 'question-not-pending' || error?.code === 'native-question-not-pending') {
+      if (error?.code === 'question-not-pending' || error?.code === 'question-changed'
+          || error?.code === 'native-question-not-pending') {
         if (!answer.questionIds && !answer.dispatched) {
           Object.assign(answer, { dispatched: true, undelivered: error.code });
           const item = store.supplement(answer.answerId);
@@ -5061,11 +5099,19 @@ export function createScopedAgents(config, {
           saveDispatch(record);
         }
         // The preflight page still showed the question the backend just refused.
-        // Read once more so pendingQuestions describes the actual state, not that
-        // stale page; a failed read means no pending question is provable.
-        let actual = { questions: [] };
-        try { actual = await observe(record); } catch { /* keep the empty state */ }
-        return consumedAnswer(record, actual);
+        // Prefer the bridge's own actual pending list; otherwise read once more so
+        // pendingQuestions describes the actual state, not that stale page. A failed
+        // read means no pending question is provable.
+        let actual;
+        if (Array.isArray(error.pendingQuestions)) {
+          actual = { questions: error.pendingQuestions.map((message, index) => ({
+            id: `pending-${index}`, message, state: 'pending' })) };
+        } else {
+          actual = { questions: [] };
+          try { actual = await observe(record); } catch { /* keep the empty state */ }
+        }
+        return consumedAnswer(record, actual,
+          error.code === 'question-changed' ? 'question-changed' : 'question-not-pending');
       }
       if (error?.notSent !== true && !NATIVE_ANSWER_REFUSALS.has(error.code)) {
         record.error = safeError(error); saveDispatch(record); await ensureWorker(record);

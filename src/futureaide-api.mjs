@@ -636,7 +636,7 @@ export class FutureAideClient {
     return { accepted: true, sessionId, workspaceId: workspace.workspaceId, workspaceTitle: workspace.title, projectVisible: true, modelRequestsStarted: 0 };
   }
 
-  async #hostCall(endpoint, args, { write = false, expectedInstance } = {}) {
+  async #hostCall(endpoint, args, { write = false, expectedInstance, beforeWrite } = {}) {
     if (!this.#hostBridgeFile) fail('host-bridge-required', 'Install and bootstrap the FutureAide host bridge first.');
     let credential;
     try { credential = JSON.parse(await readBoundedFile(this.#hostBridgeFile, 2048)); }
@@ -652,7 +652,7 @@ export class FutureAideClient {
         fail('cleanup-root-unverified', 'The configured DSH cleanup directory could not be identified.');
       }
     }
-    return (await this.#rpc(endpoint, { ...args, token: credential.token }, { write, expectedInstance, channel: 'futureaide-control' })).value;
+    return (await this.#rpc(endpoint, { ...args, token: credential.token }, { write, expectedInstance, beforeWrite, channel: 'futureaide-control' })).value;
   }
 
   async hostStatus() { return this.#hostCall('ping', {}); }
@@ -666,13 +666,13 @@ export class FutureAideClient {
   async cleanupRestore(ticket) { const expectedInstance = await this.#discover(); return this.#hostCall('cleanupRestore', {ticket}, {write:true, expectedInstance}); }
   async cleanupTempUsage(path) { return this.#hostCall('cleanupTempUsage', { path }); }
 
-  async #managedCall(method, input, write) {
+  async #managedCall(method, input, write, beforeWrite, pinnedInstance) {
     validId(input?.ownerId, 'ownerId');
     validId(input?.agentId, 'agentId');
     if (input.sessionId !== undefined) validId(input.sessionId);
     if (input.taskId !== undefined) validId(input.taskId, 'taskId');
-    const expectedInstance = await this.#discover();
-    return this.#hostCall(method, input, { write, expectedInstance });
+    const expectedInstance = pinnedInstance ?? await this.#discover();
+    return this.#hostCall(method, input, { write, expectedInstance, beforeWrite });
   }
 
   /** Managed identities are internal to one caller's roster, never model-entered addresses. */
@@ -693,7 +693,7 @@ export class FutureAideClient {
     return { sessionId: view.sessionId, cwd: view.workspace, running: view.running,
       projections: { asOfSeq: view.throughSeq, values: { modelSelection: { next: view.currentModel } } } };
   }
-  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID(), writeBlockReason } = {}) {
+  async managedSendMessage(input, text, { mode = 'queue', requestId = randomUUID(), writeBlockReason, selection, startSelection, expectedTurn } = {}) {
     validId(requestId, 'requestId');
     if (typeof text !== 'string' || text.trim().length === 0 || Buffer.byteLength(text, 'utf8') > MAX_TEXT_BYTES
         || !['queue', 'steer'].includes(mode)) fail('invalid-input', 'A nonempty message up to 128 KiB and queue or steer mode are required.');
@@ -709,7 +709,23 @@ export class FutureAideClient {
       if (reason) throw blockedSend(reason);
     } : undefined;
     if (gate) gate();
+    if (selection) {
+      let value;
+      try { value = await this.#managedCall('managedPromptV2', { ...input, message: text, mode, requestId, selection, ...(startSelection ? { startSelection } : {}), ...(expectedTurn !== undefined ? { expectedTurn } : {}) }, true, gate, expectedInstance); }
+      catch (error) {
+        if (['unknown-method', 'remote-not-found', 'not-found', 'managed-prompt-unsupported'].includes(error.code)) fail('managed-prompt-unsupported', 'This DSH host bridge cannot atomically validate model selection before sending. Update and reinstall the host bridge.');
+        if (!error.notSent && !['authentication-required', 'instance-changed'].includes(error.code)) error.uncertain = true;
+        throw error;
+      }
+      if (value?.status === 'retryable' && value.notSent === true) throw Object.assign(new Error('DSH turn or model changed before writing.'), { code: value.code ?? 'managed-model-changed', notSent: true, retryableRead: true });
+      if (value?.accepted !== true || value.requestId !== requestId || !Object.hasOwn(value, 'selected')) fail('invalid-response', 'DSH did not confirm the managed prompt.', { uncertain: true });
+      return { ...value, accepted: true, requestId, actualEffort: value.selected?.reasoningEffort ?? null, ...(value.selected?.reasoningEffort ? { actualEffortSource: 'host-readback' } : {}), actualModel: value.selected?.model ?? null };
+    }
     return this.#sendPrompt(row.sessionId, text, { mode, requestId }, expectedInstance, gate);
+  }
+  async managedPromptReceipt(input, requestId) {
+    validId(requestId, 'requestId');
+    return this.#managedCall('managedPromptReceipt', { ...input, requestId }, false);
   }
   async managedSelectModel(input, selection, { sessionOnly = false } = {}) {
     if (sessionOnly !== true) {

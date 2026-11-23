@@ -83,8 +83,7 @@ test('Codex caller carries model and effort from the catalog into turn/start', a
   assert.notEqual(sent.isError, true, JSON.stringify(sent.value));
   assert.equal(sent.value.actualModel, 'gpt-6-luna');
 
-  // A name with no model receives the ordinary native-inheritance delivery: no
-  // model or effort field may be written to thread/start or turn/start.
+  // A name without a model uses the target's default model and the plugin's effort.
   const plainCreated = await callTool(mcp.client, 'futureaide_create_agent', {
     name: '默认投递', lifetime: 'persistent', target: 'codex-desktop',
   }, meta);
@@ -95,7 +94,8 @@ test('Codex caller carries model and effort from the catalog into turn/start', a
     name: '默认投递', message: 'plain default task',
   }, meta);
   assert.notEqual(plainSent.isError, true, JSON.stringify(plainSent.value));
-  assert.equal(plainSent.value.actualModel, null);
+  assert.equal(plainSent.value.actualModel, 'gpt-6-astra');
+  assert.equal(plainSent.value.selectedEffort, 'max');
 
   // The send call can also carry the first explicit selection for a name created
   // without one. The receipt must report the full catalog id, not the substring.
@@ -133,11 +133,11 @@ test('Codex caller carries model and effort from the catalog into turn/start', a
   assert.equal(renderer.thread(selectedTurn.params.threadId)?.model, 'gpt-6-astra');
   assert.equal(renderer.thread(selectedTurn.params.threadId)?.reasoningEffort, 'max');
 
-  // Ordinary delivery keeps native inheritance: neither field is present at all.
-  assert.equal('model' in plainTurn.params, false);
-  assert.equal('effort' in plainTurn.params, false);
+  // The numeric-version 6 model uses the factory global fallback, not the 6.2 Astra entry.
+  assert.equal(plainTurn.params.model, 'gpt-6-astra');
+  assert.equal(plainTurn.params.effort, 'max');
   assert.equal(renderer.thread(plainTurn.params.threadId)?.model, 'gpt-6-astra');
-  assert.equal(renderer.thread(plainTurn.params.threadId)?.reasoningEffort, 'high');
+  assert.equal(renderer.thread(plainTurn.params.threadId)?.reasoningEffort, 'max');
   const started = renderer.calls().filter(call => call.method === 'thread/start');
   assert.ok(started.length >= 3, 'each named task has its own real thread');
   for (const call of started) {

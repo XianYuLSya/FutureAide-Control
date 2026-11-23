@@ -3,8 +3,6 @@ import path from 'node:path';
 import { BACKEND_METHODS } from './agent-backend.mjs';
 import * as cliRunner from './claude-cli-runner.mjs';
 
-export const CLAUDE_CLI_MODELS = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'];
-export const CLAUDE_CLI_EFFORTS = cliRunner.CLAUDE_EFFORTS;
 const coverage = { source: 'claude-cli', complete: false,
   note: 'File attribution uses the shared before/after workspace comparison.' };
 const fail = (code, message, extra) => Object.assign(new Error(message), { code, ...extra });
@@ -21,6 +19,7 @@ export function createClaudeCliBackend(record, deps = {}) {
   // One backend instance per operation. Readiness is fresh on the next status
   // or dispatch, while a single creation does not repeatedly spawn auth probes.
   let checked;
+  let catalog;
   async function preflight() {
     checked ??= runner.probeClaudeCli();
     const result = await checked;
@@ -61,11 +60,22 @@ export function createClaudeCliBackend(record, deps = {}) {
     // window where the adapter process dies after the runner recorded the refusal and
     // before it could save its own rejected request.
     const refused = native?.notSent === true || native?.error?.notSent === true;
-    const next = refused ? 'rejected' : 'accepted';
+    const accepted = native.businessAccepted === true || request.status === 'accepted';
+    const next = refused ? 'rejected' : accepted ? 'accepted' : native.state === 'failed' ? 'failed' : 'unknown';
     let changed = request.status !== next;
     request.status = next;
-    if (native.model && native.model !== value.currentModel?.model) {
-      value.currentModel = { provider: 'claude-cli', model: native.model };
+    if (native.businessAccepted === true && native.applied?.model) {
+      request.modelEvidence = { requestId: id, model: native.applied.model,
+        actualEffort: native.applied.effort ?? null, businessAccepted: true,
+        ...(native.inputUuid ? { inputUuid: native.inputUuid } : {}),
+        ...(native.effortAdjustment ? { effortAdjustment: native.effortAdjustment } : {}) };
+      value.modelEvidence = request.modelEvidence;
+      changed = true;
+    }
+    if (native.model && (native.model !== value.currentModel?.model
+        || (native.actualEffort ?? undefined) !== value.currentModel?.reasoningEffort)) {
+      value.currentModel = { provider: 'claude-cli', model: native.model,
+        ...(native.actualEffort == null ? {} : { reasoningEffort: native.actualEffort }) };
       changed = true;
     }
     if ((native.sessionStarted || native.state === 'ended') && !value.started) {
@@ -136,7 +146,7 @@ export function createClaudeCliBackend(record, deps = {}) {
       const last = Object.values(value.requests).filter(r => r.taskId === current.task?.taskId).at(-1);
       const failed = last?.terminal?.failure;
       return { sessionId: current.sessionId, taskId: current.task?.taskId, running, throughSeq: value.seq,
-        currentModel: value.currentModel, modelSelectionObserved: false, changes: [], coverage,
+        currentModel: value.currentModel, modelEvidence: value.modelEvidence, modelSelectionObserved: false, changes: [], coverage,
         ...await submissions(value), tree: { settled: !running, running,
           ...(failed ? { rootSummary: { ready: true, state: 'failed', reply: failed.message } } : {}),
           nodes: [{ sessionId: current.sessionId, parentSessionId: null, name: current.name, status,
@@ -150,7 +160,7 @@ export function createClaudeCliBackend(record, deps = {}) {
       // The worker already stores each turn's history. Read only the tail that
       // fills this page and keep large conversations out of the shared roster.
       const ids = Object.keys(value.requests).filter(id => value.requests[id].taskId === current.task?.taskId
-        && value.requests[id].status === 'accepted');
+        && (value.requests[id].status === 'accepted' || value.requests[id].terminal?.failure));
       let hasMore = false;
       for (let index = ids.length - 1; index >= 0; index--) {
         const native = await runner.readClaudeTurn(directory(ids[index]));
@@ -172,8 +182,8 @@ export function createClaudeCliBackend(record, deps = {}) {
       const result = { consumedQuestionIds: ids, continuation: 'Parent answer:\n' + message + '\nContinue the same task.' };
       value.answers[answerId] = result; save(value); return result;
     },
-    async deliver({ requestId, message, model, explicitModel = false, writeBlockReason }) {
-      if (!message?.trim() || !requestId || Boolean(model) !== explicitModel || (explicitModel && !model.model)) {
+    async deliver({ requestId, message, model, explicitModel, writeBlockReason }) {
+      if (!message?.trim() || !requestId || (explicitModel === true && !model?.model) || (model && !model.model)) {
         throw fail('invalid-dispatch', 'A request id, message and consistent model selection are required.', { terminal: true });
       }
       const dir = directory(requestId);
@@ -186,7 +196,8 @@ export function createClaudeCliBackend(record, deps = {}) {
         throw fail('request-id-conflict', 'The request id already belongs to a different input.');
       }
       if (prior && prior.status !== 'retryable') {
-        return { accepted: prior.status === 'accepted', status: prior.status, afterSeq: prior.afterSeq };
+        return { accepted: prior.status === 'accepted', status: prior.status, afterSeq: prior.afterSeq,
+          ...(prior.status === 'accepted' ? { actualEffort: prior.modelEvidence?.actualEffort ?? null } : {}) };
       }
       if (value.active) return { accepted: false, status: 'retryable' };
       const cli = await preflight();
@@ -205,7 +216,7 @@ export function createClaudeCliBackend(record, deps = {}) {
       try {
         const result = await runner.startClaudeTurn({ cli, directory: dir, workspace: load().workspace, name: load().name,
           sessionId: value.sessionId, resume: value.started === true, message, model: model?.model,
-          effort: model?.reasoningEffort, mcpConfig,
+          effort: model?.reasoningEffort, mcpConfig, stagedControl: true,
           ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) });
         if (result?.accepted !== true && !result?.duplicate) throw fail('claude-cli-start-refused', 'The CLI worker refused the turn.', { terminal: true });
       } catch (error) {
@@ -216,27 +227,29 @@ export function createClaudeCliBackend(record, deps = {}) {
         if (request.status === 'unknown') error.uncertain = true;
         throw error;
       }
-      request.status = 'accepted'; save(value);
-      return { accepted: true, status: 'accepted', afterSeq: request.afterSeq };
+      return { accepted: false, status: 'unknown', afterSeq: request.afterSeq };
     },
     async receipt({ requestId }) {
       const value = state();
       if (value.requests[requestId]?.status === 'unknown') await refresh(value);
       const request = value.requests[requestId];
       return request && { status: request.status, afterSeq: request.afterSeq,
-        ...(request.status === 'accepted' ? { result: { accepted: true, requestId } } : {}) };
+        ...(request.status === 'rejected' ? { notSent: true, error: request.terminal?.failure } : {}),
+        ...(request.status === 'failed' ? { error: request.terminal?.failure } : {}),
+        ...(request.status === 'accepted' ? { actualEffort: request.modelEvidence?.actualEffort ?? null,
+          ...(request.modelEvidence?.effortAdjustment ? { effortAdjustment: request.modelEvidence.effortAdjustment } : {}),
+          result: { accepted: true, requestId } } : {}) };
     },
     async turn({ requestId }) {
       const value = state();
       if (value.active === requestId) await refresh(value);
       const request = value.requests[requestId];
-      return request?.terminal ? { state: 'ended', correlation: 'request-id', ...request.terminal }
+      return request?.terminal && request.status !== 'unknown' ? { state: 'ended', correlation: 'request-id', ...request.terminal }
         : { state: 'running', ...(request?.status === 'accepted' ? { correlation: 'request-id' } : {}) };
     },
     async models() {
-      return { groups: [{ id: 'claude-cli', models: CLAUDE_CLI_MODELS.map(id => ({
-        id, name: id, reasoning: { efforts: CLAUDE_CLI_EFFORTS.map(effort => ({ id: effort })) },
-      })) }], note: 'Effort values are passed verbatim. Per-model support requires verification.' };
+      catalog ??= (async () => runner.discoverClaudeModels({ cli: await preflight(), workspace: load().workspace }))();
+      try { return await catalog; } catch (error) { catalog = undefined; throw error; }
     },
     async model() {
       const value = state(); await refresh(value); return value.currentModel;

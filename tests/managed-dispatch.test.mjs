@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { FutureAideClient } from '../src/futureaide-api.mjs';
 import { createControl } from '../src/control.mjs';
+import { createDshBackend } from '../src/agent-backend.mjs';
 
 async function fixture({ modern = false, changeInstance = false } = {}) {
   const base = path.resolve('clean', 'managed-dispatch-tests');
@@ -27,9 +28,20 @@ async function fixture({ modern = false, changeInstance = false } = {}) {
     state.calls.push(body);
     const reply = value => new Response(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: true, value } }));
     const reject = code => new Response(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result: { ok: false, error: { code } } }));
+    if (method === 'managedPromptReceipt') return reply(state.nativeReceipt ?? { status: 'unknown' });
+    if (method === 'ping') return reply({ methods: state.oldBridge ? ['managedSelectModel'] : ['managedPromptV2', 'managedPromptReceipt'], ...(state.lockPolicy ? { modelPolicy: 'default-only' } : {}) });
+    if (method === 'managedPromptV2') {
+      const args = body.payload.args;
+      if (state.oldBridge) return reject('unknown-method');
+      if (state.changedModel) return reply({ accepted: false, status: 'retryable', notSent: true, code: state.changedCode ?? 'managed-model-changed' });
+      state.prompts++;
+      if (state.losePromptReply) return stalled(init.signal);
+      return reply({ accepted: true, requestId: args.requestId, selected: args.selection });
+    }
     if (method === 'managedSelectModel') {
       const args = body.payload.args;
       state.managedSelections.push(args);
+      if (state.selectionError) return reject(state.selectionError);
       return reply({ accepted: true, sessionId: args.sessionId, selected: args.selection,
         source: 'managed-session-selectModel', defaultModelBehavior: 'Session-only: the app-wide default model is unchanged.',
         modelRequestsStarted: 0 });
@@ -181,4 +193,90 @@ test('ordinary CLI calls retain session-list ownership checks', async () => {
   await assert.rejects(plain.send({ sessionId: 'another-session', message: 'wrong', requestId: 'wrong' }), /configured project/);
   assert.ok(f.state.calls.some(call => call.method === 'session/list'));
   assert.equal(f.state.prompts, 1);
+});
+
+
+test('managed model fence retries only proven unwritten requests; lost replies remain unknown', async () => {
+  const f = await fixture(), selection = { provider: 'fixture', model: 'm', reasoningEffort: 'high' };
+  f.state.changedModel = true;
+  const args = { sessionId: 'session-a', message: 'work', requestId: 'fenced', selection };
+  await assert.rejects(f.control.send(args), e => e.code === 'managed-model-changed' && e.notSent === true);
+  assert.equal(f.state.prompts, 0);
+  f.state.changedModel = false;
+  assert.equal((await f.control.send(args)).accepted, true);
+  assert.equal(f.state.prompts, 1);
+  f.state.losePromptReply = true;
+  await assert.rejects(f.control.send({ ...args, requestId: 'lost' }), e => e.uncertain === true);
+  const duplicate = await f.control.send({ ...args, requestId: 'lost' });
+  assert.equal(duplicate.status, 'unknown'); assert.equal(f.state.prompts, 2);
+  const old = await fixture(); old.state.oldBridge = true;
+  await assert.rejects(old.control.send({ ...args, requestId: 'old' }), e => e.code === 'managed-prompt-unsupported' && /Update/.test(e.message));
+  assert.equal(old.state.prompts, 0);
+});
+
+
+test('DSH recovered accepted receipt exposes confirmed model and effort including null', async () => {
+  const f = await fixture();
+  const backend = createDshBackend({ client: f.client, control: f.control, hostArgs: () => f.binding, requestDirectory: () => f.config.stateDirectory });
+  for (const [requestId, selection, expected] of [
+    ['known', { provider: 'fixture', model: 'm', reasoningEffort: 'high' }, 'high'],
+    ['no-effort', { provider: 'fixture', model: 'm' }, null],
+  ]) {
+    await f.control.send({ sessionId: 'session-a', message: 'work', requestId, selection });
+    const receipt = await backend.receipt({ requestId });
+    assert.equal(receipt.status, 'accepted'); assert.equal(receipt.actualModel, 'm');
+    assert.equal(receipt.actualEffort, expected); assert.ok(Object.hasOwn(receipt, 'actualEffort'));
+    assert.equal(receipt.actualEffortSource, expected ? 'host-readback' : undefined);
+  }
+});
+
+
+test('DSH checks host prompt capability before selection and recovers native receipt by read only', async () => {
+  const f = await fixture();
+  const backend = createDshBackend({ client: f.client, control: () => f.control, hostArgs: () => f.binding, requestDirectory: () => f.config.stateDirectory });
+  f.state.oldBridge = true;
+  await assert.rejects(backend.selectModel({ requestId: 'select', provider: 'fixture', model: 'm', sessionOnly: true }), e => e.code === 'managed-prompt-unsupported' && /Update/.test(e.message));
+  assert.equal(f.state.managedSelections.length, 0);
+  f.state.oldBridge = false; f.state.losePromptReply = true;
+  await assert.rejects(f.control.send({ sessionId: 'session-a', message: 'work', requestId: 'lost-native', selection: { provider: 'fixture', model: 'm', reasoningEffort: 'high' } }), e => e.uncertain);
+  f.state.nativeReceipt = { status: 'accepted', requestId: 'lost-native', selected: { provider: 'fixture', model: 'm', reasoningEffort: 'high' } };
+  const receipt = await backend.receipt({ requestId: 'lost-native' });
+  assert.equal(receipt.status, 'accepted'); assert.equal(receipt.actualEffort, 'high'); assert.equal(receipt.actualModel, 'm'); assert.equal(receipt.actualEffortSource, 'host-readback');
+  f.state.nativeReceipt = { status: 'accepted', requestId: 'lost-native', selected: null };
+  const unknown = await backend.receipt({ requestId: 'lost-native' });
+  assert.equal(unknown.status, 'accepted'); assert.equal(unknown.actualEffort, null); assert.equal(unknown.actualModel, null); assert.equal(unknown.actualEffortSource, undefined);
+  assert.equal(f.state.prompts, 1);
+});
+
+
+test('verified model lock changes during selection: same business request writes once after reselection', async () => {
+  const f = await fixture(); f.state.lockPolicy = true; f.state.selectionError = 'managed-model-locked';
+  const backend = createDshBackend({ client: f.client, control: () => f.control, hostArgs: () => f.binding, requestDirectory: () => f.config.stateDirectory });
+  const requestId = 'business-same';
+  await assert.rejects(backend.selectModel({ requestId: 'selection-a', provider: 'fixture', model: 'a', reasoningEffort: 'high', sessionOnly: true }),
+    e => e.code === 'managed-model-changed' && e.notSent === true && e.retryableRead === true);
+  assert.equal(f.state.prompts, 0);
+  f.state.selectionError = undefined;
+  const model = { provider: 'fixture', model: 'b', reasoningEffort: 'high' };
+  assert.equal((await backend.selectModel({ requestId: 'selection-b', ...model, sessionOnly: true })).accepted, true);
+  assert.equal((await backend.deliver({ requestId, message: 'one business input', model })).accepted, true);
+  assert.equal(f.state.prompts, 1);
+  assert.equal(f.state.calls.filter(c => c.method === 'managedPromptV2')[0].payload.args.requestId, requestId);
+  const other = await fixture(); other.state.selectionError = 'managed-model-locked';
+  const unlocked = createDshBackend({ client: other.client, control: () => other.control, hostArgs: () => other.binding });
+  await assert.rejects(unlocked.selectModel({ requestId: 'other', ...model, sessionOnly: true }), e => e.code === 'managed-model-locked' && !e.retryableRead);
+  f.state.selectionError = 'managed-model-unavailable';
+  await assert.rejects(backend.selectModel({ requestId: 'different-error', ...model, sessionOnly: true }), e => e.code === 'managed-model-unavailable' && !e.retryableRead);
+});
+
+
+test('DSH persists the distinct no-write turn refusal for cold recovery', async () => {
+  const f = await fixture(); f.state.changedModel = true; f.state.changedCode = 'managed-turn-ended';
+  const backend = createDshBackend({ client: f.client, control: () => f.control, hostArgs: () => f.binding, requestDirectory: () => f.config.stateDirectory });
+  const high = { provider: 'fixture', model: 'm', reasoningEffort: 'high' }, max = { ...high, reasoningEffort: 'max' };
+  await assert.rejects(backend.deliver({ requestId: 'turn-race', message: 'work', kind: 'supplement', model: high, startModel: max, expectedTurn: { throughSeq: 4 } }),
+    error => error.code === 'managed-turn-ended' && error.notSent && error.retryableRead);
+  const receipt = await backend.receipt({ requestId: 'turn-race' });
+  assert.equal(receipt.status, 'retryable'); assert.equal(receipt.code, 'managed-turn-ended'); assert.equal(receipt.notSent, true);
+  assert.equal(f.state.prompts, 0);
 });

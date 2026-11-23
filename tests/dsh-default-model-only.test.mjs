@@ -54,3 +54,18 @@ test('the bridge announces its lock at ping only when its row carries it', async
   assert.equal((await ping({})).modelPolicy, undefined);
   assert.equal((await ping({ defaultModelOnly: true })).modelPolicy, 'default-only');
 });
+
+
+test('effort configuration merges factory, base and profile and validates fields', async t => {
+  const root = await mkdtemp(path.join(tmpdir(), 'effort-config-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const file = path.join(root, 'config.json');
+  await mkdir(path.join(root, 'profiles'));
+  await writeFile(file, JSON.stringify({ defaultEffort: 'high', modelDefaultEfforts: { Other: 'low', 'GPT-6.2-ASTRA': 'medium' } }));
+  await writeFile(path.join(root, 'profiles', 'test.json'), JSON.stringify({ workspace: root, modelDefaultEfforts: { OTHER: 'max' } }));
+  const config = await loadConfig(file, 'test');
+  assert.equal(config.defaultEffort, 'high');
+  assert.deepEqual(config.modelDefaultEfforts, { 'gpt-6.2-astra': 'medium', other: 'max' });
+  await writeFile(file, JSON.stringify({ modelDefaultEfforts: { bad: 'typo' } }));
+  await assert.rejects(loadConfig(file), /modelDefaultEfforts.bad/);
+});

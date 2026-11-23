@@ -36,9 +36,9 @@ import { ownerIdFor, ownerIdForSource } from '../src/calling-context.mjs';
 import { startHttpService } from '../src/claude-report-server.mjs';
 import { scopedManagement } from '../src/mcp-server.mjs';
 import { connectHttpMcp, callTool } from '../test/assembly/fixture.mjs';
-import { CLAUDE_CLI_MODELS, createClaudeCliBackend } from '../src/claude-cli-backend.mjs';
+import { createClaudeCliBackend } from '../src/claude-cli-backend.mjs';
 import {
-  cancelClaudeTurn, probeClaudeCli, readClaudeTurn, startClaudeTurn,
+  cancelClaudeTurn, discoverClaudeModels, probeClaudeCli, readClaudeTurn, startClaudeTurn,
 } from '../src/claude-cli-runner.mjs';
 import {
   CLI_MODELS, latestTurnDirectory, pidAlive, readInvocations, writeAuthState,
@@ -61,6 +61,8 @@ const runner = {
     exec: (cli, args, execOptions) => execFileAsync(process.execPath, [cli, ...args], execOptions) }),
   startClaudeTurn: (input, deps) => startClaudeTurn({ ...input,
     cli: { command: process.execPath, prefixArgs: [FAKE_CLI] } }, deps),
+  discoverClaudeModels: input => discoverClaudeModels({ ...input,
+    cli: { command: process.execPath, prefixArgs: [FAKE_CLI] } }),
   readClaudeTurn,
   cancelClaudeTurn,
 };
@@ -247,7 +249,7 @@ test('Claude Desktop calls a named CLI helper over MCP and receives its report i
 
 // --------------------------------------------------------------- acceptance
 
-test('a logged-out CLI refuses the name with its own reason while the four models stay listed', async t => {
+test('a logged-out CLI refuses the name and does not invent a model catalog', async t => {
   const f = await assembly('auth', { loggedIn: false, steps: [] });
   t.after(() => f.close());
 
@@ -257,10 +259,8 @@ test('a logged-out CLI refuses the name with its own reason while the four model
   assert.equal(diagnosed.ready, false);
   assert.equal(diagnosed.reason.code, 'claude-cli-auth-required', JSON.stringify(diagnosed.reason));
   assert.match(diagnosed.reason.message, /claude auth login|sign in/i);
-  assert.deepEqual(diagnosed.models, [...CLAUDE_CLI_MODELS], 'the four declared models are still listed while logged out');
-  assert.equal(diagnosed.models.length, 4);
+  assert.deepEqual(diagnosed.models, [], 'a logged-out CLI cannot verify its catalog');
   assert.equal(diagnosed.defaultModel, null, 'no default model is invented before a real turn reports one');
-  assert.deepEqual([...CLAUDE_CLI_MODELS], [...CLI_MODELS], 'the stand-in and the adapter declare the same catalog');
 
   // Creating a name is refused before the name exists, with that same reason.
   await assert.rejects(() => f.service.create({ name: '待登录', lifetime: 'persistent', target: 'claude-cli' }, extra),
@@ -310,7 +310,7 @@ test('the first dispatch names the session, ask_parent reaches the caller, answe
   assert.ok(first, 'one CLI turn ran');
   assert.ok(first.argv.includes('--session-id'), `the first turn names the conversation: ${JSON.stringify(first.argv)}`);
   assert.equal(first.resumed, false);
-  assert.equal(first.modelFlag, false, 'no --model is passed when the caller selected none');
+  assert.equal(first.modelFlag, true, 'the discovered default is frozen for the worker');
   assert.equal(first.prompt, 'do the work');
   const sessionId = first.sessionId;
   assert.match(sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-/, 'the turn carries a real session UUID');
@@ -382,7 +382,8 @@ test('a Claude CLI final waits for all three supplements in the same session', a
   assert.match(first.calls[0].error.error.message, /end this turn.*next queued message in this conversation/i);
 
   await pollUntil(f, agentId, record => !record || record.state === 'supplement_blocked' || record.state === 'failed',
-    { message: 'the one-shot final to deliver and clean up' });
+    // Three consecutive resumed CLI processes each perform their own settings handshake.
+    { timeoutMs: 90000, message: 'the one-shot final to deliver and clean up' });
   assert.equal(f.record(name), undefined);
   const turns = f.invocations().filter(invocation => invocation.command === 'print');
   assert.deepEqual(turns.map(invocation => invocation.prompt), ['initial task', ...supplements]);

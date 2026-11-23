@@ -10,7 +10,7 @@ import { createControl, endedState, modelTurnError } from './control.mjs';
 import { feedbackRecordError, submitFeedback } from './feedback-client.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
-import { actualModelName, resolveModelSelection, sameModelSelection } from './model-selection.mjs';
+import { actualModelName, resolveDispatchSelection, sameModelSelection } from './model-selection.mjs';
 import { callCodexOwner, readCodexOwnerTurns, readCodexOwnerItems } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
@@ -239,6 +239,8 @@ function treeCoverage(record, view, workspace) {
 function publicResult(record, { fullResult = false } = {}) {
   const task = record.task;
   const lastDispatch = task?.dispatches?.at(-1);
+  const activeDispatch = [...(task?.dispatches ?? [])].reverse().find(item => item.accepted === true);
+  const visibleSelection = activeDispatch?.deliverySelection ?? activeDispatch?.model ?? (!task ? record.creationSelection : task.modelSelection);
   const error = record.error ?? task?.cancelError ?? (lastDispatch?.state === 'failed' ? lastDispatch.failure : undefined)
     ?? (!['completed', 'cancelled'].includes(lastDispatch?.state) ? lastDispatch?.error : undefined);
   const view = record.observation ?? {};
@@ -246,14 +248,22 @@ function publicResult(record, { fullResult = false } = {}) {
   const explicitReports = (task?.reports ?? []).filter(report => !report.failure);
   return {
     name: record.name, lifetime: record.lifetime, target: targetOf(record), state: record.state,
+    requestedEffort: visibleSelection?.requestedEffort ?? null,
+    effortSource: visibleSelection?.effortSource ?? null,
+    selectedEffort: visibleSelection?.selectedEffort ?? null,
+    actualEffort: activeDispatch?.actualEffort ?? null,
+    actualEffortSource: activeDispatch?.actualEffort != null ? activeDispatch.actualEffortSource ?? null : null,
+    ...(['current-turn', 'new-turn'].includes(activeDispatch?.delivery) ? { inputDelivery: activeDispatch.delivery } : {}),
+    ...((activeDispatch?.effortAdjustment ?? visibleSelection?.effortAdjustment) ? { effortAdjustment: activeDispatch?.effortAdjustment ?? visibleSelection.effortAdjustment } : {}),
     // The full ID the target actually uses, never the caller's substring. The
     // explicit pin is a separate value and is only reported by a dispatch receipt;
     // list/wait must not present an intended selection as an observed model. An
     // unpinned Codex name starts null and becomes known from the live observation
     // before record.model catches up.
-    actualModel: record.modelPin && targetOf(record) !== 'claude-cli'
-      ? actualModelName(record.model) ?? actualModelName(record.observation?.currentModel)
-      : actualModelName(record.observation?.currentModel) ?? actualModelName(record.model),
+    actualModel: activeDispatch && Object.hasOwn(activeDispatch, 'actualModel') ? actualModelName(activeDispatch.actualModel)
+      : record.modelPin && targetOf(record) !== 'claude-cli'
+        ? actualModelName(record.model) ?? actualModelName(record.observation?.currentModel)
+        : actualModelName(record.observation?.currentModel) ?? actualModelName(record.model),
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
       ...(task.finishedAt ? { finishedAt: task.finishedAt } : {}),
       ...(task.result ? { result: { state: task.result.state,
@@ -289,6 +299,12 @@ function publicResult(record, { fullResult = false } = {}) {
  * accepted. `inspect` returns these rows so one requestId can be followed from the
  * local queue to its actual route. Fields absent from historical rows stay absent.
  */
+function inputEffort(selection, actualEffort = null, adjustment, source) {
+  return { requestedEffort: selection?.requestedEffort ?? null, effortSource: selection?.effortSource ?? null,
+    selectedEffort: selection?.selectedEffort ?? null, actualEffort, actualEffortSource: actualEffort == null ? null : source ?? null,
+    ...((adjustment ?? selection?.effortAdjustment) ? { effortAdjustment: adjustment ?? selection.effortAdjustment } : {}) };
+}
+
 function taskInputs(store, record) {
   const task = record.task;
   if (!task) return [];
@@ -345,14 +361,16 @@ function taskInputs(store, record) {
     if (dispatch.kind === 'answer') continue;
     if (blockedInputs.has(dispatch.requestId)) continue;
     const existing = rows.get(dispatch.requestId);
-    const delivery = dispatch.delivery
-      ?? (dispatch.state === 'blocked' || (dispatch.state === 'failed' && dispatch.error) ? 'blocked'
+    const delivery = dispatch.accepted === true && Object.hasOwn(dispatch, 'delivery') && dispatch.delivery === null
+      ? null : dispatch.delivery ?? (dispatch.state === 'blocked' || (dispatch.state === 'failed' && dispatch.error) ? 'blocked'
         : ['sending', 'queued', 'retrying'].includes(dispatch.state) ? 'local-pending' : undefined);
-    const status = lifecycle(delivery) ?? dispatch.state;
+    const status = lifecycle(delivery) ?? (dispatch.accepted ? 'accepted' : dispatch.state);
     put(dispatch.requestId, {
       requestId: dispatch.requestId,
+      ...inputEffort(dispatch.accepted ? dispatch.deliverySelection ?? dispatch.model : dispatch.model, dispatch.accepted ? dispatch.actualEffort ?? null : null, dispatch.effortAdjustment, dispatch.actualEffortSource),
+      actualModel: dispatch.accepted && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel) : null,
       ...(dispatch.mode ? { mode: dispatch.mode } : {}),
-      ...(delivery ? { delivery } : {}),
+      ...(delivery === null ? { delivery: null } : delivery ? { delivery } : {}),
       accepted: dispatch.accepted === true,
       queued: dispatch.accepted !== true && (waitingRoute(delivery) || ['sending', 'queued', 'retrying'].includes(dispatch.state)),
       ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
@@ -414,7 +432,10 @@ function taskInputs(store, record) {
           && (waitingRoute(route) || ['sending', 'queued', 'retrying'].includes(dispatch.state))) {
         delivery = 'answer-pending'; queued = true;
       } else if (dispatch.accepted === true) {
-        delivery = 'accepted-route-unknown'; accepted = true;
+        delivery = dispatch.delivery === null ? null : 'accepted-route-unknown'; accepted = true;
+      } else if (route === 'blocked' || dispatch.state === 'blocked'
+          || (dispatch.state === 'failed' && dispatch.error)) {
+        delivery = 'blocked'; reason = dispatch.error?.code ?? 'send-failed';
       } else {
         delivery = 'unknown'; reason = dispatch.error?.code ?? 'answer-outcome-unknown';
       }
@@ -430,6 +451,8 @@ function taskInputs(store, record) {
     }
     put(answer.answerId, {
       requestId: answer.answerId,
+      ...inputEffort((dispatch?.accepted ? dispatch.deliverySelection : undefined) ?? dispatch?.model ?? answer.modelSelection, dispatch?.accepted ? dispatch.actualEffort ?? null : answer.actualEffort ?? null, dispatch?.effortAdjustment, dispatch?.actualEffortSource ?? answer.actualEffortSource),
+      actualModel: dispatch?.accepted && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel) : null,
       mode: 'steer',
       delivery,
       accepted,
@@ -437,7 +460,7 @@ function taskInputs(store, record) {
       ...(dispatch?.turnId ?? answer.turnId ? { turnId: dispatch?.turnId ?? answer.turnId } : {}),
       ...(dispatch?.afterTurnId ?? answer.afterTurnId ? { afterTurnId: dispatch?.afterTurnId ?? answer.afterTurnId } : {}),
       ...(reason ? { reason } : {}),
-      status: lifecycle(delivery) ?? 'unknown',
+      status: lifecycle(delivery) ?? (accepted ? 'accepted' : 'unknown'),
       ...(existing?.createdAt ? {} : dispatch?.startedAt ? { createdAt: dispatch.startedAt } : {}),
     });
   }
@@ -1379,6 +1402,16 @@ export function createScopedAgents(config, {
    */
   async function observe(record, { checkingRestoredProfile = false } = {}) {
     const own = await observeOwn(record);
+    const evidence = own.modelEvidence;
+    if (evidence?.businessAccepted === true && evidence.requestId && evidence.actualEffort != null) {
+      const dispatch = record.task?.dispatches?.find(item => item.requestId === evidence.requestId && item.accepted === true);
+      if (dispatch && (!evidence.turnId || !dispatch.turnId || evidence.turnId === dispatch.turnId)) {
+        dispatch.actualEffort = evidence.actualEffort;
+        dispatch.actualEffortSource = evidence.actualEffortSource ?? 'host-readback';
+        if (evidence.effortAdjustment) dispatch.effortAdjustment = evidence.effortAdjustment;
+        if (evidence.model) dispatch.actualModel = evidence.model;
+      }
+    }
     const keyOf = (agentId, native) => agentId === record.agentId ? native : `${agentId}:${native}`;
     const nodes = (own.tree?.nodes ?? []).map(node => ({ ...node,
       name: node.sessionId === record.sessionId ? record.name : node.name,
@@ -1500,13 +1533,13 @@ export function createScopedAgents(config, {
    * sides name one: the native thread summary can omit it while the catalog id is
    * already the resolved model.
    */
-  function sameTurnSelection(left, right) {
+  function sameTurnSelection(left, right, fields = { model: true, effort: true }) {
     if (!left || !right) return false;
     const text = value => typeof value === 'string' ? value.trim().toLowerCase() : '';
     const model = text(left.model);
-    if (!model || model !== text(right.model)) return false;
-    if ((text(left.reasoningEffort) || '') !== (text(right.reasoningEffort) || '')) return false;
-    return !text(left.provider) || !text(right.provider) || text(left.provider) === text(right.provider);
+    if (fields.model && (!model || model !== text(right.model))) return false;
+    if (fields.effort && (!text(right.reasoningEffort) || text(left.reasoningEffort) !== text(right.reasoningEffort))) return false;
+    return !fields.model || !text(left.provider) || !text(right.provider) || text(left.provider) === text(right.provider);
   }
 
   function deliveryAccepted(delivery) {
@@ -1543,15 +1576,17 @@ export function createScopedAgents(config, {
 
   /** The selection the active root turn was started with, from native or saved evidence. */
   function activeTurnSelection(record, root) {
-    if (root?.selection) return root.selection;
     // A saved task dispatch is evidence only for the exact turn the root reports. A
     // later turn B in the same task must not borrow the first dispatch's selection.
     const turnId = root?.turnId;
-    if (!turnId) return undefined;
-    const started = (record.task?.dispatches ?? []).find(dispatch => dispatch.kind === 'task'
-      && dispatch.accepted === true && dispatch.selectionExplicit === true && dispatch.model
-      && dispatch.turnId === turnId);
-    return started?.model;
+    if (!turnId) return root?.selection;
+    const started = (record.task?.dispatches ?? []).find(dispatch => dispatch.accepted === true
+      && dispatch.delivery === 'new-turn' && dispatch.model && dispatch.turnId === turnId);
+    const evidence = started?.model ? { ...started.model,
+      ...(started.actualEffort !== undefined ? { reasoningEffort: started.actualEffort, actualEffortSource: started.actualEffortSource } : {}) } : undefined;
+    return root?.selection ? { ...evidence, ...root.selection,
+      reasoningEffort: root.selection.reasoningEffort ?? evidence?.reasoningEffort,
+      actualEffortSource: root.selection.reasoningEffort != null ? 'host-readback' : evidence?.actualEffortSource } : evidence;
   }
 
   /**
@@ -1563,12 +1598,13 @@ export function createScopedAgents(config, {
   async function rootSelectionMatch(record, selection, root) {
     const backend = await backendFor(record);
     if (typeof backend.matchRootSelection === 'function') {
-      const match = await backend.matchRootSelection({ selection,
+      const match = await backend.matchRootSelection({ selection, explicitFields: selection?.explicitFields ?? { model: true, effort: true },
         ...(root?.turnId ? { turnId: root.turnId } : {}) });
       return match?.status;
     }
     const active = activeTurnSelection(record, root);
-    return active ? (sameTurnSelection(selection, active) ? 'same' : 'different') : 'unknown';
+    if (!active || (selection?.explicitFields?.effort && !active.reasoningEffort)) return 'unknown';
+    return sameTurnSelection(selection, active, selection?.explicitFields) ? 'same' : 'different';
   }
 
   async function assertExplicitSelectionForRunning(record, pin, root) {
@@ -1593,10 +1629,17 @@ export function createScopedAgents(config, {
     };
   }
 
+  function effortReceipt(selection, actualEffort = null, adjustment, source) {
+    if (!selection) return { actualEffort, actualEffortSource: actualEffort == null ? null : source ?? null };
+    return { requestedEffort: selection.requestedEffort ?? null,
+      effortSource: selection.effortSource ?? null, selectedEffort: selection.selectedEffort ?? null,
+      actualEffort, actualEffortSource: actualEffort == null ? null : source ?? null, ...((adjustment ?? selection.effortAdjustment) ? { effortAdjustment: adjustment ?? selection.effortAdjustment } : {}) };
+  }
+
   function dispatchReceipt(dispatch) {
     if (!dispatch) return {};
     return {
-      ...(dispatch.delivery ? { delivery: dispatch.delivery } : {}),
+      ...(dispatch.delivery === null && dispatch.accepted ? { delivery: null } : dispatch.delivery ? { delivery: dispatch.delivery } : {}),
       ...(dispatch.accepted === true ? { accepted: true, queued: false } : {}),
       ...(dispatch.turnId ? { turnId: dispatch.turnId } : {}),
       ...(dispatch.delivery !== 'current-turn' && dispatch.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
@@ -1604,6 +1647,7 @@ export function createScopedAgents(config, {
       ...(dispatch.deliveryIntent?.expectedTurnId ? { expectedTurnId: dispatch.deliveryIntent.expectedTurnId } : {}),
       ...(dispatch.mode ? { mode: dispatch.mode } : {}),
       selectionExplicit: dispatch.selectionExplicit === true,
+      ...effortReceipt(dispatch.accepted ? dispatch.deliverySelection ?? dispatch.model : dispatch.model, dispatch.actualEffort, dispatch.effortAdjustment, dispatch.actualEffortSource),
     };
   }
 
@@ -1634,8 +1678,8 @@ export function createScopedAgents(config, {
     const terminalDelivery = item?.status === 'blocked' ? 'blocked'
       : item?.status === 'accepted' ? (stored.delivery ?? dispatch?.delivery ?? 'accepted-route-unknown')
         : item?.status === 'unknown' ? 'unknown' : undefined;
-    const delivery = terminalDelivery ?? stored.delivery ?? dispatch?.delivery ?? fallback.delivery
-      ?? 'local-pending';
+    const delivery = dispatch?.accepted === true && Object.hasOwn(dispatch, 'delivery') && dispatch.delivery === null
+      ? null : terminalDelivery ?? stored.delivery ?? dispatch?.delivery ?? fallback.delivery ?? 'local-pending';
     const accepted = item?.status === 'blocked' ? false
       : item?.status === 'accepted' || dispatch?.accepted === true || deliveryAccepted(delivery);
     const queued = !accepted && item?.status !== 'blocked' && (deliveryQueued(delivery)
@@ -1656,23 +1700,31 @@ export function createScopedAgents(config, {
       ...(reason ? { error: { code: reason, message: reason === 'dispatch-expired'
         ? 'This input passed its six hours before it could be sent.'
         : 'This input could not be delivered; its body is kept.' } } : {}),
-      actualModel: actualModelName(item?.selection) ?? actualModelName(fallback.pin)
-        ?? actualModelName(current.model) ?? actualModelName(current.modelPin),
+      ...effortReceipt((dispatch?.accepted ? dispatch.deliverySelection ?? dispatch.model : undefined) ?? item?.selection ?? fallback.pin, dispatch?.actualEffort ?? stored.actualEffort ?? null, dispatch?.effortAdjustment ?? stored.effortAdjustment, dispatch?.actualEffortSource ?? stored.actualEffortSource),
+      actualModel: dispatch && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel)
+        : actualModelName(item?.selection) ?? actualModelName(fallback.pin)
+          ?? actualModelName(current.model) ?? actualModelName(current.modelPin),
       ...(current.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable',
         message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
       ...(fallback.previousReport ? { previousReport: fallback.previousReport } : {}),
     };
   }
 
-  async function resolveRequestedPin(record, input) {
-    const request = selectionRequest(input);
-    if (request.model === undefined && !record.modelPin) {
-      // Fail before a catalog read: an effort alone may only refine an already
-      // explicit choice, never silently pin the host's current default.
-      return resolveModelSelection({ groups: [] }, request, { pinned: record.modelPin });
-    }
+  async function resolveRequestedPin(record, input = {}, frozenConfig) {
     const backend = await backendFor(record);
-    return resolveModelSelection(await backend.models(), request, { pinned: record.modelPin });
+    const catalog = await backend.models();
+    const current = input.model !== undefined && !dshDefaultOnly(record) ? undefined :
+      targetOf(record) === 'dsh' && !record.modelPin ? catalog?.default :
+      dshDefaultOnly(record) ? catalog?.default : (record.modelPin ? undefined : await backend.model());
+    const request = selectionRequest(input);
+    if (dshDefaultOnly(record)) delete request.model;
+    const selection = resolveDispatchSelection(catalog, request, {
+      pinned: dshDefaultOnly(record) ? undefined : record.modelPin, current, config: frozenConfig ?? config.behavior ?? config,
+    });
+    return selection && { ...selection, explicitFields: {
+      model: !dshDefaultOnly(record) && input.model !== undefined,
+      effort: input.effort !== undefined,
+    }, explicitInput: selectionRequest(input), effortConfig: frozenConfig ?? { defaultEffort: (config.behavior ?? config).defaultEffort, modelDefaultEfforts: { ...((config.behavior ?? config).modelDefaultEfforts ?? {}) } } };
   }
 
   /**
@@ -1683,12 +1735,14 @@ export function createScopedAgents(config, {
    * turn — then the real next-turn control is read instead. `sessionOnly` is set for
    * explicit pins and omitted for default-follow, which keeps the old DSH behavior.
    */
-  async function confirmDshSelection(backend, target, dispatch, selection, observed, { sessionOnly = false } = {}) {
+  async function confirmDshSelection(record, backend, target, dispatch, selection, observed, { sessionOnly = false } = {}) {
     const current = observed && observed.modelSelectionObserved !== false
       ? observed.currentModel
       : await backend.model();
     if (sameModelSelection(current, selection)) return;
-    const selected = await backend.selectModel({ ...selection, requestId: `${dispatch.requestId}-model`,
+    dispatch.modelSelectionAttempt = (dispatch.modelSelectionAttempt ?? 0) + 1;
+    saveDispatch(record);
+    const selected = await backend.selectModel({ ...selection, requestId: `${dispatch.requestId}-model-${dispatch.modelSelectionAttempt}`,
       ...(sessionOnly ? { sessionOnly: true } : {}) });
     if (selected.accepted !== true) {
       throw Object.assign(new Error(`${backend.labels?.host ?? target} did not confirm the selected model.`),
@@ -1714,25 +1768,86 @@ export function createScopedAgents(config, {
   }
 
   async function followHostModel(record, dispatch, observed) {
-    if (dispatch.modelReady) return;
+    if (dispatch.modelReady && !(dshDefaultOnly(record) && !dispatch.deliveryIntent)) return;
     // Every save below happens after an await, so each one is fenced on the round this
     // dispatch belongs to: a stale copy must never overwrite a round that has moved on.
     const backend = await backendFor(record);
     const target = targetOf(record);
-    if (dshDefaultOnly(record)) {
-      // Frozen before the installation locked DSH to its default: never applied.
-      delete dispatch.model;
-      dispatch.explicitModel = false;
-      dispatch.selectionExplicit = false;
+    if (!dispatch.model && dispatch.pendingSelection) {
+      dispatch.model = await resolveRequestedPin(record, dispatch.pendingSelection.input, dispatch.pendingSelection.config);
+      delete dispatch.pendingSelection;
+      saveDispatch(record);
     }
     const explicit = dispatch.selectionExplicit === true && dispatch.model !== undefined;
     if (target === 'dsh') {
+      let lockedDefault;
+      if (dshDefaultOnly(record) && !dispatch.deliveryIntent && dispatch.model) {
+        const catalog = await backend.models();
+        lockedDefault = catalog?.default;
+        if (catalog?.default?.model && (catalog.default.model !== dispatch.model.model
+            || (catalog.default.provider ?? '') !== (dispatch.model.provider ?? ''))) {
+          const before = dispatch.model;
+          delete dispatch.deliveryModel;
+          delete dispatch.deliverySelection;
+          const input = { ...(before.explicitInput?.effort !== undefined ? { effort: before.explicitInput.effort } : {}) };
+          const frozenConfig = before.effortConfig ?? config.behavior ?? config;
+          dispatch.model = { ...resolveDispatchSelection(catalog, input, { current: catalog.default, config: frozenConfig }),
+            explicitFields: { model: false, effort: before.explicitFields?.effort === true },
+            explicitInput: before.explicitInput, effortConfig: before.effortConfig };
+          dispatch.modelReselection = { before: { provider: before.provider, model: before.model },
+            after: { provider: dispatch.model.provider, model: dispatch.model.model }, reason: 'locked-default-changed-before-write' };
+          saveDispatch(record);
+        }
+      }
+      if (dispatch.kind !== 'task' && observed?.running === true && !dispatch.deliveryIntent) {
+        const current = observed.modelSelectionObserved !== false && observed.currentModel
+          ? observed.currentModel : await backend.model();
+        const fields = dispatch.model?.explicitFields;
+        if (!current?.model || (fields?.effort && !current.reasoningEffort)) {
+          throw Object.assign(new Error('The running DSH turn selection could not be confirmed.'), { code: 'model-selection-unconfirmed', terminal: true, notSent: true });
+        }
+        let stepSelection;
+        if (!dshDefaultOnly(record) && !fields?.model && fields?.effort) {
+          // An effort-only steer belongs to the active provider even when the host
+          // default now names a different provider with the same model ID. Resolve
+          // against that provider's own capabilities; preserve model as start(B).
+          const catalog = await backend.models();
+          const groups = (catalog?.groups ?? []).filter(group => (group.id ?? group.provider) === current.provider);
+          const activeCatalog = { ...catalog, groups, routableProviders: [current.provider] };
+          stepSelection = resolveDispatchSelection(activeCatalog,
+            { model: current.model, effort: dispatch.model.explicitInput?.effort },
+            { current, config: dispatch.model.effortConfig ?? config.behavior ?? config });
+          dispatch.deliverySelection = stepSelection;
+        }
+        const changesModel = fields?.model && (current.model !== dispatch.model.model || (current.provider ?? '') !== (dispatch.model.provider ?? ''));
+        const changesEffort = fields?.effort && current.reasoningEffort !== (stepSelection ?? dispatch.model).reasoningEffort;
+        const currentMatchesLock = !dshDefaultOnly(record) || !lockedDefault?.model
+          || (current.model === lockedDefault.model && (current.provider ?? '') === (lockedDefault.provider ?? ''));
+        if (!changesModel && !changesEffort && currentMatchesLock) {
+          dispatch.deliveryModel = { ...current };
+          dispatch.modelReady = true;
+          saveDispatch(record);
+          return;
+        }
+        delete dispatch.deliveryModel;
+        if (stepSelection) {
+          await confirmDshSelection(record, backend, target, dispatch, stepSelection, observed, { sessionOnly: true });
+          dispatch.deliveryModel = { ...stepSelection };
+          record.model = { ...stepSelection };
+          dispatch.modelReady = true;
+          saveDispatch(record);
+          return;
+        }
+        delete dispatch.deliverySelection;
+        // DSH supports a session-local selection for the next model step of an
+        // active turn. Apply an explicit change through its normal host check.
+      }
       if (!dispatch.model) {
         // DSH default-follow keeps the old resolveModel and its catalog validation.
         dispatch.model = resolveModel(await backend.models(), {});
         saveDispatch(record);
       }
-      await confirmDshSelection(backend, target, dispatch, dispatch.model, observed, { sessionOnly: explicit });
+      await confirmDshSelection(record, backend, target, dispatch, dispatch.model, observed, { sessionOnly: true });
       record.model = { ...dispatch.model };
       dispatch.modelReady = true;
       saveDispatch(record);
@@ -1785,9 +1900,9 @@ export function createScopedAgents(config, {
     // is already queued or being recovered. `freezeModel` on a queued supplement
     // records that it had no pin when it was accepted, so a later pin cannot leak in.
     const { model: frozenModel, freezeModel, mode, selectionExplicit, ...dispatchExtra } = extra;
-    const selected = dshDefaultOnly(record) ? undefined
-      : frozenModel !== undefined ? frozenModel
+    let selected = frozenModel !== undefined ? frozenModel
       : freezeModel === true ? undefined : record.modelPin;
+    if (dispatchExtra.reminder === true) selected = await resolveRequestedPin(record, {});
     const dispatch = { requestId, message, kind, answerIds, state: 'sending', afterSeq: baseline.throughSeq, startedAt: now(),
       mode: mode === 'queue' ? 'queue' : mode === 'steer' ? 'steer' : record.task?.mode ?? 'steer',
       ...(selected ? { model: { ...selected } } : {}),
@@ -1908,6 +2023,7 @@ export function createScopedAgents(config, {
         : (observed?.running === true && dispatch.mode !== 'queue' ? 'steer' : 'start');
       dispatch.deliveryIntent = { method, mode: dispatch.mode,
         ...(method === 'steer' && root?.turnId ? { expectedTurnId: root.turnId } : {}),
+        ...(target === 'dsh' && method === 'steer' ? { expectedThroughSeq: Number.isSafeInteger(observed?.throughSeq) ? observed.throughSeq : null } : {}),
         ...(method === 'start' && root?.turnId ? { afterTurnId: root.turnId } : {}) };
       saveDispatch(record);
       // The adapter has its own asynchronous preparation (host lock, state reads, preflight,
@@ -1933,18 +2049,20 @@ export function createScopedAgents(config, {
         mode: dispatch.mode === 'queue' ? 'queue' : 'steer',
         ...(dispatch.selectionExplicit === undefined ? {}
           : { selectionExplicit: dispatch.selectionExplicit === true }),
-        ...(modern
-          ? (dispatch.model ? { model: dispatch.model } : {})
+        ...(dispatch.model?.explicitFields ? { explicitFields: dispatch.model.explicitFields } : {}),
+        ...(target === 'dsh' && dispatch.model ? { startModel: dispatch.model } : {}),
+        ...(target === 'dsh' && method === 'steer' ? { expectedTurn: { throughSeq: dispatch.deliveryIntent.expectedThroughSeq } } : {}),
+        ...(modern || target === 'claude-cli' || target === 'dsh'
+          ? (dispatch.model ? { model: target === 'dsh' ? dispatch.deliveryModel ?? dispatch.model : dispatch.model } : {})
           : (explicit ? { model: dispatch.model, explicitModel: true } : { explicitModel: false })) });
       // A native receipt names the actual route. When it does not, a Codex write is
-      // never reported as current or new from `accepted` alone. A receipt that only
-      // proves an unproven write is unknown, even when an older route is still on it.
       const nativeUnknown = target === 'codex-desktop' && dispatch.kind === 'answer'
         && sent.accepted !== true && ['unknown', 'sending'].includes(sent.status);
       const delivery = nativeUnknown ? 'unknown'
-        : typeof sent.delivery === 'string' ? sent.delivery
+        : target === 'dsh' && sent.accepted === true && Object.hasOwn(sent, 'delivery') && sent.delivery === null
+          ? null : typeof sent.delivery === 'string' ? sent.delivery
         : (sent.reschedule === true || sent.waiting === true || sent.status === 'waiting') ? 'local-pending'
-          : target === 'codex-desktop' ? (sent.accepted === true ? 'accepted-route-unknown' : sent.status ?? 'unknown')
+          : ['codex-desktop', 'dsh'].includes(target) ? (sent.accepted === true ? 'accepted-route-unknown' : sent.status ?? 'unknown')
             : sent.accepted !== true ? (['retryable', 'retrying'].includes(sent.status) ? 'local-pending' : sent.status ?? 'unknown')
               : dispatch.kind === 'answer' ? 'answered'
                 : method === 'steer' ? 'current-turn' : 'new-turn';
@@ -1952,9 +2070,14 @@ export function createScopedAgents(config, {
       const state = accepted ? 'running'
         : ['after-current', 'local-pending', 'answer-pending'].includes(delivery) ? 'queued'
           : delivery === 'blocked' ? 'blocked' : ['unknown', 'accepted-route-unknown'].includes(delivery) ? 'unknown'
-            : sent.status ?? 'failed';
+            : ['rejected', 'failed'].includes(sent.status) ? 'failed' : sent.status ?? 'failed';
       Object.assign(dispatch, { delivery, state, accepted,
         ...(sent.turnId ? { turnId: sent.turnId } : {}),
+        ...(accepted ? { actualEffort: sent.actualEffort ?? null } : {}),
+        ...(accepted && Object.hasOwn(sent, 'actualModel') ? { actualModel: sent.actualModel }
+          : accepted && dispatch.deliveryModel?.model ? { actualModel: dispatch.deliveryModel.model } : {}),
+        ...(accepted && sent.effortAdjustment ? { effortAdjustment: sent.effortAdjustment } : {}),
+        ...(accepted && sent.actualEffort != null ? { actualEffortSource: sent.actualEffortSource ?? (target === 'dsh' || target === 'claude-cli' ? 'host-readback' : 'native-turn-start') } : {}),
         ...(sent.afterTurnId ?? (delivery === 'after-current' ? sent.turnId ?? root?.turnId : undefined)
           ? { afterTurnId: sent.afterTurnId ?? sent.turnId ?? root?.turnId } : {}),
         ...(sent.afterSeq !== undefined ? { afterSeq: sent.afterSeq } : {}),
@@ -1963,19 +2086,23 @@ export function createScopedAgents(config, {
       // the queued-wait route it never took. A queue row that opened B keeps its
       // known A as history.
       if (delivery === 'current-turn') delete dispatch.afterTurnId;
+      if (target === 'dsh' && accepted && delivery === 'new-turn') { delete dispatch.deliverySelection; delete dispatch.deliveryModel; }
       if (accepted && explicit && target === 'codex-desktop') {
         // The native turn now runs with the pinned model; record the real display value
         // and only now make it the name's intended selection. A refused or still
         // waiting input never changes the pin.
         record.model = { ...dispatch.model };
-        record.modelPin = { ...dispatch.model };
+        if (dispatch.model?.explicitFields?.model) record.modelPin = { provider: dispatch.model.provider, model: dispatch.model.model };
       }
       if (dispatch.kind === 'supplement') {
         saveSupplementReceipt(dispatch.requestId, accepted ? 'accepted'
           : delivery === 'blocked' ? 'blocked' : delivery === 'unknown' ? 'unknown' : 'queued',
         accepted ? null : dispatch.error?.code ?? sent.reason ?? null, dispatchReceipt(dispatch));
       }
-      if (!accepted && ['retryable', 'retrying'].includes(dispatch.state)) {
+      if (!accepted && (['retryable', 'retrying'].includes(dispatch.state) || sent.status === 'retryable')) {
+        if (target === 'dsh' && sent.notSent === true && (['managed-turn-ended', 'managed-turn-changed', 'managed-turn-unknown'].includes(sent.code) || dshDefaultOnly(record))) {
+          delete dispatch.deliveryIntent; delete dispatch.deliveryModel; delete dispatch.deliverySelection; dispatch.modelReady = false;
+        }
         dispatch.state = 'retrying'; deferRetry(dispatch);
       }
     } catch (error) {
@@ -2000,19 +2127,21 @@ export function createScopedAgents(config, {
       // transient transport failure: retrying it would loop forever and hide the typo.
       const modelError = ['model-required', 'model-required-for-effort', 'model-not-found',
         'effort-not-supported', 'model-default-invalid', 'codex-model-change-while-running'].includes(error.code);
-      // The registration probe is a read-only preflight that runs before any native
-      // write. Only a Codex answer that this poll's recovery already proved unwritten
-      // may treat a missing probe as a temporary prerequisite; a first task dispatch,
-      // an ordinary supplement or another backend keeps the original failure policy.
       const registrationUnavailable = error.code === 'codex-report-not-ready'
         && targetOf(record) === 'codex-desktop' && dispatch.kind === 'answer'
         && recoveryNotSent === true;
-      const retryable = !modelError && (error.retryableRead === true || registrationUnavailable
+      if (targetOf(record) === 'dsh' && error?.notSent === true && error?.terminal !== true
+          && (['managed-turn-ended', 'managed-turn-changed', 'managed-turn-unknown'].includes(error.code) || dshDefaultOnly(record))) {
+        delete dispatch.deliveryIntent; delete dispatch.deliveryModel; delete dispatch.deliverySelection;
+        dispatch.modelReady = false;
+      }
+      const retryable = !modelError && (error.notSent === true || error.retryableRead === true || registrationUnavailable
         || (targetOf(record) !== 'dsh' && (!delivering || error.code === 'agent-busy')));
       const state = error.terminal === true || modelError ? 'failed'
         : targetOf(record) !== 'dsh' && !delivering ? 'retrying'
           : error.uncertain ? 'unknown' : retryable ? 'retrying' : 'failed';
-      Object.assign(dispatch, { state, afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
+      Object.assign(dispatch, { state, ...(state === 'unknown' ? { delivery: 'unknown' } : {}),
+        afterSeq: error.afterSeq ?? dispatch.afterSeq, error: safeError(error) });
       if (registrationUnavailable && state === 'retrying') dispatch.delivery = 'local-pending';
       if (dispatch.state === 'retrying' && targetOf(record) !== 'dsh') {
         if (targetOf(record) === 'codex-desktop' && /^codex-native-rpc-(unavailable|timeout|response-timeout|closed)$/.test(error.code ?? '')) {
@@ -2552,15 +2681,16 @@ export function createScopedAgents(config, {
     // the first turn/start, so the resolved ID is the display value until then.
     if (record.modelPin && !dshDefaultOnly(record)) {
       if (targetOf(record) === 'dsh') {
-        if (!sameModelSelection(created.model, record.modelPin)) {
-          const selected = await backend.selectModel({ ...record.modelPin,
+        const creationSelection = record.creationSelection ?? record.modelPin;
+        if (!sameModelSelection(created.model, creationSelection)) {
+          const selected = await backend.selectModel({ ...creationSelection,
             requestId: `${record.agentId}-model`, sessionOnly: true });
           if (selected.accepted !== true) {
             throw Object.assign(new Error(`${backend.labels?.host ?? targetOf(record)} did not confirm the selected model.`),
               { code: 'model-selection-unconfirmed', uncertain: selected.status === 'unknown' });
           }
         }
-        record.model = { ...record.modelPin };
+        record.model = { ...creationSelection };
       }
       // Codex has no session-only select API: the resolved pin is reported by the
       // creation receipt, but its actualModel stays unobserved until the first turn.
@@ -2596,7 +2726,8 @@ export function createScopedAgents(config, {
       // later change rewrite an input the caller had already accepted.
       const frozen = Object.prototype.hasOwnProperty.call(record.task, 'modelSelection')
         ? { model: record.task.modelSelection, freezeModel: true,
-          selectionExplicit: record.task.selectionExplicit === true } : {};
+          selectionExplicit: record.task.selectionExplicit === true,
+          ...(record.task.pendingSelection ? { pendingSelection: record.task.pendingSelection } : {}) } : {};
       await sendDispatch(record, record.task.message, 'task', [], record.task.requestId, observed, frozen);
     } finally { trackWorkspaceBaseline(record, baseline); }
   }
@@ -2639,7 +2770,12 @@ export function createScopedAgents(config, {
       if (targetOf(record) === 'codex-desktop') {
         try {
           const root = await rootTurnFor(record);
-          if (root.known && root.turnId) answer.turnId = root.turnId;
+          if (root.known && root.turnId) {
+            answer.turnId = root.turnId;
+            const active = activeTurnSelection(record, root);
+            answer.actualEffort = active?.actualEffort ?? active?.reasoningEffort ?? null;
+            answer.actualEffortSource = answer.actualEffort != null ? (active?.actualEffortSource ?? null) : null;
+          }
         } catch { /* the answer already succeeded; its route stays as the card path */ }
       }
       if (record.observation?.questions) record.observation.questions = record.observation.questions.map(question =>
@@ -3196,6 +3332,7 @@ export function createScopedAgents(config, {
       // this intent never reached that send; keep the exact request ID. A direct
       // answer or a first task dispatch has no supplement row, so this loop is the
       // only place that can retry it after a transient root read.
+      if (dshDefaultOnly(record)) { delete dispatch.deliveryIntent; dispatch.modelReady = false; }
       if (!allowResend) return 'not-sent';
       await dispatchOnce(record, dispatch);
       return;
@@ -3234,18 +3371,34 @@ export function createScopedAgents(config, {
       return;
     }
     if (receipt.status === 'accepted') Object.assign(dispatch, { accepted: true, state: 'running', error: undefined, failure: undefined, nextAttemptAt: undefined, retryAttempts: undefined,
-      delivery: receipt.delivery ?? dispatch.delivery ?? 'accepted-route-unknown',
+      delivery: Object.hasOwn(receipt, 'delivery') ? receipt.delivery : 'accepted-route-unknown',
       ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
+      ...(Object.hasOwn(receipt, 'actualEffort') ? { actualEffort: receipt.actualEffort } : {}),
+      ...(receipt.actualEffort != null && receipt.actualEffortSource ? { actualEffortSource: receipt.actualEffortSource } : {}),
+      ...(receipt.effortAdjustment ? { effortAdjustment: receipt.effortAdjustment } : {}),
+      ...(Object.hasOwn(receipt, 'actualModel') ? { actualModel: receipt.actualModel } : {}),
       ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}) });
     if (receipt.status === 'accepted' && receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
+    if (receipt.status === 'accepted' && receipt.delivery === 'new-turn' && targetOf(record) === 'dsh') {
+      delete dispatch.deliverySelection; delete dispatch.deliveryModel;
+    }
     if (receipt.status === 'rejected') {
-      dispatch.state = 'failed';
+      dispatch.state = 'failed'; dispatch.accepted = false;
       if (answer) dispatch.error ??= { code: 'codex-delivery-refused',
         message: 'The native side rejected this answer; it was not written.' };
+      else dispatch.error = receipt.error ?? { code: receipt.code ?? 'send-rejected', message: receipt.message ?? 'The input was not accepted.' };
+    }
+    if (receipt.status === 'failed') {
+      dispatch.state = 'failed'; dispatch.accepted = false;
+      dispatch.error = receipt.error ?? { code: receipt.code ?? 'send-rejected', message: receipt.message ?? 'The input was not accepted.' };
     }
     if (receipt.status === 'retryable') {
-      // Other unknown inputs stay read-only.
-      if (!answer && dispatch.state === 'unknown') return;
+      if (targetOf(record) === 'dsh' && (['managed-turn-ended', 'managed-turn-changed', 'managed-turn-unknown'].includes(receipt.code) || dshDefaultOnly(record))) {
+        delete dispatch.deliveryIntent; delete dispatch.deliveryModel; delete dispatch.deliverySelection; dispatch.modelReady = false;
+      }
+      // Other unknown inputs stay read-only unless the native receipt itself proves
+      // the write never started.
+      if (!answer && dispatch.state === 'unknown' && receipt.notSent !== true) return;
       if (!allowResend) return 'not-sent';
       // The acknowledged thread may have an empty rollout until its first turn starts.
       // The adapter retries that exact start only after a receipt proves it was not sent.
@@ -3280,11 +3433,16 @@ export function createScopedAgents(config, {
       dispatch.afterSeq = receipt?.afterSeq ?? dispatch.afterSeq;
       if (receipt?.status === 'accepted') {
         Object.assign(dispatch, { accepted: true, state: 'running', error: undefined,
-          delivery: receipt.delivery ?? dispatch.delivery ?? 'accepted-route-unknown',
+          delivery: Object.hasOwn(receipt, 'delivery') ? receipt.delivery : 'accepted-route-unknown',
           ...(receipt.turnId ? { turnId: receipt.turnId } : {}),
+          ...(Object.hasOwn(receipt, 'actualEffort') ? { actualEffort: receipt.actualEffort } : {}),
+          ...(receipt.actualEffort != null && receipt.actualEffortSource ? { actualEffortSource: receipt.actualEffortSource } : {}),
+          ...(receipt.effortAdjustment ? { effortAdjustment: receipt.effortAdjustment } : {}),
+          ...(Object.hasOwn(receipt, 'actualModel') ? { actualModel: receipt.actualModel } : {}),
           ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}),
           nextAttemptAt: undefined, retryAttempts: undefined });
         if (receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
+        if (receipt.delivery === 'new-turn' && targetOf(record) === 'dsh') { delete dispatch.deliverySelection; delete dispatch.deliveryModel; }
         return 'accepted';
       }
       // Only a Codex answer waiting receipt that carries its own no-write evidence is
@@ -4109,10 +4267,15 @@ export function createScopedAgents(config, {
         target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
         ...(parent ? { parentAgentId: parent.agentId } : {}) };
       await ensureTargetBackend(record);
-      if (hasModelRequest({ model, effort }) && !dshDefaultOnly(record)) {
+      {
         // Resolve against the live target catalog before the name exists, so a typo
         // creates nothing and a valid pin is part of the first durable record.
-        record.modelPin = await resolveRequestedPin(record, { model, effort });
+        let preview;
+        try { preview = await resolveRequestedPin(record, { model, effort }); }
+        catch (error) { if (hasModelRequest({ model, effort })) throw error; }
+        if (preview) record.creationSelection = preview;
+        if (preview && model !== undefined && !dshDefaultOnly(record)) record.modelPin = { provider: preview.provider, model: preview.model };
+        if (effort !== undefined) record.pendingEffort = effort;
       }
       store.insert(record, { requireOpenParent: Boolean(parent) });
       if (extra) extra[Symbol.for('futureaide.feedbackDispatchScope')] = { agentId: record.agentId, taskId: null };
@@ -4139,7 +4302,7 @@ export function createScopedAgents(config, {
       // A DSH name of an installation locked to the host default takes no selection:
       // the input is sent as if the caller had named no model and no effort.
       const ignoreSelectionFor = record => {
-        if (dshDefaultOnly(record)) { request = {}; wantsSelection = false; }
+        if (dshDefaultOnly(record) && request.model !== undefined) { request = { ...request, model: undefined }; wantsSelection = hasModelRequest(request); }
       };
       const supplementStates = new Set(['running', 'awaiting_input', 'awaiting_report', 'reconnecting']);
       let enteredOperation = false;
@@ -4161,18 +4324,22 @@ export function createScopedAgents(config, {
         ...(extraReceipt.turnId ? { turnId: extraReceipt.turnId } : {}),
         // The receipt reports the full ID resolved for this input, not a stale
         // display value from before the pin changed.
+        ...effortReceipt(pin),
+        ...(dshDefaultOnly(record) ? { modelLocked: true } : {}),
         actualModel: actualModelName(pin) ?? actualModelName(record.model),
         ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
       });
       const persistPin = (record, pin) => {
-        if (!wantsSelection) return;
-        record.modelPin = { ...pin };
+        if (request.model === undefined || dshDefaultOnly(record)) return;
+        record.modelPin = { provider: pin.provider, model: pin.model };
         store.save(record);
       };
       const queue = async (record, pin, { usePinnedModel = false, savePin = false,
         requestId = uid('request'), mode, selectionExplicit = false, afterTurnId } = {}) => {
+        if (!pin) pin = await resolveRequestedPin(record, request);
+        usePinnedModel = false;
         const previous = record.modelPin;
-        if (savePin) record.modelPin = { ...pin };
+        if (savePin && request.model !== undefined && !dshDefaultOnly(record)) record.modelPin = { provider: pin.provider, model: pin.model };
         let changed;
         try {
           // With no explicit selection the SQL copies the live pin in the same
@@ -4292,9 +4459,8 @@ export function createScopedAgents(config, {
         // substring is resolved to its real ID before any busy/model decision, so an
         // unknown model still reports the catalog.
         const resolvePin = async (root, view) => {
-          if (!wantsSelection) return dshDefaultOnly(record) ? undefined : record.modelPin;
           const pin = await resolveRequestedPin(record, request);
-          if (target === 'codex-desktop' && activeTask) {
+          if (wantsSelection && target === 'codex-desktop' && activeTask) {
             if (!root || root.known === false) {
               throw Object.assign(new Error('The running turn’s model and reasoning effort could not be confirmed, so this selection was not sent.'),
                 { code: 'model-selection-unconfirmed', uncertain: true, terminal: true });
@@ -4318,11 +4484,12 @@ export function createScopedAgents(config, {
           try { view = await observe(record); }
           catch (error) {
             if (target !== 'codex-desktop') throw error;
+            if (wantsSelection) throw Object.assign(new Error('The running turn selection could not be confirmed; this input was not sent.'),
+              { code: 'model-selection-unconfirmed', terminal: true, notSent: true });
             // A root observation failure is not permission to drop the input. An
             // ordinary queue is stored first and reported local-pending; the worker
             // will read the root when it is readable again.
-            const pin = wantsSelection ? await resolveRequestedPin(record, request)
-              : dshDefaultOnly(record) ? undefined : record.modelPin;
+            const pin = await resolveRequestedPin(record, request);
             const mode = effectiveMode(record);
             const receipt = await queue(record, pin, { ...(wantsSelection ? {} : { usePinnedModel: true }),
               mode, selectionExplicit: wantsSelection });
@@ -4434,7 +4601,18 @@ export function createScopedAgents(config, {
               { code: 'previous-task-unsettled', retryable: true });
           }
         }
-        const pin = await resolvePin(undefined, undefined);
+        if (request.effort === undefined && record.pendingEffort !== undefined && request.model === undefined) {
+          request = { ...request, effort: record.pendingEffort };
+          wantsSelection = true;
+        }
+        let pin, pendingSelection;
+        try { pin = await resolvePin(undefined, undefined); }
+        catch (error) {
+          if (!(error?.retryableRead || error?.code === 'agent-busy') || wantsSelection) throw error;
+          const behavior = config.behavior ?? config;
+          pendingSelection = { input: selectionRequest(request), config: { defaultEffort: behavior.defaultEffort,
+            modelDefaultEfforts: { ...(behavior.modelDefaultEfforts ?? {}) } } };
+        }
         const snapshot = record.task ? { ...record.task, ...(publicResult(record).error ? { error: publicResult(record).error } : {}),
           changes: attributedChanges(record, record.observation ?? {}),
           coverage: treeCoverage(record, record.observation ?? {}), tree: publicTree(record, record.observation ?? {}) } : undefined;
@@ -4446,12 +4624,13 @@ export function createScopedAgents(config, {
         const requestId = uid('request');
         const next = { ...record, state: 'running', observation: undefined, error: undefined,
           nextAttemptAt: undefined, retryAttempts: 0, sleep: undefined,
-          ...(wantsSelection ? { modelPin: { ...pin } } : {}),
+          ...(request.model !== undefined && !dshDefaultOnly(record) ? { modelPin: { provider: pin.provider, model: pin.model } } : {}),
+          pendingEffort: undefined,
           // A pin saved before the lock was turned on goes with the next task.
           ...(dshDefaultOnly(record) ? { modelPin: undefined } : {}),
           task: { taskId: uid('task'), requestId, message, mode: requestedMode ?? 'steer',
             state: 'starting', startedAt: now(), dispatches: [], answers: [],
-            modelSelection: pin ? { ...pin } : null, selectionExplicit: wantsSelection, finalReminder: 'armed' } };
+            modelSelection: pin ? { ...pin } : null, ...(pendingSelection ? { pendingSelection } : {}), selectionExplicit: wantsSelection, finalReminder: 'armed' } };
         // A task assignment ends the previous round for good: its release attempt loses
         // its ticket here, so the host refuses it at the point where it would unsubscribe
         // and the new turn is free to subscribe the thread again.
@@ -4485,7 +4664,10 @@ export function createScopedAgents(config, {
           requestId, taskKey, mode: effectiveMode(record, { start: true }), delivery: dispatch?.delivery,
           ...(dispatch?.turnId ? { turnId: dispatch.turnId } : {}),
           ...(dispatch?.afterTurnId ? { afterTurnId: dispatch.afterTurnId } : {}),
-          actualModel: actualModelName(current.model) ?? actualModelName(current.modelPin),
+          ...effortReceipt(dispatch?.model, dispatch?.actualEffort, dispatch?.effortAdjustment, dispatch?.actualEffortSource),
+          ...(dshDefaultOnly(record) ? { modelLocked: true } : {}),
+          actualModel: dispatch && Object.hasOwn(dispatch, 'actualModel') ? actualModelName(dispatch.actualModel)
+            : actualModelName(current.model) ?? actualModelName(current.modelPin),
           ...(dispatch?.state === 'retrying' ? { retrying: true } : {}),
           ...(previousReport ? { previousReport } : {}),
           ...(error ? { error } : {}),
@@ -4570,10 +4752,12 @@ export function createScopedAgents(config, {
         ...(result.requestId ? { requestId: result.requestId } : {}),
         ...(result.taskKey ? { taskKey: result.taskKey } : {}),
         ...(result.mode ? { mode: result.mode } : {}),
-        ...(result.delivery ? { delivery: result.delivery } : {}),
+        ...(Object.hasOwn(result, 'delivery') ? { delivery: result.delivery } : {}),
         ...(result.turnId ? { turnId: result.turnId } : {}),
         ...(result.afterTurnId ? { afterTurnId: result.afterTurnId } : {}),
         actualModel: result.actualModel ?? null,
+        ...effortReceipt(result, result.actualEffort ?? null, result.effortAdjustment, result.actualEffortSource),
+        ...(result.modelLocked ? { modelLocked: true } : {}),
         ...(result.queued !== undefined ? { queued: result.queued === true } : {}), ...(result.retrying ? { retrying: true } : {}),
         ...(result.callbackError ? { callbackError: result.callbackError } : {}), ...(result.error ? { error: result.error } : {}) });
       const existing = name === undefined ? undefined : store.named(owner.ownerId, assertName(name));
@@ -4616,7 +4800,11 @@ export function createScopedAgents(config, {
     },
     async answer({ name, message }, extra) {
       textMessage(message);
-      return withName(extra, name, record => answerLocked(requireWritableTarget(record), message));
+      return withName(extra, name, async record => {
+        requireWritableTarget(record);
+        const selection = await resolveRequestedPin(record, {});
+        return answerLocked(record, message, undefined, { modelSelection: selection, selectionExplicit: false });
+      });
     },
     async list(extra) {
       const owner = await context(extra);
@@ -5233,6 +5421,7 @@ export function createScopedAgents(config, {
     await ensureWorker(record, { wake: true });
     return { name: record.name, answered: true, state: 'resuming',
       ...(answer.nativeAnswered ? { delivery: 'native-question', ...(answer.turnId ? { turnId: answer.turnId } : {}) } : answer.nativeFallback ? { delivery: 'continuation-queued' } : {}),
+      ...effortReceipt(answer.modelSelection, answer.actualEffort ?? null, undefined, answer.actualEffortSource),
       actualModel: actualModelName(answer.modelSelection) ?? actualModelName(record.model) };
   }
   // Keep the public entry that caused native reads attached across asynchronous work.

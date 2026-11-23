@@ -57,7 +57,7 @@ async function readState(directory, turn) {
  * is never mangled. On the final pass a trailing line without a newline (a result the CLI
  * flushed just before exiting) is treated as a complete line instead of being dropped.
  */
-function createStdoutReader(directory, state) {
+function createStdoutReader(directory, state, onLine = () => {}) {
   let offset = 0;
   let pending = Buffer.alloc(0);
   let handle;
@@ -79,6 +79,7 @@ function createStdoutReader(directory, state) {
         pending = pending.subarray(lineBreak + 1);
         if (!line.trim()) continue;
         applyClaudeLine(state, line);
+        onLine(line);
         applied += 1;
       }
     }
@@ -122,9 +123,10 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
   let child;
   try {
     // The prompt arrives on stdin: `-p` with no positional prompt reads it from there.
-    child = spawnImpl(turn.command, [...(turn.prefixArgs ?? []), ...(turn.args ?? [])], {
+    child = spawnImpl(turn.command, [...(turn.prefixArgs ?? []), ...(turn.args ?? []),
+      ...(turn.stagedControl ? ['--input-format', 'stream-json', '--replay-user-messages'] : [])], {
       cwd: turn.workspace,
-      stdio: [stdin.fd, stdout.fd, stderr.fd],
+      stdio: [turn.stagedControl ? 'pipe' : stdin.fd, stdout.fd, stderr.fd],
       windowsHide: true,
     });
   } catch (error) {
@@ -135,6 +137,7 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
   // Registered immediately: a CLI that fails at once must not be missed while a file is written.
   child.once('exit', code => settled({ code: code ?? null }));
   child.once('error', error => settled({ code: null, spawnError: error }));
+  if (turn.stagedControl) child.stdin.on('error', () => {});
 
   state.pid = Number.isSafeInteger(child.pid) ? child.pid : null;
   state.phase = 'running';
@@ -152,11 +155,62 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
   };
   let pendingState = !await saveRunningState();
 
-  const drain = createStdoutReader(directory, state);
+  const responses = new Map();
+  const drain = createStdoutReader(directory, state, line => {
+    try { const event = JSON.parse(line); if (event.type === 'control_response') responses.set(event.response?.request_id, event.response); } catch {}
+  });
   let lastBeat = Date.now();
   let result;
   let initError;
+  if (turn.stagedControl) {
+    let seq = 0;
+    const request = async subtype => {
+      const id = `stage-${++seq}`;
+      child.stdin.write(JSON.stringify({ type: 'control_request', request_id: id, request: { subtype } }) + '\n');
+      const until = Date.now() + 30000;
+      while (Date.now() < until) {
+        await drain();
+        const response = responses.get(id);
+        if (response) {
+          if (response.subtype !== 'success') throw new Error(`${subtype}: ${response.error ?? 'refused'}`);
+          return response.response ?? {};
+        }
+        const exited = await Promise.race([finished, sleep(pollMs).then(() => null)]);
+        if (exited) { result = exited; throw new Error(`${subtype}: CLI exited`); }
+      }
+      throw new Error(`${subtype}: timed out`);
+    };
+    try {
+      await request('initialize');
+      const catalog = await request('list_models');
+      const settings = await request('get_settings');
+      const applied = settings.applied;
+      const row = catalog.models?.find(item => !item.disabled && item.resolvedModel === applied?.model);
+      if (!row || (!Array.isArray(row.supportedEffortLevels) && row.supportsEffort !== false) || !applied?.model
+          || (turn.selectedModel && applied.model !== turn.selectedModel)
+          || (turn.selectedEffort && !applied.effort)
+          || (applied.effort && !row.supportedEffortLevels?.includes(applied.effort))) {
+        throw new Error('CLI did not confirm the selected model, supported efforts and applied effort');
+      }
+      state.capabilities = { model: row.resolvedModel, supportedEffortLevels: row.supportedEffortLevels ?? [] };
+      state.applied = applied;
+      if (turn.selectedEffort && applied.effort !== turn.selectedEffort) {
+        state.effortAdjustment = { requested: turn.selectedEffort, actual: applied.effort ?? null,
+          reason: 'Claude reported a different applied effort after its settings and policy were applied.' };
+      }
+      state.model = applied.model;
+      state.actualEffort = applied.effort ?? null;
+      state.inputUuid = turn.inputUuid;
+      await writeJsonFile(directory, CLAUDE_TURN_FILES.state, state, { retryMs: statePublishRetryMs });
+      const prompt = await readFile(fileName(CLAUDE_TURN_FILES.prompt), 'utf8');
+      child.stdin.end(JSON.stringify({ type: 'user', uuid: turn.inputUuid, message: { role: 'user', content: prompt }, parent_tool_use_id: null, session_id: turn.sessionId }) + '\n');
+      state.businessSubmitted = true;
+    } catch (error) {
+      initError = { code: 'claude-capabilities-unconfirmed', message: String(error.message ?? error), notSent: true };
+    }
+  }
   for (;;) {
+    if (initError) break;
     try { if (await drain()) pendingState = true; }
     catch (error) { addWarning(state, 'claude-stream-read-failed', error); }
     // The first system/init already says whether this CLI may keep running: a permission mode

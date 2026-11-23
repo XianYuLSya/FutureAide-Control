@@ -148,8 +148,7 @@ test('a bridge locked to the default model refuses every other session selection
   await host.managedCreate(input);
   await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'other', model: 'alpha' } }),
     error => error.controlCode === 'managed-model-locked');
-  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } }),
-    error => error.controlCode === 'managed-model-locked', 'the default model with another effort is another choice');
+
   assert.deepEqual(f.modelSelections, [], 'no refused choice reached the Agent');
   const same = await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model' } });
   assert.equal(same.accepted, true, 'the default itself stays selectable');
@@ -159,8 +158,7 @@ test('a bridge locked to the default model refuses every other session selection
   assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'high' } })).accepted, true);
   assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model' } })).accepted, true,
     'a pin saved without an effort is still the default model');
-  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } }),
-    error => error.controlCode === 'managed-model-locked');
+  assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } })).accepted, true);
   assert.equal(f.defaultSaves.length, 0);
 });
 
@@ -795,4 +793,108 @@ test('a managed agent cannot raise a UI question the dispatching chat never sees
   assert.equal(child.agent.guards[0]({ agent: child.agent, name: 'read_file' }), undefined);
   assert.equal(agent.guards[0]({ agent: child.agent, name: 'ask_user_question' }), CHILD_QUESTION_REFUSAL,
     'if the root guard does see a descendant call, it names the parent route');
+});
+
+
+test('managed prompt checks live default and selection at synchronous inbox write and deduplicates', async () => {
+  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
+  await host.managedCreate(input);
+  const selection = { provider: 'provider', model: 'model', reasoningEffort: 'high' };
+  await host.managedSelectModel({ ...input, selection });
+  const agent = f.live.get(input.sessionId), accepted = [];
+  agent.steer = message => accepted.push(message);
+  agent.followup = message => accepted.push(message);
+  let changeBeforeWrite = true;
+  f.services.sessionController.commands = {
+    hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
+    async prompt(request, source) {
+      await Promise.resolve();
+      if (changeBeforeWrite) f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'second' });
+      agent.followup({ source, content: request.content });
+      return { accepted: true };
+    },
+  };
+  const dispatch = { ...input, selection, requestId: 'request-1', mode: 'queue', message: 'business input' };
+  assert.deepEqual(await host.managedPromptV2(dispatch), { accepted: false, status: 'retryable', notSent: true, code: 'managed-model-changed' });
+  assert.equal(accepted.length, 0);
+  changeBeforeWrite = false;
+  f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'model' });
+  const result = await host.managedPromptV2(dispatch);
+  assert.equal(result.accepted, true); assert.deepEqual(result.selected, selection); assert.equal(accepted.length, 1);
+  assert.equal(JSON.stringify([...f.records.values()]).includes('business input'), false, 'bridge metadata does not persist prompt text');
+  f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'second' });
+  const observed = await host.managedPromptReceipt(dispatch);
+  assert.equal(observed.status, 'accepted'); assert.deepEqual(observed.selected, selection);
+  assert.equal((await host.managedPromptReceipt({ ...dispatch, requestId: 'missing' })).status, 'unknown');
+  const duplicate = await host.managedPromptV2(dispatch);
+  assert.equal(duplicate.duplicate, true); assert.deepEqual(duplicate.selected, selection); assert.equal(accepted.length, 1);
+});
+
+
+test('native accepted input without fenced confirmation reports written with unknown selection', async () => {
+  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
+  await host.managedCreate(input);
+  const selection = { provider: 'provider', model: 'model', reasoningEffort: 'high' };
+  await host.managedSelectModel({ ...input, selection });
+  const agent = f.live.get(input.sessionId), accepted = [];
+  agent.steer = message => accepted.push(message); agent.followup = message => accepted.push(message);
+  f.services.sessionController.commands = {
+    hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
+    async prompt(request, source) { accepted.push({ source, content: request.content }); return { accepted: true }; },
+  };
+  const dispatch = { ...input, selection, requestId: 'bypass', mode: 'queue', message: 'business input' };
+  assert.deepEqual((await host.managedPromptV2(dispatch)).selected, null);
+  assert.deepEqual(await host.managedPromptReceipt(dispatch), { status: 'accepted', requestId: 'bypass', selected: null, delivery: null });
+  assert.equal((await host.managedPromptV2(dispatch)).selected, null); assert.equal(accepted.length, 1);
+});
+
+test('loss before confirmed selection persists leaves accepted receipt without guessed effort', async () => {
+  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
+  await host.managedCreate(input);
+  const selection = { provider: 'provider', model: 'model', reasoningEffort: 'high' };
+  await host.managedSelectModel({ ...input, selection });
+  const agent = f.live.get(input.sessionId), accepted = [];
+  agent.steer = message => accepted.push(message); agent.followup = message => accepted.push(message);
+  f.services.sessionController.commands = {
+    hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
+    async prompt(request, source) { agent.followup({ source, content: request.content }); return { accepted: true }; },
+  };
+  const originalWrite = f.store.write;
+  f.store.write = async (key, record) => {
+    if (record.promptSelections?.crash?.confirmedSelection) throw new Error('crash before confirmation');
+    return originalWrite(key, record);
+  };
+  const dispatch = { ...input, selection, requestId: 'crash', mode: 'queue', message: 'business input' };
+  await assert.rejects(host.managedPromptV2(dispatch), /crash before confirmation/);
+  assert.deepEqual(await host.managedPromptReceipt(dispatch), { status: 'accepted', requestId: 'crash', selected: null, delivery: null });
+  assert.equal((await host.managedPromptV2(dispatch)).selected, null); assert.equal(accepted.length, 1);
+});
+
+
+test('managed prompt fences turn identity and records actual delivery', async () => {
+  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
+  await host.managedCreate(input);
+  const high = { provider: 'provider', model: 'model', reasoningEffort: 'high' }, max = { ...high, reasoningEffort: 'max' };
+  await host.managedSelectModel({ ...input, selection: high });
+  const agent = f.live.get(input.sessionId), accepted = [];
+  agent.steer = message => accepted.push(message); agent.followup = message => accepted.push(message);
+  f.services.sessionController.commands = { hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
+    async prompt(request, source) { agent.steer({ source, content: request.content }); return { accepted: true }; } };
+  const inputA = { ...input, requestId: 'turn-race', message: 'task', mode: 'steer', selection: high, startSelection: max, expectedTurn: { throughSeq: 3 } };
+  agent.phase = { kind: 'idle' }; agent.session.seq = 4;
+  assert.deepEqual(await host.managedPromptV2(inputA), { accepted: false, status: 'retryable', notSent: true, code: 'managed-turn-ended' });
+  assert.equal(accepted.length, 0);
+  await host.managedSelectModel({ ...input, selection: max });
+  const started = await host.managedPromptV2({ ...inputA, selection: max, expectedTurn: undefined });
+  assert.equal(started.delivery, 'new-turn'); assert.equal(started.selected.reasoningEffort, 'max');
+  assert.equal((await host.managedPromptReceipt(inputA)).delivery, 'new-turn'); assert.equal(accepted.length, 1);
+  await host.managedSelectModel({ ...input, selection: high });
+  agent.phase = { kind: 'running', abort: new AbortController() }; agent.session.seq = 5; agent.session.events = [{ seq: 4, type: 'assistant/message' }];
+  const joined = await host.managedPromptV2({ ...inputA, requestId: 'joined' });
+  assert.equal(joined.delivery, 'current-turn'); assert.equal(joined.selected.reasoningEffort, 'high');
+  agent.session.events.push({ seq: 5, type: 'turn/end' }, { seq: 6, type: 'turn/start' }); agent.session.seq = 7;
+  assert.equal((await host.managedPromptV2({ ...inputA, requestId: 'changed' })).code, 'managed-turn-changed');
+  assert.equal((await host.managedPromptV2({ ...inputA, requestId: 'unknown', expectedTurn: { throughSeq: null } })).code, 'managed-turn-unknown');
+  agent.phase.abort.abort();
+  assert.equal((await host.managedPromptV2({ ...inputA, requestId: 'aborted' })).code, 'managed-turn-ended');
 });

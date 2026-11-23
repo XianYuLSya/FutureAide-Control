@@ -1,3 +1,4 @@
+import { EFFORT_ORDER, FACTORY_MODEL_DEFAULT_EFFORTS } from './model-selection.mjs';
 import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -19,7 +20,7 @@ const cleanupDefaults = {
   agentCleanupIntervalMs: 900000,
   cleanupGraceMs: 86400000,
 };
-const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs', 'dshDefaultModelOnly', ...Object.keys(cleanupDefaults)];
+const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs', 'dshDefaultModelOnly', ...Object.keys(cleanupDefaults), 'defaultEffort', 'modelDefaultEfforts'];
 
 function cleanupSettings(base, overrides = {}) {
   const result = { ...cleanupDefaults, ...pick(base, Object.keys(cleanupDefaults)), ...pick(overrides, Object.keys(cleanupDefaults)) };
@@ -35,6 +36,14 @@ const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 function dshConfig(value) {
+  if (value.defaultEffort !== undefined && (typeof value.defaultEffort !== 'string' || !EFFORT_ORDER.includes(value.defaultEffort.toLowerCase()))) throw new Error('defaultEffort must be a valid effort.');
+  if (value.modelDefaultEfforts !== undefined) {
+    if (!value.modelDefaultEfforts || typeof value.modelDefaultEfforts !== 'object' || Array.isArray(value.modelDefaultEfforts)) throw new Error('modelDefaultEfforts must be an object.');
+    for (const [key, effort] of Object.entries(value.modelDefaultEfforts)) {
+      if (!key.trim()) throw new Error('modelDefaultEfforts contains an empty model key.');
+      if (typeof effort !== 'string' || !EFFORT_ORDER.includes(effort.toLowerCase())) throw new Error('modelDefaultEfforts.' + key + ' must be a valid effort.');
+    }
+  }
   if (value.target !== undefined && value.target !== 'dsh') throw new Error('Only target=dsh is supported. Select the DSH data directory or an explicit DSH instance.');
   if (value.managedStateDirectory !== undefined && (typeof value.managedStateDirectory !== 'string' || !path.isAbsolute(value.managedStateDirectory))) throw new Error('The managed host state path must be absolute.');
   if (value.reportPort !== undefined && (!Number.isInteger(value.reportPort) || value.reportPort < 0 || value.reportPort > 65535)) throw new Error('The loopback report port must be an integer between 0 and 65535.');
@@ -65,6 +74,10 @@ const teamBoard = (value, fallback = false) => typeof value === 'boolean' ? valu
  * bridge installed from this configuration refuses any other session selection.
  */
 const dshDefaultModelOnly = (value, fallback = false) => typeof value === 'boolean' ? value : fallback;
+
+function mergeEfforts(...tables) {
+  return Object.assign({}, ...tables.filter(Boolean).map(table => Object.fromEntries(Object.entries(table).map(([key, value]) => [key.trim().toLowerCase(), value.toLowerCase()]))));
+}
 
 function validateProfileName(profile) {
   if (typeof profile !== 'string' || !PROFILE_NAME_PATTERN.test(profile)
@@ -159,6 +172,8 @@ export async function loadConfig(filename, profile) {
       claudeCallbackReminderMs: claudeCallbackReminderMs(selected.claudeCallbackReminderMs,
         claudeCallbackReminderMs(supplied.claudeCallbackReminderMs)),
       dshDefaultModelOnly: dshDefaultModelOnly(selected.dshDefaultModelOnly, dshDefaultModelOnly(supplied.dshDefaultModelOnly)),
+      defaultEffort: selected.defaultEffort ?? supplied.defaultEffort ?? 'max',
+      modelDefaultEfforts: mergeEfforts(FACTORY_MODEL_DEFAULT_EFFORTS, supplied.modelDefaultEfforts, selected.modelDefaultEfforts),
       stateDirectory: path.join(path.dirname(filename), 'state', 'profiles', profile),
       registryDirectory: path.join(path.dirname(filename), 'agents'),
       configFile: filename,
@@ -173,6 +188,8 @@ export async function loadConfig(filename, profile) {
     teamBoard: teamBoard(supplied.teamBoard),
     claudeCallbackReminderMs: claudeCallbackReminderMs(supplied.claudeCallbackReminderMs),
     dshDefaultModelOnly: dshDefaultModelOnly(supplied.dshDefaultModelOnly),
+    defaultEffort: supplied.defaultEffort ?? 'max',
+    modelDefaultEfforts: mergeEfforts(FACTORY_MODEL_DEFAULT_EFFORTS, supplied.modelDefaultEfforts),
     stateDirectory: path.join(path.dirname(filename), 'state'),
     registryDirectory: path.join(path.dirname(filename), 'agents'),
     configFile: filename,

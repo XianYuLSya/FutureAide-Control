@@ -794,7 +794,7 @@ export const name = 'futureaide-control-host';
 export const inject = ['connection', 'webServer', 'agents', 'sessions'];
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 export const MANAGED_METHODS = ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedSelectModel',
-  'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedCleanupInspect', 'managedCleanupStage', 'managedCleanupFinalize', 'managedCleanupRestore'];
+  'managedPromptV2', 'managedPromptReceipt', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedCleanupInspect', 'managedCleanupStage', 'managedCleanupFinalize', 'managedCleanupRestore'];
 
 // DSH's own question tool opens a prompt in the DSH window, which the chat that
 // dispatched the task never sees: the agent waits and the caller is never asked.
@@ -1493,10 +1493,8 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       if (defaultModelOnly) {
         const current = service('agentDefaultModel')?.currentSelection();
         const fallback = current ? modelValue(current) : undefined;
-        // The default model with no effort named is still the default: older pins were
-        // saved that way. Any other model, or another effort, is refused.
-        const allowed = fallback && selection.provider === fallback.provider && selection.model === fallback.model
-          && (selection.reasoningEffort === undefined || selection.reasoningEffort === fallback.reasoningEffort);
+        // Lock the model only; the host validates the effort below.
+        const allowed = fallback && selection.provider === fallback.provider && selection.model === fallback.model;
         if (!allowed) reject('managed-model-locked');
       }
       const agent = await activate(record);
@@ -1621,6 +1619,96 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       const result=await cleanup.restore({ticket:input.operationToken,proof:MANAGED_CLEANUP_PROOF});
       if (result.restored) {record.closing=false; record.activity='turn-ended'; delete record.cleanupToken; delete record.cleanupVersion; delete record.cleanupEligibleAt; await persist(record);}
       return result;
+    }); },
+    // Use the host's text-prompt admission and fence its synchronous inbox write.
+    managedPromptV2(input) { return serial(input, async () => {
+      managedId(input.sessionId); managedId(input.requestId);
+      if (typeof input.message !== 'string' || !input.message.trim() || Buffer.byteLength(input.message, 'utf8') > 131072 || !['queue', 'steer'].includes(input.mode)) reject('invalid-input');
+      const selection = modelValue(input.selection);
+      const startSelection = input.startSelection ? modelValue(input.startSelection) : selection;
+      const record = await load(input);
+      if (record.closing || record.cancelled) reject('managed-task-closed');
+      const agent = await activate(record);
+      const controller = service('sessionController'), commands = controller?.commands, agents = controller?.agents;
+      if (typeof commands?.prompt !== 'function' || typeof commands?.hasPromptRequest !== 'function' || typeof agents?.serializeImageAdmission !== 'function') reject('managed-prompt-unsupported');
+      record.promptSelections ??= {};
+      const messageHash = createHash('sha256').update(input.message).digest('hex');
+      const prior = record.promptSelections[input.requestId];
+      if (prior && (prior.messageHash !== messageHash || prior.mode !== input.mode)) reject('managed-prompt-conflict');
+      if (commands.hasPromptRequest(agent.session, input.requestId)) {
+        return { accepted: true, requestId: input.requestId, selected: prior?.confirmedSelection ?? null, delivery: prior?.confirmedDelivery ?? null, duplicate: true };
+      }
+      record.promptSelections[input.requestId] = { messageHash, mode: input.mode, selection };
+      await persist(record);
+      return agents.serializeImageAdmission(agent, async () => {
+        let mismatch = false, turnRefusal, intercepted = false, delivery = null;
+        const originals = { steer: agent.steer, followup: agent.followup };
+        if (typeof originals.steer !== 'function' || typeof originals.followup !== 'function') reject('managed-prompt-unsupported');
+        for (const method of ['steer', 'followup']) agent[method] = function(message, ...args) {
+          if (message?.source?.rpcId === input.requestId) {
+            intercepted = true;
+            if (input.expectedTurn !== undefined) {
+              const through = input.expectedTurn?.throughSeq;
+              const phase = agent.phase;
+              if (!Number.isSafeInteger(through) || through < -1 || through > sessionCursor(agent.session) || !phase || typeof phase.kind !== 'string') {
+                turnRefusal = 'managed-turn-unknown'; throw new Error(turnRefusal);
+              }
+              const ended = phase.kind === 'idle' || phase.kind === 'maintenance' || phase.abort?.signal?.aborted === true;
+              if (ended) {
+                delivery = 'new-turn';
+                if (!sameSelectionValue(startSelection, selection)) { turnRefusal = 'managed-turn-ended'; throw new Error(turnRefusal); }
+              } else {
+                let events;
+                if (typeof agent.session?.snapshotEvents === 'function') events = agent.session.snapshotEvents(through + 1);
+                else if (Array.isArray(agent.session?.events)) events = agent.session.events.filter(event => Number.isSafeInteger(event.seq) && event.seq > through);
+                if (!Array.isArray(events) || events.some(event => !Number.isSafeInteger(event.seq)) || !phase.abort?.signal) {
+                  turnRefusal = 'managed-turn-unknown'; throw new Error(turnRefusal);
+                }
+                if (events.some(event => event.type === 'turn/start' || event.type === 'turn/end')) {
+                  turnRefusal = 'managed-turn-changed'; throw new Error(turnRefusal);
+                }
+                delivery = 'current-turn';
+              }
+            } else if (input.mode === 'steer') {
+              const phase = agent.phase;
+              if (!phase || typeof phase.kind !== 'string') { turnRefusal = 'managed-turn-unknown'; throw new Error(turnRefusal); }
+              if (phase.kind !== 'idle' && phase.kind !== 'maintenance' && phase.abort?.signal?.aborted !== true) {
+                turnRefusal = 'managed-turn-changed'; throw new Error(turnRefusal);
+              }
+              delivery = 'new-turn';
+            } else delivery = 'new-turn';
+            const current = typeof agent.model?.current === 'function' ? agent.model.current() : undefined;
+            const fallback = service('agentDefaultModel')?.currentSelection();
+            if (!sameSelectionValue(current, selection) || (defaultModelOnly && (!fallback || fallback.provider !== selection.provider || fallback.model !== selection.model))) {
+              mismatch = true; throw new Error('managed-model-changed');
+            }
+          }
+          return originals[method].call(this, message, ...args);
+        };
+        try {
+          const request = { sessionId: input.sessionId, requestId: input.requestId, mode: input.mode, content: [{ type: 'text', text: input.message }], clientTimeZone: 'Asia/Shanghai' };
+          const result = await commands.prompt(request, { kind: 'user', rpcId: input.requestId, clientTimeZone: 'Asia/Shanghai' });
+          if (result?.accepted !== true || (!intercepted && !commands.hasPromptRequest(agent.session, input.requestId))) reject('managed-prompt-unconfirmed');
+          if (!intercepted) return { accepted: true, requestId: input.requestId, selected: null, delivery: null };
+          record.promptSelections[input.requestId].confirmedSelection = selection;
+          record.promptSelections[input.requestId].confirmedDelivery = delivery;
+          try { await persist(record); } catch (error) { delete record.promptSelections[input.requestId].confirmedSelection; delete record.promptSelections[input.requestId].confirmedDelivery; throw error; }
+          return { accepted: true, requestId: input.requestId, selected: selection, delivery };
+        } catch (error) {
+          if (turnRefusal && !commands.hasPromptRequest(agent.session, input.requestId)) return { accepted: false, status: 'retryable', notSent: true, code: turnRefusal };
+          if (mismatch && !commands.hasPromptRequest(agent.session, input.requestId)) return { accepted: false, status: 'retryable', notSent: true, code: 'managed-model-changed' };
+          throw error;
+        } finally { agent.steer = originals.steer; agent.followup = originals.followup; }
+      });
+    }); },
+    managedPromptReceipt(input) { return serial(input, async () => {
+      managedId(input.requestId);
+      const record = await load(input), agent = await activate(record);
+      const prior = record.promptSelections?.[input.requestId];
+      const commands = service('sessionController')?.commands;
+      if (typeof commands?.hasPromptRequest !== 'function') reject('managed-prompt-unsupported');
+      if (!commands.hasPromptRequest(agent.session, input.requestId)) return { status: 'unknown', requestId: input.requestId };
+      return { status: 'accepted', requestId: input.requestId, selected: prior?.confirmedSelection ?? null, delivery: prior?.confirmedDelivery ?? null };
     }); },
     managedHistory(input) { return serial(input, async () => {
       const record = await load(input);

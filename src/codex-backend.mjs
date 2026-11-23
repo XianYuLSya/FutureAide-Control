@@ -1,6 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { createCodexHost, emptyProjection, markerLine, CODEX_FILE_COVERAGE } from './codex-host.mjs';
-import { isCodexReadRetryable, isCodexThreadMissing } from './codex-ipc.mjs';
+import { isCodexReadRetryable, isCodexRpcUnavailable, isCodexThreadMissing, sameWireSelection } from './codex-ipc.mjs';
 import { CODEX_ASK_PARENT_INSTRUCTION, presentedNativeQuestion } from './report-contract.mjs';
 
 const METHODS = ['probe', 'create', 'beginTask', 'observe', 'history', 'answer', 'deliver', 'receipt',
@@ -500,6 +500,10 @@ export async function createCodexBackend(record, deps = {}) {
   function receiptFrom(value, id) {
     const request = value.requests[id];
     if (!request) return undefined;
+    const confirmed = request.status === 'accepted' && Boolean(request.turnId);
+    const start = confirmed && request.route === 'new-turn';
+    const steer = confirmed && request.route === 'current-turn' && request.turnId === request.intent?.expectedTurnId;
+    const actualEffort = (start ? request.delivery?.effort : steer ? request.intent.actualEffort : null) ?? null;
     return {
       accepted: request.status === 'accepted',
       status: request.status,
@@ -508,6 +512,8 @@ export async function createCodexBackend(record, deps = {}) {
       ...(Number.isSafeInteger(request.afterSeq) ? { afterSeq: request.afterSeq } : {}),
       ...(request.route ? { delivery: request.route } : {}),
       ...(request.turnId ? { turnId: request.turnId } : {}),
+      actualEffort,
+      actualEffortSource: actualEffort ? (start ? 'native-turn-start' : request.intent.actualEffortSource ?? null) : null,
       ...(request.afterTurnId ? { afterTurnId: request.afterTurnId } : {}),
       ...(request.mode ? { mode: request.mode } : {}),
       ...(request.intent ? { intent: request.intent } : {}),
@@ -681,7 +687,7 @@ export async function createCodexBackend(record, deps = {}) {
       (value.answers ??= {})[answerId] = result; save(value);
       return result;
     },
-    async deliver({ requestId, message, kind, mode, selectionExplicit, model: dispatchModel,
+    async deliver({ requestId, message, kind, mode, selectionExplicit, explicitFields, model: dispatchModel,
       explicitModel, allowStart = true, startOnly = false, writeBlockReason }) {
       snapshotRevision++;
       // The shared layer's fence for this call. Absent means the caller never gated its
@@ -774,6 +780,7 @@ export async function createCodexBackend(record, deps = {}) {
           kind: kind ?? (value.binding ? 'supplement' : 'task'),
           startedAt: new Date().toISOString(), afterSeq: projection(value).seq, status: 'retryable', attempted: false,
           mode: mode ?? 'steer', selectionExplicit: explicitNow,
+          ...(explicitFields === undefined ? {} : { explicitFields: { ...explicitFields } }),
           ...(frozenSelection ? { model: { ...frozenSelection }, explicitModel: explicitNow,
             ...(delivery ? { delivery: { model: delivery.model, ...(delivery.effort ? { effort: delivery.effort } : {}) } } : {}) }
             : { explicitModel: false }) };
@@ -894,6 +901,7 @@ export async function createCodexBackend(record, deps = {}) {
                 ...(request.delivery.effort ? { reasoningEffort: request.delivery.effort } : {}) } }
                 : (dispatchModel === undefined ? {} : { selection: dispatchModel })),
               selectionExplicit: explicitNow ? true : (selectionExplicit === false ? false : undefined),
+              ...(request.explicitFields ? { explicitFields: request.explicitFields } : {}),
               ...(selectionExplicit === undefined && request.model?.model && !explicitNow ? { legacySelection: true } : {}),
               knownSelections: knownSelectionsFor(value),
               ...(allowStart === false ? { allowStart: false } : {}),
@@ -1041,7 +1049,7 @@ export async function createCodexBackend(record, deps = {}) {
      * first; a catalog id is never compared with a wire slug. `status` is `same`,
      * `different`, `unknown` (no proof), or `idle` (no running root turn).
      */
-    async matchRootSelection({ selection: wanted, turnId } = {}) {
+    async matchRootSelection({ selection: wanted, turnId, explicitFields } = {}) {
       if (!wanted?.model) {
         throw fail('model-required', 'An explicit model selection requires a model id; nothing was compared.',
           { terminal: true });
@@ -1076,10 +1084,8 @@ export async function createCodexBackend(record, deps = {}) {
         return { status: 'unknown', reason: 'no-wire-selection', running: true,
           ...(root.turnId ? { turnId: root.turnId } : {}), resolved };
       }
-      const status = actual.model !== resolved.model ? 'different'
-        : resolved.effort === undefined ? 'same'
-          : actual.reasoningEffort === undefined ? 'unknown'
-            : actual.reasoningEffort === resolved.effort ? 'same' : 'different';
+      const same = sameWireSelection(actual, { model: resolved.model, reasoningEffort: resolved.effort }, explicitFields);
+      const status = same === undefined ? 'unknown' : same ? 'same' : 'different';
       return { status, running: true, ...(root.turnId ? { turnId: root.turnId } : {}),
         ...(root.selectionSource ? { source: root.selectionSource } : {}),
         resolved, actual: { ...actual } };

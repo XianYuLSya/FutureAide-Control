@@ -33,7 +33,7 @@ function dshFixture(calls) {
     async hostStatus() {
       calls.push('hostStatus');
       return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus',
-        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] };
+        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPromptV2', 'managedPromptReceipt'] };
     },
     async managedCreate() { calls.push('managedCreate'); return { sessionId: 'never', modelRequestsStarted: 0 }; },
     async managedBeginTask() { calls.push('managedBeginTask'); return { treeProtocol: 1, reportProtocol: 1 }; },
@@ -54,7 +54,7 @@ async function fixture(records = [legacyRecord()]) {
     store,
     clientFactory: () => api,
     controlFactory: () => ({ async send() { calls.push('send'); return { accepted: true, afterSeq: 1 }; },
-      async wait() { return { state: 'running' }; }, async models() { return { default: {}, groups: [] }; },
+      async wait() { return { state: 'running' }; }, async models() { return { default: { provider: 'fixture', model: 'dsh-model' }, groups: [{ id: 'fixture', models: [{ id: 'dsh-model', reasoningEfforts: ['max'] }] }] }; },
       async selectModel() { return { accepted: true }; } }),
     callCodex: async (threadId, tool) => (tool === 'read_thread'
       ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } } : { accepted: true }),

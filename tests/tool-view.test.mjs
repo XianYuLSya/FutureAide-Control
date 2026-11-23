@@ -377,3 +377,13 @@ test('an inspect answer says how many paths it left to the changes tool', () => 
   assert.doesNotMatch(compactInspect(result).changes.note, /first 200 changed paths/,
     'the workspace cap sentence belongs to the changes tool, which lists them');
 });
+test('confirmed input delivery survives compact list, wait and inspect without changing report delivery', () => {
+  const item = { name: 'agent', state: 'running', lifetime: 'persistent', inputDelivery: 'new-turn',
+    reports: { total: 1, pending: 0, latest: { summary: 'done', final: true, delivery: 'delivered' } } };
+  assert.equal(compactAgent(item).inputDelivery, 'new-turn');
+  assert.equal(compactAgent(item).report.delivery, 'delivered');
+  assert.equal(compactList({ items: [item], total: 1 }).items[0].inputDelivery, 'new-turn');
+  assert.equal(compactWait({ items: [item] }).items[0].inputDelivery, 'new-turn');
+  assert.equal(compactInspect(item).inputDelivery, 'new-turn');
+  assert.equal('inputDelivery' in compactAgent({ name: 'pending' }), false);
+});

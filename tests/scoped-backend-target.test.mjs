@@ -77,7 +77,7 @@ function dshFixture(events) {
     async hostStatus() {
       events.push('hostStatus');
       return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus',
-        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] };
+        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPromptV2', 'managedPromptReceipt'] };
     },
     async managedCreate(input) {
       events.push('managedCreate');
@@ -104,7 +104,7 @@ function dshFixture(events) {
     async models() {
       events.push('models');
       return { default: { provider: 'fixture', model: 'dsh-model' }, routableProviders: ['fixture'],
-        groups: [{ id: 'fixture', models: [{ id: 'dsh-model', reasoningEfforts: ['off'] }] }] };
+        groups: [{ id: 'fixture', models: [{ id: 'dsh-model', reasoningEfforts: ['off', 'max'] }] }] };
     },
     async selectModel() { events.push('selectModel'); return { accepted: true }; },
     async send(input) { events.push(['send', input.requestId]); session.running = true; session.seq += 1; return { accepted: true, afterSeq: session.seq }; },
@@ -390,7 +390,8 @@ test('an unpinned Codex name reports actualModel from the live observation, neve
     assert.equal(created.actualModel, null, 'creation has no observed model yet');
     const receipt = await f.service.send({ name: 'partner', message: 'work' }, extra(A));
     assert.equal(receipt.queued, true);
-    assert.equal(receipt.actualModel, null);
+    assert.equal(receipt.actualModel, 'desktop-model');
+    assert.equal(receipt.actualEffort, null, 'the pending selection is not yet confirmed');
     await f.service.poll(f.record('partner').agentId);
     const observed = f.record('partner');
     assert.ok(observed.observation?.currentModel, 'the poll recorded the real observation');
@@ -430,11 +431,11 @@ test('Codex first dispatch uses the frozen pin while a running turn only accepts
     assert.equal(f.record('partner').model, undefined, 'no session-only model write exists for Codex');
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, null,
       'list waits for a real observation instead of presenting the pin as actual');
-    assert.deepEqual(f.record('partner').modelPin, PRO_SELECTION);
+    assert.deepEqual(f.record('partner').modelPin, { provider: 'fixture', model: 'desktop-pro' });
     await f.service.send({ name: 'partner', message: 'work' }, extra(A));
     await f.service.poll(f.record('partner').agentId);
     assert.equal(deliveries.length, 1);
-    assert.deepEqual(deliveries[0].model, PRO_SELECTION,
+    assert.deepEqual([deliveries[0].model.provider, deliveries[0].model.model, deliveries[0].model.reasoningEffort], Object.values(PRO_SELECTION),
       'the first dispatch uses the selection frozen when the name was created');
     assert.equal(deliveries[0].selectionExplicit, false,
       'this send did not explicitly select the inherited pin');
@@ -444,7 +445,7 @@ test('Codex first dispatch uses the frozen pin while a running turn only accepts
     assert.equal(events.includes('desktop:selectModel'), false,
       'the shared layer never calls Codex selectModel');
     assert.deepEqual([adapter.root.running, adapter.root.turnId], [true, 'turn-1']);
-    assert.deepEqual((await adapter.rootTurn()).selection, PRO_SELECTION);
+    assert.deepEqual([adapter.root.selection.provider, adapter.root.selection.model, adapter.root.selection.reasoningEffort], Object.values(PRO_SELECTION));
     assert.equal((await adapter.matchRootSelection({ selection: PRO_SELECTION, turnId: 'turn-1' })).status, 'same');
     assert.equal((await adapter.matchRootSelection({ selection: DEFAULT_SELECTION, turnId: 'turn-1' })).status, 'different');
     assert.equal((await adapter.matchRootSelection({ selection: PRO_SELECTION, turnId: 'turn-old' })).status, 'unknown',
@@ -456,12 +457,12 @@ test('Codex first dispatch uses the frozen pin while a running turn only accepts
     assert.equal(same.turnId, 'turn-1');
     assert.equal(same.actualModel, 'desktop-pro');
     assert.equal(deliveries.length, 2);
-    assert.deepEqual([deliveries[1].mode, deliveries[1].selectionExplicit, deliveries[1].model],
-      ['steer', true, PRO_SELECTION]);
+    assert.deepEqual([deliveries[1].mode, deliveries[1].selectionExplicit, deliveries[1].model.model, deliveries[1].model.reasoningEffort],
+      ['steer', true, PRO_SELECTION.model, PRO_SELECTION.reasoningEffort]);
     const sameRow = f.store.supplementInputs(f.record('partner').agentId)
       .find(row => row.requestId === same.requestId);
     assert.deepEqual([sameRow.delivery, sameRow.turnId], ['current-turn', 'turn-1']);
-    assert.deepEqual(f.record('partner').modelPin, PRO_SELECTION);
+    assert.deepEqual(f.record('partner').modelPin, { provider: 'fixture', model: 'desktop-pro' });
 
     const beforeRefusals = f.store.supplementInputs(f.record('partner').agentId).length;
     const beforeDispatches = f.record('partner').task.dispatches.length;
@@ -471,7 +472,7 @@ test('Codex first dispatch uses the frozen pin while a running turn only accepts
       assert.equal(error.code, 'codex-model-change-while-running',
         `${mode}: a real model change is refused even when it asks to queue`);
     }
-    assert.deepEqual(f.record('partner').modelPin, PRO_SELECTION,
+    assert.deepEqual(f.record('partner').modelPin, { provider: 'fixture', model: 'desktop-pro' },
       'the refused selection is not persisted');
     assert.equal(f.store.supplementInputs(f.record('partner').agentId).length, beforeRefusals,
       'the refused changes queued nothing');
@@ -490,7 +491,7 @@ test('Codex first dispatch uses the frozen pin while a running turn only accepts
     assert.equal(deliveries.length, 3);
     const inherited = deliveries.at(-1);
     assert.equal(inherited.selectionExplicit, false);
-    assert.equal('model' in inherited, false, 'native inheritance sends no model field');
+    assert.equal(inherited.model.model, 'desktop-model', 'the default model is frozen for the start');
   } finally { f.service.close(); }
 });
 
@@ -566,7 +567,7 @@ test('an earlier queued input keeps its frozen selection when the name pin chang
     assert.equal(queued.afterTurnId, 'turn-1');
     assert.equal(queued.actualModel, 'a-model');
     const queuedRow = f.store.supplement(queued.requestId);
-    assert.deepEqual(queuedRow.selection, A_SELECTION);
+    assert.deepEqual([queuedRow.selection.provider, queuedRow.selection.model, queuedRow.selection.reasoningEffort], Object.values(A_SELECTION));
     assert.equal(queuedRow.selectionExplicit, false);
 
     // A later pin write is for future turns only. The queued row already froze A.
@@ -578,7 +579,7 @@ test('an earlier queued input keeps its frozen selection when the name pin chang
 
     const delivered = deliveries.find(item => item.message === 'old input');
     assert.ok(delivered, 'the queued input was delivered when the root became idle');
-    assert.deepEqual(delivered.model, A_SELECTION, 'the earlier input is not rewritten by the later pin');
+    assert.deepEqual([delivered.model.provider, delivered.model.model, delivered.model.reasoningEffort], Object.values(A_SELECTION), 'the earlier input is not rewritten by the later pin');
     assert.equal(delivered.selectionExplicit, false);
     assert.equal(delivered.mode, 'queue');
     const deliveredRow = f.store.supplementInputs(f.record('partner').agentId)

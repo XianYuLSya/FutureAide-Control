@@ -11,6 +11,17 @@ import {
 import { createCodexBackend } from '../src/codex-backend.mjs';
 import { createCodexNativeRpc } from '../src/codex-ipc.mjs';
 import { liveThread, livePage, liveTurn } from './live-thread-fixture.mjs';
+import { resolveDispatchSelection } from '../src/model-selection.mjs';
+
+test('missing Codex capabilities remain unknown; an empty supported list sends no effort', () => {
+  const entry = { id: 'm', model: 'wire-m', isDefault: true, defaultReasoningEffort: 'low' };
+  const unknown = sharedCodexCatalog([entry]);
+  assert.throws(() => resolveDispatchSelection(unknown), { code: 'effort-capability-unknown' });
+  const fixed = sharedCodexCatalog([{ ...entry, supportedReasoningEfforts: [] }]);
+  const selected = resolveDispatchSelection(fixed);
+  assert.equal(selected.selectedEffort, null);
+  assert.deepEqual(codexDeliverySelection(fixed, selected), { modelId: 'm', model: 'wire-m' });
+});
 
 const directory = () => fileURLToPath(new URL(`../clean/validation/codex/${randomUUID()}/`, import.meta.url));
 

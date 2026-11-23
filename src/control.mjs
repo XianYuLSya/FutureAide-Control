@@ -187,7 +187,7 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
     } catch (error) {
       const status = managed && ['send', 'select-model'].includes(kind) && error.retryableRead === true
         ? 'retryable' : error.uncertain ? 'unknown' : 'rejected';
-      await writeFile(filename, JSON.stringify({ ...record, status }), { mode: 0o600 });
+      await writeFile(filename, JSON.stringify({ ...record, status, ...(status === 'retryable' ? { code: error.code, notSent: error.notSent === true } : {}) }), { mode: 0o600 });
       Object.assign(error, { receipt: filename, sessionId: session.sessionId, requestId,
         ...(Number.isSafeInteger(record.afterSeq) ? { afterSeq: record.afterSeq } : {}) });
       throw error;
@@ -345,7 +345,7 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
       return view === 'events' ? page : historyMessages(page, row);
     },
     async send({ sessionId, message, requestId, mode = 'queue', background = false, agentId, codexThreadId,
-      suppressCallback = false, archive = false, taskName, writeBlockReason } = {}) {
+      suppressCallback = false, archive = false, taskName, writeBlockReason, selection, startSelection, expectedTurn } = {}) {
       // The callback target is only what this connection was explicitly given: an agent's own
       // bound task, or a profile that names one. Nothing is guessed from the environment.
       const target = codexThreadId === undefined ? config.codexThreadId : codexThreadId;
@@ -372,7 +372,7 @@ export function createControl(config, { client, managed, notify = notifyCodex, i
           { code: blocked, terminal: true, notSent: true });
         }
         const sent = managed ? await api.managedSendMessage(managed, message, { requestId, mode,
-          ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) })
+          ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}), ...(selection ? { selection } : {}), ...(startSelection ? { startSelection } : {}), ...(expectedTurn !== undefined ? { expectedTurn } : {}) })
           : await api.sendMessage(id, message, { requestId, mode });
         return { ...sent, afterSeq };
       });

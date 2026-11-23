@@ -1233,3 +1233,29 @@ test('a later unknown answer write stays unknown even when an older receipt was 
       'an older notSent receipt cannot seal a later unknown write');
   } finally { f.service.close(); }
 });
+
+test('a delivered report keeps a temporary registration failure out of the public error', async () => {
+  const f = await fixture();
+  try {
+    const lead = await f.start('lead', 'Fix the ten places.');
+    await f.ask(lead, 'Which contract applies?');
+    await f.poll(lead);
+
+    // The report tools are temporarily unreadable, and no report has been delivered
+    // for this task yet: the dispatch preflight refusal is still accurate here.
+    f.registration.ready = false;
+    assert.equal((await f.answer(lead, 'Contract B.')).answered, true);
+    await f.poll(lead);
+    const noisy = (await f.service.list(extra(BOSS))).items.find(item => item.name === 'lead');
+    assert.equal(noisy.error?.code, 'codex-report-not-ready');
+    assert.equal(noisy.reports.pending, 0);
+
+    // The helper's cross-session report still arrives. Once it is delivered, the same
+    // preflight code is noise and must not remain the agent's public error.
+    assert.equal((await f.report(lead, 'Half fixed.')).accepted, true);
+    await f.poll(lead); await f.poll(lead);
+    const quiet = (await f.service.list(extra(BOSS))).items.find(item => item.name === 'lead');
+    assert.equal(quiet.reports.latest.delivery, 'delivered', 'the report was actually delivered');
+    assert.equal(quiet.error, undefined, 'a delivered report makes the registration preflight noise disappear');
+  } finally { f.service.close(); }
+});

@@ -142,9 +142,10 @@ const fullEntry = () => ({
 
 test('list and wait answer compactly and return the full structure only for detail', async () => {
   const entry = fullEntry();
+  const listFilters = [];
   const { client, close } = await connected({
     async resume() {},
-    async list() { return { items: [entry], total: 1 }; },
+    async list(_extra, filters) { listFilters.push(filters); return { items: [entry], total: 1 }; },
     async wait() { return { items: [entry], notListed: ['gone'], note: 'Absence alone does not prove completion.', timedOut: false }; },
   });
   try {
@@ -158,6 +159,9 @@ test('list and wait answer compactly and return the full structure only for deta
     assert.equal(compact.total, 1);
     const detail = await client.callTool({ name: 'futureaide_list_agents', arguments: { detail: true } });
     assert.deepEqual(JSON.parse(detail.content[0].text), { items: [entry], total: 1 }, 'detail is the unchanged structure');
+    await client.callTool({ name: 'futureaide_list_agents', arguments: { name: '助手', state: 'failed' } });
+    assert.deepEqual(listFilters.at(-1), { name: '助手', state: 'failed' },
+      'name and state filters reach the service that both the stdio and Claude entry share');
 
     const waited = JSON.parse((await client.callTool({ name: 'futureaide_wait_agents', arguments: { timeout_seconds: 0 } })).content[0].text);
     assert.equal(waited.items[0].task, 'x'.repeat(80) + '…');

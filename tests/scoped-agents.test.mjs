@@ -246,7 +246,7 @@ test('model failure is visible in list wait and inspect, notifies once and clear
     assert.equal(failed.state, 'failed');
     assert.deepEqual(failed.error, { source: 'model', code: 'no_healthy_account', httpStatus: 503,
       message: 'The model gateway has no healthy account available.' });
-    assert.deepEqual((await f.service.list(extra(A))).items[0].error, failed.error);
+    assert.deepEqual((await f.service.list(extra(A), { state: 'failed' })).items[0].error, failed.error);
     assert.deepEqual((await f.service.wait({ names: ['artist'] }, extra(A))).items[0].error, failed.error);
     assert.deepEqual((await f.service.inspect({ name: 'artist' }, extra(A))).error, failed.error);
     assert.equal(f.record().error, undefined, 'successful observation does not replace model failure with a connection error');
@@ -287,7 +287,7 @@ test('model failure backfill uses only the inspected original request and does n
     assert.equal(inspection.error.code, 'no_healthy_account');
     assert.equal(f.historyRequests.length, 1);
     assert.equal(f.reads.length, 1);
-    assert.deepEqual((await f.service.list(extra(A))).items[0].error, inspection.error);
+    assert.deepEqual((await f.service.list(extra(A), { state: 'failed' })).items[0].error, inspection.error);
 
     await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
     const next = f.record();
@@ -3050,5 +3050,88 @@ test('DSH run preserves a confirmed acceptance with unknown delivery as null', a
     assert.equal(result.accepted, true);
     assert.equal(Object.hasOwn(result, 'delivery'), true);
     assert.equal(result.delivery, null);
+  } finally { f.service.close(); }
+});
+
+
+test('an answer for a consumed question is a no-send receipt, not the old error', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'ask me first' }, extra(A));
+    const record = f.record();
+    const session = f.sessions.get(record.sessionId);
+
+    // The caller saw q1; by the time it answers, q1 is gone and q2 is pending.
+    record.observation = { ...(record.observation ?? {}), questions: [{ id: 'q1', message: 'Which one?', state: 'pending' }] };
+    f.store.save(record);
+    session.questions = [{ id: 'q2', message: 'A different one?', state: 'pending' }];
+    const changed = await f.service.answer({ name: 'artist', message: 'old answer' }, extra(A));
+    assert.equal(changed.answered, false);
+    assert.equal(changed.delivered, false);
+    assert.equal(changed.reason, 'question-changed');
+    assert.deepEqual(changed.pendingQuestions, ['A different one?']);
+    assert.equal(session.questions[0].state, 'pending', 'the new question is not consumed by the old answer');
+    assert.equal(f.sends.filter(item => item.message.includes('old answer')).length, 0, 'nothing was sent');
+
+    // The caller saw q2; it is consumed before the answer reaches a backend.
+    const fresh = f.record();
+    fresh.observation = { ...(fresh.observation ?? {}), questions: [{ id: 'q2', message: 'A different one?', state: 'pending' }] };
+    f.store.save(fresh);
+    session.questions = [];
+    const consumed = await f.service.answer({ name: 'artist', message: 'answer after consume' }, extra(A));
+    assert.equal(consumed.answered, false);
+    assert.equal(consumed.delivered, false);
+    assert.equal(consumed.reason, 'question-not-pending');
+    assert.deepEqual(consumed.pendingQuestions, []);
+    assert.equal(f.sends.filter(item => item.message.includes('answer after consume')).length, 0);
+    assert.equal(f.record().task.answers?.length ?? 0, 0, 'no answer intent was recorded');
+
+    // The same race one layer deeper: the preflight sees q3, but the native answer
+    // call finds it consumed. That is a settled no-send too, even though the backend
+    // returns no consumed ids.
+    const race = f.record();
+    race.observation = { ...(race.observation ?? {}), questions: [{ id: 'q3', message: 'Which third?', state: 'pending' }] };
+    f.store.save(race);
+    session.questions = [{ id: 'q3', message: 'Which third?', state: 'pending' }];
+    const nativeAnswer = f.api.managedAnswer;
+    f.api.managedAnswer = async () => { session.questions = []; return { consumedQuestionIds: [] }; };
+    try {
+      const raced = await f.service.answer({ name: 'artist', message: 'raced answer' }, extra(A));
+      assert.equal(raced.answered, false);
+      assert.equal(raced.reason, 'question-not-pending');
+      assert.deepEqual(raced.pendingQuestions, [], 'the consumed question is not reported as still pending');
+      assert.equal(f.sends.filter(item => item.message.includes('raced answer')).length, 0);
+    } finally { f.api.managedAnswer = nativeAnswer; }
+  } finally { f.service.close(); }
+});
+
+test('list defaults to active names and finds inactive ones by name or state within the caller', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'active', lifetime: 'persistent' }, extra(A));
+    await f.service.send({ name: 'active', message: 'work' }, extra(A));
+    const at = new Date().toISOString();
+    f.store.insert({ agentId: `agent-${'a'.repeat(32)}`, ownerId: ownerIdFor(A), sessionId: 'session-failed',
+      name: 'failed-one', lifetime: 'persistent', target: 'dsh', workspace, created: true, state: 'failed',
+      createdAt: at, updatedAt: at, history: [] });
+    f.store.insert({ agentId: `agent-${'b'.repeat(32)}`, ownerId: ownerIdFor(A), sessionId: 'session-cleanup',
+      name: 'cleanup-one', lifetime: 'persistent', target: 'dsh', workspace, created: true, state: 'cleanup_failed',
+      closed: true, createdAt: at, updatedAt: at, history: [] });
+
+    const defaults = await f.service.list(extra(A));
+    assert.deepEqual(defaults.items.map(item => item.name), ['active']);
+    assert.equal(defaults.total, 1);
+    const byName = await f.service.list(extra(A), { name: 'failed-one' });
+    assert.deepEqual(byName.items.map(item => [item.name, item.state]), [['failed-one', 'failed']]);
+    const byState = await f.service.list(extra(A), { state: 'cleanup_failed' });
+    assert.deepEqual(byState.items.map(item => [item.name, item.state]), [['cleanup-one', 'cleanup_failed']]);
+    const activeOnly = await f.service.list(extra(A), { state: 'active' });
+    assert.deepEqual(activeOnly.items.map(item => item.name), ['active']);
+    const both = await f.service.list(extra(A), { name: 'failed-one', state: 'failed' });
+    assert.equal(both.items.length, 1);
+    const mismatch = await f.service.list(extra(A), { name: 'failed-one', state: 'cleanup_failed' });
+    assert.equal(mismatch.items.length, 0);
+    assert.equal((await f.service.list(extra(B))).items.length, 0, 'another caller never sees these names');
   } finally { f.service.close(); }
 });

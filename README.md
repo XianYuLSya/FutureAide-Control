@@ -182,7 +182,7 @@ futureaide_send_agent({name: "审稿", message: "接着检查刚才提到的第�
 | `futureaide_create_agent` | 预留名字，可选 `target`、`model`、`effort` |
 | `futureaide_send_agent` | 派单或补充，也可以更新模型和强度；`mode` 可选插话或排队 |
 | `futureaide_answer_agent` | 回答助手的问题 |
-| `futureaide_list_agents` | 看本聊天的名单，有下属时一人一行列出整棵树 |
+| `futureaide_list_agents` | 看本聊天的名单；默认只列活跃名字，可按 `name` 或 `state` 查历史，有下属时一人一行列出整棵树 |
 | `futureaide_wait_agents` | 派单后用回执中的 taskKey 等一次，省略 timeout_seconds，直到有报告、提问或终态。收到阶段报告后如需等下一件事，把 nextCursor 原样作为 after。显式 0 为快照，1–45 为有界查询。 |
 
 本机 Codex 的单次工具预算为 60 秒，进度通知不能续期。Claude Code 交互主会话默认约两分钟把长调用转到后台；子代理及非交互模式的行为不同。连接断开或宿主超时后，原任务仍会回报，请保留原派单回执。无需循环等待或重派。

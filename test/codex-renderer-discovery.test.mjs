@@ -247,5 +247,7 @@ test('discovery lost after thread creation reports a retryable first turn on tha
   t.after(() => clearTimeout(holdEventLoop));
   rows = [endpoint];
   await host.createFirstTurn({ ...input, nativeSessionId: thread.id });
-  assert.deepEqual(calls, ['thread/start', 'thread/list', 'thread/read', 'turn/start']);
+  // The read-only reattach uses the replacement connection directly; the probe follows
+  // it on the same generation and still gates the first turn write.
+  assert.deepEqual(calls, ['thread/start', 'thread/read', 'thread/list', 'turn/start']);
 });

@@ -2903,7 +2903,7 @@ export function createScopedAgents(config, {
         if (!actualRelative || actualRelative.startsWith('..') || path.isAbsolute(actualRelative)) throw new Error('The state directory resolves outside its owned root.');
         await removeTree(directory, { recursive: true, force: true });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      store.remove(record, { deliveredReceipt: autoClaimed || autoRetry });
+      store.remove(record);
       forgetBackend(record);
       return { name: record.name, deleted: true, sessionDataRemoved: !record.nativeSessionRetained,
         ...(record.nativeSessionRetained !== undefined ? { nativeSessionRetained: record.nativeSessionRetained } : {}) };

@@ -1,6 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
-import { writeDeliveredReceipts } from './roster-store.mjs';
 
 const digest = text => createHash('sha256').update(text, 'utf8').digest('hex');
 const required = ['agents', 'owners'];
@@ -371,13 +370,7 @@ export function completeRosterTicket(filename, ticketId) {
         const steps = new Set(get.all(ticketId,id).map(row => row.step));
         if (!steps.has('native-complete') || !steps.has('private-complete')) throw new Error('cleanup-steps-incomplete');
       }
-      const hasTaskKeys = Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_keys'").get());
       for (const id of tree.treeIds) {
-        if (hasTaskKeys) {
-          const row = db.prepare('SELECT owner,body FROM agents WHERE id=?').get(id);
-          const body = JSON.parse(row.body);
-          writeDeliveredReceipts(db, { agentId: id, ownerId: row.owner, task: body.task });
-        }
         for (const table of ['submissions','supplements','backend_state','agent_history']) db.prepare(`DELETE FROM ${table} WHERE agent=?`).run(id);
         db.prepare('DELETE FROM leases WHERE key=? OR key=?').run(id,`worker:${id}`);
         db.prepare('DELETE FROM agents WHERE id=?').run(id);

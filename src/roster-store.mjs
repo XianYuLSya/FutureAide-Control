@@ -1554,6 +1554,9 @@ export class RosterStore {
   remove(record, { deliveredReceipt = false } = {}) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
+    // Pending cross-group approval: the cleanup-ticket and automatic-cleanup
+    // production paths no longer pass deliveredReceipt; the capability stays
+    // dormant until the cleanup owner decides.
     if (deliveredReceipt) writeDeliveredReceipts(this.db, record);
     this.db.prepare('DELETE FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL')
       .run(record.ownerId, record.agentId);

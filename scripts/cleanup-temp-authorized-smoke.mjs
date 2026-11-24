@@ -105,7 +105,7 @@ let log = '';
 let child;
 let ended;
 function startHost() {
-  child = spawn('C:/Users/汝皇/AppData/Local/Programs/DeepSeek Harness/DeepSeek Harness.exe', ['--expose-internals',
+  child = spawn((process.env.LOCALAPPDATA || process.env.USERPROFILE + '/AppData/Local') + '/Programs/DeepSeek Harness/DeepSeek Harness.exe', ['--expose-internals',
     path.join(entry.runtime, entry.relative),
     '--profile', 'web',
     '--patch', patchFile,

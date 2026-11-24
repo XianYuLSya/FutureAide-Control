@@ -1,5 +1,20 @@
 # 更新记录
 
+## 0.5.21 — 2026-11-24 · 断连自动接回，等回包不轮询，插话和排队分得清
+
+升级后重启监工 `scoped-worker` 才生效。升级时已开着的 Claude Desktop 会话，要重连 FutureAide Control 插件或新开一个会话：升级前启动的桥做长等待会返回 MCP `-32001 Request timed out`。已经派出的单保留原回执，重连后凭原 `taskKey` 查回包，不要重派。
+
+- **Codex 断连后自动接回。** 插件和 Codex 的连接断开后，监工自己接回。Codex 主页面换了新连接时，只读查询先改用新连接，派单这类写入要等新连接核实后才放行。修正了探针超时把只读查询全部挡在页面前的问题。
+- **补充可以选插话还是排队。** `send`、`run` 新增 `mode`：`steer` 插进正在跑的这一轮，`queue` 等这一轮结束，作为下一轮的开头。回执的 `delivery` 写明去向：`current-turn`、`after-current`、`new-turn`，或只存在本地的 `local-pending`。DSH 不接受显式 `queue`，Claude CLI 不接受显式 `steer`，这时返回 `mode-unsupported`，什么也不保存。带着名字原有模型的补充不再被误判成“运行中换模型”。
+- **等回包不用轮询。** 派单后用 `futureaide_wait_agents({taskKeys:[taskKey]})` 等一次，等到报告、提问或结束事件就返回，不用传 `timeout_seconds`。处理完一件再等下一件时，把上次的 `nextCursor` 作为 `after` 传入。Claude 会话实测一次等待 197.8 秒收到最终回报，纯空等的请求从 1 次降到 0 次。Codex 调用方单次等待受宿主 60 秒上限，超时后任务照跑，最终回报照常送达。
+- **反馈通道。** 调用方用 `futureaide_feedback`、受管助手用 `feedback` 报告插件的问题，记在本机收件箱。同一问题按编号累计次数，附带版本、目标、名字、调用方、时间和出错的工具。整理用 `feedback-pending`、`feedback-organize`、`feedback-todos`，用法见技能说明。
+- **派单时选思考强度。** `run`、`create`、`send` 可传 `effort`。不传时依次取 `modelDefaultEfforts`（出厂只有 GPT-6.2-Astra 是 high）和 `defaultEffort`（出厂 max），再就近取模型支持的档位。名字上显式选过的强度会带到之后的 `send`、`answer` 和排队起的新一轮。回执的 `actualEffort` 报实际生效的档位。
+- 回答时按问题身份核对：问题已被处理或换了，回执返回 `answered:false`、原因和当前待答的问题，不再报错，也不发送。
+- 报告照常送达时，不再报 `codex-report-not-ready`。
+- `futureaide_list_agents` 默认只列活跃的名字。传 `name` 可读单个名字（包括已结束的），传 `state` 按状态筛选。
+
+已知问题：`futureaide_wait_agents` 读到的最终回报，可能又作为普通通知送来一次；很长的正文在等待结果里可能被截断，以通知为准。
+
 ## 0.5.20 — 2026-11-18 · Claude CLI 中断和补充消息
 
 - Windows 上其他程序短暂占用状态文件时，Claude 助手会继续执行，文件释放后补写进度。任务已经结束、状态文件仍被占用时，插件会单独保存本次结果。后台进程异常退出时会留下具体错误，方便区分写盘故障和模型失败。

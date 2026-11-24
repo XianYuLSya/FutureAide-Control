@@ -1132,6 +1132,13 @@ export function createManagedHost(ctx, { stateDirectory, store, removeDirectory 
       name: 'feedback',
       description: 'Record a plugin problem or friction in the local feedback inbox. Use ask_parent for decisions and report_parent for deliverables.',
       parameters: { type: 'object', properties: { kind: { type: 'string', enum: ['problem', 'friction'] }, message: { type: 'string', minLength: 1, maxLength: 1200 }, severity: { type: 'string', enum: ['low', 'medium', 'high'] } }, required: ['kind', 'message'], additionalProperties: false },
+      output: {
+        schema: { type: 'object', properties: {
+          saved: { oneOf: [{ type: 'boolean' }, { type: 'null' }] },
+          id: { type: 'string' }, count: { type: 'integer' }, code: { type: 'string' }, message: { type: 'string' },
+        }, required: ['saved'], additionalProperties: false },
+        render: (_args, receipt) => [{ type: 'text', text: JSON.stringify(receipt) }],
+      },
       async execute(args, exec) {
         const deadline = Date.now() + 2000;
         if (exec.agent !== agent || record.closing || record.cancelled) reject('managed-task-closed');

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { z } from 'zod';
 import { apply, createHostHandler, createManagedHost, CHILD_QUESTION_REFUSAL, ROOT_QUESTION_REFUSAL } from '../src/host-plugin.mjs';
 import { pendingFeedback } from '../src/feedback-inbox.mjs';
 import { installDesktopHostBridge, installHostBridge } from '../src/host-install.mjs';
@@ -55,7 +56,12 @@ async function fixture() {
       ['write_file', { name: 'write_file', description: 'Write a file' }],
     ]);
     const guards = [];
-    const tools = { register: definition => definitions.set(definition.name, definition),
+    const tools = { register(definition) {
+      if (!definition.output?.schema || typeof definition.output.render !== 'function') {
+        throw new TypeError(`tool "${definition.name}" must declare output { schema, render, presentationMeta? }`);
+      }
+      definitions.set(definition.name, definition);
+    },
       get: name => definitions.get(name), guard: guard => guards.push(guard), schemas: () => [],
       view: () => ({ restrictableNames: new Set(definitions.keys()) }),
       restrict: ({ deny }) => deny.forEach(name => definitions.delete(name)) };
@@ -98,7 +104,9 @@ async function fixture() {
     failNextRemoval: () => { failRemoval = true; },
     own: (childId, parent) => ownedBy.set(childId, parent),
     create: (context = ctx, options = {}) => createManagedHost(context, { stateDirectory: path.join(root, 'managed'), store, removeDirectory,
-      installDelegation: async agentCtx => { agentCtx.get('tools').register({name:'managed_subagent'}); }, ...options }) };
+      installDelegation: async agentCtx => {
+        agentCtx.get('tools').register({ name: 'managed_subagent', output: { schema: { type: 'object' }, render: () => [] } });
+      }, ...options }) };
 }
 
 const identity = workspace => ({ ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a', workspace, treeProtocol: 1, reportProtocol: 1 });
@@ -203,9 +211,13 @@ test('managed feedback records bound task context and recent report failure whil
   await assert.rejects(agent.definitions.get('report_parent').execute({ message: '  ' }, exec), e => e.controlCode === 'invalid-report');
   await agent.definitions.get('ask_parent').execute({ message: '需要决定' }, exec);
   assert.equal(agent.guards.map(guard => guard({ agent, name: 'feedback' })).find(Boolean), undefined);
-  const receipt = await agent.definitions.get('feedback').execute({ kind: 'problem', message: '报告空白未通过' }, exec);
-  assert.equal(receipt.saved, true);
+  const feedback = agent.definitions.get('feedback');
+  const args = { kind: 'problem', message: '报告空白未通过' };
+  const receipt = await feedback.execute(args, exec);
   const [row] = pendingFeedback(configFile);
+  assert.deepEqual(receipt, { saved: true, id: row.id, count: 1 });
+  assert.deepEqual(z.fromJSONSchema(feedback.output.schema).parse(receipt), receipt);
+  assert.deepEqual(feedback.output.render(args, receipt), [{ type: 'text', text: JSON.stringify(receipt) }]);
   assert.deepEqual({ source: row.occurrences[0].source, caller: row.occurrences[0].caller, target: row.occurrences[0].target, name: row.occurrences[0].name, version: row.occurrences[0].version },
     { source: 'dsh', caller: 'codex', target: 'dsh', name: '测试助手', version: manifest.version });
   assert.equal(row.occurrences[0].error.tool, 'report_parent');
@@ -242,7 +254,12 @@ test('legacy managed bridge returns feedback unavailable without affecting repor
   const f = await fixture(), input = identity(f.workspace), host = f.create();
   await host.managedCreate(input); await host.managedBeginTask({ ...input, taskId: 'task-a' });
   const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
-  assert.deepEqual(await agent.definitions.get('feedback').execute({ kind: 'problem', message: '问题' }, exec), { saved: false, code: 'feedback-unavailable' });
+  const feedback = agent.definitions.get('feedback');
+  const args = { kind: 'problem', message: '问题' };
+  const receipt = await feedback.execute(args, exec);
+  assert.deepEqual(receipt, { saved: false, code: 'feedback-unavailable' });
+  assert.deepEqual(z.fromJSONSchema(feedback.output.schema).parse(receipt), receipt);
+  assert.deepEqual(feedback.output.render(args, receipt), [{ type: 'text', text: JSON.stringify(receipt) }]);
   assert.equal((await agent.definitions.get('report_parent').execute({ message: '正常报告' }, exec)).accepted, true);
 });
 

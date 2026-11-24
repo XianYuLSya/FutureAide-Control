@@ -2901,9 +2901,10 @@ export function createScopedAgents(config, {
    * instead of vanishing from the roster while its session survives. A child already in
    * cleanup_failed is retried too — closed is not the same as cleaned.
    */
-  async function clearRecord(record, { autoClaimed = false } = {}) {
+  async function clearRecord(record, { autoClaimed = false, autoRetry = false } = {}) {
     requireWritableTarget(record);
     record.state = 'cleaning'; record.closed = true;
+    if (autoClaimed || autoRetry) record.autoCleanupClosed = true;
     if (!autoClaimed) store.save(record);
     try {
       for (const child of store.childrenOf(record.agentId)) {
@@ -2911,7 +2912,7 @@ export function createScopedAgents(config, {
         if (!current || current.agentId === record.agentId) continue;
         const verdict = await store.locked(current.agentId, async () => {
           const fresh = store.get(current.agentId);
-          return fresh ? clearRecord(fresh) : { deleted: true };
+          return fresh ? clearRecord(fresh, { autoRetry: autoClaimed || autoRetry }) : { deleted: true };
         }, { waitMs: 0 });
         if (verdict?.deleted !== true) {
           throw Object.assign(new Error(`The managed subagent “${current.name}” could not be cleaned; this name stays listed so cleanup can be retried.`),
@@ -2939,7 +2940,7 @@ export function createScopedAgents(config, {
         if (!actualRelative || actualRelative.startsWith('..') || path.isAbsolute(actualRelative)) throw new Error('The state directory resolves outside its owned root.');
         await removeTree(directory, { recursive: true, force: true });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
-      store.remove(record);
+      store.remove(record, { deliveredReceipt: autoClaimed || autoRetry });
       forgetBackend(record);
       return { name: record.name, deleted: true, sessionDataRemoved: !record.nativeSessionRetained,
         ...(record.nativeSessionRetained !== undefined ? { nativeSessionRetained: record.nativeSessionRetained } : {}) };
@@ -3985,7 +3986,9 @@ export function createScopedAgents(config, {
   async function pollLocked(record) {
     if (readOnlyTarget(record)) return publicResult(record);
     if (record.state === 'cleaning') {
-      return Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now() ? publicResult(record) : clearRecord(record);
+      const nextAttempt = Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0);
+      if (nextAttempt > Date.now()) return publicResult(record);
+      return clearRecord(record, { autoRetry: record.autoCleanupClosed === true });
     }
     if (record.closed || record.state === 'cleanup_failed') return publicResult(record);
     const missingTree = retainMissingTreeFailure(record);

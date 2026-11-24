@@ -1565,46 +1565,20 @@ export class RosterStore {
     return consumed;
   }
   remove(record, { deliveredReceipt = false } = {}) {
-    if (deliveredReceipt) return this.removeWithReceipt(record);
-    this.db.prepare('DELETE FROM supplements WHERE agent=? AND owner=?').run(record.agentId, record.ownerId);
-    this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(record.agentId);
-    this.db.prepare('DELETE FROM submissions WHERE agent=?').run(record.agentId);
-    // Task history lives in its own table now: deleting the name has to delete what
-    // the tasks said, and it has to happen before the checkpoint below, so the freed
-    // cells are overwritten by secure_delete and the old WAL copies are truncated.
-    this.db.prepare('DELETE FROM agent_history WHERE agent=?').run(record.agentId);
-    this.db.prepare('DELETE FROM agents WHERE id=? AND owner=?').run(record.agentId, record.ownerId);
-    // The per-target host lock is shared with other names and is left to its holder.
-    this.db.prepare('DELETE FROM leases WHERE key=? OR key=?').run(record.agentId, `worker:${record.agentId}`);
-    // Secure-delete overwrites freed database cells; checkpoint removes old WAL copies.
-    const checkpoint = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
-    this.touched(record.agentId);
-    if (checkpoint?.busy) {
-      // The name comes back only as a marker telling the caller to delete again. Its
-      // history is deliberately not restored: the delete has already erased it, and a
-      // tombstone must not resurrect the task text this call was asked to remove.
-      this.insert({ agentId: record.agentId, ownerId: record.ownerId, name: record.name, lifetime: record.lifetime,
-        ...(record.target ? { target: record.target } : {}),
-        workspace: record.workspace, sessionId: record.sessionId, state: 'cleanup_failed', nativeDestroyed: true, history: [],
-        updatedAt: new Date().toISOString(), error: 'Database cleanup is waiting for another reader. Delete this name again to finish.' });
-      throw new Error('The session was removed; local database cleanup is still pending.');
-    }
-  }
-
-  // Pending cross-group approval: this opt-in receipt path keeps the cleanup-ticket
-  // and automatic-cleanup behavior isolated until the cleanup owner decides. Production
-  // remove() above stays byte-for-byte on the 2fdb3b4 deletion/rollback semantics.
-  removeWithReceipt(record) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      writeDeliveredReceipts(this.db, record);
+      if (deliveredReceipt) writeDeliveredReceipts(this.db, record);
       this.db.prepare('DELETE FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL')
         .run(record.ownerId, record.agentId);
       this.db.prepare('DELETE FROM supplements WHERE agent=? AND owner=?').run(record.agentId, record.ownerId);
       this.db.prepare('DELETE FROM backend_state WHERE agent=?').run(record.agentId);
       this.db.prepare('DELETE FROM submissions WHERE agent=?').run(record.agentId);
+      // Task history lives in its own table now: deleting the name has to delete what
+      // the tasks said, and it has to happen before the checkpoint below, so the freed
+      // cells are overwritten by secure_delete and the old WAL copies are truncated.
       this.db.prepare('DELETE FROM agent_history WHERE agent=?').run(record.agentId);
       this.db.prepare('DELETE FROM agents WHERE id=? AND owner=?').run(record.agentId, record.ownerId);
+      // The per-target host lock is shared with other names and is left to its holder.
       this.db.prepare('DELETE FROM leases WHERE key=? OR key=?').run(record.agentId, `worker:${record.agentId}`);
       this.db.exec('COMMIT');
     } catch (error) {
@@ -1612,9 +1586,13 @@ export class RosterStore {
       this.touched(record.agentId);
       throw error;
     }
+    // Secure-delete overwrites freed database cells; checkpoint removes old WAL copies.
     const checkpoint = this.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
     this.touched(record.agentId);
     if (checkpoint?.busy) {
+      // The name comes back only as a marker telling the caller to delete again. Its
+      // history is deliberately not restored: the delete has already erased it, and a
+      // tombstone must not resurrect the task text this call was asked to remove.
       this.insert({ agentId: record.agentId, ownerId: record.ownerId, name: record.name, lifetime: record.lifetime,
         ...(record.target ? { target: record.target } : {}),
         workspace: record.workspace, sessionId: record.sessionId, state: 'cleanup_failed', nativeDestroyed: true, history: [],

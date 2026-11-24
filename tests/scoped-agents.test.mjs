@@ -2337,6 +2337,100 @@ test('supplement key begins after existing reports and does not duplicate submis
   } finally { f.service.close(); }
 });
 
+for (const automatic of [true, false]) test(`${automatic ? 'automatic' : 'manual'} tree cleanup handles child receipt`, async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: automatic ? 'once' : 'persistent' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'parent' }, extra(A));
+    await f.service.create({ name: 'child', lifetime: 'persistent' }, extra(A));
+    const parent = f.record(), child = f.record('child');
+    child.parentAgentId = parent.agentId;
+    child.task = { taskId: 'child-task', state: 'completed', reports: [{ id: 'submission:child-final', final: true, delivery: { state: 'delivered' } }], dispatches: [] };
+    child.observation = { tree: { settled: true, running: false }, questions: [] };
+    f.store.save(child);
+    const key = f.store.saveTaskKey(child.ownerId, child.agentId, 'child-request', 'child-task');
+    if (automatic) {
+      const ready = f.store.get(parent.agentId);
+      ready.task.reports = [{ id: 'parent-final', final: true, delivery: { state: 'delivered' } }];
+      f.store.save(ready);
+      assert.equal(f.store.claimAutoCleanup(ready), true);
+      await f.service.poll(parent.agentId);
+    }
+    else await f.service.delete({ name: 'artist' }, extra(A));
+    assert.equal(f.store.get(child.agentId), undefined, JSON.stringify(f.store.get(parent.agentId)));
+    const mapping = f.store.resolveTaskKey(child.ownerId, key);
+    if (automatic) assert.equal(mapping.receipt.finalSubmissionId, 'child-final');
+    else assert.equal(mapping, null);
+  } finally { f.service.close(); }
+});
+
+test('public delete retry after a busy automatic cleanup retains the confirmed receipt', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    const sent = await f.service.send({ name: 'artist', message: 'work' }, extra(A));
+    const parent = f.record();
+    parent.task.reports = [{ id: 'submission:busy-final', final: true, delivery: { state: 'delivered' } }]; f.store.save(parent);
+    assert.equal(f.store.claimAutoCleanup(parent), true);
+    const prepare = f.store.db.prepare.bind(f.store.db);
+    f.store.db.prepare = sql => /wal_checkpoint/i.test(sql) ? { get: () => ({ busy: 1 }) } : prepare(sql);
+    try { await f.service.poll(parent.agentId); } finally { f.store.db.prepare = prepare; }
+    assert.equal(f.record().state, 'cleanup_failed');
+    await f.service.delete({ name: 'artist' }, extra(A));
+    assert.equal(f.store.resolveTaskKey(parent.ownerId, sent.taskKey).receipt.finalSubmissionId, 'busy-final');
+  } finally { f.service.close(); }
+});
+
+test('automatic child cleanup retries an uncertain destroy with its original source', async () => {
+  const f = await fixture();
+  try {
+    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
+    await f.service.send({ name: 'artist', message: 'parent' }, extra(A));
+    await f.service.create({ name: 'child', lifetime: 'persistent' }, extra(A));
+    const parent = f.record(), child = f.record('child'); child.parentAgentId = parent.agentId;
+    child.task = { taskId: 'child-task', state: 'completed', reports: [{ id: 'child-final', final: true, delivery: { state: 'delivered' } }], dispatches: [] };
+    f.store.save(child);
+    const key = f.store.saveTaskKey(child.ownerId, child.agentId, 'child-request', 'child-task');
+    parent.task.reports = [{ id: 'parent-final', final: true, delivery: { state: 'delivered' } }]; f.store.save(parent);
+    assert.equal(f.store.claimAutoCleanup(parent), true);
+    const destroy = f.api.managedDestroy; let failed = false;
+    f.api.managedDestroy = async input => {
+      if (!failed && input.sessionId === child.sessionId) { failed = true; throw Object.assign(new Error('unknown'), { uncertain: true }); }
+      return destroy(input);
+    };
+    await f.service.poll(parent.agentId);
+    const retry = f.store.get(child.agentId);
+    assert.equal(retry.autoCleanupClosed, true);
+    retry.nextAttemptAt = 0; f.store.save(retry);
+    await f.service.poll(child.agentId);
+    assert.equal(f.store.resolveTaskKey(child.ownerId, key).receipt.finalSubmissionId, 'child-final');
+  } finally { f.service.close(); }
+});
+
+test('cleanup ticket preserves the old wait receipt across same-name replacement', async () => {
+  const dir = await mkdtemp(path.join(workspace, 'clean', 'scoped-tests', 'ticket-wait-'));
+  const file = path.join(dir, 'roster.sqlite');
+  const store = new RosterStore(file); const f = await fixture({ store });
+  try {
+    const sent = await f.service.run({ name: 'artist', message: 'old', lifetime: 'once' }, extra(A));
+    const old = f.record();
+    old.task.reports = [{ id: 'submission:ticket-final', final: true, message: 'private', delivery: { state: 'delivered' } }];
+    store.save(old);
+    const tree = readRosterTree(file, old.agentId);
+    claimRosterTree(file, { rootId: old.agentId, fingerprint: tree.fingerprint, ticketId: 'ticket-wait' });
+    recordRosterStep(file, 'ticket-wait', old.agentId, 'native-complete', { removed: true });
+    recordRosterStep(file, 'ticket-wait', old.agentId, 'private-complete', { removed: true });
+    completeRosterTicket(file, 'ticket-wait');
+    const replacement = await f.service.run({ name: 'artist', message: 'new', lifetime: 'persistent' }, extra(A));
+    const oldWait = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
+    const newWait = await f.service.wait({ taskKeys: [replacement.taskKey], timeoutSeconds: 0 }, extra(A));
+    assert.notEqual(replacement.taskKey, sent.taskKey);
+    assert.equal(oldWait.events[0].type, 'delivered');
+    assert.equal(oldWait.events[0].id, `${sent.taskKey}:delivered:ticket-final`);
+    assert.equal(newWait.events.some(event => event.type === 'delivered'), false);
+  } finally { f.service.close(); }
+});
+
 test('send returns its original key without rechecking a reused name', async () => {
   const f = await fixture();
   try {

@@ -1731,6 +1731,34 @@ export function createScopedAgents(config, {
     };
   }
 
+  function nameModelPin(record, selection) {
+    return { provider: selection.provider, model: selection.model,
+      ...(targetOf(record) === 'codex-desktop' ? { requestedEffort: selection.explicitInput?.effort ?? null } : {}) };
+  }
+
+  function lastCodexPinSelection(task) {
+    return task?.dispatches?.findLast(dispatch => dispatch.accepted === true && dispatch.selectionExplicit === true)?.model
+      ?? (task?.modelSelection?.explicitFields?.model ? task.modelSelection : undefined);
+  }
+
+  function pinnedCodexEffort(record) {
+    const pin = record.modelPin;
+    if (!pin || targetOf(record) !== 'codex-desktop') return undefined;
+    if (Object.hasOwn(pin, 'requestedEffort')) return pin.requestedEffort ?? undefined;
+    // Before the pin carried effort, only explicit inputs prove what the caller chose.
+    const previous = lastCodexPinSelection(record.task)
+      ?? store.historyFor(record.agentId).map(lastCodexPinSelection).findLast(Boolean)
+      ?? record.creationSelection;
+    if (previous?.model === pin.model && previous.provider === pin.provider) return previous.explicitInput?.effort;
+  }
+
+  function rememberAcceptedCodexPin(record, dispatch) {
+    if (targetOf(record) !== 'codex-desktop' || dispatch.selectionExplicit !== true || !dispatch.model
+        || lastCodexPinSelection(record.task) !== dispatch.model) return;
+    const fields = dispatch.model.explicitFields;
+    if (fields?.model || (fields?.effort && record.modelPin)) record.modelPin = nameModelPin(record, dispatch.model);
+  }
+
   async function resolveRequestedPin(record, input = {}, frozenConfig) {
     const backend = await backendFor(record);
     const catalog = await backend.models();
@@ -1739,6 +1767,7 @@ export function createScopedAgents(config, {
       dshDefaultOnly(record) ? catalog?.default : (record.modelPin ? undefined : await backend.model());
     const request = selectionRequest(input);
     if (dshDefaultOnly(record)) delete request.model;
+    if (!hasModelRequest(request)) request.effort = pinnedCodexEffort(record);
     const selection = resolveDispatchSelection(catalog, request, {
       pinned: dshDefaultOnly(record) ? undefined : record.modelPin, current, config: frozenConfig ?? config.behavior ?? config,
     });
@@ -2113,7 +2142,7 @@ export function createScopedAgents(config, {
         // and only now make it the name's intended selection. A refused or still
         // waiting input never changes the pin.
         record.model = { ...dispatch.model };
-        if (dispatch.model?.explicitFields?.model) record.modelPin = { provider: dispatch.model.provider, model: dispatch.model.model };
+        rememberAcceptedCodexPin(record, dispatch);
       }
       if (dispatch.kind === 'supplement') {
         saveSupplementReceipt(dispatch.requestId, accepted ? 'accepted'
@@ -3417,6 +3446,7 @@ export function createScopedAgents(config, {
       ...(Object.hasOwn(receipt, 'actualModel') ? { actualModel: receipt.actualModel } : {}),
       ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}) });
     if (receipt.status === 'accepted' && receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
+    if (receipt.status === 'accepted') rememberAcceptedCodexPin(record, dispatch);
     if (receipt.status === 'accepted' && receipt.delivery === 'new-turn' && targetOf(record) === 'dsh') {
       delete dispatch.deliverySelection; delete dispatch.deliveryModel;
     }
@@ -3480,6 +3510,7 @@ export function createScopedAgents(config, {
           ...(receipt.afterTurnId ? { afterTurnId: receipt.afterTurnId } : {}),
           nextAttemptAt: undefined, retryAttempts: undefined });
         if (receipt.delivery === 'current-turn') delete dispatch.afterTurnId;
+        rememberAcceptedCodexPin(record, dispatch);
         if (receipt.delivery === 'new-turn' && targetOf(record) === 'dsh') { delete dispatch.deliverySelection; delete dispatch.deliveryModel; }
         return 'accepted';
       }
@@ -4312,7 +4343,7 @@ export function createScopedAgents(config, {
         try { preview = await resolveRequestedPin(record, { model, effort }); }
         catch (error) { if (hasModelRequest({ model, effort })) throw error; }
         if (preview) record.creationSelection = preview;
-        if (preview && model !== undefined && !dshDefaultOnly(record)) record.modelPin = { provider: preview.provider, model: preview.model };
+        if (preview && model !== undefined && !dshDefaultOnly(record)) record.modelPin = nameModelPin(record, preview);
         if (effort !== undefined) record.pendingEffort = effort;
       }
       store.insert(record, { requireOpenParent: Boolean(parent) });
@@ -4665,7 +4696,7 @@ export function createScopedAgents(config, {
         const requestId = uid('request');
         const next = { ...record, state: 'running', observation: undefined, error: undefined,
           nextAttemptAt: undefined, retryAttempts: 0, sleep: undefined,
-          ...(request.model !== undefined && !dshDefaultOnly(record) ? { modelPin: { provider: pin.provider, model: pin.model } } : {}),
+          ...(request.model !== undefined && !dshDefaultOnly(record) ? { modelPin: nameModelPin(record, pin) } : {}),
           pendingEffort: undefined,
           // A pin saved before the lock was turned on goes with the next task.
           ...(dshDefaultOnly(record) ? { modelPin: undefined } : {}),

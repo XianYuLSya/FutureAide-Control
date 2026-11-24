@@ -431,7 +431,7 @@ test('Codex first dispatch uses the frozen pin while a running turn only accepts
     assert.equal(f.record('partner').model, undefined, 'no session-only model write exists for Codex');
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, null,
       'list waits for a real observation instead of presenting the pin as actual');
-    assert.deepEqual(f.record('partner').modelPin, { provider: 'fixture', model: 'desktop-pro' });
+    assert.deepEqual(f.record('partner').modelPin, { provider: 'fixture', model: 'desktop-pro', requestedEffort: null });
     await f.service.send({ name: 'partner', message: 'work' }, extra(A));
     await f.service.poll(f.record('partner').agentId);
     assert.equal(deliveries.length, 1);
@@ -462,7 +462,8 @@ test('Codex first dispatch uses the frozen pin while a running turn only accepts
     const sameRow = f.store.supplementInputs(f.record('partner').agentId)
       .find(row => row.requestId === same.requestId);
     assert.deepEqual([sameRow.delivery, sameRow.turnId], ['current-turn', 'turn-1']);
-    assert.deepEqual(f.record('partner').modelPin, { provider: 'fixture', model: 'desktop-pro' });
+    const pinnedSelection = { provider: 'fixture', model: 'desktop-pro', requestedEffort: 'high' };
+    assert.deepEqual(f.record('partner').modelPin, pinnedSelection);
 
     const beforeRefusals = f.store.supplementInputs(f.record('partner').agentId).length;
     const beforeDispatches = f.record('partner').task.dispatches.length;
@@ -472,7 +473,7 @@ test('Codex first dispatch uses the frozen pin while a running turn only accepts
       assert.equal(error.code, 'codex-model-change-while-running',
         `${mode}: a real model change is refused even when it asks to queue`);
     }
-    assert.deepEqual(f.record('partner').modelPin, { provider: 'fixture', model: 'desktop-pro' },
+    assert.deepEqual(f.record('partner').modelPin, pinnedSelection,
       'the refused selection is not persisted');
     assert.equal(f.store.supplementInputs(f.record('partner').agentId).length, beforeRefusals,
       'the refused changes queued nothing');

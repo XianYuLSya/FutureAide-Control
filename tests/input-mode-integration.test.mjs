@@ -469,9 +469,9 @@ function fakeCodex() {
   return factory;
 }
 
-async function codexFixture() {
+async function codexFixture(behavior) {
   const codex = fakeCodex();
-  const f = await fixture({ adapters: { 'codex-desktop': codex } });
+  const f = await fixture({ adapters: { 'codex-desktop': codex }, behavior });
   return { ...f, codex };
 }
 
@@ -482,6 +482,99 @@ async function startCodex(f, name = 'codex-agent') {
   assert.equal(f.codex.state.running, true, 'the first Codex turn is running');
   return { name, agentId: f.record(name).agentId, turnId: f.codex.state.turnId };
 }
+
+const effortOf = receipt => [receipt.requestedEffort, receipt.selectedEffort, receipt.effortSource, receipt.actualEffort];
+
+test('Codex same-name run, send, answer and queued B retain the explicitly pinned effort', async () => {
+  const f = await codexFixture({ defaultEffort: 'max' });
+  let restarted;
+  try {
+    const name = 'pinned-effort';
+    const first = await f.service.run({ name, target: 'codex-desktop', model: MODEL.model,
+      effort: 'high', message: 'start A' }, extra(THREAD));
+    const agentId = f.record(name).agentId;
+    await f.service.poll(agentId);
+    const turnA = f.codex.state.turnId;
+    assert.deepEqual(effortOf(first).slice(0, 3), ['high', 'high', 'explicit']);
+
+    const queued = await f.service.send({ name, message: 'Q opens B', mode: 'queue' }, extra(THREAD));
+    assert.equal(queued.afterTurnId, turnA);
+    const resumed = await f.service.run({ name, message: 'run joins A' }, extra(THREAD));
+    const sent = await f.service.send({ name, message: 'send joins A' }, extra(THREAD));
+    f.codex.state.question = { id: 'pinned-effort-question', state: 'pending', message: 'Continue?' };
+    const answer = await f.service.answer({ name, message: 'yes' }, extra(THREAD));
+    await f.service.poll(agentId);
+
+    f.codex.state.running = false;
+    f.codex.state.loseNext = true;
+    await f.service.poll(agentId);
+    restarted = f.reopen();
+    await restarted.poll(agentId);
+    const row = inputFor(await restarted.inspect({ name }, extra(THREAD)), queued.requestId);
+    assert.deepEqual({ sameName: [queued, resumed, sent, answer].map(receipt => effortOf(receipt).slice(0, 3)),
+      newTurn: effortOf(row) }, {
+      sameName: Array.from({ length: 4 }, () => ['high', 'high', 'explicit']),
+      newTurn: ['high', 'high', 'explicit', 'high'],
+    });
+    assert.deepEqual([resumed, sent].map(effortOf), Array.from({ length: 2 }, () => ['high', 'high', 'explicit', 'high']));
+    assert.equal(f.codex.calls.deliver.find(input => input.kind === 'answer').model.reasoningEffort, 'high');
+    assert.equal(row.actualEffortSource, 'native-turn-start');
+    assert.equal(row.delivery, 'new-turn');
+    assert.notEqual(row.turnId, turnA);
+    const queuedWrites = f.codex.calls.deliver.filter(input => input.requestId === queued.requestId);
+    assert.deepEqual(queuedWrites.map(input => [input.model.reasoningEffort, input.selectionExplicit]), [['high', false]]);
+  } finally { (restarted ?? f.service).close(); }
+});
+
+test('Codex restores a legacy effort pin and only changes it after an accepted explicit supplement', async () => {
+  const f = await codexFixture({ defaultEffort: 'high' });
+  try {
+    const name = 'change-pinned-effort';
+    await f.service.run({ name, target: 'codex-desktop', model: MODEL.model, effort: 'high', message: 'start A' }, extra(THREAD));
+    const agentId = f.record(name).agentId;
+    await f.service.poll(agentId);
+    const legacy = f.record(name);
+    delete legacy.modelPin.requestedEffort;
+    f.store.save(legacy);
+    assert.deepEqual(effortOf(await f.service.send({ name, message: 'legacy A' }, extra(THREAD))),
+      ['high', 'high', 'explicit', 'high']);
+
+    await assert.rejects(f.service.send({ name, effort: 'max', mode: 'queue', message: 'would change A' }, extra(THREAD)),
+      { code: 'codex-model-change-while-running' });
+    f.codex.state.running = false;
+    f.codex.state.loseNext = true;
+    await f.service.send({ name, effort: 'max', message: 'explicit B' }, extra(THREAD));
+    await f.service.poll(agentId);
+    assert.deepEqual(effortOf(await f.service.run({ name, message: 'inherits recovered B' }, extra(THREAD))),
+      ['max', 'max', 'explicit', 'max']);
+
+    f.codex.state.running = false;
+    await f.service.send({ name, model: MODEL.model, message: 'select a model with no effort' }, extra(THREAD));
+    assert.deepEqual(effortOf(await f.service.send({ name, message: 'inherits default' }, extra(THREAD))),
+      ['high', 'high', 'global-default', 'high']);
+  } finally { f.service.close(); }
+});
+
+test('Codex effort omitted when selecting a model follows the configured defaults', async () => {
+  for (const [modelDefaultEfforts, expected, source] of [
+    [{ [MODEL.model]: 'high' }, 'high', 'model-default'],
+    [{}, 'max', 'global-default'],
+  ]) {
+    const f = await codexFixture({ defaultEffort: 'max', modelDefaultEfforts });
+    try {
+      const name = 'default-effort';
+      await f.service.run({ name, target: 'codex-desktop', model: MODEL.model, message: 'start A' }, extra(THREAD));
+      const agentId = f.record(name).agentId;
+      await f.service.poll(agentId);
+      assert.equal(f.codex.state.actualEffort, expected);
+      const queued = await f.service.send({ name, mode: 'queue', message: 'next turn' }, extra(THREAD));
+      f.codex.state.running = false;
+      await f.service.poll(agentId);
+      const row = inputFor(await f.service.inspect({ name }, extra(THREAD)), queued.requestId);
+      assert.deepEqual(effortOf(row), [expected, expected, source, expected]);
+    } finally { f.service.close(); }
+  }
+});
 
 test('Codex idle: both modes start a turn with no backlog', async () => {
   for (const mode of ['steer', 'queue']) {

@@ -3,14 +3,14 @@ import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { withCodexInstrumentation, getCodexInstrumentation, codexInstrumentationEnabled } from './codex-instrumentation.mjs';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
-import { cp, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { copyFile, cp, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { watch } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { updateCliRoutes } from './config.mjs';
-import { buildCliProxyEnv, defaultFaswitchRoot, normalizeProxySpec, resolveCliRoute } from './cli-proxy.mjs';
-import { activeTaskUse } from './cleanup-worktree.mjs';
+import { buildCliProxyEnv, defaultFaswitchRoot, normalizeProxySpec, redactProxyCredentials, resolveCliRoute } from './cli-proxy.mjs';
+import { managedTokenFile, MANAGED_TOKEN_FILENAME, mergeRunTaskDefaults } from './managed-cli-policy.mjs';
 import { killProcessCage } from './process-cage.mjs';
 import { activeReportPort } from './report-endpoint.mjs';
 import { createControl, endedState, modelTurnError } from './control.mjs';
@@ -18,17 +18,21 @@ import { feedbackRecordError, submitFeedback } from './feedback-client.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { actualModelName, resolveDispatchSelection, sameModelSelection } from './model-selection.mjs';
-import { resolveRoleDefaults } from './team-config-defaults.mjs';
+import { classifyManagedRole, loadTeamConfigDefaults, normalizeRoleKey, resolveRoleDefaults } from './team-config-defaults.mjs';
+import { boardPrompt, extractBoardMentions, isDescendant, resolveBoardMention } from './board-routing.mjs';
+import { commitSha, createWorktree, fullSha, git, gitRoot, hasWorktreeEvidence, inspectWorktree,
+  otherProfilesReference, plainDirectoryPath, referencesWorktree, removeVerifiedWorktree, withWorktreeLock, workspaceEvidence, worktreeError, worktreeIdentity } from './worktree-guard.mjs';
+export { extractBoardMentions };
 import { callCodexOwner, readCodexOwnerTurns, readCodexOwnerItems } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
 import { bindClaude, claudeInboxBodyHash, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-sessions.mjs';
-import { captureNativeQuestionHistory, isCancelledRound, RosterStore, submissionNoticeId, submissionRef } from './roster-store.mjs';
+import { activeManagedRequestId, captureNativeQuestionHistory, isCancelledRound, RosterStore, submissionNoticeId, submissionRef } from './roster-store.mjs';
 import { canReleaseThreads, canSleep, hasPendingDelivery, RELEASE_RECHECK_MS, releaseDue,
   releaseRetryDelay } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, isCodexTransientTimeout, normalizeTarget, readStatusModels, REMOVED_TARGETS, removedTarget, resolveBackend,
+import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, invalidTarget, isCodexTransientTimeout, isUnavailableStoredTarget, normalizeTarget, readStatusModels, REMOVED_TARGETS, removedTarget, resolveBackend,
   TARGET_LABELS, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 import { FINAL_REPORT_REMINDER, presentedNativeQuestion } from './report-contract.mjs';
@@ -46,13 +50,19 @@ const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_repor
 // the default list. An unknown state is kept too: hiding it would be a guess.
 const INACTIVE_STATES = new Set(['completed', 'failed', 'cancelled', 'cleanup_failed']);
 const STALE_IDLE_MS = 5 * 60 * 1000;
-const MENTION_PATTERN = /@([\p{L}\p{N}._-]+(?:\/[\p{L}\p{N}._-]+)?)/gu;
 const isPullOwner = owner => owner?.source === 'antigravity' || owner?.source === 'managed-cli';
 
-function normalizeRole(role) {
+function normalizeRole(role, { teamConfigPath } = {}) {
   if (role === undefined || role === null || role === '') return undefined;
-  if (typeof role !== 'string' || !role.trim() || role.trim().length > 40 || /[\x00-\x1f/]/.test(role)) {
+  if (typeof role !== 'string' || !role.trim() || role.length > 40 || /[\x00-\x1f\x7f]/.test(role)) {
     throw Object.assign(new Error('role must be a non-empty string of at most 40 characters without slashes or control characters.'), { code: 'invalid-role' });
+  }
+  if (role.includes('/')) {
+    const resolved = resolveRoleDefaults(role, { teamConfigPath });
+    if (!resolved.matched || !resolved.roleKey || resolved.roleKey.includes('/')) {
+      throw Object.assign(new Error('role must be a non-empty string of at most 40 characters without slashes or control characters.'), { code: 'invalid-role' });
+    }
+    return resolved.roleKey;
   }
   return role.trim();
 }
@@ -64,22 +74,6 @@ function inferRoleFromName(name) {
   return prefix ? prefix : undefined;
 }
 
-export function extractBoardMentions(text, explicitMentions) {
-  const found = new Set();
-  if (typeof text === 'string') {
-    for (const match of text.matchAll(MENTION_PATTERN)) {
-      if (match[1]) found.add(match[1]);
-    }
-  }
-  if (Array.isArray(explicitMentions)) {
-    for (const item of explicitMentions) {
-      if (typeof item === 'string' && item.trim()) {
-        found.add(item.trim().replace(/^@/, ''));
-      }
-    }
-  }
-  return [...found];
-}
 const METHODS = DSH_HOST_METHODS;
 const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
@@ -192,9 +186,12 @@ function defaultCodexProbe() {
 const reportProtocolError = (host = 'DSH') => Object.assign(new Error(`Update the ${host} plugin bridge and reload the plugin/MCP connection to enable explicit reports; restarting ${host} is not required.`), { code: 'report-protocol-required' });
 const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host} bridge and caller must support task-tree protocol 1. Update the plugin bridge and reload the plugin/MCP connection; restarting ${host} is not required.`), { code: 'tree-protocol-required' });
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200),
-  ...(error?.discoveryReason ? { discoveryReason: error.discoveryReason } : {}) });
-const readOnlyTarget = record => REMOVED_TARGETS.includes(record?.target);
-const isHeadlessCli = target => target === 'claude-cli' || target === 'codex-cli' || target === 'agy-cli';
+  ...(error?.discoveryReason ? { discoveryReason: error.discoveryReason } : {}),
+  ...(error?.notSent === true && /^(?:proxy-unavailable|proxy-required)$/.test(error.code ?? '') ? { notSent: true } : {}) });
+const readOnlyTarget = record => isUnavailableStoredTarget(record?.target);
+const HEADLESS_CLI_TARGETS = ['codex-cli', 'claude-cli', 'agy-cli'];
+const isHeadlessCli = target => HEADLESS_CLI_TARGETS.includes(target);
+const modelProviderFor = target => ({ 'claude-cli': 'claude-cli', 'agy-cli': 'antigravity' })[target] ?? 'openai';
 
 function sumTwoUsages(a, b) {
   const valid = [a, b].filter(item => item && typeof item === 'object');
@@ -248,11 +245,18 @@ function effectiveTrustedCaller(extra) {
       };
     }
   }
+  if (caller?.source === "managed-cli") {
+    const binding = extra?.[Symbol.for("futureaide.trustedCaller")];
+    return { ...caller, callerTaskId: binding?.callerTaskId, callerRequestId: binding?.callerRequestId,
+      readOnlyScout: binding?.readOnlyScout === true };
+  }
   return caller;
 }
 
 function requireWritableTarget(record) {
-  if (readOnlyTarget(record)) throw removedTarget(record.target);
+  if (readOnlyTarget(record)) {
+    throw REMOVED_TARGETS.includes(record.target) ? removedTarget(record.target) : invalidTarget(record.target);
+  }
   return record;
 }
 
@@ -471,11 +475,13 @@ function publicResult(record, { fullResult = false } = {}) {
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
       ...(task.finishedAt ? { finishedAt: task.finishedAt } : {}),
       ...(task.usage ? { usage: task.usage } : {}),
+      ...(fullResult && task.usageDetails ? { usageDetails: task.usageDetails } : {}),
       ...(task.result ? { result: { state: task.result.state,
         ...(fullResult ? { reply: task.result.reply } : { summary: compactText(task.result.reply, 800) }),
         files: (task.result.changes ?? []).slice(0, 12).map(fileSummary), coverage: task.result.coverage } } : {}) } : null,
     ...(record.usage || task?.usage ? { usage: record.usage ?? task.usage } : {}),
     activity: view.activity ?? (record.state === 'idle' ? 'Waiting for a task' : record.state),
+    ...(view.lastStep ? { lastStep: view.lastStep } : {}),
     ...(record.state === 'running' && view.stalled === true ? { stalled: true } : {}),
     // unconfirmed is counted over the whole list, not the 12 paths this answer can
     // afford: a compact view must not under-report how much is unattributed.
@@ -938,7 +944,8 @@ export function owesFastPoll(record, at = Date.now()) {
 
 /** Name-addressed operations; owner and native identifiers never come from tool arguments. */
 export function createScopedAgents(config, {
-  store = new RosterStore(path.join(config.stateDirectory, 'roster.sqlite')),
+  teamConfigPath = config?.teamConfigPath || process.env.FUTUREAIDE_ROLES_CONFIG,
+  store = new RosterStore(path.join(config.stateDirectory, 'roster.sqlite'), { teamConfigPath }),
   callCodex = undefined,
   nativeRequest = undefined,
   codexInvoke = undefined,
@@ -969,31 +976,14 @@ export function createScopedAgents(config, {
   spawnFaswitch = undefined,
   findFaswitchExe = undefined,
   faswitchWakeTimeoutMs = 5000,
-  teamConfigPath = config?.teamConfigPath,
 } = {}) {
   const notify = notifyDesktop ?? createDesktopToastNotifier();
   const settlementInflight = new Map();
-  const worktreeLocks = new Map();
   let lastFaswitchWakeAt = 0;
 
-  async function withWorktreeLock(repoPath, fn) {
-    const key = pathKey(repoPath);
-    const prior = worktreeLocks.get(key) ?? Promise.resolve();
-    let release;
-    const gate = new Promise(resolve => { release = resolve; });
-    const chain = prior.then(() => gate, () => gate);
-    worktreeLocks.set(key, chain);
-    await prior.catch(() => {});
-    try {
-      return await fn();
-    } finally {
-      release();
-      if (worktreeLocks.get(key) === chain) worktreeLocks.delete(key);
-    }
-  }
-
   function applyCallerDefaults({ role, target, model, effort, lifetime } = {}) {
-    const explicitRole = normalizeRole(role);
+    const requestedRole = normalizeRole(role, { teamConfigPath });
+    const explicitRole = requestedRole;
     const dshDisabled = Array.isArray(config?.disabledTargets) && config.disabledTargets.includes('dsh');
     if (!explicitRole && !dshDisabled) {
       return {
@@ -1007,6 +997,9 @@ export function createScopedAgents(config, {
       };
     }
     const defaults = resolveRoleDefaults(explicitRole, { teamConfigPath });
+    if (explicitRole && (explicitRole.toLowerCase() === 'boss' || (defaults.source === 'file' && !defaults.matched))) {
+      throw Object.assign(new Error('This role is not dispatchable in the current team configuration.'), { code: 'invalid-role' });
+    }
     const effectiveTarget = target !== undefined ? target : defaults.target;
     const normalizedTarget = normalizeTarget(effectiveTarget);
     const sameDefaultTarget = normalizedTarget === defaults.target;
@@ -1099,9 +1092,10 @@ export function createScopedAgents(config, {
   }
 
   function cliConfigForRecord(current) {
-    if (!current || current.proxyOverride === undefined) return config;
+    const { antigravityCallerTokenFile: _desktopToken, ...childConfig } = config;
+    if (!current || current.proxyOverride === undefined) return childConfig;
     return {
-      ...config,
+      ...childConfig,
       cliRoutes: {
         ...(config.cliRoutes ?? {}),
         [targetOf(current)]: current.proxyOverride,
@@ -1205,7 +1199,12 @@ export function createScopedAgents(config, {
   // instead of polling a finished name while it waits.
   let releaseWakeAt;
   let monitorUnavailableSince, monitorError;
-  const agentDirectory = record => path.join(config.stateDirectory, 'scoped', record.ownerId, record.agentId);
+  const scopedRoot = path.resolve(config.stateDirectory, 'scoped');
+  const agentDirectory = record => path.join(scopedRoot, record.ownerId, record.agentId);
+  const removeScopedDirectory = async directory => {
+    if (!path.relative(scopedRoot, directory)) throw worktreeError('worktree-unverified', 'Cannot remove the whole state root.');
+    if (await plainDirectoryPath(scopedRoot, directory)) await removeTree(directory, { recursive: true, force: true });
+  };
   const workspaceBaselineFile = record => path.join(agentDirectory(record), 'workspace-baseline.json');
   // The snapshot is started before the dispatch is written and saved after it without
   // being awaited, so git runs next to the dispatch instead of in front of it. It is
@@ -1300,7 +1299,9 @@ export function createScopedAgents(config, {
         FUTUREAIDE_ROSTER_PATH: store.location,
         FUTUREAIDE_REPORT_PORT: String(activeReportPort(config)),
         ...(config.configFile ? { FUTUREAIDE_CONFIG: config.configFile } : {}),
-        ...(config.antigravityCallerTokenFile ? { FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE: config.antigravityCallerTokenFile } : {}),
+        ...(teamConfigPath ? { FUTUREAIDE_ROLES_CONFIG: path.resolve(teamConfigPath) } : {}),
+        FUTUREAIDE_MANAGED_CLI_TOKEN_FILE: process.env.FUTUREAIDE_MANAGED_CLI_TOKEN_FILE
+          || managedTokenFile(config.antigravityCallerTokenFile) || path.join(config.stateDirectory, MANAGED_TOKEN_FILENAME),
       };
       if (current._resolvedProxyRoute && (current._resolvedProxyRoute.mode === 'proxy' || current._resolvedProxyRoute.mode === 'direct')) {
         return buildCliProxyEnv(base, current._resolvedProxyRoute);
@@ -1414,7 +1415,8 @@ export function createScopedAgents(config, {
         control: () => controlFactory(settings(load()), { client, managed: hostArgs(load()) }),
         hostArgs: () => hostArgs(load()) } });
     }
-    return resolveBackend(record, { target, load, deps, config, adapters: backendAdapters, ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
+    return resolveBackend(record, { target, load, deps, config: isHeadlessCli(target) ? deps.config : config,
+      adapters: backendAdapters, ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
   }
   const forgetBackend = record => { clients.delete(record.agentId); operationBackends.delete(record); };
   // A target without a usable adapter is refused before the name is taken, and is
@@ -1434,7 +1436,8 @@ export function createScopedAgents(config, {
       const route = await verifyClaudeCliProxyIfConfigured(record);
       if (route) record._resolvedProxyRoute = route;
     }
-    const backend = await resolveBackend(record, { target, load: () => record, deps, config, adapters: backendAdapters,
+    const backend = await resolveBackend(record, { target, load: () => record, deps,
+      config: isHeadlessCli(target) ? deps.config : config, adapters: backendAdapters,
       ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
     const probe = await backend.probe();
     const required = backend.requiredMethods ?? probe.methods ?? [];
@@ -1544,33 +1547,30 @@ export function createScopedAgents(config, {
     }
     return { own, all };
   }
+  function permittedRecords(owner, extra) {
+    if (effectiveTrustedCaller(extra)?.source === "managed-cli") {
+      return owner.callerAgentId ? store.descendantsOf([owner.callerAgentId]) : [];
+    }
+    return visibleRecords(resolveTeamRootOwnerId(owner, extra)).all;
+  }
+
+  function canAccessMember(owner, extra, member) {
+    return Boolean(member && (effectiveTrustedCaller(extra)?.source === "managed-cli"
+      ? owner.callerAgentId && isDescendant(store, member, owner.callerAgentId)
+      : rootOwnerIdForRecord(member) === resolveTeamRootOwnerId(owner, extra)));
+  }
+
   function named(owner, name, extra) {
     const wanted = assertName(name);
-    if (!wanted.includes('/')) {
-      const direct = store.named(owner.ownerId, wanted);
-      if (direct) return direct;
-    }
-    const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
-    const { all: teamAll } = visibleRecords(rootOwnerId);
-    if (owner.ownerId !== rootOwnerId) {
-      const seen = new Set(teamAll.map(r => r.agentId));
-      for (const ownRec of store.list(owner.ownerId)) {
-        if (!seen.has(ownRec.agentId)) {
-          seen.add(ownRec.agentId);
-          teamAll.push(ownRec);
-        }
-      }
-    }
+    const teamAll = permittedRecords(owner, extra);
     if (wanted.startsWith('agent-')) {
       const byId = teamAll.find(r => r.agentId === wanted);
       if (byId) return byId;
     }
-    const byPath = teamAll.filter(r => managedPath(r) === wanted);
+    const byPath = wanted.includes("/") ? teamAll.filter(r => managedPath(r) === wanted) : [];
     if (byPath.length === 1) return byPath[0];
     if (byPath.length > 1) {
-      const activeByPath = byPath.filter(r => !r.closed && !INACTIVE_STATES.has(r.state));
-      if (activeByPath.length === 1) return activeByPath[0];
-      const paths = (activeByPath.length > 1 ? activeByPath : byPath).map(r => managedPath(r));
+      const paths = byPath.map(r => managedPath(r));
       throw Object.assign(
         new Error(`“${wanted}” matches multiple team members: ${paths.join(', ')}. Pass the full team path to disambiguate.`),
         { code: 'node-ambiguous', paths },
@@ -1579,10 +1579,7 @@ export function createScopedAgents(config, {
     const byShort = teamAll.filter(r => r.name === wanted);
     if (byShort.length === 1) return byShort[0];
     if (byShort.length > 1) {
-      const activeMatches = byShort.filter(r => !r.closed && !INACTIVE_STATES.has(r.state));
-      if (activeMatches.length === 1) return activeMatches[0];
-      const candidates = activeMatches.length > 1 ? activeMatches : byShort;
-      const paths = candidates.map(r => managedPath(r));
+      const paths = byShort.map(r => managedPath(r));
       throw Object.assign(
         new Error(`“${wanted}” matches multiple team members: ${paths.join(', ')}. Pass a team path such as “${paths[0]}” to disambiguate.`),
         { code: 'node-ambiguous', paths },
@@ -2013,7 +2010,7 @@ export function createScopedAgents(config, {
       if (!await ensure()) {
         // Nothing can watch this installation right now. Keep the sleeping
         // baseline so a later call resumes the same task instead of losing it.
-        store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+        store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' }, record);
         return false;
       }
       store.wake(record.agentId, record.sleep.taskId);
@@ -2022,7 +2019,7 @@ export function createScopedAgents(config, {
     if (record.sleep) return true;
     if (!needsPoll(record, hasSubmission)) return false;
     const ready = await ensure();
-    if (!ready) store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+    if (!ready) store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' }, record);
     // Only an explicit wake — new work arriving from outside — is news for the loop. A
     // poll also calls this, and announcing from there would make every poll re-hint its
     // own name and turn the loop into a self-feeding burst.
@@ -2433,7 +2430,7 @@ export function createScopedAgents(config, {
       if (error?.code === 'model-catalog-unavailable' && !dshDefaultOnly(record) && input.model === undefined && record.modelPin?.model) {
         const eff = request.effort ?? record.creationSelection?.selectedEffort ?? null;
         return {
-          provider: record.modelPin.provider ?? (targetOf(record) === 'claude-cli' ? 'claude-cli' : targetOf(record) === 'agy-cli' ? 'antigravity' : 'openai'),
+          provider: record.modelPin.provider ?? modelProviderFor(targetOf(record)),
           model: record.modelPin.model,
           ...(eff ? { reasoningEffort: eff } : {}),
           requestedEffort: eff,
@@ -2480,7 +2477,8 @@ export function createScopedAgents(config, {
    * returns. Anything written after such an await is fenced on the round it belongs to.
    */
   const roundMovedOn = (record, latest = store.get(record.agentId)) =>
-    !latest || latest.closed || latest.task?.taskId !== record.task?.taskId || Boolean(terminalRound(latest));
+    !latest || latest.closed || latest.task?.taskId !== record.task?.taskId
+    || latest.task?.preemptionEpoch !== record.task?.preemptionEpoch || Boolean(terminalRound(latest));
 
   function dispatchRefused(code = 'round-finished') {
     return Object.assign(new Error(code === 'dispatch-expired'
@@ -2620,7 +2618,7 @@ export function createScopedAgents(config, {
     // written, so a round that ended, closed or moved on in the meantime gets no dispatch.
     const fresh = store.get(record.agentId);
     if (!fresh || fresh.task?.taskId !== task.taskId || fresh.closed
-        || fresh.task?.cancelRequested || terminalRound(fresh)) {
+        || fresh.task?.cancelRequested || fresh.task?.preemptionEpoch !== task.preemptionEpoch || terminalRound(fresh)) {
       throw dispatchRefused();
     }
     // `extra` is written with the dispatch, before the first save, so a reminder is
@@ -2642,6 +2640,7 @@ export function createScopedAgents(config, {
     // own critical-point check refuses, and the subscription is restored by this write.
     invalidateRelease(record);
     task.dispatches.push(dispatch);
+    if (task.preemption?.requestId === requestId) delete task.preemption;
     record.state = 'running'; task.state = 'running';
     saveDispatch(record); // The intent survives a caller or worker exiting during the write.
     await dispatchOnce(record, dispatch, observed);
@@ -2662,6 +2661,7 @@ export function createScopedAgents(config, {
     // it is old, and a matched answer's receipt is proof of the same thing.
     const intent = requestId === undefined ? undefined
       : (record.task.dispatches ?? []).find(entry => entry.requestId === requestId);
+    if (intent?.preemptedBy || (record.task.preemption && record.task.preemption.requestId !== requestId)) return 'round-finished';
     if (intent?.accepted === true) return undefined;
     if (kind === 'task') return dispatchExpired(record.task.startedAt) ? 'dispatch-expired' : undefined;
     // A final that arrived through the inbox while the adapter was preparing (a helper can
@@ -2774,6 +2774,8 @@ export function createScopedAgents(config, {
       const effectiveTimeoutMinutes = dispatch.timeoutMinutes ?? record.task?.turnTimeoutMinutes ?? record.turnTimeoutMinutes;
       const sent = await backend.deliver({ requestId: dispatch.requestId,
         message: dispatch.message, kind: dispatch.kind,
+        ...(record.readOnlyScout === true ? { readOnly: true } : {}),
+        ...(dispatch.restartFresh === true ? { restartFresh: true } : {}),
         writeBlockReason: reasonFor,
         allowStart,
         ...(startOnly ? { startOnly: true } : {}),
@@ -3279,7 +3281,7 @@ export function createScopedAgents(config, {
    */
   async function notifyFailure(record, terminal, view, finalDispatch) {
     const task = record.task;
-    if (!task || terminal !== 'failed' || task.cancelRequested) return;
+    if (!task || terminal !== 'failed' || task.cancelRequested || !store.stillCurrentTurn(record)) return;
     const text = `${hostLabel(record)}「${record.name}」执行失败：${failureReason(record, view, finalDispatch)}`;
     task.reports ??= [];
     let failure = task.reports.find(report => report.failure === true);
@@ -3295,8 +3297,7 @@ export function createScopedAgents(config, {
     persist = () => store.save(record), allowSend = true, submission = false, reportSummary = undefined,
     treeDeadline = undefined,
   } = {}) {
-    if (notice.state === 'delivered') return;
-    if (notice.state === 'blocked') return;
+    if (!store.stillCurrentTurn(record) || notice.state === 'delivered' || notice.state === 'blocked') return;
     // Only the report's own createdAt (or the notice's creation time) may date it.
     // An old row with no real timestamp is expired, never stamped with "now".
     if (!Number.isFinite(Date.parse(notice.createdAt ?? ''))) {
@@ -3700,6 +3701,7 @@ export function createScopedAgents(config, {
     const backend = await checkHost(record, { taskTree: true });
     const after = record.task.dispatches[0]?.afterSeq;
     const started = await backend.beginTask({
+      ...(record.readOnlyScout === true ? { readOnly: true } : {}),
       ...(Number.isSafeInteger(after) && after >= -1 ? { taskStartSeq: after } : {}) });
     if (started.treeProtocol !== TREE_PROTOCOL) throw treeProtocolError(hostLabel(record));
     if (started.reportProtocol !== REPORT_PROTOCOL) throw reportProtocolError(hostLabel(record));
@@ -3725,6 +3727,23 @@ export function createScopedAgents(config, {
     } finally { trackWorkspaceBaseline(record, baseline); }
   }
 
+  function confirmedAnswer(record, answer) {
+    const receipt = store.backendState(record.agentId)?.answers?.[answer.answerId];
+    const ids = receipt?.consumedQuestionIds;
+    const expected = answer.questionIdsSeen;
+    return Array.isArray(ids) && ids.length && (!receipt.taskId || receipt.taskId === record.task.taskId)
+      && Array.isArray(expected) && ids.length === expected.length && expected.every(id => ids.includes(id)) ? receipt : undefined;
+  }
+
+  function recoverLegacyAnswer(record, answer) {
+    const confirmed = confirmedAnswer(record, answer);
+    if (confirmed) Object.assign(answer, { questionIds: confirmed.consumedQuestionIds,
+      continuation: confirmed.continuation ?? `Parent answer:\n${answer.message}\nContinue the same task.`,
+      ...(confirmed.nativeAnswered ? { dispatched: true, nativeAnswered: true, accepted: true } : {}) });
+    else Object.assign(answer, { dispatched: true, undelivered: "explicit-answer-required" });
+    store.save(record);
+  }
+
   async function resolveAnswer(record, answer, { questionIds } = {}) {
     if (answer.questionIds) return true;
     const backend = await backendFor(record);
@@ -3741,7 +3760,7 @@ export function createScopedAgents(config, {
         const latest = store.get(record.agentId);
         return !roundMovedOn(record, latest) && !latest.task.cancelRequested && (!item || !dispatchExpired(item.created));
       };
-      result = await backend.answer({ answerId: answer.answerId, message: answer.message,
+      result = confirmedAnswer(record, answer) ?? await backend.answer({ answerId: answer.answerId, message: answer.message,
         ...(Array.isArray(questionIds) && questionIds.length ? { questionIds } : {}),
         ...(targetOf(record) === 'codex-desktop' ? { canAnswer } : {}) });
     } catch (error) {
@@ -3767,6 +3786,10 @@ export function createScopedAgents(config, {
         ? 'The question this answer belonged to is no longer pending; a different question is pending now, so nothing was sent.'
         : 'This subagent has no unanswered question; nothing was sent.'),
       { code, notSent: true, ...(reported ? { pendingQuestions: reported } : {}) });
+    }
+    if (questionIds && (result.consumedQuestionIds.length !== questionIds.length
+        || questionIds.some(id => !result.consumedQuestionIds.includes(id)))) {
+      throw Object.assign(new Error("The backend did not confirm the selected question IDs."), { code: "question-changed" });
     }
     answer.questionIds = result.consumedQuestionIds;
     if (result.nativeAnswered === true) {
@@ -3872,9 +3895,267 @@ export function createScopedAgents(config, {
    * instead of vanishing from the roster while its session survives. A child already in
    * cleanup_failed is retried too — closed is not the same as cleaned.
    */
-  async function clearRecord(record, { autoClaimed = false, autoRetry = false } = {}) {
+  const worktreeOptions = record => ({ workspace: config.workspace, shared: tree =>
+    store.list().some(other => other.agentId !== record.agentId && referencesWorktree(other, tree))
+    || otherProfilesReference(tree, { stateDirectory: config.stateDirectory, rosterPath: store.location }) });
+
+  function mergeTarget(owner, extra, initial) {
+    const current = store.get(initial.agentId);
+    if (!canAccessMember(owner, extra, current) || current.ownerId !== initial.ownerId
+        || current.parentAgentId !== initial.parentAgentId || current.sessionId !== initial.sessionId
+        || current.worktreePath !== initial.worktreePath || current.task?.taskId !== initial.task?.taskId) {
+      throw worktreeError("worktree-binding-changed", "The roster or worktree binding changed while waiting.");
+    }
+    const task = current.task;
+    const taskSettled = !task || ["completed", "failed", "cancelled"].includes(task.state);
+    if (current.cleanupRosterTicket || (current.closed && !current.worktreeMerge?.worktreeRemoved)
+        || (!current.worktreeMerge?.worktreeRemoved && !["idle", "completed", "failed", "cancelled"].includes(current.state))
+        || !taskSettled || task?.preemption || current.observation?.running || (task?.cancelRequested && !task.cancelTreeSettled)
+        || (task?.dispatches ?? []).some(item => item.accepted !== true && !["completed", "failed", "cancelled", "blocked"].includes(item.state))
+        || owesWork(current) || store.submissionDebt(current.agentId, task?.taskId) > 0
+        || store.openQuestions(current).unanswered || store.openQuestions(current).undelivered) {
+      throw worktreeError("agent-running", "The subagent still has an active turn or unresolved work.");
+    }
+    if (!current.worktreePath) throw worktreeError("worktree-not-found", "This subagent has no isolated worktree to merge.");
+    return current;
+  }
+
+  async function snapshotMergeSource(source, head, indexFile) {
+    const indexTree = (await git(source, ["write-tree"])).stdout.trim();
+    await git(source, ["read-tree", head], { indexFile });
+    await git(source, ["add", "-A", "--", "."], { indexFile });
+    await git(source, ["reset", "-q", head, "--", ".work"], { indexFile }).catch(() => {});
+    const sourceTree = (await git(source, ["write-tree"], { indexFile })).stdout.trim();
+    if (indexTree !== sourceTree) {
+      const pathsBetween = async (from, to) => (await git(source,
+        ["diff", "--name-only", "--no-renames", "-z", from, to])).stdout.split("\0").filter(Boolean);
+      const staged = new Set(await pathsBetween(head, indexTree));
+      if ((await pathsBetween(indexTree, sourceTree)).some(file => staged.has(file))) {
+        throw worktreeError("worktree-retained", "The staged and working versions differ. The source worktree was retained.");
+      }
+    }
+    return { sourceTree, indexTree, indexFile };
+  }
+
+  async function removeMergeScratch(directory) {
+    if (await plainDirectoryPath(config.stateDirectory, directory)) await rm(directory, { recursive: true, force: true });
+  }
+
+  async function confirmDiscardableMerge(record, root) {
+    const pending = record.worktreeMerge;
+    if (!pending || pending.worktreeRemoved) return;
+    if (!['applying', 'discarded'].includes(pending.stage) || pending.applied || !pending.before
+        || await workspaceEvidence(root, pending.files) !== pending.before) {
+      throw worktreeError("worktree-retained", "The pending merge may have changed its destination. The worktree was retained.");
+    }
+  }
+
+  async function mergeWorktree(initial, recheck, { discardWorktree } = {}) {
+    const summary = (record, phase, error) => ({ action: "merge", name: record.name, ok: !error,
+      summary: error
+        ? (error.message ?? `合入 ${record.name} 未完成（阶段：${phase?.stage ?? "applying"}）`)
+        : phase?.discarded ? `已弃置 ${record.name} 的改动并移除 worktree`
+          : `已合入 ${record.name} 的 ${phase?.files?.length ?? 0} 个改动文件并移除 worktree`,
+      applied: phase?.applied === true, worktreeRemoved: phase?.worktreeRemoved === true,
+      recordClosed: phase?.recordClosed === true, recordCloseRequired: phase?.closeRequired === true,
+      mergedFiles: phase?.discarded ? [] : phase?.files ?? [], stage: phase?.stage ?? "applying",
+      ...(phase?.discarded ? { discarded: true } : {}),
+      ...(error ? { error: safeError(error) } : {}) });
+    let record = initial;
+    let phase = record.worktreeMerge;
+    let stage = phase?.worktreeRemoved ? "recordClosed" : phase?.applied ? "worktreeRemoved" : "applying";
+    try {
+      const root = await gitRoot(record.repoRoot ?? record.rootWorkspace ?? config.workspace);
+      await withWorktreeLock(root, async () => {
+        record = recheck();
+        if (['failed', 'cancelled'].includes(record.state) && !record.worktreeMerge) {
+          const stopped = await observeOwn(record);
+          if (stopped.running !== false || stopped.tree?.settled !== true) {
+            throw worktreeError('agent-running', 'The stopped state could not be confirmed.');
+          }
+          record = recheck();
+        }
+        phase = record.worktreeMerge;
+        const options = worktreeOptions(record);
+        const identity = await worktreeIdentity(record, options);
+        const journal = async next => {
+          const current = store.get(record.agentId);
+          if (JSON.stringify(current) !== JSON.stringify(record)) throw worktreeError("worktree-binding-changed", "The roster changed during merge.");
+          const previous = { ...record };
+          record.worktreeMerge = next;
+          if (!store.save(record, { expectedTurn: previous })) throw worktreeError("worktree-binding-changed", "The roster rejected the merge stage.");
+          phase = next;
+        };
+        const applyPatch = async (apply, patchFile) => {
+          if (await workspaceEvidence(root, phase.files) !== phase.before) {
+            throw worktreeError("worktree-apply-unknown", "The destination changed before application.");
+          }
+          await git(root, [...apply, "--check", patchFile]);
+          await git(root, [...apply, patchFile]);
+          if (await workspaceEvidence(root, phase.files) !== phase.after) {
+            throw worktreeError("worktree-apply-unknown", "The patch outcome could not be verified.");
+          }
+          await journal({ ...phase, stage: "applied", applied: true });
+        };
+        const needsThreeWay = patchFile => git(root, ["apply", "--check", "--whitespace=nowarn", patchFile]).then(() => false, () => true);
+        const patchArgs = threeWay => ["apply", ...(threeWay ? ["--3way"] : []), "--whitespace=nowarn"];
+        if (!phase?.applied && !phase?.discarded && !phase?.worktreeRemoved) {
+          const evidence = phase && await workspaceEvidence(root, phase.files);
+          if (phase && evidence === phase.after && (!discardWorktree || evidence !== phase.before)) {
+            await journal({ ...phase, stage: "applied", applied: true });
+          } else {
+            if (phase && evidence !== phase.before) {
+              throw worktreeError("worktree-apply-unknown", "The previous application cannot be confirmed. The worktree was retained.");
+            }
+            if (phase && discardWorktree) {
+              await confirmDiscardableMerge(record, root);
+              await journal({ ...phase, stage: "discarded", discarded: true });
+            } else {
+              if (identity.missing) throw worktreeError("worktree-not-found", "The worktree is unavailable.");
+              const sourceHead = await commitSha(identity.worktreePath, "HEAD");
+              const base = phase?.base ?? (fullSha(record.worktreeBaseHead)
+                ? await commitSha(identity.worktreePath, record.worktreeBaseHead)
+                : (await git(identity.worktreePath, ["merge-base", await commitSha(root, "HEAD"), sourceHead])).stdout.trim());
+              if (!fullSha(base)) throw worktreeError("invalid-base-sha", "The worktree and its destination have no verified base.");
+              await mkdir(config.stateDirectory, { recursive: true });
+              const key = uid("merge");
+              const tmp = await mkdtemp(path.join(config.stateDirectory, "m-"));
+              try {
+                 const { sourceTree, indexTree, indexFile } = await snapshotMergeSource(identity.worktreePath, sourceHead, path.join(tmp, "s"));
+                const diffArgs = ["--cached", "--no-renames", base, "--", ".", ":(exclude).work"];
+                const files = (await git(identity.worktreePath, ["diff", "--name-only", "-z", ...diffArgs],
+                   { indexFile })).stdout.split("\0").filter(Boolean).sort();
+                const closeRequired = record.lifetime === "once" && config.agentAutoCleanup !== false;
+                if (!phase && !files.length) {
+                  await journal({ key, path: identity.worktreePath, stage: "applied", applied: true, closeRequired, files,
+                    sourceTree, sourceHead, indexTree, base });
+                } else {
+                  const { stdout: patch } = await git(identity.worktreePath,
+                     ["diff", "--binary", "--full-index", "--no-ext-diff", ...diffArgs], { indexFile, encoding: "buffer" });
+                  const patchSha = createHash("sha256").update(patch).digest("hex");
+                  if (phase && (sourceHead !== phase.sourceHead || sourceTree !== phase.sourceTree || patchSha !== phase.patchSha
+                      || (phase.indexTree && indexTree !== phase.indexTree) || JSON.stringify(files) !== JSON.stringify(phase.files))) {
+                    throw worktreeError("worktree-retained", "The source changed before the pending application. The worktree was retained.");
+                  }
+                  const patchFile = path.join(tmp, "p");
+                  await writeFile(patchFile, patch);
+                  if (!phase) {
+                    const dirty = new Set((await git(root, ["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all", "--ignored=matching"])).stdout
+                      .split("\0").filter(Boolean).map(line => line.slice(3).replace(/\/$/, "")));
+                    const conflictingFiles = files.filter(file => [...dirty].some(name => file === name || file.startsWith(name + "/") || name.startsWith(file + "/")));
+                    if (conflictingFiles.length) throw worktreeError("worktree-merge-conflict", "The destination has local changes on the patch paths.", { conflictingFiles });
+                    const before = await workspaceEvidence(root, files);
+                    const scratch = path.join(tmp, "w");
+                    await mkdir(scratch);
+                    const gitDirectory = (await git(root, ["rev-parse", "--absolute-git-dir"])).stdout.trim();
+                    const originalIndex = (await git(root, ["rev-parse", "--path-format=absolute", "--git-path", "index"])).stdout.trim();
+                    const shadowIndex = path.join(tmp, "i");
+                    await copyFile(originalIndex, shadowIndex);
+                    for (const file of files) {
+                      const destination = path.join(scratch, file);
+                      await mkdir(path.dirname(destination), { recursive: true });
+                      try { await copyFile(path.join(root, file), destination); }
+                      catch (error) { if (error.code !== "ENOENT" && error.code !== "ENOTDIR") throw error; }
+                    }
+                    const threeWay = await needsThreeWay(patchFile);
+                    await git(scratch, ["--git-dir", gitDirectory, "--work-tree", scratch, ...patchArgs(threeWay), patchFile],
+                       { indexFile: shadowIndex }).catch(() => {
+                        throw worktreeError("worktree-merge-conflict", "The patch conflicts with the destination history.", { conflictingFiles: files });
+                      });
+                    const after = await workspaceEvidence(scratch, files, { gitRoot: root, indexFile: shadowIndex });
+                    await journal({ key, path: identity.worktreePath, stage: "applying", closeRequired, files, before, after,
+                      threeWay, patchSha, sourceTree, sourceHead, indexTree, base });
+                  }
+                  await applyPatch(patchArgs(phase.threeWay ?? await needsThreeWay(patchFile)), patchFile);
+                }
+               } finally { await removeMergeScratch(tmp); }
+            }
+          }
+        }
+        stage = "worktreeRemoved";
+        if (!phase.worktreeRemoved) {
+          if (!identity.missing && !discardWorktree && !phase.discarded) {
+            const status = (await git(identity.worktreePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"])).stdout;
+            if (status.split("\0").some(line => line.startsWith("!! ") || /^.{3}\.work(?:\/|$)/.test(line))) {
+              throw worktreeError("worktree-retained", "The source contains user files excluded from the patch.");
+            }
+            if (await commitSha(identity.worktreePath, "HEAD") !== phase.sourceHead) {
+              throw worktreeError("worktree-retained", "The source HEAD changed after the patch was prepared.");
+            }
+            const temp = await mkdtemp(path.join(config.stateDirectory, "m-"));
+            try {
+              const { sourceTree, indexTree } = await snapshotMergeSource(identity.worktreePath, phase.sourceHead, path.join(temp, "s"));
+              if (sourceTree !== phase.sourceTree || (phase.indexTree && indexTree !== phase.indexTree)) {
+                throw worktreeError("worktree-retained", "The source files or index changed after the patch was prepared.");
+              }
+            } finally { await removeMergeScratch(temp); }
+          }
+          if (phase.discarded && await workspaceEvidence(root, phase.files) !== phase.before) {
+            throw worktreeError("worktree-apply-unknown", "The destination changed before the discard.");
+          }
+          await removeVerifiedWorktree(record, options, { force: true });
+          await journal({ ...phase, stage: "worktreeRemoved", worktreeRemoved: true });
+        }
+      });
+      stage = "recordClosed";
+      if (phase.closeRequired) {
+        const result = await clearRecord(record, { autoClaimed: true });
+        if (!result.deleted) throw worktreeError(result.error?.code ?? "worktree-record-close-failed",
+          result.error?.message ?? "The worktree is removed, but the roster record could not be closed.");
+        phase = { ...phase, stage: "recordClosed", recordClosed: true };
+      } else {
+        const update = { ...record, workspace: record.callerWorkspace ?? record.rootWorkspace, workspaceMode: "inherit" };
+        delete update.worktreePath;
+        delete update.worktreeBaseHead;
+        delete update.unmergedWorktree;
+        delete update.worktreeMerge;
+        if (!store.save(update, { expectedTurn: record })) throw worktreeError("worktree-record-close-failed", "The roster workspace could not be restored.");
+        phase = { ...phase, stage: "complete" };
+      }
+      forgetBackend(record);
+      wakeWaiters();
+      return summary(record, phase);
+    } catch (error) {
+      if (!phase && (error?.code === "worktree-merge-conflict" || error?.code === "worktree-busy")) throw error;
+      return summary(record, { ...phase, stage }, error);
+    }
+  }
+
+  async function cleanupProof(record, { discardWorktree = false } = {}) {
+    const current = store.get(record.agentId);
+    if (!current) return { verified: [], error: { code: "agent-not-found" } };
+    const verified = [current, ...store.descendantsOf([record.agentId])];
+    for (const member of verified) {
+      if (!hasWorktreeEvidence(member)) continue;
+      const options = worktreeOptions(member);
+      try {
+        if (discardWorktree) {
+          const identity = await worktreeIdentity(member, options);
+          await confirmDiscardableMerge(member, identity.root);
+          continue;
+        }
+        if ((await inspectWorktree(member, options)).state === "clean") continue;
+      } catch { /* keep the roster and its worktree pointer */ }
+      return { verified, error: { code: "worktree-retained", message: `Resolve the worktree for “${member.name}” before removing this roster tree.` } };
+    }
+    if (!store.cleanupTreeMatches(record, verified)) return { verified, error: { code: "cleanup-tree-changed" } };
+    return { verified };
+  }
+
+  async function removeOwnedWorktree(record, { force = false, recheck } = {}) {
+    const options = worktreeOptions(record);
+    const anchor = record.repoRoot ?? record.rootWorkspace ?? config.workspace;
+    return withWorktreeLock(anchor, async () => {
+      if (force) await confirmDiscardableMerge(record, await gitRoot(anchor));
+      return removeVerifiedWorktree(record, options, { force, recheck });
+    });
+  }
+
+  async function clearRecord(record, { autoClaimed = false, autoRetry = false, discardWorktree = record.discardWorktree === true } = {}) {
     requireWritableTarget(record);
     const automatic = autoClaimed || autoRetry;
+    const proof = await cleanupProof(record, { discardWorktree });
+    if (proof.error) return { name: record.name, deleted: false, state: record.state, error: proof.error };
     record.state = 'cleaning'; record.closed = true;
     if (automatic) record.autoCleanupClosed = true;
     if (!autoClaimed) store.save(record);
@@ -3885,7 +4166,7 @@ export function createScopedAgents(config, {
         if (!current || current.agentId === record.agentId) continue;
         const verdict = await store.locked(current.agentId, async () => {
           const fresh = store.get(current.agentId);
-          return fresh ? clearRecord(fresh, { autoRetry: autoClaimed || autoRetry }) : { deleted: true };
+          return fresh ? clearRecord(fresh, { autoRetry: autoClaimed || autoRetry, discardWorktree }) : { deleted: true };
         }, { waitMs: 0 });
         if (verdict?.deleted !== true) {
           throw Object.assign(new Error(`The managed subagent “${current.name}” could not be cleaned; this name stays listed so cleanup can be retried.`),
@@ -3893,14 +4174,6 @@ export function createScopedAgents(config, {
         }
       }
       if (record.lifetime === 'once' && record.parentAgentId) await keepChildSnapshot(record);
-      const capturedNativeState = isHeadlessCli(targetOf(record)) ? store.backendState(record.agentId) : undefined;
-      const resumeSessionId = targetOf(record) === 'codex-cli'
-        ? (capturedNativeState?.threadId ?? null)
-        : targetOf(record) === 'claude-cli'
-          ? (capturedNativeState?.started ? capturedNativeState?.sessionId ?? null : null)
-          : targetOf(record) === 'agy-cli'
-            ? (capturedNativeState?.started ? capturedNativeState?.conversationId ?? null : null)
-            : null;
       const agentPathBeforeRemove = managedPath(record);
       const rootOwnerBeforeRemove = rootOwnerIdForRecord(record);
       if (!record.nativeDestroyed) {
@@ -3912,43 +4185,15 @@ export function createScopedAgents(config, {
         if (result.nativeSessionRetained !== undefined) record.nativeSessionRetained = result.nativeSessionRetained;
         record.nativeDestroyed = true; store.save(record);
       }
-      if (record.workspaceMode === 'worktree' && record.worktreePath) {
-        const wtPath = path.resolve(record.worktreePath);
-        const repoRoot = path.resolve(record.rootWorkspace ?? config.workspace);
-        const worktreesRoot = path.join(repoRoot, '.work', 'worktrees');
-        const wtRel = path.relative(worktreesRoot, wtPath);
-        if (wtRel && !wtRel.startsWith('..') && !path.isAbsolute(wtRel)) {
-          const runtimeRoot = path.dirname(path.resolve(config.stateDirectory));
-          const otherInUse = await activeTaskUse(runtimeRoot, wtPath, []).catch(() => false);
-          // `record` itself is still in `agents` until `store.remove` below, so check whether
-          // any OTHER agent references `wtPath`.
-          const canonicalWt = wtPath.replaceAll('\\', '/').toLowerCase();
-          const otherAgentUses = otherInUse && store.list().some(other =>
-            other.agentId !== record.agentId
-            && JSON.stringify(other).replaceAll('\\\\', '/').toLowerCase().includes(canonicalWt));
-          if (!otherAgentUses) {
-            await execFileAsync('git', ['-C', repoRoot, 'worktree', 'remove', '--force', wtPath], { windowsHide: true }).catch(() => {});
-            await removeTree(wtPath, { recursive: true, force: true }).catch(() => {});
-            await execFileAsync('git', ['-C', repoRoot, 'worktree', 'prune'], { windowsHide: true }).catch(() => {});
-          }
-        }
-      }
+      if (record.worktreePath) await removeOwnedWorktree(record, { force: discardWorktree });
       const pendingBaseline = record.task?.taskId ? baselineWrites.get(record.task.taskId) : undefined;
       if (pendingBaseline) await pendingBaseline;
-      const directory = agentDirectory(record);
-      const root = path.resolve(config.stateDirectory, 'scoped');
-      const relative = path.relative(root, path.resolve(directory));
-      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('The subagent state directory is outside its owned root.');
-      try {
-        const meta = await lstat(directory);
-        if (meta.isSymbolicLink() || !meta.isDirectory()) throw new Error('The owned state path is not a plain directory.');
-        const resolved = await realpath(directory);
-        const actualRoot = await realpath(root);
-        const actualRelative = path.relative(actualRoot, resolved);
-        if (!actualRelative || actualRelative.startsWith('..') || path.isAbsolute(actualRelative)) throw new Error('The state directory resolves outside its owned root.');
-        await removeTree(directory, { recursive: true, force: true });
-      } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      await removeScopedDirectory(agentDirectory(record));
       if (record.lifetime === 'once' && (autoClaimed || autoRetry)) {
+        const target = targetOf(record);
+        const native = isHeadlessCli(target) ? store.backendState(record.agentId) : undefined;
+        const resumeSessionId = target === 'codex-cli' ? native?.threadId ?? null
+          : native?.started ? (target === 'agy-cli' ? native.conversationId : native.sessionId) ?? null : null;
         store.saveAgentStub({
           agentId: record.agentId,
           rootOwnerId: rootOwnerBeforeRemove,
@@ -3958,9 +4203,10 @@ export function createScopedAgents(config, {
           agentPath: agentPathBeforeRemove,
           parentAgentId: record.parentAgentId ?? null,
           target: targetOf(record),
-          workspace: record.rootWorkspace ?? record.workspace ?? null,
+          workspace: record.callerWorkspace ?? record.rootWorkspace ?? record.workspace ?? null,
           resumeSessionId,
           model: actualModelName(record.model) ?? actualModelName(record.modelPin) ?? null,
+          readOnlyScout: record.readOnlyScout === true,
           lastTaskSummary: record.task?.message ? compactText(record.task.message, 120) : null,
         });
       } else {
@@ -4156,6 +4402,14 @@ export function createScopedAgents(config, {
       store.save(record);
       return publicResult(record);
     }
+    if (targetOf(record) === 'agy-cli' && record.observation?.running === true) {
+      const latest = await observe(record).catch(() => undefined);
+      if (latest?.running !== false) {
+        record.state = task.state = 'running';
+        store.save(record);
+        return publicResult(record);
+      }
+    }
     task.state = task.cancelRequested ? 'cancelled' : task.result.state;
     task.finishedAt ??= now();
     const finalDelivered = task.reports.filter(report => report.final)
@@ -4199,27 +4453,15 @@ export function createScopedAgents(config, {
         return publicResult(record);
       }
       if (realTreeSettled) {
-        if (record.lifetime === 'once' && record.workspaceMode === 'worktree' && record.worktreePath) {
-          const wtPath = path.resolve(record.worktreePath);
-          const wtExists = await lstat(wtPath).then(s => s.isDirectory()).catch(() => false);
-          if (wtExists) {
-            const [{ stdout: porcelain }, { stdout: wtHead }] = await Promise.all([
-              execFileAsync('git', ['-C', wtPath, 'status', '--porcelain'], { encoding: 'utf8', windowsHide: true }).catch(() => ({ stdout: '' })),
-              execFileAsync('git', ['-C', wtPath, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true }).catch(() => ({ stdout: '' })),
-            ]);
-            const hasDirtyFiles = Boolean(String(porcelain ?? '').trim());
-            const headTrimmed = String(wtHead ?? '').trim();
-            const hasCommitsAhead = Boolean(record.worktreeBaseHead && headTrimmed && headTrimmed !== record.worktreeBaseHead);
-            if (hasDirtyFiles || hasCommitsAhead) {
-              record.unmergedWorktree = true;
-              record.state = 'idle';
-              delete task.autoCleanupPending;
-              store.save(record);
-              return publicResult(record);
-            }
-          }
+        const proof = await cleanupProof(record);
+        if (proof.error) {
+          if (record.worktreePath) record.unmergedWorktree = true;
+          record.state = "idle";
+          delete task.autoCleanupPending;
+          store.save(record);
+          return publicResult(record);
         }
-        if (store.claimAutoCleanup(record)) return clearRecord(record, { autoClaimed: true });
+        if (store.claimAutoCleanup(record, proof.verified)) return clearRecord(record, { autoClaimed: true });
         const latest = store.get(record.agentId);
         if (latest?.task?.taskId === task.taskId && latest.task.cancelRequested) {
           task.cancelRequested = true;
@@ -4851,13 +5093,13 @@ export function createScopedAgents(config, {
         store.setSupplement(item.requestId, 'blocked', current.task.cancelRequested ? 'task-cancelled' : 'task-closed'); continue;
       }
       if (priorAnswer) {
-        if (!priorAnswer.questionIds) await answerLocked(record, item.message, item.requestId,
-          { modelSelection: item.selection ?? null, selectionExplicit: item.selectionExplicit === true,
-            created: item.created });
-        if (store.supplement(item.requestId)?.status !== 'blocked') {
-          saveSupplementReceipt(item.requestId, 'accepted', null,
-            { delivery: priorAnswer.nativeAnswered ? 'answered' : 'answer-pending', mode: 'steer' });
+        recoverLegacyAnswer(record, priorAnswer);
+        if (!priorAnswer.questionIds) {
+          store.setSupplement(item.requestId, 'blocked', 'explicit-answer-required');
+          continue;
         }
+        saveSupplementReceipt(item.requestId, 'accepted', null,
+          { delivery: priorAnswer.nativeAnswered ? 'answered' : 'answer-pending', mode: 'steer' });
         if (!priorAnswer.dispatched) return;
         continue;
       }
@@ -4867,22 +5109,8 @@ export function createScopedAgents(config, {
         store.setSupplement(item.requestId, 'blocked', 'final-submitted'); return;
       }
       const mode = item.mode === 'queue' ? 'queue' : 'steer';
-      const pendingQuestion = (scheduled.questions ?? []).some(question => question.state === 'pending');
-      if (pendingQuestion && mode !== 'queue') {
-        // An ordinary input to a waiting helper is its answer; explicit queue never is.
-        store.setSupplement(item.requestId, 'sending');
-        await answerLocked(record, item.message, item.requestId,
-          { modelSelection: item.selection ?? null, selectionExplicit: item.selectionExplicit === true,
-            created: item.created });
-        if (store.supplement(item.requestId)?.status !== 'blocked') {
-          const answer = (record.task.answers ?? []).find(entry => entry.answerId === item.requestId);
-          saveSupplementReceipt(item.requestId, 'accepted', null,
-            { delivery: answer?.nativeAnswered ? 'answered' : 'answer-pending', mode: 'steer' });
-        }
-        return;
-      }
-      if (pendingQuestion && mode === 'queue') {
-        // Explicit queue waits, and the question stays unanswered for a separate answer.
+      const pendingQuestion = pendingIn(scheduled).length > 0 || store.openQuestions(record).unanswered > 0;
+      if (pendingQuestion) {
         if (root?.running) saveSupplementReceipt(item.requestId, 'queued', null,
           { delivery: 'after-current', afterTurnId: root.turnId, mode: 'queue' });
         else saveSupplementReceipt(item.requestId, 'queued', null, { delivery: 'local-pending', mode: 'queue' });
@@ -5169,7 +5397,16 @@ export function createScopedAgents(config, {
       if (nextAttempt > Date.now()) return publicResult(record);
       return clearRecord(record, { autoRetry: record.autoCleanupClosed === true });
     }
-    if (record.closed || record.state === 'cleanup_failed') return publicResult(record);
+    if (record.closed || record.worktreeMerge || record.state === "cleanup_failed") return publicResult(record);
+    const route = store.boardRoutes(record.agentId)[0];
+    if (route && (route.urgent || record.state === "idle")) {
+      try {
+        if (await routeBoardLocked(record, route)) return publicResult(record);
+      } catch (error) {
+        if (record.task?.preemption || !store.stillCurrentTurn(record)) return publicResult(store.get(record.agentId) ?? record);
+        throw error;
+      }
+    }
     const missingTree = retainMissingTreeFailure(record);
     // What the helper already wrote is taken in before anything decides that a finished
     // round may skip work: an accepted late ask or report is this round's work, and a
@@ -5260,6 +5497,8 @@ export function createScopedAgents(config, {
         }
         if (restored) saveDispatch(record);
       }
+      if (task?.preemption) return publicResult(record);
+      if (route?.urgent && await routeBoardLocked(record, route)) return publicResult(record);
       if (hasSupplements) await drainSupplements(record);
       if (task?.reports?.length) {
         await deliverReports(record);
@@ -5282,12 +5521,15 @@ export function createScopedAgents(config, {
       }
       else await negotiateTree(record);
       for (const answer of task.answers ?? []) {
-        if (!answer.questionIds && !answer.dispatched && !task.cancelRequested) {
-          try { await resolveAnswer(record, answer); }
-          catch (error) { if (!NATIVE_ANSWER_REFUSALS.has(error.code)) throw error; }
+        if (answer.questionIds || answer.dispatched || task.cancelRequested) continue;
+        if (!answer.explicit) recoverLegacyAnswer(record, answer);
+        else {
+          try { await resolveAnswer(record, answer, { questionIds: answer.questionIdsSeen }); }
+          catch (error) { if (!NATIVE_ANSWER_REFUSALS.has(error.code) && !['question-changed', 'question-not-pending'].includes(error.code)) throw error; }
         }
       }
       const view = await observe(record);
+      if (!store.stillCurrentTurn(record)) return publicResult(store.get(record.agentId) ?? record);
       const turnBackend = await backendFor(record);
       let turnSnapshot = turnBackend.takeObservedTurnSnapshot?.();
       if (task.cancelRequested && task.cancelVerified && !view.running && treeSettled(record, view)) {
@@ -5338,6 +5580,7 @@ export function createScopedAgents(config, {
       // A reminder is best-effort: its own dispatch never decides how the task ended,
       // and an undecided outcome for it is not work the task is still waiting on. A
       // reminder that did arrive starts a turn, which view.running already reports.
+      if (!store.stillCurrentTurn(record)) return publicResult(store.get(record.agentId) ?? record);
       const outstanding = task.dispatches.some(dispatch => !['completed', 'cancelled', 'failed', 'blocked'].includes(dispatch.state)
         && !(dispatch.reminder && ['unknown', 'failed'].includes(dispatch.state)));
       if (task.cancelRequested && !view.running && treeSettled(record, view)) {
@@ -5348,11 +5591,18 @@ export function createScopedAgents(config, {
         store.save(record);
         return await finishReports(record, view);
       }
+      if (await dispatchAnswers(record, view)) return publicResult(record);
+      if (route && await routeBoardLocked(record, route)) return publicResult(record);
+      if (task.boardOnly && !unanswered.length && !task.cancelRequested && !task.reports?.some(report => report.final)) {
+        record.state = "idle";
+        task.state = "completed";
+        task.finishedAt ??= now();
+        store.save(record);
+        return publicResult(record);
+      }
       if (unanswered.length && !task.cancelRequested) {
         record.state = task.state = 'awaiting_input'; store.save(record); return await finishReports(record, view);
       }
-      // Every other target reads its answer as the next turn, once this one has ended.
-      if (await dispatchAnswers(record, view)) return publicResult(record);
       const finalReport = task.reports.find(report => report.final);
       if (!treeSettled(record, view) && !finalReportReady(finalReport)) {
         waitForTree(record, view);
@@ -5381,7 +5631,7 @@ export function createScopedAgents(config, {
       if (terminal === 'failed' && !task.cancelRequested) await notifyFailure(record, terminal, view, finalDispatch);
       return await finishReports(record, view);
     } catch (error) {
-      if (supersededRead(error)) { announceWork(record.agentId); return publicResult(store.get(record.agentId) ?? record); }
+      if (!store.stillCurrentTurn(record) || supersededRead(error)) { announceWork(record.agentId); return publicResult(store.get(record.agentId) ?? record); }
       // A write that refused at its own last moment and proved it was never sent: this copy
       // is stale by definition, so none of it is saved. The newer round keeps what it has.
       if (error?.notSent === true && error?.terminal === true) {
@@ -5535,7 +5785,7 @@ export function createScopedAgents(config, {
       }
       return status;
     },
-    async create({ name, role, lifetime: rawLifetime, target: rawTarget, model: rawModel, effort: rawEffort, worktree, workspaceMode, workspace_mode, proxy, timeoutMinutes, timeoutMs, _revivedSessionId } = {}, extra) {
+    async create({ name, role, lifetime: rawLifetime, target: rawTarget, model: rawModel, effort: rawEffort, worktree, baseSha, workspaceMode, workspace_mode, proxy, timeoutMinutes, timeoutMs, _revivedSessionId, _revivedFrom, _revivedReadOnlyScout } = {}, extra) {
       const normalizedTimeout = normalizeTurnTimeoutOptions({ timeoutMs, timeoutMinutes });
       const callerHasModelRequest = hasModelRequest({ model: rawModel, effort: rawEffort });
       const {
@@ -5546,11 +5796,14 @@ export function createScopedAgents(config, {
         lifetime,
         autoFilledModel,
       } = applyCallerDefaults({ role, target: rawTarget, model: rawModel, effort: rawEffort, lifetime: rawLifetime });
-      if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
       const resolvedWorkspaceMode = workspaceMode ?? workspace_mode ?? (worktree === true ? 'worktree' : worktree === false ? 'inherit' : 'inherit');
       if (!['inherit', 'worktree'].includes(resolvedWorkspaceMode)) {
         throw Object.assign(new Error('workspaceMode must be "inherit" or "worktree".'), { code: 'invalid-workspace-mode' });
       }
+      if (baseSha !== undefined && (resolvedWorkspaceMode !== 'worktree' || !fullSha(baseSha))) {
+        throw worktreeError('invalid-base-sha', 'baseSha requires a worktree and a full hexadecimal commit SHA.');
+      }
+      if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
       let normalizedProxyOverride;
       if (proxy !== undefined && proxy !== null && proxy !== '') {
         const proxyStr = typeof proxy === 'string' ? proxy.trim().toLowerCase() : '';
@@ -5589,31 +5842,11 @@ export function createScopedAgents(config, {
       const resolvedRole = explicitRole ?? inferRoleFromName(chosenName);
       const agentId = uid('agent');
       const baseWorkspace = owner.workspace ?? config.workspace;
-      let effectiveWorkspace = baseWorkspace;
-      let createdWorktreePath;
-      let createdWorktreeBaseHead;
-      if (resolvedWorkspaceMode === 'worktree') {
-        const shortId = agentId.replace(/^agent-/, '').slice(0, 8);
-        const safeSlug = chosenName.replace(/[^a-zA-Z0-9\u4e00-\u9fa5._-]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
-        const worktreesDir = path.join(baseWorkspace, '.work', 'worktrees');
-        createdWorktreePath = path.join(worktreesDir, `${safeSlug}-${shortId}`);
-        await mkdir(worktreesDir, { recursive: true });
-        await withWorktreeLock(baseWorkspace, async () => {
-          const { stdout: headOut } = await execFileAsync('git', ['-C', baseWorkspace, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true }).catch(() => ({ stdout: '' }));
-          createdWorktreeBaseHead = String(headOut ?? '').trim() || undefined;
-          await execFileAsync('git', ['-C', baseWorkspace, 'worktree', 'add', '--detach', createdWorktreePath], { windowsHide: true });
-        });
-        effectiveWorkspace = createdWorktreePath;
-      }
-
-      const rollbackWorktree = async () => {
-        if (!createdWorktreePath) return;
-        await withWorktreeLock(baseWorkspace, async () => {
-          await execFileAsync('git', ['-C', baseWorkspace, 'worktree', 'remove', '--force', createdWorktreePath], { windowsHide: true }).catch(() => {});
-          await removeTree(createdWorktreePath, { recursive: true, force: true }).catch(() => {});
-          await execFileAsync('git', ['-C', baseWorkspace, 'worktree', 'prune'], { windowsHide: true }).catch(() => {});
-        });
-      };
+      const isolated = resolvedWorkspaceMode === "worktree"
+        ? await createWorktree(baseWorkspace, chosenName.replace(/[^a-zA-Z0-9\u4e00-\u9fa5._-]+/g, "-")
+          + "-" + agentId.slice(6, 14), baseSha) : undefined;
+      const rollbackWorktree = () => isolated && withWorktreeLock(isolated.repoRoot,
+        () => removeVerifiedWorktree({ ...isolated, rootWorkspace: isolated.repoRoot }));
 
       const record = {
         agentId,
@@ -5623,13 +5856,10 @@ export function createScopedAgents(config, {
         ...(resolvedRole ? { role: resolvedRole } : {}),
         lifetime,
         target: backendTarget,
-        workspace: effectiveWorkspace,
-        ...(resolvedWorkspaceMode === 'worktree' ? {
-          workspaceMode: 'worktree',
-          worktreePath: createdWorktreePath,
-          rootWorkspace: baseWorkspace,
-          ...(createdWorktreeBaseHead ? { worktreeBaseHead: createdWorktreeBaseHead } : {}),
-        } : {}),
+        workspace: isolated?.workspace ?? baseWorkspace,
+        ...(isolated ? { ...isolated, workspaceMode: "worktree", rootWorkspace: isolated.repoRoot } : {}),
+        ...(caller?.readOnlyScout === true || _revivedReadOnlyScout === true ? { readOnlyScout: true } : {}),
+        ...(_revivedFrom ? { revivedFrom: _revivedFrom } : {}),
         ...(normalizedProxyOverride !== undefined ? { proxyOverride: normalizedProxyOverride } : {}),
         ...(normalizedTimeout.timeoutMs !== undefined ? { turnTimeoutMs: normalizedTimeout.timeoutMs } : {}),
         ...(normalizedTimeout.timeoutMinutes !== undefined ? { turnTimeoutMinutes: normalizedTimeout.timeoutMinutes } : {}),
@@ -5656,7 +5886,7 @@ export function createScopedAgents(config, {
               preview = await resolveRequestedPin(record, effort !== undefined ? { effort } : {}).catch(() => undefined);
             } else if (autoFilledModel && error?.code === 'model-catalog-unavailable' && model) {
               preview = {
-                provider: backendTarget === 'claude-cli' ? 'claude-cli' : backendTarget === 'agy-cli' ? 'antigravity' : 'openai',
+                provider: modelProviderFor(backendTarget),
                 model,
                 ...(effort ? { reasoningEffort: effort } : {}),
                 requestedEffort: effort ?? null,
@@ -5788,19 +6018,6 @@ export function createScopedAgents(config, {
         const fresh = store.get(record.agentId) ?? record;
         return queue(fresh, undefined, { usePinnedModel: true, mode, afterTurnId });
       };
-      const answerReceipt = async (record, requestId, pin, { selectionExplicit = false } = {}) => {
-        const result = await answerLocked(record, message, requestId,
-          { modelSelection: pin, selectionExplicit });
-        const notSent = result.answered !== true && result.delivered === false
-          && typeof result.reason === 'string' && result.reason.startsWith('question-');
-        const delivery = notSent ? 'not-sent'
-          : result.error?.code === 'answer-not-delivered' ? 'blocked'
-            : result.answered !== true ? 'answer-pending'
-              : result.delivery === 'native-question' ? 'answered' : 'answer-pending';
-        const taskKey = store.saveTaskKey(record.ownerId, record.agentId, requestId, record.task.taskId);
-        return { ...result, requestId, taskKey, mode: 'steer', delivery,
-          accepted: delivery === 'answered', queued: !notSent && delivery === 'answer-pending' };
-      };
       // Named so the busy retry below runs exactly this body against a fresh record.
       const operation = async record => {
         enteredOperation = true;
@@ -5861,6 +6078,7 @@ export function createScopedAgents(config, {
           throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
         }
         const target = targetOf(record);
+        if (record.worktreeMerge) throw worktreeError("worktree-busy", "Finish the worktree merge before assigning another turn.");
         const activeTask = record.task && !stoppedTask && ACTIVE.has(record.state);
         // An input that arrives behind an existing queue takes its place at the tail
         // and never jumps a queued start, even when this caller could write at once.
@@ -5912,7 +6130,7 @@ export function createScopedAgents(config, {
             return supplementReceipt(record, receipt.requestId, { pin, mode, delivery: 'local-pending' });
           }
           if ((view.reports ?? []).some(report => report.final)) throw new Error('The agent has already submitted its final report.');
-          const pendingQuestion = (view.questions ?? []).some(question => question.state === 'pending');
+          const pendingQuestion = pendingIn(view).length > 0 || store.openQuestions(record).unanswered > 0;
           // DSH supports steering only. A native turn that ended in ask_parent still
           // leaves a pending question: that is busy too, and explicit queue must never
           // turn the problem into an answer or a supplement. awaiting_report without a
@@ -5921,13 +6139,7 @@ export function createScopedAgents(config, {
             return modeUnsupported(record, 'queue', ['steer']);
           }
           if (isHeadlessCli(target)) {
-            // An omitted mode or explicit steer given while a question is pending is
-            // the answer, never a queued supplement: the caller is answering.
-            if (pendingQuestion && requestedMode !== 'queue') {
-              const pin = await resolvePin(undefined, view);
-              return answerReceipt(record, uid('request'), pin, { selectionExplicit: wantsSelection });
-            }
-            if (pendingQuestion && requestedMode === 'queue') {
+            if (pendingQuestion) {
               const pin = await resolvePin(undefined, view);
               const receipt = await queue(record, pin, { ...(wantsSelection ? { savePin: true } : { usePinnedModel: true }),
                 mode: 'queue', selectionExplicit: wantsSelection });
@@ -5948,11 +6160,6 @@ export function createScopedAgents(config, {
               { pin, mode: cliMode, delivery: 'local-pending' });
           }
           if (target === 'dsh') {
-            if (pendingQuestion) {
-              const pin = await resolvePin(undefined, view);
-              persistPin(record, pin);
-              return answerReceipt(record, uid('request'), pin, { selectionExplicit: wantsSelection });
-            }
             const pin = await resolvePin(undefined, view);
             persistPin(record, pin);
             const ahead = queuedAhead();
@@ -5967,7 +6174,7 @@ export function createScopedAgents(config, {
           let root;
           try { root = await rootTurnFor(record); }
           catch { root = { known: false }; }
-          if (pendingQuestion && effectiveMode(record) === 'queue') {
+          if (pendingQuestion) {
             const pin = await resolvePin(root, view);
             // A running turn cannot change its selection through a queue row either.
             // The pin is written only after a native start proves the new turn used it.
@@ -5983,10 +6190,6 @@ export function createScopedAgents(config, {
             return supplementReceipt(record, receipt.requestId,
               { pin, mode: 'queue', delivery: root.running ? 'after-current' : 'local-pending',
                 ...(root.running && root.turnId ? { afterTurnId: root.turnId } : {}) });
-          }
-          if (pendingQuestion) {
-            const pin = await resolvePin(root, view);
-            return answerReceipt(record, uid('request'), pin, { selectionExplicit: wantsSelection });
           }
           const pin = await resolvePin(root, view);
           const mode = effectiveMode(record);
@@ -6161,7 +6364,7 @@ export function createScopedAgents(config, {
      * keeps its own application and lifetime, so a conflicting explicit value is
      * refused instead of quietly running the task on the wrong backend.
      */
-    async run({ tasks, name, role, message, lifetime: rawLifetime, target: rawTarget, model: rawModel, effort: rawEffort, mode, worktree, workspaceMode, workspace_mode, proxy, timeoutMinutes, timeoutMs } = {}, extra) {
+    async run({ tasks, name, role, message, lifetime: rawLifetime, target: rawTarget, model: rawModel, effort: rawEffort, mode, worktree, baseSha, workspaceMode, workspace_mode, proxy, timeoutMinutes, timeoutMs } = {}, extra) {
       if (tasks !== undefined) {
         if (!Array.isArray(tasks) || tasks.length === 0) {
           throw Object.assign(new Error('tasks must be a non-empty array of task items.'), { code: 'invalid-arguments' });
@@ -6176,12 +6379,15 @@ export function createScopedAgents(config, {
           ...ownMembers.map(r => r.name),
           ...stubs.map(s => s.name),
         ]);
+        const shared = { role, lifetime: rawLifetime, target: rawTarget, model: rawModel, effort: rawEffort,
+          mode, worktree, baseSha, workspaceMode, workspace_mode, proxy, timeoutMinutes, timeoutMs };
         const prepared = tasks.map(item => {
-          if (!item || typeof item !== 'object') {
+          if (!item || typeof item !== 'object' || Array.isArray(item)) {
             throw Object.assign(new Error('Each entry in tasks must be an object.'), { code: 'invalid-arguments' });
           }
-          textMessage(item.message);
-          const itemRole = normalizeRole(item.role);
+          const spec = mergeRunTaskDefaults(shared, item);
+          textMessage(spec.message);
+          const itemRole = normalizeRole(spec.role, { teamConfigPath });
           let assignedName;
           if (typeof item.name === 'string' && item.name.trim()) {
             assignedName = assertName(item.name);
@@ -6202,26 +6408,10 @@ export function createScopedAgents(config, {
             if (!assignedName) throw new Error('Could not generate an unused subagent name; pass one explicitly.');
             usedNames.add(assignedName);
           }
-          const itemWorktree = item.worktree ?? worktree;
-          const itemWorkspaceMode = item.workspaceMode ?? item.workspace_mode
-            ?? (itemWorktree === true ? 'worktree' : itemWorktree === false ? 'inherit' : (workspaceMode ?? workspace_mode));
-          const itemProxy = item.proxy ?? proxy;
-          const itemTimeoutMinutes = item.timeoutMinutes ?? timeoutMinutes;
-          const itemTimeoutMs = item.timeoutMs ?? timeoutMs;
-          return {
-            name: assignedName,
-            ...(itemRole ? { role: itemRole } : {}),
-            message: item.message,
-            ...(item.lifetime !== undefined ? { lifetime: item.lifetime } : {}),
-            ...(item.target !== undefined ? { target: item.target } : {}),
-            ...(item.model !== undefined ? { model: item.model } : {}),
-            ...(item.effort !== undefined ? { effort: item.effort } : {}),
-            ...(item.mode !== undefined ? { mode: item.mode } : {}),
-            ...(itemWorkspaceMode !== undefined ? { workspaceMode: itemWorkspaceMode } : {}),
-            ...(itemProxy !== undefined ? { proxy: itemProxy } : {}),
-            ...(itemTimeoutMinutes !== undefined ? { timeoutMinutes: itemTimeoutMinutes } : {}),
-            ...(itemTimeoutMs !== undefined ? { timeoutMs: itemTimeoutMs } : {}),
-          };
+          if (spec.baseSha !== undefined && (spec.workspaceMode !== "worktree" || !fullSha(spec.baseSha))) {
+            throw worktreeError("invalid-base-sha", "baseSha requires a worktree and a full hexadecimal commit SHA.");
+          }
+          return { ...spec, name: assignedName, role: itemRole };
         });
         const items = await Promise.all(prepared.map(spec => service.run(spec, extra)));
         const taskKeys = items.map(entry => entry?.taskKey).filter(Boolean);
@@ -6246,6 +6436,9 @@ export function createScopedAgents(config, {
       const createdLifetime = effectiveLifetime ?? 'once';
       if (!['once', 'persistent'].includes(createdLifetime)) throw new Error('lifetime must be once or persistent.');
       const effectiveWorkspaceMode = workspaceMode ?? workspace_mode ?? (worktree === true ? 'worktree' : worktree === false ? 'inherit' : undefined);
+      if (baseSha !== undefined && (effectiveWorkspaceMode !== "worktree" || !fullSha(baseSha))) {
+        throw worktreeError("invalid-base-sha", "baseSha requires a worktree and a full hexadecimal commit SHA.");
+      }
       const sent = result => ({ state: result.state, accepted: result.accepted === true,
         ...(result.requestId ? { requestId: result.requestId } : {}),
         ...(result.taskKey ? { taskKey: result.taskKey } : {}),
@@ -6259,7 +6452,12 @@ export function createScopedAgents(config, {
         ...(result.queued !== undefined ? { queued: result.queued === true } : {}), ...(result.retrying ? { retrying: true } : {}),
         ...(result.callbackError ? { callbackError: result.callbackError } : {}), ...(result.error ? { error: result.error } : {}) });
       const trimmedName = typeof name === 'string' && name.trim() ? assertName(name) : (name !== undefined && name !== '' ? assertName(name) : undefined);
-      const existing = trimmedName === undefined ? undefined : store.named(owner.ownerId, trimmedName);
+      let existing;
+      if (trimmedName !== undefined) {
+        try { existing = named(owner, trimmedName, extra); }
+        catch (error) { if (error.code !== "agent-not-found") throw error; }
+      }
+      if (existing?.worktreeMerge) throw worktreeError("worktree-busy", "Finish the worktree merge before assigning another turn.");
       if (existing) {
         // send only says "closing, blocked or not ready"; a caller that picked this
         // name needs to know the name is on its way out rather than misbound.
@@ -6270,9 +6468,12 @@ export function createScopedAgents(config, {
         const boundTarget = targetOf(existing);
         const rawWanted = rawTarget !== undefined ? normalizeTarget(rawTarget) : undefined;
         if (rawWanted !== undefined && rawWanted !== boundTarget) throw Object.assign(new Error(`The name “${existing.name}” is already bound to ${hostLabel(existing)}; it cannot run on ${TARGET_LABELS[rawWanted]}. Omit target to continue this name, or use another name.`), { code: 'target-conflict' });
+        if (baseSha !== undefined && existing.worktreeBaseHead?.toLowerCase() !== baseSha.toLowerCase()) {
+          throw worktreeError("worktree-base-conflict", "An existing name cannot change its worktree base.");
+        }
         if (rawLifetime !== undefined && rawLifetime !== existing.lifetime) throw Object.assign(new Error(`The name “${existing.name}” is already a ${existing.lifetime} subagent; omit lifetime, pass ${existing.lifetime}, or use another name.`), { code: 'lifetime-conflict' });
         if (explicitRole && !existing.role) { existing.role = explicitRole; store.save(existing); }
-        const result = await service.send({ name: existing.name, message, model: rawModel, effort: rawEffort, mode: requestedMode, timeoutMinutes, timeoutMs }, extra);
+        const result = await service.send({ name: trimmedName, message, model: rawModel, effort: rawEffort, mode: requestedMode, timeoutMinutes, timeoutMs }, extra);
         const wakeCmd = buildWakeCmd(owner, result.taskKey);
         return {
           name: existing.name,
@@ -6300,6 +6501,7 @@ export function createScopedAgents(config, {
         model: rawModel,
         effort: rawEffort,
         workspaceMode: effectiveWorkspaceMode,
+        baseSha,
         proxy,
         timeoutMinutes,
         timeoutMs,
@@ -6335,12 +6537,20 @@ export function createScopedAgents(config, {
         };
       }
     },
-    async answer({ name, message }, extra) {
+    async answer({ name, message, questionId, question_id: wireQuestionId, questionIds, answerId } = {}, extra) {
       textMessage(message);
+      const single = questionId !== undefined ? questionId : wireQuestionId;
+      const ids = single !== undefined ? [single] : questionIds;
+      if ((questionId !== undefined && wireQuestionId !== undefined) || (single !== undefined && questionIds !== undefined)
+          || (ids !== undefined && (!Array.isArray(ids) || !ids.length
+            || ids.some(id => typeof id !== "string" || !id.trim()) || new Set(ids).size !== ids.length))
+          || (answerId !== undefined && (typeof answerId !== "string" || !answerId.trim()))) {
+        throw Object.assign(new Error("Choose one question ID or a nonempty array of unique question IDs."), { code: "invalid-question-selection" });
+      }
       return withName(extra, name, async record => {
         requireWritableTarget(record);
         const selection = await resolveRequestedPin(record, {});
-        return answerLocked(record, message, undefined, { modelSelection: selection, selectionExplicit: false });
+        return answerLocked(record, message, answerId, { questionIds: ids, modelSelection: selection });
       });
     },
     async list(extra, { scope = 'team', name: filterName, role: filterRole, state: filterState } = {}) {
@@ -6349,6 +6559,7 @@ export function createScopedAgents(config, {
       }
       const owner = await context(extra);
       const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+      if (scope === 'all' && effectiveTrustedCaller(extra)?.source === 'managed-cli') scope = 'team';
       const wantedName = filterName === undefined ? undefined : assertName(filterName);
       const wantedRole = normalizeRole(filterRole);
       if (filterState !== undefined && (typeof filterState !== 'string' || !filterState
@@ -6398,7 +6609,7 @@ export function createScopedAgents(config, {
         if (wantedName === undefined) {
           throw Object.assign(new Error('scope="agent" requires name.'), { code: 'name-required' });
         }
-        const { all: teamAll } = visibleRecords(rootOwnerId);
+        const teamAll = permittedRecords(owner, extra);
         const byPath = teamAll.filter(r => managedPath(r) === wantedName);
         let chosenRecord = byPath[0];
         if (!chosenRecord) {
@@ -6414,7 +6625,8 @@ export function createScopedAgents(config, {
           }
         }
         if (!chosenRecord) {
-          const stub = store.getAgentStub(rootOwnerId, wantedName);
+          const candidate = store.getAgentStub(rootOwnerId, wantedName);
+          const stub = canAccessMember(owner, extra, candidate) ? candidate : undefined;
           if (stub) {
             const stubDetail = {
               name: stub.name,
@@ -6557,16 +6769,7 @@ export function createScopedAgents(config, {
       }
 
       // Default: scope === 'team' — whole team tree under this root owner.
-      const { all: teamAll } = visibleRecords(rootOwnerId);
-      const seenIds = new Set(teamAll.map(r => r.agentId));
-      if (owner.ownerId !== rootOwnerId) {
-        for (const ownRec of store.list(owner.ownerId)) {
-          if (!seenIds.has(ownRec.agentId)) {
-            seenIds.add(ownRec.agentId);
-            teamAll.push(ownRec);
-          }
-        }
-      }
+      const teamAll = permittedRecords(owner, extra);
       const nowMs = Date.now();
       let selected = teamAll;
       if (wantedName !== undefined) {
@@ -6715,15 +6918,18 @@ export function createScopedAgents(config, {
         if (current?.task?.taskId === record.task.taskId) await ensureWorker(current);
       }
     },
-    async delete({ name }, extra) {
+    async delete({ name, discardWorktree, discard_worktree } = {}, extra) {
       const owner = await context(extra);
       const record = requireWritableTarget(named(owner, name, extra));
+      const discard = discardWorktree === true || discard_worktree === true;
+      const proof = await cleanupProof(record, { discardWorktree: discard });
+      if (proof.error) return { name, deleted: false, state: record.state, error: proof.error };
       if (targetOf(record) === 'dsh') {
-        const result = await withName(extra, name, current => clearRecord(current));
+        const result = await withName(extra, name, current => clearRecord(current, { discardWorktree: discard }));
         if (result.queued) await ensureWorker(store.get(record.agentId), { wake: true });
         return result;
       }
-      const queued = store.requestCleanup(record);
+      const queued = store.requestCleanup(record, proof.verified, { discardWorktree: discard });
       if (queued) await ensureWorker(store.get(record.agentId), { wake: true });
       const current = queued ? undefined : store.get(record.agentId);
       return { name, deleted: false, queued, state: queued ? 'cleaning' : current?.cleanupRosterTicket ? 'cleanup-claimed' : 'removed',
@@ -6803,7 +7009,7 @@ export function createScopedAgents(config, {
       const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
       if (names) names.forEach(assertName);
       if (taskKeys && (!Array.isArray(taskKeys) || taskKeys.some(key => typeof key !== 'string'))) throw new Error('taskKeys must be an array of task keys.');
-      const available = taskKeys ? [] : visibleRecords(rootOwnerId).all;
+      const available = taskKeys ? [] : permittedRecords(owner, extra);
       const matchesWaitName = (record, wanted) => record.name === wanted || managedPath(record) === wanted;
       const selected = available.filter(record => !names || names.some(wanted => matchesWaitName(record, wanted)));
       const notListed = new Set((names ?? []).filter(name => !available.some(record => matchesWaitName(record, name))));
@@ -6880,6 +7086,9 @@ export function createScopedAgents(config, {
                 mapping = cross;
               }
             }
+            if (mapping && effectiveTrustedCaller(extra)?.source === "managed-cli"
+                && !canAccessMember(owner, extra, store.get(mapping.agentId)
+                  ?? store.listAgentStubs(rootOwnerId).find(stub => stub.agentId === mapping.agentId))) mapping = null;
             if (!mapping) throw Object.assign(new Error('Task receipt is unavailable for this owner.'), { code: 'task-receipt-unavailable' });
             const effectiveKeyOwner = mapping.ownerId ?? owner.ownerId;
             if (mapping.receipt?.expired) throw Object.assign(new Error('Task receipt has expired.'), { code: 'task-receipt-expired' });
@@ -7067,6 +7276,12 @@ export function createScopedAgents(config, {
       if (typeof submissionId !== 'string' || !submissionId) throw Object.assign(new Error('A submission ID is required.'), { code: 'invalid-submission-id' });
       const owner = await context(extra);
       const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+      if (effectiveTrustedCaller(extra)?.source === "managed-cli") {
+        const mapping = store.resolveTaskKeyAnyOwner(taskKey);
+        const member = mapping && (store.get(mapping.agentId)
+          ?? store.listAgentStubs(rootOwnerId).find(stub => stub.agentId === mapping.agentId));
+        if (!canAccessMember(owner, extra, member)) throw permissionDenied();
+      }
       let effectiveOwnerId = owner.ownerId;
       let stored = store.storedReportBody(effectiveOwnerId, taskKey, submissionId);
       if (stored.error === 'task-receipt-unavailable') {
@@ -7129,7 +7344,7 @@ export function createScopedAgents(config, {
       // One listener serves every name: record the failure on each waiting name
       // instead of starting a process per agent.
       for (const record of pending) {
-        store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' });
+        store.setError(record.agentId, monitorError ?? { code: 'monitor-unavailable', message: 'The shared monitor could not start.' }, record);
       }
     },
     // One shared round: poll every name that still owes work through the same
@@ -7140,8 +7355,11 @@ export function createScopedAgents(config, {
       releaseWakeAt = undefined;
       const inbox = pendingInbox();
       const scanAt = Date.now();
+      const boardAgents = new Set(store.boardRouteAgents());
+      if (sweep) for (const agentId of boardAgents) if (!store.get(agentId)) await routeBoardTarget(agentId);
       const wanted = new Set(only ?? []);
       for (const [agentId, dueAt] of inbox) if (dueAt <= scanAt) wanted.add(agentId);
+      for (const agentId of boardAgents) wanted.add(agentId);
       // Only a real hint — a file event or work queued in this process — may skip a
       // name's own one-second floor. A name that merely owes fast work is polled again
       // as soon as the floor allows, not on every round: otherwise every completion
@@ -7167,7 +7385,7 @@ export function createScopedAgents(config, {
         // Only the whole record shows whose stamp it is, so that one name is read here
         // and every other name keeps using its projection.
         const full = mayHoldReleaseSchedule(candidate) ? store.get(agentId) : undefined;
-        if (!needsPoll(full ?? candidate ?? store.get(agentId), hasSubmission)) { fastPoll.delete(agentId); continue; }
+        if (!boardAgents.has(agentId) && !needsPoll(full ?? candidate ?? store.get(agentId), hasSubmission)) { fastPoll.delete(agentId); continue; }
         // A finished round whose only outstanding work is its own release re-check is not
         // busy: the listener sleeps to that moment, so waiting costs no round at all.
         const recheckAt = releaseRecheckAt(full ?? candidate ?? store.get(agentId));
@@ -7272,104 +7490,51 @@ export function createScopedAgents(config, {
       wakeWaiters();
       if (agentId) announceWork(agentId);
     },
-    async postBoard({ message, mentions, author: explicitAuthor } = {}, extra) {
+    async postBoard({ message, mentions, urgent = false, author: explicitAuthor } = {}, extra) {
       textMessage(message);
+      if (typeof urgent !== "boolean") throw Object.assign(new Error("urgent must be a boolean."), { code: "invalid-arguments" });
+      const caller = effectiveTrustedCaller(extra);
       const owner = await context(extra);
       const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
-      const callerAgent = owner.callerAgentId ? store.get(owner.callerAgentId) : undefined;
-      const author = callerAgent
-        ? managedPath(callerAgent)
-        : (typeof explicitAuthor === 'string' && explicitAuthor.trim() ? explicitAuthor.trim() : 'Boss');
-      const authorRole = callerAgent ? (callerAgent.role ?? inferRoleFromName(callerAgent.name) ?? null) : 'Boss';
+      const callerAgent = owner.callerAgentId ? store.get(owner.callerAgentId)
+        : !caller ? store.agentForCodexThread(callingThread(extra), { includeAutoClosed: true }) : undefined;
+      const author = callerAgent ? managedPath(callerAgent)
+        : (typeof explicitAuthor === "string" && explicitAuthor.trim() ? explicitAuthor.trim() : "Boss");
+      const authorRole = callerAgent ? (callerAgent.role ?? inferRoleFromName(callerAgent.name) ?? null) : "Boss";
       const parsedMentions = extractBoardMentions(message, mentions);
+      const active = visibleRecords(rootOwnerId).all.filter(member => !member.closed);
+      const stubs = store.listAgentStubs(rootOwnerId);
+      const actor = { authorAgentId: callerAgent?.agentId ?? null,
+        authorTaskId: caller ? caller.callerTaskId : callerAgent?.task?.taskId,
+        authorRequestId: caller ? caller.callerRequestId : activeManagedRequestId(callerAgent?.task) };
+      if (caller?.source === "managed-cli" && !boardActor(actor, rootOwnerId)) throw permissionDenied();
+      if (urgent && callerAgent && !isBoardAuthority(actor, rootOwnerId)) throw permissionDenied();
       const routed = [];
-
-      const { all: teamMembers } = visibleRecords(rootOwnerId);
+      const seen = new Set();
       for (const mention of parsedMentions) {
-        if (!mention || mention === author || mention === 'Boss' || mention === 'all') continue;
-        const activeMatch = teamMembers.find(r => !r.closed && managedPath(r) === mention)
-          ?? teamMembers.find(r => !r.closed && r.name === mention && !INACTIVE_STATES.has(r.state))
-          ?? teamMembers.find(r => !r.closed && r.name === mention);
-        const boardPrompt = `[团队黑板点名 · 来自 ${author}]\n${message}\n\n请针对点名你的问题查证并通过 report_parent(message, final=true)（如需请示则用 ask_parent）简要回复。`;
-        if (activeMatch) {
-          try {
-            const targetExtra = targetCallerExtraForOwner(activeMatch.ownerId, activeMatch);
-            const sent = await service.send({ name: activeMatch.name, message: boardPrompt }, targetExtra);
-            routed.push({
-              mention,
-              name: activeMatch.name,
-              agentPath: managedPath(activeMatch),
-              action: 'woken',
-              ...(sent?.taskKey ? { taskKey: sent.taskKey } : {}),
-            });
-          } catch (error) {
-            routed.push({
-              mention,
-              name: activeMatch.name,
-              agentPath: managedPath(activeMatch),
-              action: 'failed',
-              error: safeError(error),
-            });
-          }
-          continue;
+        if (!urgent && (!mention || mention === author || mention === "Boss" || mention === "all")) continue;
+        const member = resolveBoardMention(mention, active, managedPath)
+          ?? resolveBoardMention(mention, stubs, stub => stub.agentPath);
+        if (urgent && (!member || (callerAgent && !isDescendant(store, member, callerAgent.agentId)))) {
+          throw permissionDenied();
         }
-        const stub = store.getAgentStub(rootOwnerId, mention);
-        if (stub) {
-          try {
-            const stubExtra = targetCallerExtraForOwner(stub.ownerId, stub);
-            store.deleteAgentStub(stub.agentId);
-            const created = await service.create({
-              name: stub.name,
-              ...(stub.role ? { role: stub.role } : {}),
-              lifetime: 'once',
-              target: stub.target,
-              ...(stub.model ? { model: stub.model } : {}),
-              _revivedSessionId: stub.resumeSessionId ?? undefined,
-            }, stubExtra);
-            if (created.created === true && !created.error) {
-              const sent = await service.send({ name: stub.name, message: boardPrompt }, stubExtra);
-              routed.push({
-                mention,
-                name: stub.name,
-                agentPath: stub.agentPath,
-                action: 'revived',
-                resumedSession: Boolean(stub.resumeSessionId),
-                ...(sent?.taskKey ? { taskKey: sent.taskKey } : {}),
-              });
-            } else {
-              routed.push({
-                mention,
-                name: stub.name,
-                agentPath: stub.agentPath,
-                action: 'failed',
-                ...(created.error ? { error: created.error } : {}),
-              });
-            }
-          } catch (error) {
-            routed.push({
-              mention,
-              name: stub.name,
-              agentPath: stub.agentPath,
-              action: 'failed',
-              error: safeError(error),
-            });
-          }
-          continue;
-        }
-        routed.push({ mention, action: 'not-found' });
+        if (!member) { routed.push({ mention, action: "not-found" }); continue; }
+        if (seen.has(member.agentId)) continue;
+        seen.add(member.agentId);
+        routed.push({ mention, name: member.name, agentPath: member.agentPath ?? managedPath(member),
+          targetAgentId: member.agentId, taskId: member.task?.taskId ?? null, action: "deferred" });
       }
-
-      const saved = store.postBoardMessage({
-        rootOwnerId,
-        author,
-        authorRole,
-        authorAgentId: callerAgent?.agentId ?? null,
-        text: message,
-        mentions: parsedMentions,
-        routed,
-      });
+      const saved = store.postBoardMessage({ rootOwnerId, author, authorRole, ...actor, text: message,
+        mentions: parsedMentions, routed, urgent });
+      for (const id of seen) {
+        await routeBoardTarget(id);
+        announceWork(id);
+      }
+      const result = store.listBoardMessages(rootOwnerId, { afterSeq: saved.seq - 1, limit: 500 })
+        .messages.find(item => item.seq === saved.seq) ?? saved;
       wakeWaiters();
-      return { posted: true, message: saved, mentions: parsedMentions, routed };
+      if (result.routed.some(item => item.action === "deferred")) await ensureMonitor();
+      return { posted: true, seq: result.seq, message: result, mentions: parsedMentions, routed: result.routed };
     },
     async readBoard({ limit = 50, afterSeq = 0 } = {}, extra) {
       const owner = await context(extra);
@@ -7387,6 +7552,8 @@ export function createScopedAgents(config, {
       keep_children,
       killTree,
       kill_tree,
+      discardWorktree,
+      discard_worktree,
       message,
     } = {}, extra) {
       const normalizedAction = typeof action === 'string' ? action.trim().toLowerCase() : '';
@@ -7398,11 +7565,15 @@ export function createScopedAgents(config, {
       }
       const owner = await context(extra);
       const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+      if (effectiveTrustedCaller(extra)?.source === "managed-cli" && ["strays", "sweep", "adopt"].includes(normalizedAction)) {
+        throw permissionDenied();
+      }
       const callerWorkspace = owner.workspace ?? config.workspace;
       const normCallerWs = callerWorkspace ? pathKey(callerWorkspace) : null;
       const STRAY_IDLE_MS = 30 * 60 * 1000;
 
       const effectiveParent = parent !== undefined ? parent : (reparentTo !== undefined ? reparentTo : reparent_to);
+      const managedCallerId = effectiveTrustedCaller(extra)?.source === "managed-cli" ? owner.callerAgentId : undefined;
       const effectiveKeepChildren = (killTree === true || kill_tree === true)
         ? false
         : (keepChildren !== undefined
@@ -7416,15 +7587,17 @@ export function createScopedAgents(config, {
           forgetBackend({ agentId: item.agentId });
           const srcDir = path.join(scopedRoot, item.oldOwnerId, item.agentId);
           const dstDir = path.join(scopedRoot, item.newOwnerId, item.agentId);
-          const hasSrc = await lstat(srcDir).then(s => s.isDirectory()).catch(() => false);
-          if (!hasSrc) continue;
-          await mkdir(path.dirname(dstDir), { recursive: true });
           try {
-            await rename(srcDir, dstDir);
-          } catch {
-            await cp(srcDir, dstDir, { recursive: true, force: true }).catch(() => {});
-            await removeTree(srcDir, { recursive: true, force: true }).catch(() => {});
-          }
+            if (!await plainDirectoryPath(scopedRoot, srcDir)) continue;
+            await plainDirectoryPath(scopedRoot, dstDir);
+            await mkdir(path.dirname(dstDir), { recursive: true });
+            await plainDirectoryPath(scopedRoot, dstDir);
+            try { await rename(srcDir, dstDir); }
+            catch {
+              await cp(srcDir, dstDir, { recursive: true, force: true });
+              await removeScopedDirectory(srcDir);
+            }
+          } catch { /* A moved roster entry must never remove an unverified state tree. */ }
         }
       };
 
@@ -7489,7 +7662,8 @@ export function createScopedAgents(config, {
         return strays;
       };
 
-      const forcePurgeSingleRecord = async rec => {
+      const discard = discardWorktree === true || discard_worktree === true;
+      const forcePurgeSingleRecord = async (rec, explicitDiscard = false) => {
         if (!rec) return;
         const fresh = store.get(rec.agentId) ?? rec;
         try {
@@ -7501,31 +7675,8 @@ export function createScopedAgents(config, {
         } catch {}
         const dir = agentDirectory(fresh);
         await killProcessCage({ pids: [], turnDir: dir, sessionId: fresh.sessionId }).catch(() => {});
-        if (fresh.workspaceMode === 'worktree' && fresh.worktreePath) {
-          const wtPath = path.resolve(fresh.worktreePath);
-          const repoRoot = path.resolve(fresh.rootWorkspace ?? config.workspace);
-          const worktreesRoot = path.join(repoRoot, '.work', 'worktrees');
-          const wtRel = path.relative(worktreesRoot, wtPath);
-          if (wtRel && !wtRel.startsWith('..') && !path.isAbsolute(wtRel)) {
-            const canonicalWt = wtPath.replaceAll('\\', '/').toLowerCase();
-            const sharedWithSurvivor = store.list().some(other =>
-              other.agentId !== fresh.agentId
-              && !other.closed
-              && JSON.stringify(other).replaceAll('\\', '/').toLowerCase().includes(canonicalWt));
-            if (!sharedWithSurvivor) {
-              await withWorktreeLock(repoRoot, async () => {
-                await execFileAsync('git', ['-C', repoRoot, 'worktree', 'remove', '--force', wtPath], { windowsHide: true }).catch(() => {});
-                await removeTree(wtPath, { recursive: true, force: true }).catch(() => {});
-                await execFileAsync('git', ['-C', repoRoot, 'worktree', 'prune'], { windowsHide: true }).catch(() => {});
-              });
-            }
-          }
-        }
-        const scopedRoot = path.resolve(config.stateDirectory, 'scoped');
-        const rel = path.relative(scopedRoot, path.resolve(dir));
-        if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
-          await removeTree(dir, { recursive: true, force: true }).catch(() => {});
-        }
+        if (fresh.worktreePath) await removeOwnedWorktree(fresh, { force: explicitDiscard });
+        await removeScopedDirectory(dir).catch(() => {});
         store.deleteAgentStub?.(fresh.agentId);
         try {
           store.remove(fresh, { deliveredReceipt: false });
@@ -7538,7 +7689,7 @@ export function createScopedAgents(config, {
 
       const resolveOptionalParentRecord = parentSpec => {
         if (parentSpec === undefined || parentSpec === null || parentSpec === '' || parentSpec === 'root' || parentSpec === 'Boss') {
-          return null;
+          return managedCallerId ? store.get(managedCallerId) : null;
         }
         return named(owner, String(parentSpec), extra);
       };
@@ -7562,7 +7713,14 @@ export function createScopedAgents(config, {
           }
           return depth;
         };
-        const orderedIds = [...strayIds].sort((a, b) => depthOf(b) - depthOf(a));
+          const protectedIds = new Set();
+        for (const id of strayIds) {
+          const member = store.get(id);
+          if (!member || !(await cleanupProof(member)).error) continue;
+          protectedIds.add(id);
+          for (const child of store.descendantsOf([id])) protectedIds.add(child.agentId);
+        }
+        const orderedIds = [...strayIds].filter(id => !protectedIds.has(id)).sort((a, b) => depthOf(b) - depthOf(a));
         const sweptNames = [];
         for (const id of orderedIds) {
           const rec = store.get(id);
@@ -7729,6 +7887,7 @@ export function createScopedAgents(config, {
             target: stub.target,
             ...(stub.model ? { model: stub.model } : {}),
             _revivedSessionId: stub.resumeSessionId ?? undefined,
+            _revivedReadOnlyScout: stub.readOnlyScout,
           }, createExtra);
           let sent;
           if (created.created === true && !created.error && typeof message === 'string' && message.trim()) {
@@ -7783,14 +7942,9 @@ export function createScopedAgents(config, {
           throw Object.assign(new Error('kick requires target.'), { code: 'invalid-arguments' });
         }
         const trimmedTarget = target.trim();
-        let record;
-        try {
-          record = named(owner, trimmedTarget, extra);
-        } catch (err) {
-          if (err?.code !== 'agent-not-found') throw err;
-          record = store.list().find(r => r && (r.agentId === trimmedTarget || managedPath(r) === trimmedTarget || r.name === trimmedTarget));
-          if (!record) throw err;
-        }
+        const record = named(owner, trimmedTarget, extra);
+        const proof = await cleanupProof(record, { discardWorktree: discard });
+        if (proof.error) return { action: "kick", name: record.name, ok: false, error: proof.error };
 
         if (effectiveKeepChildren) {
           const explicitNewParent = effectiveParent !== undefined ? resolveOptionalParentRecord(effectiveParent) : undefined;
@@ -7813,7 +7967,7 @@ export function createScopedAgents(config, {
             await relocateMovedDirs(moved);
           }
           const promotedChildren = directChildren.map(c => store.get(c.agentId)?.name ?? c.name);
-          await forcePurgeSingleRecord(record);
+          await forcePurgeSingleRecord(record, discard);
           wakeWaiters();
           return {
             action: 'kick',
@@ -7830,9 +7984,9 @@ export function createScopedAgents(config, {
         const descendants = store.descendantsOf([record.agentId]);
         const removedNames = [...descendants.map(d => d.name), record.name];
         for (const child of [...descendants].reverse()) {
-          await forcePurgeSingleRecord(child);
+          await forcePurgeSingleRecord(child, discard);
         }
-        await forcePurgeSingleRecord(record);
+        await forcePurgeSingleRecord(record, discard);
         wakeWaiters();
         return {
           action: 'kick',
@@ -7849,172 +8003,21 @@ export function createScopedAgents(config, {
         if (typeof target !== 'string' || !target.trim()) {
           throw Object.assign(new Error('merge requires target.'), { code: 'invalid-arguments' });
         }
-        const trimmedTarget = target.trim();
-        let record;
-        try {
-          record = named(owner, trimmedTarget, extra);
-        } catch (err) {
-          if (err?.code !== 'agent-not-found') throw err;
-          record = store.list().find(r => r && !r.closed && (r.agentId === trimmedTarget || managedPath(r) === trimmedTarget || r.name === trimmedTarget));
-          if (!record) throw err;
-        }
-        if (record.state === 'running' || record.state === 'creating') {
-          throw Object.assign(
-            new Error(`Subagent “${record.name}” is still ${record.state}; wait for it to finish or cancel it before merging its worktree.`),
-            { code: 'agent-running' },
-          );
-        }
-        if (!record.worktreePath) {
-          throw Object.assign(
-            new Error(`Subagent “${record.name}” has no isolated worktree to merge.`),
-            { code: 'worktree-not-found' },
-          );
-        }
-        const wtPath = path.resolve(record.worktreePath);
-        const repoRoot = path.resolve(record.rootWorkspace ?? callerWorkspace ?? config.workspace);
-        const wtExists = await lstat(wtPath).then(s => s.isDirectory()).catch(() => false);
-        if (!wtExists) {
-          throw Object.assign(
-            new Error(`Worktree directory no longer exists: ${wtPath}`),
-            { code: 'worktree-not-found' },
-          );
-        }
-
-        const parseNullPaths = raw => String(raw ?? '')
-          .split('\0')
-          .map(entry => entry.replaceAll('\\', '/').trim())
-          .filter(entry => entry && entry !== '.work' && !entry.startsWith('.work/'));
-
-        const mergeOutcome = await withWorktreeLock(repoRoot, async () => {
-          const { stdout: repoHeadOut } = await execFileAsync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true });
-          const { stdout: wtHeadOut } = await execFileAsync('git', ['-C', wtPath, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true });
-          const repoHead = repoHeadOut.trim();
-          const wtHead = wtHeadOut.trim();
-
-          let baseCommit = record.worktreeBaseHead;
-          if (baseCommit) {
-            const validBase = await execFileAsync('git', ['-C', wtPath, 'cat-file', '-e', `${baseCommit}^{commit}`], { windowsHide: true })
-              .then(() => true)
-              .catch(() => false);
-            if (!validBase) baseCommit = undefined;
-          }
-          if (!baseCommit) {
-            const { stdout: mbOut } = await execFileAsync('git', ['-C', wtPath, 'merge-base', repoHead, wtHead], { encoding: 'utf8', windowsHide: true })
-              .catch(() => ({ stdout: wtHead }));
-            baseCommit = mbOut.trim() || wtHead;
-          }
-
-          const [wtCommitted, wtStaged, wtUnstaged, wtUntracked] = await Promise.all([
-            execFileAsync('git', ['-C', wtPath, 'diff', '--name-only', '--no-renames', '-z', baseCommit, 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
-            execFileAsync('git', ['-C', wtPath, 'diff', '--cached', '--name-only', '--no-renames', '-z', 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
-            execFileAsync('git', ['-C', wtPath, 'diff', '--name-only', '--no-renames', '-z', 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
-            execFileAsync('git', ['-C', wtPath, 'ls-files', '--others', '--exclude-standard', '-z'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
-          ]);
-          const mergedFiles = [...new Set([...wtCommitted, ...wtStaged, ...wtUnstaged, ...wtUntracked])].sort();
-
-          if (mergedFiles.length > 0) {
-            const [mainStaged, mainUnstaged, mainUntracked] = await Promise.all([
-              execFileAsync('git', ['-C', repoRoot, 'diff', '--cached', '--name-only', '--no-renames', '-z', 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
-              execFileAsync('git', ['-C', repoRoot, 'diff', '--name-only', '--no-renames', '-z', 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
-              execFileAsync('git', ['-C', repoRoot, 'ls-files', '--others', '--exclude-standard', '-z'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
-            ]);
-            const mainDirtySet = new Set([...mainStaged, ...mainUnstaged, ...mainUntracked]);
-            const conflictingFiles = mergedFiles.filter(f => mainDirtySet.has(f));
-            if (conflictingFiles.length > 0) {
-              throw Object.assign(
-                new Error(`Cannot merge worktree for “${record.name}”: main workspace has uncommitted changes on ${conflictingFiles.join(', ')}.`),
-                { code: 'worktree-merge-conflict', conflictingFiles },
-              );
-            }
-
-            await execFileAsync('git', ['-C', wtPath, 'add', '-A'], { windowsHide: true });
-            const { stdout: patchBuffer } = await execFileAsync(
-              'git',
-              ['-C', wtPath, 'diff', '--cached', '--binary', '--full-index', '--no-ext-diff', '--no-renames', baseCommit, '--', '.', ':(exclude).work'],
-              { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024, windowsHide: true },
-            );
-
-            if (patchBuffer && patchBuffer.length > 0) {
-              const patchDir = agentDirectory(record);
-              await mkdir(patchDir, { recursive: true });
-              const patchFile = path.join(patchDir, `worktree-merge-${Date.now()}-${process.pid}.patch`);
-              await writeFile(patchFile, patchBuffer);
-              try {
-                const directOk = await execFileAsync('git', ['-C', repoRoot, 'apply', '--check', '--whitespace=nowarn', patchFile], { windowsHide: true })
-                  .then(() => true)
-                  .catch(() => false);
-                if (directOk) {
-                  await execFileAsync('git', ['-C', repoRoot, 'apply', '--whitespace=nowarn', patchFile], { windowsHide: true });
-                } else {
-                  const threeWayOk = await execFileAsync('git', ['-C', repoRoot, 'apply', '--check', '--3way', '--whitespace=nowarn', patchFile], { windowsHide: true })
-                    .then(() => true)
-                    .catch(() => false);
-                  if (!threeWayOk) {
-                    await execFileAsync('git', ['-C', wtPath, 'reset', '--mixed', wtHead], { windowsHide: true }).catch(() => {});
-                    throw Object.assign(
-                      new Error(`Cannot merge worktree for “${record.name}”: changes conflict with main workspace history.`),
-                      { code: 'worktree-merge-conflict', conflictingFiles: mergedFiles },
-                    );
-                  }
-                  await execFileAsync('git', ['-C', repoRoot, 'apply', '--3way', '--whitespace=nowarn', patchFile], { windowsHide: true });
-                }
-              } finally {
-                await rm(patchFile, { force: true }).catch(() => {});
-              }
+        const initial = named(owner, target.trim(), extra);
+        return store.locked(initial.agentId, async () => {
+          const cur = store.get(initial.agentId);
+          if (cur && !cur.closed && ["idle", "completed", "failed", "cancelled"].includes(cur.state)
+              && (!cur.task || ["completed", "failed", "cancelled"].includes(cur.task.state))
+              && cur.observation?.running === true) {
+            const refreshed = await observeOwn(cur).catch(() => null);
+            if (refreshed && refreshed.running === false && refreshed.tree?.settled === true) {
+              cur.observation = refreshed;
+              store.save(cur);
             }
           }
-
-          const worktreesRoot = path.join(repoRoot, '.work', 'worktrees');
-          const wtRel = path.relative(worktreesRoot, wtPath);
-          let worktreeRemoved = false;
-          if (wtRel && !wtRel.startsWith('..') && !path.isAbsolute(wtRel)) {
-            const runtimeRoot = path.dirname(path.resolve(config.stateDirectory));
-            const anyInUse = await activeTaskUse(runtimeRoot, wtPath, []).catch(() => false);
-            const canonicalWt = wtPath.replaceAll('\\', '/').toLowerCase();
-            const sharedWithOther = anyInUse && store.list().some(other =>
-              other.agentId !== record.agentId
-              && !other.closed
-              && JSON.stringify(other).replaceAll('\\', '/').toLowerCase().includes(canonicalWt));
-            if (!sharedWithOther) {
-              await execFileAsync('git', ['-C', repoRoot, 'worktree', 'remove', '--force', wtPath], { windowsHide: true }).catch(() => {});
-              await removeTree(wtPath, { recursive: true, force: true }).catch(() => {});
-              await execFileAsync('git', ['-C', repoRoot, 'worktree', 'prune'], { windowsHide: true }).catch(() => {});
-              worktreeRemoved = !(await lstat(wtPath).then(() => true).catch(() => false));
-            }
-          }
-          return { mergedFiles, worktreeRemoved };
+          const record = mergeTarget(owner, extra, initial);
+          return mergeWorktree(record, () => mergeTarget(owner, extra, initial), { discardWorktree: discard });
         });
-
-        const fresh = store.get(record.agentId) ?? record;
-        const wasDeferredOnceCleanup = fresh.lifetime === 'once' && fresh.unmergedWorktree === true;
-        const updated = {
-          ...fresh,
-          workspace: repoRoot,
-          workspaceMode: 'inherit',
-          updatedAt: now(),
-        };
-        delete updated.worktreePath;
-        delete updated.worktreeBaseHead;
-        delete updated.unmergedWorktree;
-        store.db.prepare('UPDATE agents SET body=? WHERE id=?').run(JSON.stringify(updated), updated.agentId);
-        store.touched(updated.agentId);
-        forgetBackend(updated);
-        if (wasDeferredOnceCleanup && config.agentAutoCleanup !== false) {
-          await clearRecord(updated, { autoClaimed: true }).catch(() => {});
-        }
-        wakeWaiters();
-
-        const summary = mergeOutcome.mergedFiles.length
-          ? `Merged ${mergeOutcome.mergedFiles.length} file(s) from ${fresh.name} into main workspace and removed worktree.`
-          : `No file changes in ${fresh.name}'s worktree; removed temporary worktree.`;
-        return {
-          action: 'merge',
-          ok: true,
-          name: fresh.name,
-          mergedFiles: mergeOutcome.mergedFiles,
-          worktreeRemoved: mergeOutcome.worktreeRemoved,
-          summary,
-        };
       }
 
       // action === 'resume'
@@ -8026,7 +8029,7 @@ export function createScopedAgents(config, {
       try {
         record = named(owner, trimmedTarget, extra);
       } catch (err) {
-        if (err?.code === 'agent-not-found') {
+        if (err?.code === 'agent-not-found' && !managedCallerId) {
           const stub = store.findAgentStubGlobal(trimmedTarget, rootOwnerId);
           if (stub) {
             const adopted = await service.manageTeam({
@@ -8273,10 +8276,10 @@ export function createScopedAgents(config, {
       if (!['status', 'bind'].includes(action)) {
         throw Object.assign(new Error('action must be "status" or "bind".'), { code: 'invalid-proxy-action' });
       }
-      if (!['codex-cli', 'claude-cli', 'agy-cli', 'all'].includes(target)) {
+      if (!isHeadlessCli(target) && target !== 'all') {
         throw Object.assign(new Error('target must be "codex-cli", "claude-cli", "agy-cli", or "all".'), { code: 'invalid-proxy-target' });
       }
-      const targets = target === 'all' ? ['codex-cli', 'claude-cli', 'agy-cli'] : [target];
+      const targets = target === 'all' ? HEADLESS_CLI_TARGETS : [target];
       if (action === 'bind') {
         if (proxy === undefined || proxy === null || String(proxy).trim() === '') {
           throw Object.assign(new Error('proxy value is required for action="bind".'), { code: 'invalid-proxy-config' });
@@ -8301,13 +8304,13 @@ export function createScopedAgents(config, {
           source: route.source ?? 'inherit',
           mode: route.mode ?? null,
           port: route.port ?? null,
-          proxyUrl: route.proxyUrl ?? null,
+          proxyUrl: route.proxyUrl ? redactProxyCredentials(route.proxyUrl) : null,
           profileName: route.profileName ?? null,
           profileId: route.profileId ?? null,
           proxyReachable: route.proxyReachable ?? null,
           ...(route.configuredVia ? { configuredVia: route.configuredVia } : {}),
           ...(!route.ok && route.code ? { code: route.code } : {}),
-          ...(route.error ? { error: route.error } : {}),
+          ...(route.error ? { error: redactProxyCredentials(route.error) } : {}),
         };
       }));
       const failed = routes.find(r => !r.ok);
@@ -8326,15 +8329,29 @@ export function createScopedAgents(config, {
     },
     async gc({ onceRetentionMs = config.onceTerminalRetentionMs, idleRetentionMs = config.agentIdleRetentionMs, nowMs = Date.now() } = {}) {
       if (config.agentAutoCleanup === false) return { enabled: false, removed: [] };
-      const removed = store.gcStaleAgents({ onceRetentionMs, idleRetentionMs, nowMs });
-      const scopedRoot = path.resolve(config.stateDirectory, 'scoped');
-      for (const entry of removed) {
-        const dir = path.join(scopedRoot, entry.ownerId, entry.agentId);
-        const rel = path.relative(scopedRoot, path.resolve(dir));
-        if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
-          await removeTree(dir, { recursive: true, force: true }).catch(() => {});
-        }
+      const removedTrees = [];
+      for (const candidate of store.list()) {
+        if (!candidate.worktreePath || !["idle", "completed"].includes(candidate.state)) continue;
+        const stamp = Date.parse(candidate.task?.finishedAt ?? candidate.updatedAt ?? candidate.createdAt ?? "");
+        const threshold = candidate.lifetime === "once" ? onceRetentionMs : idleRetentionMs;
+        if (!Number.isFinite(stamp) || nowMs - stamp < (threshold ?? (candidate.lifetime === "once" ? 86400000 : 43200000))) continue;
+        try {
+          await store.locked(candidate.agentId, async () => {
+            const fresh = store.get(candidate.agentId);
+            if (JSON.stringify(fresh) !== JSON.stringify(candidate) || store.childrenOf(fresh.agentId).length
+                || fresh.cleanupRosterTicket || owesWork(fresh)) return;
+            const hold = store.autoCleanupHold(fresh.agentId);
+            if (hold.pending || hold.blocked) return;
+            const unchanged = () => JSON.stringify(store.get(fresh.agentId)) === JSON.stringify(fresh);
+            await removeOwnedWorktree(fresh, { recheck: unchanged });
+            if (!unchanged()) return;
+            store.remove(fresh, { deliveredReceipt: true });
+            removedTrees.push({ agentId: fresh.agentId, ownerId: fresh.ownerId, name: fresh.name, target: targetOf(fresh) });
+          }, { waitMs: 0 });
+        } catch { /* retain the record and retry after the next scan */ }
       }
+      const removed = [...removedTrees, ...store.gcStaleAgents({ onceRetentionMs, idleRetentionMs, nowMs })];
+      for (const entry of removed) await removeScopedDirectory(agentDirectory(entry)).catch(() => {});
       return { enabled: true, removed };
     },
     async ensureIdleMonitor() {
@@ -8382,6 +8399,177 @@ export function createScopedAgents(config, {
       store.close();
     },
   };
+
+  function permissionDenied() {
+    return Object.assign(new Error("This operation is outside the caller’s managed authority."), { code: "permission-denied" });
+  }
+
+  function boardActor(route, rootOwnerId) {
+    const actor = store.get(route.authorAgentId);
+    if (!actor || actor.closed || rootOwnerIdForRecord(actor) !== rootOwnerId
+        || !route.authorTaskId || !route.authorRequestId || actor.task?.taskId !== route.authorTaskId
+        || activeManagedRequestId(actor.task) !== route.authorRequestId
+        || actor.task?.cancelRequested || terminalRound(actor) || !["running", "awaiting_input", "awaiting_report"].includes(actor.state)) return undefined;
+    return actor;
+  }
+
+  function isBoardAuthority(route, rootOwnerId) {
+    if (!route.authorAgentId) return true;
+    const actor = boardActor(route, rootOwnerId);
+    if (!actor) return false;
+    const tier = classifyManagedRole(actor.role ?? inferRoleFromName(actor.name), { teamConfigPath });
+    return tier === 'lead' || tier === 'review';
+  }
+
+  function finalizeBoardDispatch(record, route, dispatch, action) {
+    if (dispatch.accepted) {
+      const taskKey = store.saveTaskKey(record.ownerId, record.agentId, route.requestId, record.task.taskId);
+      store.finishBoardRoute(route, { action: route.revived ? "revived" : action, taskKey,
+        ...(route.revived ? { resumedSession: route.resumedSession === true } : {}) });
+    } else if (["failed", "blocked", "cancelled", "unknown"].includes(dispatch.state)) {
+      store.finishBoardRoute(route, { action: "failed", error: dispatch.error ?? { code: "board-delivery-unconfirmed" } });
+    }
+  }
+
+  async function routeBoardLocked(record, route) {
+    const task = record.task;
+    const prior = task?.dispatches?.find(dispatch => dispatch.requestId === route.requestId);
+    if (prior) {
+      finalizeBoardDispatch(record, route, prior, prior.boardAction ?? "woken");
+      return false;
+    }
+    const migration = task?.preemption;
+    if (migration && migration.requestId !== route.requestId) return false;
+    if (!migration && ((route.taskId && task?.taskId !== route.taskId)
+        || rootOwnerIdForRecord(record) !== route.rootOwner || record.closed || record.worktreeMerge
+        || (route.urgent && (!isBoardAuthority(route, route.rootOwner)
+          || (route.authorAgentId && !isDescendant(store, record, route.authorAgentId)))))) {
+      store.finishBoardRoute(route, { action: "failed", error: { code: "board-route-stale" } });
+      return false;
+    }
+    if (!record.created) return false;
+    const message = boardPrompt(route.author, route.text);
+    if (!task || record.state === "idle" || terminalRound(record)) {
+      if (owesWork(record) || (task?.autoCleanupPending && record.lifetime === "once")) return false;
+      const next = { ...record, state: "running", observation: undefined, error: undefined, sleep: undefined,
+        task: { taskId: uid("task"), requestId: route.requestId, message, mode: "steer", state: "starting",
+          startedAt: now(), dispatches: [], answers: [], modelSelection: record.modelPin ?? null, boardOnly: true,
+          boardAction: route.urgent ? "woken-urgent" : "woken" } };
+      invalidateRelease(next);
+      if (!store.replaceTask(next, record, task ? { ...task } : undefined)) return false;
+      Object.assign(record, next);
+      await beginTask(record);
+      const dispatch = record.task.dispatches.find(item => item.requestId === route.requestId);
+      if (dispatch) finalizeBoardDispatch(record, route, dispatch, record.task.boardAction);
+      return true;
+    }
+    if (task.cancelRequested || task.result || task.reports?.some(report => report.final)
+        || store.hasFinalNotice(record.agentId, task.taskId)) return false;
+    if (migration?.retryAt > Date.now()) return true;
+    const view = migration ? record.observation ?? {} : await observeOwn(record);
+    if (!route.urgent && (view.running || pendingIn(view).length || store.openQuestions(record).unanswered
+        || store.openQuestions(record).undelivered || (task.answers ?? []).some(answer => !answer.dispatched))) return false;
+    const cli = isHeadlessCli(targetOf(record));
+    const old = task.dispatches.at(-1);
+    const stop = cli && Boolean(migration?.stop ?? (view.running === true && old?.requestId));
+    let active = record;
+    let proof = migration?.proof;
+    if (route.urgent && cli) {
+      if (!old && !migration) await negotiateTree(record);
+      const backend = await backendFor(record);
+      if (stop && !backend.preemptTurn) {
+        store.finishBoardRoute(route, { action: "failed", error: { code: "preemption-unavailable" } });
+        return false;
+      }
+      active = migration ? record : store.beginPreemption(record, route, { stop, oldRequestId: old?.requestId });
+      if (!active) return false;
+      if (stop && !proof) {
+        try {
+          proof = await backend.preemptTurn(active, { expectedRequestId: old.requestId });
+        } catch (error) {
+          active.task.preemption.retryAt = Date.now() + 1000;
+          store.save(active);
+          return true;
+        }
+        if (proof?.ok !== true || proof.stopped !== true) {
+          store.abortPreemption(active);
+          store.finishBoardRoute(route, { action: "failed", error: { code: "preemption-unconfirmed" } });
+          return true;
+        }
+        active.task.preemption.proof = { sessionId: proof.sessionId, sessionResumable: proof.sessionResumable, sessionCwd: proof.sessionCwd };
+        store.save(active);
+        proof = active.task.preemption.proof;
+      }
+    }
+    if (stop && proof) {
+      const native = store.backendState(active.agentId);
+      if (native) {
+        if (native.active === old.requestId) delete native.active;
+        const target = targetOf(active);
+        const sessionKey = target === "codex-cli" ? "threadId" : target === "agy-cli" ? "conversationId" : "sessionId";
+        if (proof.sessionResumable === false) {
+          native.started = false;
+          delete native[sessionKey];
+          delete native.sessionCwd;
+        } else if (proof.sessionId) {
+          native.started = true;
+          native[sessionKey] = proof.sessionId;
+          if (proof.sessionCwd) native.sessionCwd = proof.sessionCwd;
+        }
+        store.saveBackendState(active.agentId, native);
+      }
+    }
+    const restartFresh = cli && route.urgent && (proof?.sessionResumable === false || !old);
+    const action = stop ? "preempted" : route.urgent ? "woken-urgent" : "woken";
+    const previous = active.task.dispatches.at(-1);
+    if (stop && previous) Object.assign(previous, { state: "completed", preemptedBy: route.requestId });
+    const prompt = restartFresh ? (active.task.dispatches[0]?.message ?? active.task.message) + "\n\n" + message : message;
+    const dispatch = await sendDispatch(active, prompt, "board", [], route.requestId,
+      stop ? { ...view, running: false } : view, { mode: "steer", boardAction: action, ...(restartFresh ? { restartFresh: true } : {}) });
+    Object.assign(record, active);
+    finalizeBoardDispatch(record, route, dispatch, action);
+    return true;
+  }
+
+  async function routeBoardTarget(agentId) {
+    try {
+      return await store.locked(agentId, async () => {
+        const route = store.boardRoutes(agentId)[0];
+        if (!route) return;
+        const record = store.get(agentId);
+        if (record && !record.closed) return routeBoardLocked(record, route);
+        if (record) return;
+        const stub = store.listAgentStubs(route.rootOwner).find(item => item.agentId === agentId);
+        if (!stub || (route.urgent && (!isBoardAuthority(route, route.rootOwner)
+            || (route.authorAgentId && !isDescendant(store, stub, route.authorAgentId))))) {
+          return store.finishBoardRoute(route, { action: "failed", error: { code: "board-route-stale" } });
+        }
+        const findRevived = () => store.list(stub.ownerId).find(member => !member.closed && member.revivedFrom === agentId);
+        let revived = findRevived();
+        if (!revived) {
+          const stubExtra = targetCallerExtraForOwner(stub.ownerId, stub);
+          const created = await service.create({ name: stub.name, role: stub.role ?? undefined, lifetime: "once",
+            target: stub.target, model: stub.model ?? undefined, _revivedSessionId: stub.resumeSessionId,
+            _revivedFrom: agentId, _revivedReadOnlyScout: stub.readOnlyScout }, stubExtra);
+          if (created.created !== true || created.error) return;
+          revived = findRevived();
+        }
+        if (!revived?.created) return;
+        store.retargetBoardRoutes(agentId, revived.agentId, { resumedSession: Boolean(stub.resumeSessionId) });
+        store.deleteAgentStub(agentId);
+        const replacement = store.boardRoutes(revived.agentId)[0];
+        await store.locked(revived.agentId, async () => {
+          if (replacement) await routeBoardLocked(revived, replacement);
+        }, { waitMs: 40 });
+      }, { waitMs: 40 });
+    } catch (error) {
+      if (!["agent-busy", "round-finished"].includes(error.code)) {
+        // A durable intent will be reconciled on the next monitor pass.
+        const record = store.get(agentId);
+        if (record) announceWork(record.agentId);
+      }
+    }
+  }
 
   const pendingIn = view => (view?.questions ?? []).filter(question => question.state === 'pending');
 
@@ -8568,7 +8756,7 @@ export function createScopedAgents(config, {
         : 'The question was already consumed or is no longer pending, so this answer was not sent.' };
   }
 
-  async function answerLocked(record, message, queuedAnswerId, { modelSelection, selectionExplicit = false, created } = {}) {
+  async function answerLocked(record, message, answerId, { questionIds, modelSelection } = {}) {
     if (!record.task || record.closed || record.task.cancelRequested) throw new Error('This subagent has no open task waiting for an answer.');
     // A finished round cannot be answered: its question is only information by then.
     if (terminalRound(record)) throw Object.assign(new Error('This subagent’s round has already ended, so the question is only information; the answer was not delivered.'),
@@ -8581,45 +8769,25 @@ export function createScopedAgents(config, {
     await checkHost(record);
     const view = await observe(record);
     const pending = pendingIn(view);
-    const existing = (record.task.answers ?? []).find(answer => queuedAnswerId ? answer.answerId === queuedAnswerId
-      : !answer.dispatched && !answer.questionIds && answer.message === message);
-    // A supplement already queued under this id may be the input that was captured
-    // before the question changed. Closing it here keeps its receipt honest instead
-    // of leaving it "sending" for the scheduler to treat as accepted.
-    const noSend = (reason, actual) => {
-      const item = queuedAnswerId ? store.supplement(queuedAnswerId) : undefined;
-      if (item && item.status !== 'blocked') store.setSupplement(item.requestId, 'blocked', reason);
-      return consumedAnswer(record, actual, reason);
-    };
-    const existingQuestionIds = Array.isArray(existing?.questionIdsSeen) && existing.questionIdsSeen.length
-      ? existing.questionIdsSeen : undefined;
-    if (!existing) {
-      if (!pending.length) return noSend('question-not-pending', view);
-      const pendingIds = new Set(pending.map(question => question.id));
-      if (seenPending.length && !seenPending.some(question => pendingIds.has(question.id)))
-        return noSend('question-changed', view);
-    } else {
-      if (!pending.length) return noSend('question-not-pending', view);
-      if (existingQuestionIds && !existingQuestionIds.every(id => pending.some(question => question.id === id)))
-        return noSend('question-changed', view);
+    const existing = answerId && (record.task.answers ?? []).find(answer => answer.answerId === answerId);
+    if (existing && (!existing.explicit || existing.message !== message
+        || (questionIds && (questionIds.length !== existing.questionIdsSeen?.length
+          || !questionIds.every(id => existing.questionIdsSeen.includes(id)))))) {
+      return consumedAnswer(record, view, "question-changed");
     }
+    if (existing?.questionIds) return { name: record.name, answered: true, state: record.state, questionIds: existing.questionIds,
+      answerId: existing.answerId, ...(existing.nativeAnswered ? { delivery: "native-question" } : {}) };
+    const ordered = store.submissionsInOrder(record.agentId, record.task.taskId)
+      .filter(item => item.kind === "ask").map(item => submissionRef(item.id));
+    const selected = existing?.questionIdsSeen ?? questionIds ?? [ordered.find(id => pending.some(question => question.id === id))
+      ?? (seenPending[0]?.id ?? pending[0]?.id)].filter(Boolean);
+    const noSend = (reason, actual) => consumedAnswer(record, actual, reason);
+    if (!pending.length && !(existing && confirmedAnswer(record, existing))) return noSend("question-not-pending", view);
+    if ((!selected.length || !selected.every(id => pending.some(question => question.id === id)))
+        && !(existing && confirmedAnswer(record, existing))) return noSend("question-changed", view);
     record.task.answers ??= [];
-    const answer = existing ?? { answerId: queuedAnswerId ?? uid('answer'), message, dispatched: false };
-    // Remember the exact question identity this intent was created for. A later
-    // retry may only consume those ids; a replacement question is never written with
-    // this text.
-    answer.questionIdsSeen ??= pending.map(question => question.id);
-    // The six-hour clock belongs to the caller's original input, not to the later poll
-    // that happens to dispatch the continuation. Keep the supplement's enqueue time.
-    answer.created ??= created ?? now();
-    // The continuation is dispatched on a later poll. Freeze the selection on the
-    // answer intent now: a queued supplement carries its enqueue-time selection,
-    // while a direct answer freezes the name's current pin.
-    if (!Object.prototype.hasOwnProperty.call(answer, 'modelSelection')) {
-      const frozen = modelSelection !== undefined ? modelSelection : record.modelPin;
-      answer.modelSelection = frozen ? { ...frozen } : null;
-      answer.selectionExplicit = selectionExplicit === true;
-    }
+    const answer = existing ?? { answerId: answerId ?? uid("answer"), message, dispatched: false, explicit: true,
+      questionIdsSeen: selected, created: now(), modelSelection: modelSelection ? { ...modelSelection } : null };
     if (!existing) record.task.answers.push(answer);
     if (!store.saveAnswerWithTaskKey(record, answer.answerId)) throw dispatchRefused();
     try {
@@ -8634,8 +8802,6 @@ export function createScopedAgents(config, {
           || error?.code === 'native-question-not-pending') {
         if (!answer.questionIds && !answer.dispatched) {
           Object.assign(answer, { dispatched: true, undelivered: error.code });
-          const item = store.supplement(answer.answerId);
-          if (item) store.setSupplement(item.requestId, 'blocked', error.code);
           saveDispatch(record);
         }
         // The preflight page still showed the question the backend just refused.
@@ -8671,7 +8837,7 @@ export function createScopedAgents(config, {
     }
     record.state = 'running'; record.task.state = 'running'; store.save(record);
     await ensureWorker(record, { wake: true });
-    return { name: record.name, answered: true, state: 'resuming',
+    return { name: record.name, answered: true, state: 'resuming', answerId: answer.answerId, questionIds: answer.questionIds,
       ...(answer.nativeAnswered ? { delivery: 'native-question', ...(answer.turnId ? { turnId: answer.turnId } : {}) } : answer.nativeFallback ? { delivery: 'continuation-queued' } : {}),
       ...effortReceipt(answer.modelSelection, answer.actualEffort ?? null, undefined, answer.actualEffortSource),
       actualModel: actualModelName(answer.modelSelection) ?? actualModelName(record.model) };

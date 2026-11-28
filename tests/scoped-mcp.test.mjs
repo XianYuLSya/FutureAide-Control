@@ -42,7 +42,7 @@ test('installed MCP exposes only name-addressed tools and forwards trusted reque
     assert.ok(!tools.some(tool => /spawn_agent|register_peer|create_session|profile_create/.test(tool.name)));
     for (const tool of tools) {
       const fields = Object.keys(tool.inputSchema.properties ?? {});
-      assert.ok(!fields.some(field => /id$|workspace|profile|callback|address/.test(field)), `${tool.name}: ${fields}`);
+      assert.ok(!fields.some(field => field !== 'question_id' && /id$|workspace|profile|callback|address/.test(field)), `${tool.name}: ${fields}`);
     }
     const threadId = '11111111-1111-4111-8111-111111111111';
     const result = await client.callTool({ name: 'futureaide_create_agent', arguments: { name: '画图助手', lifetime: 'once' }, _meta: { threadId } });
@@ -65,7 +65,7 @@ test('creation advertises one optional target and never repeats it on later call
   try {
     const { tools } = await client.listTools();
     const create = tools.find(tool => tool.name === 'futureaide_create_agent');
-    assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['effort', 'lifetime', 'model', 'name', 'proxy', 'role', 'target', 'worktree']);
+    assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['baseSha', 'effort', 'lifetime', 'model', 'name', 'proxy', 'role', 'target', 'worktree']);
     for (const tool of tools) {
       const supportsSelection = ['futureaide_run_agent', 'futureaide_create_agent', 'futureaide_send_agent'].includes(tool.name);
       for (const field of ['model', 'effort']) {
@@ -74,9 +74,9 @@ test('creation advertises one optional target and never repeats it on later call
       }
     }
     assert.deepEqual(
-      create.inputSchema.properties.target.enum.filter(t => t !== 'agy-cli'),
-      ['dsh', 'codex-desktop', 'codex-cli', 'claude-cli'],
-      'every supported application is reachable from the public schema (with optional agy-cli)',
+      create.inputSchema.properties.target.enum,
+      ['dsh', 'codex-desktop', 'codex-cli', 'claude-cli', 'agy-cli'],
+      'every supported application is reachable from the public schema',
     );
     assert.ok(!create.inputSchema.required?.includes('target'), 'the target stays optional');
     const cliProxy = tools.find(tool => tool.name === 'futureaide_cli_proxy');

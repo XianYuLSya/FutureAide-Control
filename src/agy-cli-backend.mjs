@@ -1,3 +1,4 @@
+import { answerCliQuestions } from './cli-question-selection.mjs';
 // Headless Google Antigravity CLI (`agy-cli`) backend implementing all 15 `BACKEND_METHODS`.
 import { createHash } from 'node:crypto';
 import path from 'node:path';
@@ -38,6 +39,7 @@ function sumUsageList(items) {
 }
 
 function formatRunningActivity(native, nowMs = Date.now()) {
+  if (native?.cleanupPending) return { stalled: false, activity: '进程待清理' };
   const refIso = native?.lastEventAt ?? native?.updatedAt ?? native?.startedAt;
   const parsedMs = typeof refIso === 'string' && refIso ? Date.parse(refIso) : NaN;
   const hasTimestamp = Number.isFinite(parsedMs);
@@ -52,30 +54,48 @@ function formatRunningActivity(native, nowMs = Date.now()) {
   return { stalled: false, silentSeconds: silentSec, activity: `${silentSec}s前 · ${step}` };
 }
 
+const agyBackend = {
+  target: 'agy-cli', host: 'Antigravity CLI', provider: 'antigravity', sessionKey: 'conversationId',
+  probe: cliRunner.probeAgyCli, start: cliRunner.startAgyTurn, read: cliRunner.readAgyTurn,
+  cancel: cliRunner.cancelAgyTurn, models: cliRunner.readAgyCliModels,
+  cliPath: 'agyCliPath', reportConfig: 'agyCliReportConfig', missingTurn: 'agy-turn-not-found',
+};
+
 export function createAgyCliBackend(record, deps = {}) {
-  const load = deps.load ?? (() => record);
   const runner = deps.runner ?? cliRunner;
+  return createHeadlessStreamBackend(record, { ...deps, runner: {
+    probe: runner.probeAgyCli, start: runner.startAgyTurn, read: runner.readAgyTurn,
+    cancel: runner.cancelAgyTurn, models: runner.readAgyCliModels,
+  } }, agyBackend);
+}
+
+function createHeadlessStreamBackend(record, deps, profile) {
+  const { target, host, provider, sessionKey } = profile;
+  const load = deps.load ?? (() => record);
+  const runner = { ...profile, ...deps.runner };
   const nowFn = deps.now ?? (() => Date.now());
   const state = () => ({ seq: 0, requests: {}, answers: {}, answered: [], ...deps.readNativeState?.() });
   const save = value => {
-    if (!deps.writeNativeState) throw fail('agy-cli-state-unavailable', 'The shared native-state store is required.');
-    if (deps.writeNativeState(value) === false) throw fail('agent-not-found', 'The managed Antigravity CLI name was removed.');
+    if (!deps.writeNativeState) throw fail(target + '-state-unavailable', 'The shared native-state store is required.');
+    if (deps.writeNativeState(value) === false) throw fail('agent-not-found', 'The managed ' + host + ' name was removed.');
   };
   const callbacksReady = () => typeof deps.readParentSubmissions === 'function'
-    && (typeof deps.agyCliReportConfig === 'function' || deps.callerEnv !== undefined);
+    && (typeof deps[profile.reportConfig] === 'function' || deps.callerEnv !== undefined);
 
   let checked;
   let cachedLiveModels;
   async function preflight({ fresh = false } = {}) {
     if (fresh) checked = undefined;
-    checked ??= runner.probeAgyCli({
-      ...(deps.config?.agyCliPath ? { cliPath: deps.config.agyCliPath } : {}),
+    checked ??= runner.probe({
+      ...(deps.config?.[profile.cliPath] ? { cliPath: deps.config[profile.cliPath] } : {}),
       config: deps.config ?? {},
+      workspace: load().workspace,
+      stateDirectory: deps.stateDirectory ?? deps.config?.stateDirectory,
       ...(deps.resolveRoute ? { resolveRoute: deps.resolveRoute } : {}),
     });
     const result = await checked;
     if (!result?.ok) {
-      throw fail(result?.code ?? 'agy-cli-not-ready', result?.error ?? 'Antigravity CLI is not ready.', {
+      throw fail(result?.code ?? target + '-not-ready', result?.error ?? host + ' is not ready.', {
         ...(result?.route ? { route: publicRouteSummary(result.route) } : {}),
       });
     }
@@ -97,7 +117,7 @@ export function createAgyCliBackend(record, deps = {}) {
     if (!/^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,119}$/.test(requestId)) {
       throw fail('invalid-dispatch', 'Invalid request id.', { terminal: true });
     }
-    return path.join(deps.requestDirectory(), 'agy-cli', 'turns', requestId);
+    return path.join(deps.requestDirectory(), target, 'turns', requestId);
   }
 
   async function refresh(value) {
@@ -105,9 +125,9 @@ export function createAgyCliBackend(record, deps = {}) {
     if (!id) return undefined;
     const request = value.requests[id];
     let native;
-    try { native = await runner.readAgyTurn(directory(id)); }
+    try { native = await runner.read(directory(id)); }
     catch (error) {
-      if (request?.status === 'unknown' && error?.code === 'agy-turn-not-found') {
+      if (request?.status === 'unknown' && error?.code === profile.missingTurn) {
         request.status = 'retryable';
         delete value.active;
         save(value);
@@ -121,12 +141,18 @@ export function createAgyCliBackend(record, deps = {}) {
     let changed = request.status !== next;
     request.status = next;
 
-    if (typeof native.conversationId === 'string' && native.conversationId && native.conversationId !== value.conversationId) {
-      value.conversationId = native.conversationId;
+    if (typeof native.conversationId === 'string' && native.conversationId
+        && (native.conversationId !== value[sessionKey] || (native.sessionCwd && native.sessionCwd !== value.sessionCwd))) {
+      value[sessionKey] = native.conversationId;
+      if (native.sessionCwd) value.sessionCwd = native.sessionCwd;
       changed = true;
     }
     if (native.usage && JSON.stringify(native.usage) !== JSON.stringify(request.usage)) {
       request.usage = { ...native.usage };
+      changed = true;
+    }
+    if (native.usageDetails && JSON.stringify(native.usageDetails) !== JSON.stringify(request.usageDetails)) {
+      request.usageDetails = native.usageDetails;
       changed = true;
     }
     const observedModel = native.model || native.requestedModel || request.model?.model || null;
@@ -134,7 +160,7 @@ export function createAgyCliBackend(record, deps = {}) {
     if (observedModel && (observedModel !== value.currentModel?.model
         || observedEffort !== value.currentModel?.reasoningEffort)) {
       value.currentModel = {
-        provider: 'antigravity',
+        provider,
         model: observedModel,
         ...(observedEffort ? { reasoningEffort: observedEffort } : {}),
       };
@@ -154,8 +180,8 @@ export function createAgyCliBackend(record, deps = {}) {
           }
           : {
             source: 'model',
-            code: 'agy-cli-failed',
-            message: 'The Antigravity CLI turn failed.',
+            code: target + '-failed',
+            message: 'The ' + host + ' turn failed.',
             ...native.error,
           })
         : undefined;
@@ -165,7 +191,7 @@ export function createAgyCliBackend(record, deps = {}) {
         endSeq: ++value.seq,
         ...(failure ? { failure } : {}),
       };
-      if (!value.started) delete value.conversationId;
+      if (!value.started) delete value[sessionKey];
       delete value.active;
       changed = true;
     }
@@ -177,24 +203,24 @@ export function createAgyCliBackend(record, deps = {}) {
     const value = state();
     const id = value.active;
     if (!id) return { cancelRequested: true };
-    const result = await runner.cancelAgyTurn(directory(id));
+    const result = await runner.cancel(directory(id));
     if (result !== true && result?.stopped !== true) {
-      return { cancelRequested: false, reason: result?.note ?? 'The Antigravity CLI process tree is still running.' };
+      return { cancelRequested: false, reason: result?.note ?? 'The ' + host + ' process tree is still running.' };
     }
     await refresh(value);
     return { cancelRequested: true };
   }
 
   const backend = {
-    target: 'agy-cli',
-    labels: { host: 'Antigravity CLI', bridge: 'The Antigravity CLI runner' },
+    target,
+    labels: { host, bridge: 'The ' + host + ' runner' },
     requiredMethods: BACKEND_METHODS,
 
     async probe() {
       let info;
       if (!load().created) info = await preflight();
       return {
-        identity: { application: 'agy-cli' },
+        identity: { application: target },
         methods: BACKEND_METHODS,
         treeProtocol: 1,
         reportProtocol: callbacksReady() ? 1 : null,
@@ -204,7 +230,7 @@ export function createAgyCliBackend(record, deps = {}) {
 
     async create() {
       if (!callbacksReady()) {
-        throw fail('agy-cli-report-not-ready', 'The Antigravity CLI parent-report bridge is unavailable.');
+        throw fail(target + '-report-not-ready', 'The ' + host + ' parent-report bridge is unavailable.');
       }
       await preflight();
       save(state());
@@ -248,11 +274,13 @@ export function createAgyCliBackend(record, deps = {}) {
         running,
         stalled: liveActivity.stalled,
         activity: liveActivity.activity,
+        ...(last?.lastStep ? { lastStep: last.lastStep } : {}),
         ...(liveActivity.silentSeconds !== undefined ? { silentSeconds: liveActivity.silentSeconds } : {}),
         throughSeq: value.seq,
         currentModel: value.currentModel,
         modelSelectionObserved: false,
         ...(taskUsage ? { usage: taskUsage } : {}),
+        ...(last?.usageDetails ? { usageDetails: last.usageDetails } : {}),
         ...(agentUsage ? { agentUsage } : {}),
         changes: [],
         coverage,
@@ -278,7 +306,7 @@ export function createAgyCliBackend(record, deps = {}) {
     async history({ targetSessionId, maxMessages = 20, requestId } = {}) {
       const current = load();
       if (targetSessionId && targetSessionId !== current.sessionId) {
-        throw fail('unknown-owned-node', 'Unknown Antigravity CLI session.');
+        throw fail('unknown-owned-node', 'Unknown ' + host + ' session.');
       }
       const value = state();
       const messages = [];
@@ -288,7 +316,7 @@ export function createAgyCliBackend(record, deps = {}) {
       );
       let hasMore = false;
       for (let index = ids.length - 1; index >= 0; index--) {
-        const native = await runner.readAgyTurn(directory(ids[index]));
+        const native = await runner.read(directory(ids[index]));
         messages.unshift(...(native.messages ?? []));
         if (native.messagesDropped > 0 || messages.length >= maxMessages) {
           hasMore = native.messagesDropped > 0 || messages.length > maxMessages || index > 0;
@@ -299,20 +327,8 @@ export function createAgyCliBackend(record, deps = {}) {
       return { messages: messages.slice(-maxMessages), hasMore, ...(failure ? { failure } : {}) };
     },
 
-    async answer({ answerId, message }) {
-      const value = state();
-      if (value.answers[answerId]) return value.answers[answerId];
-      const pending = (await submissions(value)).questions.filter(q => q.state === 'pending');
-      if (!pending.length) throw fail('question-not-pending', 'There is no unanswered question for this task.');
-      const ids = pending.map(q => q.id);
-      value.answered.push(...ids);
-      const result = {
-        consumedQuestionIds: ids,
-        continuation: `Parent answer:\n${message}\nContinue the same task.`,
-      };
-      value.answers[answerId] = result;
-      save(value);
-      return result;
+    async answer(input) {
+      return answerCliQuestions(input, { value: state(), load, submissions, save });
     },
 
     async deliver({ requestId, message, model, explicitModel, timeoutMs, timeoutMinutes, writeBlockReason } = {}) {
@@ -344,8 +360,8 @@ export function createAgyCliBackend(record, deps = {}) {
       }
 
       const current = load();
-      const reportConfig = typeof deps.agyCliReportConfig === 'function'
-        ? deps.agyCliReportConfig(requestId)
+      const reportConfig = typeof deps[profile.reportConfig] === 'function'
+        ? deps[profile.reportConfig](requestId)
         : (deps.callerEnv ? { callerEnv: deps.callerEnv } : undefined);
       const request = {
         messageHash: hash,
@@ -359,13 +375,13 @@ export function createAgyCliBackend(record, deps = {}) {
       save(value);
 
       try {
-        const result = await runner.startAgyTurn({
+        const result = await runner.start({
           cli: preflightInfo.spec ?? preflightInfo.cli,
           directory: dir,
           workspace: current.workspace,
           name: current.name,
-          conversationId: value.conversationId,
-          resume: Boolean(value.conversationId),
+          conversationId: value[sessionKey],
+          resume: Boolean(value[sessionKey]),
           message,
           model: model?.model,
           effort: model?.reasoningEffort,
@@ -382,7 +398,7 @@ export function createAgyCliBackend(record, deps = {}) {
           ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}),
         });
         if (result?.accepted !== true && !result?.duplicate) {
-          throw fail('agy-cli-start-refused', 'The Antigravity CLI worker refused the turn.', { terminal: true });
+          throw fail(target + '-start-refused', 'The ' + host + ' worker refused the turn.', { terminal: true });
         }
       } catch (error) {
         request.status = error.terminal ? 'rejected'
@@ -442,14 +458,14 @@ export function createAgyCliBackend(record, deps = {}) {
       ].filter(item => typeof item === 'string' && item.trim());
       if (!cachedLiveModels) {
         const info = await preflight().catch(() => null);
-        cachedLiveModels = await runner.readAgyCliModels({
+        cachedLiveModels = await runner.models({
           cli: info?.spec ?? info?.cli,
           route: info?.route,
           liveDiscovery: Boolean(info?.ok),
         });
       }
       if (!dynamicExtras.length) return cachedLiveModels;
-      return runner.readAgyCliModels({
+      return runner.models({
         liveDiscovery: false,
         extraModels: [
           ...cachedLiveModels.groups[0].models.map(m => m.id),
@@ -465,15 +481,53 @@ export function createAgyCliBackend(record, deps = {}) {
     },
 
     async selectModel() {
-      throw fail('model-selection-unsupported', 'Antigravity CLI applies an explicit model selection when a turn starts.');
+      throw fail('model-selection-unsupported', host + ' applies an explicit model selection when a turn starts.');
     },
 
+    async preemptTurn(_record, { expectedRequestId } = {}) {
+      const value = state();
+      const request = value.requests[expectedRequestId];
+      const refused = { ok: false, stopped: false, sessionId: null, sessionResumable: false, sessionCwd: null };
+      if (!expectedRequestId || !request || request.taskId !== load().task?.taskId) return refused;
+      if (value.active !== expectedRequestId && (value.active || Object.keys(value.requests).at(-1) !== expectedRequestId
+          || !(request.preempted || request.terminal))) return refused;
+
+      if (request.preempted) return request.preempted;
+      const dir = directory(expectedRequestId);
+      let stopped;
+      try { stopped = await runner.cancel(dir, { expectedRequestId }); }
+      catch (error) {
+        if (error.code === 'preempt-cage-still-running') return refused;
+        throw error;
+      }
+      if (stopped?.stopped !== true || stopped.ok === false) return refused;
+      let native;
+      try { native = await runner.read(dir); }
+      catch (error) {
+        if (error.code !== 'agy-turn-not-found' && error.code !== profile.missingTurn) throw error;
+      }
+      // Preserve native session evidence without settling the parent task.
+      const sessionId = native?.conversationId ?? value[sessionKey] ?? null;
+      const sessionResumable = Boolean(sessionId && (Boolean(sessionId)));
+      if (sessionResumable) {
+        value[sessionKey] = sessionId;
+        value.started = true;
+      } else {
+        delete value[sessionKey];
+        delete value.started;
+      }
+      value.sessionCwd = sessionResumable ? (native?.sessionCwd ?? value.sessionCwd ?? load().workspace) : undefined;
+      request.preempted = { ok: true, stopped: true, sessionId, sessionResumable, sessionCwd: value.sessionCwd ?? null };
+      delete value.active;
+      save(value);
+      return request.preempted;
+    },
     cancel,
 
     async destroy() {
       const result = await cancel();
       if (!result.cancelRequested) return { destroyed: false, message: result.reason };
-      return { destroyed: true, nativeSessionRetained: Boolean(state().conversationId) };
+      return { destroyed: true, nativeSessionRetained: Boolean(state()[sessionKey]) };
     },
 
     async cursor() {
@@ -482,7 +536,7 @@ export function createAgyCliBackend(record, deps = {}) {
   };
 
   if (deps.withHostLock) {
-    for (const method of ['beginTask', 'observe', 'answer', 'deliver', 'receipt', 'turn', 'model', 'cancel', 'destroy']) {
+    for (const method of ['beginTask', 'observe', 'answer', 'deliver', 'receipt', 'turn', 'model', 'preemptTurn', 'cancel', 'destroy']) {
       const action = backend[method];
       backend[method] = (...args) => deps.withHostLock(() => action(...args), { key: load().agentId });
     }

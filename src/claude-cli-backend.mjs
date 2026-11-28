@@ -1,3 +1,4 @@
+import { answerCliQuestions } from './cli-question-selection.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { BACKEND_METHODS } from './agent-backend.mjs';
@@ -123,7 +124,7 @@ export function createClaudeCliBackend(record, deps = {}) {
         ...(native.actualEffort == null ? {} : { reasoningEffort: native.actualEffort }) };
       changed = true;
     }
-    if ((native.sessionStarted || native.state === 'ended') && !value.started) {
+    if (native.sessionStarted && !value.started) {
       value.started = true;
       changed = true;
     }
@@ -229,15 +230,8 @@ export function createClaudeCliBackend(record, deps = {}) {
       const failure = value.requests[requestId ?? ids.at(-1)]?.terminal?.failure;
       return { messages: messages.slice(-maxMessages), hasMore, ...(failure ? { failure } : {}) };
     },
-    async answer({ answerId, message }) {
-      const value = state();
-      if (value.answers[answerId]) return value.answers[answerId];
-      const pending = (await submissions(value)).questions.filter(q => q.state === 'pending');
-      if (!pending.length) throw fail('question-not-pending', 'There is no unanswered question for this task.');
-      const ids = pending.map(q => q.id);
-      value.answered.push(...ids);
-      const result = { consumedQuestionIds: ids, continuation: 'Parent answer:\n' + message + '\nContinue the same task.' };
-      value.answers[answerId] = result; save(value); return result;
+    async answer(input) {
+      return answerCliQuestions(input, { value: state(), load, submissions, save });
     },
     async deliver({ requestId, message, model, explicitModel, timeoutMs, timeoutMinutes, writeBlockReason }) {
       if (!message?.trim() || !requestId || (explicitModel === true && !model?.model) || (model && !model.model)) {
@@ -272,8 +266,9 @@ export function createClaudeCliBackend(record, deps = {}) {
       value.requests[requestId] = request; value.active = requestId; save(value);
       try {
         const current = load();
-        const result = await runner.startClaudeTurn({ cli, directory: dir, workspace: current.workspace, name: current.name,
-          sessionId: value.sessionId, resume: value.started === true, message, model: model?.model,
+        const callerEnv = { ...mcpConfig?.callerEnv, FUTUREAIDE_MANAGED_TARGET: 'claude-cli' };
+        const result = await runner.startClaudeTurn({ callerEnv, cli, directory: dir, workspace: current.workspace, name: current.name,
+          requestId, role: current.role, sessionId: value.sessionId, resume: value.started === true, message, model: model?.model,
           effort: model?.reasoningEffort, mcpConfig, config: deps.config, stagedControl: true,
           timeoutMs: timeoutMs ?? current.task?.turnTimeoutMs ?? current.turnTimeoutMs,
           timeoutMinutes: timeoutMinutes ?? current.task?.turnTimeoutMinutes ?? current.turnTimeoutMinutes,
@@ -318,6 +313,44 @@ export function createClaudeCliBackend(record, deps = {}) {
     async selectModel() {
       throw fail('model-selection-unsupported', 'Claude CLI applies an explicit model selection when a turn starts.');
     },
+    async preemptTurn(_record, { expectedRequestId } = {}) {
+      const value = state();
+      const request = value.requests[expectedRequestId];
+      const refused = { ok: false, stopped: false, sessionId: null, sessionResumable: false, sessionCwd: null };
+      if (!expectedRequestId || !request || request.taskId !== load().task?.taskId) return refused;
+      if (value.active !== expectedRequestId && (value.active || Object.keys(value.requests).at(-1) !== expectedRequestId
+          || !(request.preempted || request.terminal))) return refused;
+
+      if (request.preempted) return request.preempted;
+      const dir = directory(expectedRequestId);
+      let stopped;
+      try { stopped = await runner.cancelClaudeTurn(dir, { expectedRequestId }); }
+      catch (error) {
+        if (error.code === 'preempt-cage-still-running') return refused;
+        throw error;
+      }
+      if (stopped?.stopped !== true || stopped.ok === false) return refused;
+      let native;
+      try { native = await runner.readClaudeTurn(dir); }
+      catch (error) {
+        if (error.code !== 'claude-turn-not-found') throw error;
+      }
+      // Preserve native session evidence without settling the parent task.
+      const sessionId = native?.cliSessionId ?? value["sessionId"] ?? null;
+      const sessionResumable = Boolean(sessionId && (value.started || native?.sessionStarted === true));
+      if (sessionResumable) {
+        value["sessionId"] = sessionId;
+        value.started = true;
+      } else {
+        delete value["sessionId"];
+        delete value.started;
+      }
+      value.sessionCwd = sessionResumable ? (native?.sessionCwd ?? value.sessionCwd ?? load().workspace) : undefined;
+      request.preempted = { ok: true, stopped: true, sessionId, sessionResumable, sessionCwd: value.sessionCwd ?? null };
+      delete value.active;
+      save(value);
+      return request.preempted;
+    },
     cancel,
     async destroy() {
       const result = await cancel();
@@ -329,7 +362,7 @@ export function createClaudeCliBackend(record, deps = {}) {
   // A parent's tree inspection can observe this child while its own worker
   // dispatches. Serialize native-state writes across those roster operations.
   if (deps.withHostLock) {
-    for (const method of ['beginTask', 'observe', 'answer', 'deliver', 'receipt', 'turn', 'model', 'cancel', 'destroy']) {
+    for (const method of ['beginTask', 'observe', 'answer', 'deliver', 'receipt', 'turn', 'model', 'preemptTurn', 'cancel', 'destroy']) {
       const action = backend[method];
       backend[method] = (...args) => deps.withHostLock(() => action(...args), { key: load().agentId });
     }

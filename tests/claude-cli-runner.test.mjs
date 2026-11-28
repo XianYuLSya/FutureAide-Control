@@ -208,8 +208,8 @@ test('claudeTurnArguments builds the print-mode argv and widens nothing', () => 
   // Model and effort are only present when the caller chose them explicitly.
   assert.equal(args.includes('--model'), false);
   assert.equal(args.includes('--effort'), false);
-  // Exactly the two callback tools are pre-allowed, and no bypass flag is anywhere.
-  assert.equal(args[args.indexOf('--allowedTools') + 1], 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent');
+  // Exactly the five basic tools are pre-allowed, and no bypass flag is anywhere.
+  assert.equal(args[args.indexOf('--allowedTools') + 1], 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent,mcp__futureaide__feedback,mcp__futureaide__futureaide_board_post,mcp__futureaide__futureaide_board_read');
   for (const forbidden of ['--dangerously-skip-permissions', '--allow-dangerously-skip-permissions', '--bare']) {
     assert.equal(args.includes(forbidden), false, forbidden + ' must never be passed');
   }
@@ -229,7 +229,7 @@ test('an MCP config must declare exactly one server, and only its callbacks are 
   assert.throws(() => mcpServerFromConfig({ mcpServers: { a: {}, b: {} } }), error => error.code === 'invalid-mcp-config');
   assert.throws(() => mcpServerFromConfig({}), error => error.code === 'invalid-mcp-config');
   assert.deepEqual(allowedCallbackTools('futureaide'),
-    ['mcp__futureaide__ask_parent', 'mcp__futureaide__report_parent']);
+    ['mcp__futureaide__ask_parent', 'mcp__futureaide__report_parent', 'mcp__futureaide__feedback', 'mcp__futureaide__futureaide_board_post', 'mcp__futureaide__futureaide_board_read']);
 });
 
 test('the system prompt names both parent callbacks and the final report flag', () => {
@@ -494,7 +494,7 @@ test('the CLI receives exactly the documented argv, prompt and MCP config', { ti
   assert.equal(receipt.sessionId, SESSION);
   assert.equal(receipt.permissionMode, 'auto');
   assert.equal(receipt.permissionPrompts, 'none');
-  assert.equal(receipt.allowedTools, 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent');
+  assert.equal(receipt.allowedTools, 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent,mcp__futureaide__feedback,mcp__futureaide__futureaide_board_post,mcp__futureaide__futureaide_board_read');
   assert.deepEqual(receipt.mcpServerNames, ['futureaide']);
   assert.equal(receipt.prompt, 'Do the task.');
   assert.equal(receipt.model, 'claude-fixture-default', 'no --model was passed, so the CLI default is reported');
@@ -644,6 +644,10 @@ test('re-reading a turn never dispatches again, and one directory is one request
   await assert.rejects(run(directory, { scenario: 'hang', message: 'A different task.' }),
     error => error.code === 'claude-request-conflict');
   assert.equal((await cancelClaudeTurn(directory)).stopped, true);
+
+  const incompleteClaim = await scratch('incomplete-claim');
+  await writeFile(path.join(incompleteClaim, CLAUDE_TURN_FILES.owner), '');
+  await assert.rejects(run(incompleteClaim), { code: 'claude-turn-not-ready' });
 });
 
 // ---------------------------------------------------------------------------
@@ -761,7 +765,11 @@ test('a worker that vanished without finalizing is reported failed, not running'
   assert.equal(diagnosed.error.code, 'claude-turn-worker-lost');
   assert.match(diagnosed.error.message, /Worker error: EPERM.*rename state\.json/);
   // Only a confirmed cancel can make a dead worker's turn read as cancelled.
-  await writeFile(path.join(directory, CLAUDE_TURN_FILES.cancel), JSON.stringify({ requestedAt: new Date().toISOString(), stopped: true }));
+  const cancelFile = path.join(directory, CLAUDE_TURN_FILES.cancel);
+  const attempt = { requestedAt: new Date().toISOString(), stopped: true };
+  await writeFile(cancelFile, JSON.stringify({ ...attempt, requestId: 'older-request' }));
+  assert.equal((await readClaudeTurn(directory, { isAlive: () => false })).state, 'failed');
+  await writeFile(cancelFile, JSON.stringify({ ...attempt, requestId: state.requestId }));
   const cancelled = await readClaudeTurn(directory, { isAlive: () => false });
   assert.equal(cancelled.state, 'cancelled');
   assert.equal(cancelled.error, undefined);

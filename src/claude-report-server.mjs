@@ -1,3 +1,5 @@
+import { activeManagedRequestId } from './roster-store.mjs';
+import { managedTokenFile, verifyManagedCaller, managedToolNames } from './managed-cli-policy.mjs';
 // Loopback management tool surface for Claude Desktop sessions.
 //
 // One narrow job: serve the shared name-addressed management tools (`futureaide_*`)
@@ -112,20 +114,7 @@ function lookupAntigravitySummary(conversationId) {
 export function trustedContextOf(caller) {
   if (!caller || typeof caller !== 'object') return undefined;
   if (caller.source === 'managed-cli') {
-    const parentAgentId = typeof caller.parentAgentId === 'string' ? caller.parentAgentId.trim() : '';
-    const ownerId = typeof caller.ownerId === 'string' ? caller.ownerId.trim() : '';
-    if (!parentAgentId && !ownerId) return undefined;
-    const workspace = typeof caller.workspace === 'string' && caller.workspace.trim()
-      ? caller.workspace.trim()
-      : (typeof caller.cwd === 'string' && caller.cwd.trim() ? caller.cwd.trim() : undefined);
-    return {
-      source: 'managed-cli',
-      ...(parentAgentId ? { parentAgentId, callerAgentId: parentAgentId } : {}),
-      ...(ownerId ? { ownerId } : {}),
-      nativeSessionId: parentAgentId || ownerId,
-      ...(workspace ? { workspace } : {}),
-      ...(caller.label ? { label: caller.label } : {}),
-    };
+    return caller.callerAgentId && caller.callerTaskId && caller.callerRequestId ? { ...caller } : undefined;
   }
   if (caller.source === 'antigravity') {
     if (typeof caller.conversationId !== 'string' || !caller.conversationId.trim()) return undefined;
@@ -174,11 +163,11 @@ export function trustedContextOf(caller) {
  *   `{ server, caller, trusted }`. The caller is the verified one above.
  */
 export function createClaudeReportServer({ resolveCaller, management,
-  instructions = INSTRUCTIONS, version = SERVER_VERSION, waitSignal } = {}) {
+  instructions = INSTRUCTIONS, version = SERVER_VERSION, waitSignal, managedCaller, roleOptions } = {}) {
   if (typeof resolveCaller !== 'function') throw new TypeError('createClaudeReportServer requires resolveCaller');
   const server = new McpServer({ name: SERVER_NAME, version }, { instructions });
   if (typeof management === 'function') {
-    management({ server, waitSignal, caller: async () => resolveCaller(),
+    management({ server, waitSignal, managedCaller, roleOptions, caller: async () => resolveCaller(),
       trusted: async () => trustedContextOf(await resolveCaller()) });
   }
   return server;
@@ -281,7 +270,9 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
   resolveCaller, instructions, identity = {}, management, rosterId = undefined, board = undefined,
   store = undefined, onCliSubmission = undefined,
   runtimeDir = undefined, antigravityCallerTokenFile = undefined, antigravityCallerToken = undefined,
+  managedCliTokenFile = undefined, teamConfigPath = undefined,
   keepAliveTimeoutMs = DEFAULT_KEEP_ALIVE_MS, log = () => {} } = {}) {
+  const roleOptions = { teamConfigPath };
   // The board is a private roster view: refusing every other address here means the
   // option cannot be widened by accident, and nothing is bound or imported when it is off.
   if (board && host !== '127.0.0.1') {
@@ -295,6 +286,11 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     : randomBytes(32).toString('hex');
   const tokenFile = antigravityCallerTokenFile
     || (runtimeDir ? path.join(runtimeDir, ANTIGRAVITY_CALLER_TOKEN_FILENAME) : undefined);
+  const managedToken = randomBytes(32).toString('hex');
+  const managedFile = managedCliTokenFile || managedTokenFile(tokenFile);
+  if (tokenFile && managedFile && path.resolve(tokenFile).toLowerCase() === path.resolve(managedFile).toLowerCase()) {
+    throw Object.assign(new Error('Managed and desktop token files must use separate destinations.'), { code: 'report-token-file-conflict' });
+  }
   // One identity per TCP connection, dropped when that socket closes.
   const identities = new WeakMap();
   let boundPort = port;
@@ -367,7 +363,7 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
         return;
       }
       const { agentId, taskId, requestId, target, kind, message, final } = payload ?? {};
-      const tokenVerified = verifyAntigravityBearerToken(headerString(req.headers, 'authorization'), callerToken);
+      const tokenVerified = verifyAntigravityBearerToken(headerString(req.headers, 'authorization'), managedToken);
       const hasDispatchBinding = typeof agentId === 'string' && agentId.length > 0
         && typeof taskId === 'string' && taskId.length > 0
         && typeof requestId === 'string' && requestId.length > 0;
@@ -379,7 +375,7 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
         const bound = store.get(agentId);
         const matchesRoster = Boolean(bound && !bound.closed
           && bound.task?.taskId === taskId
-          && bound.task?.dispatches?.at(-1)?.requestId === requestId
+          && activeManagedRequestId(bound.task) === requestId
           && (!target || bound.target === target));
         if (!matchesRoster) {
           sendJson(res, 401, { ok: false, error: { code: 'cli-callback-unauthorized', message: 'Unauthorized CLI callback: token or active dispatch binding is required.' } });
@@ -412,6 +408,7 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     if (reqPath !== HTTP_PATH) {
       if (reqPath === '/healthz' && req.method === 'GET') {
         sendJson(res, 200, { ok: true, server: SERVER_NAME, version: SERVER_VERSION, startedAt, stats,
+          management: typeof management === 'function',
           ...(rosterId === undefined ? {} : { roster: rosterId }) });
         return;
       }
@@ -440,41 +437,37 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
         });
         return;
       }
-      if (!verifyAntigravityBearerToken(headerString(req.headers, 'authorization'), callerToken)) {
+      if (!verifyAntigravityBearerToken(headerString(req.headers, 'authorization'), managedToken)) {
         stats.unidentified += 1;
         sendJson(res, 401, {
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32001, message: 'Unauthorized managed CLI caller: valid Bearer token is required.', data: { code: 'managed-cli-auth-required' } },
+          jsonrpc: '2.0', id: null,
+          error: { code: -32001, message: 'A managed CLI bearer token is required.', data: { code: 'managed-cli-auth-required' } },
         });
         return;
       }
-      const parentAgentId = headerString(req.headers, 'x-futureaide-parent-agent-id')?.trim() ?? '';
-      const ownerId = headerString(req.headers, 'x-futureaide-owner-id')?.trim() ?? '';
-      if (!parentAgentId && !ownerId) {
+      try {
+        if (!rosterId || headerString(req.headers, 'x-futureaide-roster-id') !== rosterId) {
+          throw Object.assign(new Error('The managed roster does not match.'), { code: 'report-service-foreign-roster' });
+        }
+        caller = verifyManagedCaller(store, {
+          agentId: headerString(req.headers, 'x-futureaide-agent-id'),
+          taskId: headerString(req.headers, 'x-futureaide-task-id'),
+          requestId: headerString(req.headers, 'x-futureaide-request-id'),
+          target: headerString(req.headers, 'x-futureaide-target'),
+          ownerId: headerString(req.headers, 'x-futureaide-owner-id'),
+          workspace: headerString(req.headers, 'x-futureaide-workspace-b64')
+            ? Buffer.from(headerString(req.headers, 'x-futureaide-workspace-b64'), 'base64').toString('utf8')
+            : headerString(req.headers, 'x-futureaide-workspace'),
+          role: headerString(req.headers, 'x-futureaide-role'),
+        });
+      } catch (error) {
         stats.unidentified += 1;
-        sendJson(res, 400, {
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32602, message: 'Missing x-futureaide-parent-agent-id or x-futureaide-owner-id header.', data: { code: 'invalid-managed-cli-caller' } },
+        sendJson(res, 403, {
+          jsonrpc: '2.0', id: null,
+          error: { code: -32001, message: 'The managed dispatch could not be verified.', data: { code: error.code ?? 'permission-denied' } },
         });
         return;
       }
-      const rawWorkspaceB64 = headerString(req.headers, 'x-futureaide-workspace-b64')?.trim();
-      let rawWorkspace;
-      if (rawWorkspaceB64) {
-        try { rawWorkspace = Buffer.from(rawWorkspaceB64, 'base64').toString('utf8').trim(); }
-        catch { rawWorkspace = undefined; }
-      }
-      if (!rawWorkspace) {
-        rawWorkspace = headerString(req.headers, 'x-futureaide-workspace')?.trim();
-      }
-      caller = {
-        source: 'managed-cli',
-        ...(parentAgentId ? { parentAgentId } : {}),
-        ...(ownerId ? { ownerId } : {}),
-        ...(rawWorkspace ? { workspace: rawWorkspace } : {}),
-      };
       stats.identified += 1;
     } else if (isAntigravityRequest) {
       if (!isLoopbackRemote(req.socket?.remoteAddress)) {
@@ -496,7 +489,7 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
         return;
       }
       const conversationId = typeof agyConvHeader === 'string' ? agyConvHeader.trim() : '';
-      if (!conversationId) {
+      if (!conversationId || conversationId.startsWith('managed-cli:')) {
         stats.unidentified += 1;
         sendJson(res, 400, {
           jsonrpc: '2.0',
@@ -550,12 +543,21 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     let body;
     try { body = await readBody(req); }
     catch (error) { sendJson(res, 400, { error: { code: error.code ?? 'invalid-request', message: error.message } }); return; }
+    if (isManagedCliRequest && body?.method === 'tools/call'
+        && !managedToolNames(caller.callerRole, roleOptions).includes(body.params?.name)) {
+      sendJson(res, 200, { jsonrpc: '2.0', id: body.id,
+        result: { isError: true, content: [{ type: 'text', text: JSON.stringify({
+          error: { code: 'permission-denied', message: 'This tool is outside the caller’s managed role.' },
+        }) }] } });
+      return;
+    }
     const isWait = body?.method === 'tools/call' && body?.params?.name === 'futureaide_wait_agents';
     const waitController = new AbortController();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: !isWait });
     // Only a verified caller gets a surface; an unidentified peer gets nothing.
     const mcp = caller
-      ? createClaudeReportServer({ resolveCaller: async () => caller, instructions, management, waitSignal: waitController.signal })
+      ? createClaudeReportServer({ resolveCaller: async () => caller, instructions, management, waitSignal: waitController.signal,
+        ...(isManagedCliRequest ? { managedCaller: caller, roleOptions } : {}) })
       : createUnavailableReportServer();
     const close = () => { if (!res.writableFinished) waitController.abort(); void transport.close().catch(() => {}); void mcp.close().catch(() => {}); };
     res.once('close', close);
@@ -590,24 +592,20 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     server.close(() => resolve());
     server.closeIdleConnections?.();
   });
-  if (tokenFile) {
-    try {
-      await writeAntigravityCallerTokenFile(tokenFile, {
-        token: callerToken,
-        port: boundPort,
-        pid: process.pid,
-        updatedAt: new Date().toISOString(),
-      });
-    } catch (error) {
-      await close();
-      throw error;
-    }
+  try {
+    const endpoint = { port: boundPort, pid: process.pid, updatedAt: new Date().toISOString() };
+    if (tokenFile) await writeAntigravityCallerTokenFile(tokenFile, { ...endpoint, token: callerToken });
+    if (managedFile) await writeAntigravityCallerTokenFile(managedFile, { ...endpoint, token: managedToken, roster: rosterId });
+  } catch (error) {
+    await close();
+    throw error;
   }
   const url = `http://${host}:${boundPort}${HTTP_PATH}`;
   return {
     server, stats, url, port: boundPort, host,
     antigravityCallerToken: callerToken,
     antigravityCallerTokenFile: tokenFile,
+    managedCliTokenFile: managedFile,
     // Idle keep-alive sockets would otherwise hold the listener open for the whole
     // timeout; an in-flight request still finishes.
     close,
@@ -623,7 +621,7 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
  */
 export async function startReportService({ store, port = DEFAULT_PORT, host = '127.0.0.1',
   management, board = undefined, onCliSubmission = undefined, runtimeDir = undefined,
-  antigravityCallerTokenFile = undefined, antigravityCallerToken = undefined,
+  antigravityCallerTokenFile = undefined, antigravityCallerToken = undefined, managedCliTokenFile = undefined, teamConfigPath = undefined,
   log = () => {} } = {}) {
   if (!store) throw new TypeError('startReportService requires the shared RosterStore');
   const storeDir = typeof store.location === 'string' && store.location !== ':memory:'
@@ -633,7 +631,8 @@ export async function startReportService({ store, port = DEFAULT_PORT, host = '1
   const tokenFile = antigravityCallerTokenFile
     || (process.env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE || undefined)
     || (effectiveRuntimeDir ? path.join(effectiveRuntimeDir, ANTIGRAVITY_CALLER_TOKEN_FILENAME) : undefined);
-  return startHttpService({ port, host, log, store, management, ...(board ? { board } : {}),
+  return startHttpService({ port, host, log, store, management, teamConfigPath,
+    managedCliTokenFile: managedCliTokenFile || process.env.FUTUREAIDE_MANAGED_CLI_TOKEN_FILE, ...(board ? { board } : {}),
     ...(onCliSubmission ? { onCliSubmission } : {}),
     ...(effectiveRuntimeDir ? { runtimeDir: effectiveRuntimeDir } : {}),
     ...(tokenFile ? { antigravityCallerTokenFile: tokenFile } : {}),

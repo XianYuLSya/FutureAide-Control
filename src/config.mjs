@@ -24,7 +24,7 @@ const cleanupDefaults = {
   cleanupGraceMs: 86400000,
 };
 const cliRouteFields = ['faswitchHome', 'cliRoutes', 'codexCliPath', 'agyCliPath', 'codexCliProxy', 'codexCliProxyPort', 'claudeCliProxy', 'claudeCliProxyPort', 'agyCliProxy', 'agyCliProxyPort', 'antigravityProxy', 'antigravityProxyPort', 'requireProxy', 'autoWakeFaswitch'];
-const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs', 'dshDefaultModelOnly', 'disabledTargets', 'antigravityCallerTokenFile', 'antigravityColdStartMonitor', 'turnTimeoutMinutes', 'turnTimeoutMs', ...cliRouteFields, ...Object.keys(cleanupDefaults), 'defaultEffort', 'modelDefaultEfforts'];
+const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'teamConfigPath', 'claudeCallbackReminderMs', 'dshDefaultModelOnly', 'disabledTargets', 'antigravityCallerTokenFile', 'antigravityColdStartMonitor', 'turnTimeoutMinutes', 'turnTimeoutMs', ...cliRouteFields, ...Object.keys(cleanupDefaults), 'defaultEffort', 'modelDefaultEfforts'];
 
 export function normalizeDisabledTargets(value) {
   if (value === undefined) return [];
@@ -77,7 +77,7 @@ const targetFields = ['futureaideSessionId', 'codexThreadId'];
 const UUID = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 export const PROFILE_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
-function dshConfig(value) {
+function dshConfig(value, filename) {
   if (value.defaultEffort !== undefined && (typeof value.defaultEffort !== 'string' || !EFFORT_ORDER.includes(value.defaultEffort.toLowerCase()))) throw new Error('defaultEffort must be a valid effort.');
   if (value.modelDefaultEfforts !== undefined) {
     if (!value.modelDefaultEfforts || typeof value.modelDefaultEfforts !== 'object' || Array.isArray(value.modelDefaultEfforts)) throw new Error('modelDefaultEfforts must be an object.');
@@ -94,6 +94,7 @@ function dshConfig(value) {
   if (value.dshDefaultModelOnly !== undefined && typeof value.dshDefaultModelOnly !== 'boolean') throw new Error('dshDefaultModelOnly must be true or false.');
   if (value.antigravityColdStartMonitor !== undefined && typeof value.antigravityColdStartMonitor !== 'boolean') throw new Error('antigravityColdStartMonitor must be true or false.');
   if (value.disabledTargets !== undefined) normalizeDisabledTargets(value.disabledTargets);
+  const teamConfigPath = validateOptionalPath(value.teamConfigPath, 'teamConfigPath');
   if (value.antigravityCallerTokenFile !== undefined) validateOptionalPath(value.antigravityCallerTokenFile, 'antigravityCallerTokenFile');
   if (value.faswitchHome !== undefined) validateOptionalPath(value.faswitchHome, 'faswitchHome');
   if (value.codexCliPath !== undefined) validateOptionalPath(value.codexCliPath, 'codexCliPath');
@@ -114,7 +115,8 @@ function dshConfig(value) {
   // and means the first definite absence is enough.
   if (value.claudeCallbackReminderMs !== undefined) claudeCallbackReminderMs(value.claudeCallbackReminderMs);
   const dataRoot = value.dshDataRoot ?? value.dataRoot ?? process.env.DSH_HOME ?? path.join(homedir(), '.dsh');
-  return { ...value, target: 'dsh', dataRoot, dshDataRoot: dataRoot };
+  return { ...value, target: 'dsh', dataRoot, dshDataRoot: dataRoot,
+    ...(teamConfigPath !== undefined ? { teamConfigPath: path.resolve(path.dirname(filename), teamConfigPath) } : {}) };
 }
 
 /** Defaults on for unsubscribe, EOF shutdown, cold reads and monitor recovery.
@@ -210,7 +212,7 @@ async function profileDirectory(filename, { create = false } = {}) {
 export async function loadConfig(filename, profile) {
   filename = configPath(filename);
   if (profile !== undefined) validateProfileName(profile);
-  const supplied = dshConfig(await readConfiguration(filename, { optional: true }));
+  const supplied = dshConfig(await readConfiguration(filename, { optional: true }), filename);
   const envCallerTokenFile = typeof process.env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE === 'string' && process.env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE.trim()
     ? process.env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE.trim() : undefined;
   if (profile !== undefined) {
@@ -222,14 +224,14 @@ export async function loadConfig(filename, profile) {
     }
     const selectedValue = validateProfile(await readConfiguration(profileFile));
     const selected = dshConfig({ ...selectedValue,
-      dshDataRoot: selectedValue.dshDataRoot ?? selectedValue.dataRoot ?? supplied.dshDataRoot });
+      dshDataRoot: selectedValue.dshDataRoot ?? selectedValue.dataRoot ?? supplied.dshDataRoot }, profileFile);
     const antigravityCallerTokenFile = envCallerTokenFile
       ?? validateOptionalPath(selected.antigravityCallerTokenFile ?? supplied.antigravityCallerTokenFile, 'antigravityCallerTokenFile');
     const mergedCliRoutes = (supplied.cliRoutes || selected.cliRoutes)
       ? { ...(supplied.cliRoutes ?? {}), ...(selected.cliRoutes ?? {}) } : undefined;
     return {
       hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
-      ...pick(supplied, [...transportFields, ...cliRouteFields]),
+      ...pick(supplied, [...transportFields, ...cliRouteFields, 'teamConfigPath']),
       ...selected,
       ...(mergedCliRoutes ? { cliRoutes: mergedCliRoutes } : {}),
       ...cleanupSettings(supplied, selectedValue), profile,
@@ -273,6 +275,16 @@ export async function loadConfig(filename, profile) {
   };
 }
 
+/** A managed launch binds the connection to the roster chosen by its parent. */
+export async function loadManagedRosterConfig(filename, roster) {
+  const base = await loadConfig(filename);
+  if (!roster || !path.isAbsolute(roster)) return base;
+  const stateDirectory = path.dirname(path.resolve(roster));
+  const [group, profile, ...rest] = path.relative(base.stateDirectory, stateDirectory).split(path.sep);
+  if (group?.toLowerCase() === 'profiles' && profile && !rest.length) return loadConfig(filename, profile);
+  return base;
+}
+
 function profileSummary(config, profile = null) {
   return {
     profile, workspace: config.workspace,
@@ -314,7 +326,7 @@ export async function createProfile({ profile, workspace, futureaideSessionId, c
   validateProfileName(profile);
   filename = configPath(filename);
   const selected = validateProfile({ workspace, futureaideSessionId, codexThreadId });
-  const supplied = dshConfig(await readConfiguration(filename, { optional: true }));
+  const supplied = dshConfig(await readConfiguration(filename, { optional: true }), filename);
   const value = { ...pick(supplied, transportFields), ...selected };
   const profileFile = path.join(await profileDirectory(filename, { create: true }), `${profile}.json`);
   try {

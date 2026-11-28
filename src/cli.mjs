@@ -1,10 +1,13 @@
+import { authorizeManagedTool, managedBindingFromEnv, verifyManagedCaller } from './managed-cli-policy.mjs';
+import { normalizeQuestionIds } from './cli-question-selection.mjs';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, realpath } from 'node:fs/promises';
 import { watch } from 'node:fs';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { createProfile, listProfiles, loadConfig } from './config.mjs';
+import { createProfile, listProfiles, loadConfig, loadManagedRosterConfig } from './config.mjs';
 import { boundedOutput, createControl, errorResult } from './control.mjs';
 import { installDesktopHostBridge, installHostBridge, maintenanceConfigPath } from './host-install.mjs';
 import { createAgents } from './agents.mjs';
@@ -41,11 +44,57 @@ const { values, positionals } = parseArgs({
     to: {type:'string'}, 'worktree-review': {type:'string'},
     parent: { type: 'string' }, 'reparent-to': { type: 'string' },
     'kill-tree': { type: 'boolean' }, 'keep-children': { type: 'string' },
-    author: { type: 'string' },
+    author: { type: 'string' }, urgent: { type: 'boolean' },
+    role: { type: 'string' }, lifetime: { type: 'string' }, worktree: { type: 'boolean' },
+    'base-sha': { type: 'string' }, 'discard-worktree': { type: 'boolean' },
+    'question-id': { type: 'string', multiple: true },
   },
 });
 
+const managed = process.env.FUTUREAIDE_MANAGED_CLI === '1' || Boolean(process.env.FUTUREAIDE_PARENT_REQUEST_ID);
+const managedBinding = managed ? managedBindingFromEnv() : undefined;
+const deny = message => Object.assign(new Error(message), { code: 'permission-denied' });
+const pathKey = value => process.platform === 'win32' ? path.resolve(value).toLowerCase() : path.resolve(value);
+
+async function loadScopedCliConfig() {
+  if (!managed) return loadConfig(values.config, values.profile);
+  const roster = process.env.FUTUREAIDE_ROSTER_PATH;
+  if (!roster || !path.isAbsolute(roster) || path.basename(roster).toLowerCase() !== 'roster.sqlite') {
+    throw deny('The managed caller is missing its bound roster.');
+  }
+  try {
+    const config = await loadManagedRosterConfig(process.env.FUTUREAIDE_CONFIG, roster);
+    const expected = path.join(config.stateDirectory, 'roster.sqlite');
+    const info = pathKey(roster) === pathKey(expected) && await lstat(expected);
+    if (!info?.isFile() || pathKey(await realpath(expected)) !== pathKey(expected)) throw deny('Invalid roster path.');
+    // Authenticate before the writable roster can create tables or run migrations.
+    const db = new DatabaseSync(expected, { readOnly: true });
+    try {
+      verifyManagedCaller({
+        get(id) {
+          const row = db.prepare('SELECT body FROM agents WHERE id=?').get(id);
+          return row && JSON.parse(row.body);
+        },
+        submissions(agentId, taskId) {
+          return db.prepare("SELECT kind, final FROM submissions WHERE agent=? AND task=? AND kind='report' AND final=1")
+            .all(agentId, taskId);
+        },
+      }, managedBinding);
+    } finally { db.close(); }
+    const { antigravityCallerTokenFile: _desktopToken, ...childConfig } = config;
+    return { ...childConfig, workspace: managedBinding.workspace ?? config.workspace };
+  } catch {
+    throw deny('The managed caller has no active dispatch in its configured roster.');
+  }
+}
+
 const usage = `futureaide-control <connect|status|sessions|read|send|wait|watch|cancel|models|notify|codex-status|profiles|profile-create|create-session|select-model|capabilities|host-install|host-status>
+  team run --role ROLE --message TEXT [--worktree --base-sha SHA]
+  team create --role ROLE [--worktree --base-sha SHA]
+  team answer NAME --message TEXT [--question-id ID ...]
+  team delete NAME [--discard-worktree]
+  team kick NAME [--discard-worktree]
+  board post MESSAGE [--urgent --conv CONVERSATION_ID]
   feedback-pending
   feedback-organize --id ID --through N --todo KEY --message-file FILE
   feedback-todos
@@ -273,19 +322,23 @@ if (values.help || !positionals.length) {
             import('./scoped-agents.mjs'),
             import('./calling-context.mjs'),
           ]);
-          const config = await loadConfig(values.config, values.profile);
-          const scoped = createScopedAgents(config);
+          const config = await loadScopedCliConfig();
+          const roleOptions = { teamConfigPath: (managed && process.env.FUTUREAIDE_ROLES_CONFIG?.trim()) || config.teamConfigPath };
+          const scoped = createScopedAgents(config, roleOptions);
           const keepAlive = setInterval(() => {}, 30000);
           try {
             const convId = (values.conv || values.conversation || process.env.ANTIGRAVITY_CONVERSATION_ID || '').trim();
-            if (!convId) throw new Error('wait needs --conv <convId> (or --conversation / ANTIGRAVITY_CONVERSATION_ID).');
+            if (!managed && !convId) throw new Error('wait needs --conv <convId> (or --conversation / ANTIGRAVITY_CONVERSATION_ID).');
             const names = values.names ? values.names.split(',').map(s => s.trim()).filter(Boolean) : undefined;
             const rawKeys = values.keys ?? values['task-keys'];
             const taskKeys = rawKeys ? rawKeys.split(',').map(s => s.trim()).filter(Boolean) : undefined;
             const multiTarget = (taskKeys?.length ?? 0) > 1 || (names?.length ?? 0) > 1;
             const effectiveBarrier = values.barrier ?? (multiTarget ? 'all' : 'any');
             const timeoutSec = values.timeout !== undefined ? number('timeout') : (number('timeout-seconds') ?? 3600);
-            const callerExtra = convId.startsWith('owner-')
+            const callerExtra = managed
+              ? { [TRUSTED_CALLER]: authorizeManagedTool(scoped.store, verifyManagedCaller(scoped.store, managedBinding),
+                'futureaide_wait_agents', { names, taskKeys }, roleOptions) }
+              : convId.startsWith('owner-')
               ? {
                 [TRUSTED_CALLER]: {
                   source: 'managed-cli',
@@ -326,6 +379,7 @@ if (values.help || !positionals.length) {
                     ...(evt.role ? { role: evt.role } : {}),
                     ...(evt.taskKey ? { taskKey: evt.taskKey } : {}),
                     message: evt.message ?? '',
+                    ...((evt.questionId ?? evt.submissionId) ? { questionId: evt.questionId ?? evt.submissionId } : {}),
                   });
                 } else if (evt.type === 'final' || evt.type === 'delivered' || evt.type === 'report') {
                   results.push({
@@ -360,6 +414,7 @@ if (values.help || !positionals.length) {
                         name: item.name,
                         ...(item.role ? { role: item.role } : {}),
                         message: q.message,
+                        ...(q.id ? { questionId: q.id } : {}),
                       });
                     }
                   }
@@ -432,14 +487,16 @@ if (values.help || !positionals.length) {
         }
         break;
       }
+      case 'board-post':
       case 'team':
       case 'board': {
         const [{ createScopedAgents }, { TRUSTED_CALLER, ownerIdFor }] = await Promise.all([
           import('./scoped-agents.mjs'),
           import('./calling-context.mjs'),
         ]);
-        const config = await loadConfig(values.config, values.profile);
-        const scoped = createScopedAgents(config);
+        const config = await loadScopedCliConfig();
+        const roleOptions = { teamConfigPath: (managed && process.env.FUTUREAIDE_ROLES_CONFIG?.trim()) || config.teamConfigPath };
+        const scoped = createScopedAgents(config, roleOptions);
         const keepAlive = setInterval(() => {}, 30000);
         try {
           const ws = path.resolve(values.workspace || config.workspace || process.cwd());
@@ -480,6 +537,7 @@ if (values.help || !positionals.length) {
             }
             const explicitConv = (values.conv || values.conversation || process.env.ANTIGRAVITY_CONVERSATION_ID || '').trim();
             if (explicitConv) {
+              if (explicitConv.startsWith('managed-cli:')) throw deny('Managed callers must supply their active dispatch binding.');
               if (explicitConv.startsWith('owner-')) return extraFromOwnerId(explicitConv);
               if (/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(explicitConv)
                   && scoped.store.owner(ownerIdFor(explicitConv))) {
@@ -517,7 +575,17 @@ if (values.help || !positionals.length) {
             };
           };
 
-          const callerExtra = resolveCanvasCallerExtra();
+          const managedCaller = managed ? verifyManagedCaller(scoped.store, managedBinding) : undefined;
+          const callerExtra = managedCaller ? { [TRUSTED_CALLER]: managedCaller } : resolveCanvasCallerExtra();
+          const forTool = (tool, args) => managedCaller
+            ? { [TRUSTED_CALLER]: authorizeManagedTool(scoped.store, managedCaller, tool, args, roleOptions) } : callerExtra;
+          if (!managedCaller && ['board', 'board-post'].includes(command) && values.urgent === true) {
+            const conversation = (values.conv || values.conversation || process.env.ANTIGRAVITY_CONVERSATION_ID || '').trim();
+            if (values.owner || !conversation || conversation.startsWith('managed-cli:')
+                || !(scoped.store.owner(ownerIdFor(conversation)) || scoped.store.owner(ownerIdForSource('antigravity', conversation)))) {
+              throw deny('An urgent CLI board post requires the current team conversation.');
+            }
+          }
           if (command === 'team') {
             const subAction = positionals[1];
             if (!subAction) {
@@ -535,30 +603,48 @@ if (values.help || !positionals.length) {
             const msg = await messageText();
             if (subAction === 'answer') {
               if (!effectiveTarget || !msg) throw new Error('team answer requires --target <name> and --message <text>.');
-              result = { ok: true, action: 'answer', ...(await scoped.answer({ name: effectiveTarget, message: msg }, callerExtra)) };
+              const questionIds = normalizeQuestionIds({ questionIds: values['question-id'] });
+              const args = { name: effectiveTarget, message: msg, ...(questionIds ? { questionIds } : {}) };
+              result = { ok: true, action: 'answer', ...(await scoped.answer(args, forTool('futureaide_answer_agent', args))) };
+            } else if (subAction === 'run' || subAction === 'create') {
+              const args = {
+                name: values.name ?? positionalTarget, role: values.role, target: values.target,
+                lifetime: values.lifetime ?? (subAction === 'create' ? 'once' : undefined),
+                ...(subAction === 'run' && msg !== undefined ? { message: msg } : {}),
+                ...(values.worktree !== undefined ? { worktree: values.worktree } : {}),
+                ...(values['base-sha'] !== undefined ? { baseSha: values['base-sha'] } : {}),
+              };
+              result = await scoped[subAction](args, forTool('futureaide_' + subAction + '_agent', args));
+            } else if (subAction === 'delete') {
+              const args = { name: effectiveTarget, discardWorktree: values['discard-worktree'] };
+              result = await scoped.delete(args, forTool('futureaide_delete_agent', args));
             } else {
-              result = await scoped.manageTeam({
+              const args = {
                 action: subAction,
                 ...(effectiveTarget !== undefined ? { target: effectiveTarget } : {}),
                 ...(parsedParent !== undefined ? { parent: parsedParent } : {}),
                 ...(keepChildren !== undefined ? { keepChildren } : {}),
                 ...(msg !== undefined ? { message: msg } : {}),
-              }, callerExtra);
+                ...(values['discard-worktree'] !== undefined ? { discardWorktree: values['discard-worktree'] } : {}),
+              };
+              result = await scoped.manageTeam(args, forTool('futureaide_team', args));
             }
           } else {
-            const subAction = (positionals[1] || 'read').toLowerCase();
+            const subAction = command === 'board-post' ? 'post' : (positionals[1] || 'read').toLowerCase();
             if (subAction === 'post') {
-              const msg = (await messageText()) ?? positionals.slice(2).join(' ').trim();
+              const msg = (await messageText()) ?? positionals.slice(command === 'board-post' ? 1 : 2).join(' ').trim();
               if (!msg) throw new Error('board post requires a message (via positional argument or --message).');
-              result = await scoped.postBoard({
+              const args = {
                 message: msg,
-                ...(values.author ? { author: values.author } : {}),
-              }, callerExtra);
+                ...(!managedCaller && values.author ? { author: values.author } : {}),
+                ...(values.urgent === true ? { urgent: true } : {}),
+              };
+              result = await scoped.postBoard(args, forTool('futureaide_board_post', args));
             } else if (subAction === 'read') {
               result = await scoped.readBoard({
                 ...(values.limit !== undefined ? { limit: number('limit') } : {}),
                 ...(values['after-seq'] !== undefined ? { afterSeq: number('after-seq') } : {}),
-              }, callerExtra);
+              }, forTool('futureaide_board_read', {}));
             } else {
               throw new Error('Unknown board action. Use: board post <message> | board read');
             }
@@ -590,7 +676,8 @@ if (values.help || !positionals.length) {
   } catch (error) {
     const feedbackError = positionals[0]?.startsWith('feedback-');
     console.error(JSON.stringify(feedbackError ? { code: 'feedback-command-failed',
-      message: 'Check the feedback ID, reviewed count, todo key, summary file and local inbox access.' } : errorResult(error), null, 2));
+      message: 'Check the feedback ID, reviewed count, todo key, summary file and local inbox access.' } : { ...errorResult(error),
+      ...(typeof error.code === 'string' ? { code: error.code } : {}) }, null, 2));
     process.exitCode = 1;
   }
 }

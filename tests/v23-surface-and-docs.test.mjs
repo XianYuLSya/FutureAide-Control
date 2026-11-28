@@ -26,7 +26,7 @@ async function connectMcp(service) {
     configPath: path.join(pluginRoot, 'clean', 'scoped-mcp-config-absent.json'),
     scopedFactory: () => service,
   });
-  const client = new Client({ name: 'v23-surface-test', version: '2.3.0' });
+  const client = new Client({ name: 'surface-test', version: '2.4.0' });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
   await server.connect(serverSide);
   await client.connect(clientSide);
@@ -39,7 +39,7 @@ async function connectMcp(service) {
   };
 }
 
-test('V2.3 MCP surface: agy-cli proxy target, timeout_minutes forwarding, and futureaide_team merge action', async (t) => {
+test('MCP surface advertises 2.4.0 and supports agy-cli proxy, timeout_minutes, and team merge', async (t) => {
   const calls = [];
   const mockService = {
     async resume() {},
@@ -95,11 +95,16 @@ test('V2.3 MCP surface: agy-cli proxy target, timeout_minutes forwarding, and fu
 
   const mcp = await connectMcp(mockService);
   t.after(() => mcp.close());
+  assert.equal(mcp.client.getServerVersion().version, '2.4.0');
 
   const { tools } = await mcp.client.listTools();
   for (const tool of tools) {
     const fields = Object.keys(tool.inputSchema.properties ?? {});
-    assert.ok(!fields.some(f => /id$|workspace|profile|callback|address/.test(f)), `${tool.name} has forbidden schema field: ${fields}`);
+    const allowedQuestionSelector = field => tool.name === 'futureaide_answer_agent' && field === 'question_id';
+    assert.ok(
+      !fields.some(f => !allowedQuestionSelector(f) && /id$|workspace|profile|callback|address/.test(f)),
+      `${tool.name} has forbidden schema field: ${fields}`,
+    );
   }
 
   const cliProxyTool = tools.find(tool => tool.name === 'futureaide_cli_proxy');
@@ -166,6 +171,10 @@ test('V2.3 MCP surface: agy-cli proxy target, timeout_minutes forwarding, and fu
     ok: true,
     summary: '已合入 后端1 的 2 个改动文件并移除 worktree',
     mergedFiles: ['src/auth.mjs', 'tests/auth.test.mjs'],
+    applied: false,
+    worktreeRemoved: true,
+    recordClosed: false,
+    recordCloseRequired: false,
     affected: '后端1',
   });
 
@@ -229,17 +238,28 @@ test('V2.3 compact usage formatting outputs concise cost string only when positi
     ok: true,
     summary: '合入完成',
     files: ['a.mjs'],
+    applied: true,
+    worktreeRemoved: true,
+    recordClosed: false,
+    recordCloseRequired: false,
+    stage: 'complete',
   }), {
     action: 'merge',
     ok: true,
     summary: '合入完成',
     mergedFiles: ['a.mjs'],
+    applied: true,
+    worktreeRemoved: true,
+    recordClosed: false,
+    recordCloseRequired: false,
+    stage: 'complete',
   });
 });
 
-test('V2.3 manifests, README, CHANGELOG, REFERENCE, and SKILL are aligned at 2.3.1 and respect standalone open-source boundaries', async () => {
-  const [pkgRaw, codexPluginRaw, claudePluginRaw, readme, changelog, reference, skill] = await Promise.all([
+test('release metadata is aligned at 2.4.0 and public files respect standalone open-source boundaries', async () => {
+  const [pkgRaw, lockRaw, codexPluginRaw, claudePluginRaw, readme, changelog, reference, skill] = await Promise.all([
     readPluginFile('package.json'),
+    readPluginFile('package-lock.json'),
     readPluginFile('.codex-plugin/plugin.json'),
     readPluginFile('.claude-plugin/plugin.json'),
     readPluginFile('README.md'),
@@ -249,12 +269,15 @@ test('V2.3 manifests, README, CHANGELOG, REFERENCE, and SKILL are aligned at 2.3
   ]);
 
   const pkg = JSON.parse(pkgRaw);
+  const lock = JSON.parse(lockRaw);
   const codexPlugin = JSON.parse(codexPluginRaw);
   const claudePlugin = JSON.parse(claudePluginRaw);
 
-  assert.equal(pkg.version, '2.3.1');
-  assert.equal(codexPlugin.version, '2.3.1');
-  assert.equal(claudePlugin.version, '2.3.1');
+  assert.equal(pkg.version, '2.4.0');
+  assert.equal(lock.version, pkg.version);
+  assert.equal(lock.packages[''].version, pkg.version);
+  assert.equal(codexPlugin.version, pkg.version);
+  assert.equal(claudePlugin.version, pkg.version);
 
   for (const manifest of [pkg, codexPlugin, claudePlugin]) {
     assert.match(manifest.description, /Antigravity/i);
@@ -263,7 +286,7 @@ test('V2.3 manifests, README, CHANGELOG, REFERENCE, and SKILL are aligned at 2.3
     assert.match(manifest.description, /agy-cli/);
   }
 
-  // README preserves required banner and QQ group while presenting V2.3 highlights
+  assert.match(readme, /v2\.4\.0/);
   assert.match(readme, /!\[FutureAide Control\]\(assets\/banner\.svg\)/);
   assert.match(readme, /QQ 交流群：259109974/);
   for (const feature of [
@@ -281,14 +304,15 @@ test('V2.3 manifests, README, CHANGELOG, REFERENCE, and SKILL are aligned at 2.3
     'futureaide_cli_proxy',
     '18s · 14.2k tok',
   ]) {
-    assert.ok(readme.includes(feature), `README.md is missing V2.3 highlight: ${feature}`);
+    assert.ok(readme.includes(feature), `README.md is missing a highlight: ${feature}`);
   }
 
-  assert.match(changelog, /^## 2\.3\.1 \(2026-11-28\)/m);
-  assert.match(changelog, /^## 2\.3\.0 \(2026-11-28\)/m);
+  assert.equal(changelog.match(/^## .+$/m)?.[0], '## 2.4.0');
+  assert.match(reference, /v2\.4\.0/);
   assert.match(reference, /agy-cli/);
   assert.match(reference, /timeout_minutes/);
   assert.match(reference, /"merge"/);
+
   assert.match(skill, /Do not override the user's existing workflow/i);
 
   // Standalone open-source hygiene: public docs & manifests must not leak external private canvas or workflow names

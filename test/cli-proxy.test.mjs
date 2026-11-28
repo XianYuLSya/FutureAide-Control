@@ -13,6 +13,7 @@ import {
   resolveCliRoute,
 } from '../src/cli-proxy.mjs';
 import { loadConfig } from '../src/config.mjs';
+import { createScopedAgents } from '../src/scoped-agents.mjs';
 
 async function startTcpServer() {
   const server = net.createServer(socket => socket.end());
@@ -37,7 +38,7 @@ async function getClosedPort() {
 async function makeFaswitchFixture(root, {
   profileId = '1b37fed7-2a5d-4b5a-976b-8571bbcde341',
   profileName = 'xiayuip-win',
-  codexHome = 'C:\\Users\\test\\.codex',
+  codexHome = path.join(root, 'codex-home'),
   accountProfileId = profileId,
   activationState = 'active',
   activationProfileId = profileId,
@@ -201,7 +202,7 @@ test('buildCliProxyEnv replaces stale parent proxy vars and preserves loopback N
 
   const proxied = buildCliProxyEnv(
     base,
-    { mode: 'proxy', proxyUrl: 'http://127.0.0.1:17913', codexHome: 'C:\\Users\\test\\.codex' },
+    { mode: 'proxy', proxyUrl: 'http://127.0.0.1:17913', codexHome: path.resolve('fixture-codex-home') },
   );
   assert.equal(proxied.HTTP_PROXY, 'http://127.0.0.1:17913');
   assert.equal(proxied.HTTPS_PROXY, 'http://127.0.0.1:17913');
@@ -212,7 +213,7 @@ test('buildCliProxyEnv replaces stale parent proxy vars and preserves loopback N
   assert.match(proxied.NO_PROXY, /127\.0\.0\.1/);
   assert.match(proxied.NO_PROXY, /localhost/);
   assert.match(proxied.NO_PROXY, /corp\.local/);
-  assert.equal(proxied.CODEX_HOME, 'C:\\Users\\test\\.codex');
+  assert.equal(proxied.CODEX_HOME, path.resolve('fixture-codex-home'));
 
   const direct = buildCliProxyEnv(base, { mode: 'direct', proxyUrl: null });
   assert.equal(direct.HTTP_PROXY, undefined);
@@ -259,4 +260,25 @@ test('readFaswitchRoute returns present:false when FAswitch directory does not e
   const missing = path.join(tmpdir(), `no-faswitch-${Date.now()}`);
   const result = await readFaswitchRoute({ faswitchHome: missing, env: {} });
   assert.equal(result.present, false);
+});
+
+test('Antigravity CLI binds port 7901 and checks it in status for all backends', async t => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'fa-agy-proxy-'));
+  const configFile = path.join(dir, 'config.json');
+  await writeFile(configFile, JSON.stringify({ cliRoutes: { 'codex-cli': 'direct', 'claude-cli': 'direct' } }));
+  const seen = [];
+  const service = createScopedAgents({ workspace: dir, stateDirectory: dir, configFile, faswitchHome: dir,
+    cliRoutes: { 'codex-cli': 'direct', 'claude-cli': 'direct' },
+  }, {
+    checkCliProxy: async url => { seen.push(url); return { ok: true }; },
+  });
+  t.after(async () => { service.close(); await rm(dir, { recursive: true, force: true }); });
+  const bound = await service.manageCliProxy({ action: 'bind', target: 'agy-cli', proxy: 7901 });
+  assert.equal(bound.ok, true);
+  const all = await service.manageCliProxy({ target: 'all' });
+  assert.equal(all.ok, true);
+  assert.deepEqual(all.routes.map(item => [item.target, item.port]), [
+    ['codex-cli', null], ['claude-cli', null], ['agy-cli', 7901],
+  ]);
+  assert.deepEqual(seen, ['http://127.0.0.1:7901', 'http://127.0.0.1:7901']);
 });

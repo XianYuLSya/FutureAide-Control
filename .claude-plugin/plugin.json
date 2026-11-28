@@ -1,6 +1,6 @@
 {
   "name": "futureaide-control",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "description": "Cross-client headless subagent controller for Antigravity, Codex, and Claude: dispatch codex-cli, claude-cli, and agy-cli fleets by role or name with <50ms callbacks, isolated git worktrees, team board @mentions, proxy locks, and live token billing.",
   "author": {
     "name": "FutureAide"

@@ -19,7 +19,7 @@ const extra = threadId => ({ _meta: { threadId } });
 const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
 async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles,
-  callCodex: callCodexOverride, config: extraConfig = {} } = {}) {
+  callCodex: callCodexOverride, modernPrompt = false, config: extraConfig = {} } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
@@ -32,7 +32,8 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
   const selections = [];
   const api = {
     async connectionIdentity() { if (offline) throw new Error('DSH offline'); return { application: 'dsh', dataRoot: path.join(stateDirectory, 'native') }; },
-    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
+    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy',
+      ...(modernPrompt ? ['managedPromptV2', 'managedPromptReceipt'] : [])] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId, { ...input, model: { provider: 'fixture', model: 'test' }, running: false, seq: 0, questions: [], changes: [], turns: new Map() });
       return { ...sessions.get(input.sessionId), modelRequestsStarted: 0 };
@@ -73,7 +74,8 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
       const s = sessions.get(input.sessionId);
       s.answers ??= new Map();
       if (s.answers.has(input.answerId)) return s.answers.get(input.answerId);
-      const pending = s.questions.filter(question => question.state === 'pending');
+      const pending = s.questions.filter(question => question.state === 'pending'
+        && (!input.questionIds || input.questionIds.includes(question.id)));
       pending.forEach(question => { question.state = 'answered'; });
       const result = { consumedQuestionIds: pending.map(question => question.id), continuation: `Answer: ${input.message}` };
       s.answers.set(input.answerId, result);
@@ -946,22 +948,23 @@ test('cancel intent cannot attach to a replacement task', async () => {
   f.service.close();
 });
 
-test('a send already in flight is stopped again after it returns', async () => {
+test('a send already in flight is stopped again after it returns', { timeout: 5000 }, async () => {
   let release, entered;
   const started = new Promise(resolve => { entered = resolve; });
   const gate = new Promise(resolve => { release = resolve; });
-  const f = await fixture({ beforeSend: async () => { entered(); await gate; } });
+  const f = await fixture({ modernPrompt: true, beforeSend: async () => { entered(); await gate; } });
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   const sending = f.service.send({ name: 'artist', message: 'task' }, extra(A));
-  await started;
-  const cancel = await f.service.cancel({ name: 'artist' }, extra(A));
-  assert.equal(cancel.accepted, true);
-  assert.equal(f.cancellations.length, 1);
-  release(); await sending;
-  assert.equal(f.cancellations.length, 2);
-  assert.equal(f.record().task.cancelVerified, true);
-  assert.equal(f.sessions.get(f.record().sessionId).running, false);
-  f.service.close();
+  try {
+    await Promise.race([started, sending.then(() => assert.fail('The send ended before reaching the fixture.'))]);
+    const cancel = await f.service.cancel({ name: 'artist' }, extra(A));
+    assert.equal(cancel.accepted, true);
+    assert.equal(f.cancellations.length, 1);
+    release(); await sending;
+    assert.equal(f.cancellations.length, 2);
+    assert.equal(f.record().task.cancelVerified, true);
+    assert.equal(f.sessions.get(f.record().sessionId).running, false);
+  } finally { release(); await sending.catch(() => {}); f.service.close(); }
 });
 
 test('final delivery cannot declare cancellation before the host stop and tree recheck', async () => {
@@ -1337,17 +1340,17 @@ test('busy supplements persist independently and are dispatched in order to the 
 });
 
 test('an answer older than six hours is never written and does not hold the final', async () => {
-  const f = await fixture();
+  const f = await fixture({ modernPrompt: true });
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
     await f.service.send({ name: 'artist', message: 'ask first' }, extra(A));
     const record = f.record();
     f.sessions.get(record.sessionId).questions = [{ id: 'old-question', state: 'pending', message: 'Decide?' }];
     await f.service.poll(record.agentId);
-    const receipt = await f.service.send({ name: 'artist', message: 'the answer' }, extra(A));
-    assert.equal(receipt.delivery, 'answer-pending');
+    const receipt = await f.service.answer({ name: 'artist', message: 'the answer', questionId: 'old-question' }, extra(A));
+    assert.equal(receipt.answered, true);
     const aged = f.record();
-    const answer = aged.task.answers.find(entry => entry.answerId === receipt.requestId);
+    const answer = aged.task.answers.find(entry => entry.answerId === receipt.answerId);
     answer.created = '2020-01-01T00:00:00.000Z';
     // The asking turn has ended; only the answer continuation is left.
     aged.task.dispatches[0].state = 'completed';
@@ -1358,13 +1361,13 @@ test('an answer older than six hours is never written and does not hold the fina
     const latest = f.record();
     assert.equal(f.sends.slice(sends).filter(item => item.message.includes('the answer')).length, 0,
       'the expired answer is never written');
-    const settled = latest.task.answers.find(entry => entry.answerId === receipt.requestId);
+    const settled = latest.task.answers.find(entry => entry.answerId === receipt.answerId);
     assert.equal(settled.undelivered, 'dispatch-expired');
     assert.equal(settled.delivery, 'unknown');
     assert.deepEqual(f.store.openQuestions(latest), { unanswered: 0, undelivered: 0 },
       'the expired answer cannot hold the final report');
     const inspected = await f.service.inspect({ name: 'artist' }, extra(A));
-    const input = inspected.inputs?.find(entry => entry.requestId === receipt.requestId);
+    const input = inspected.inputs?.find(entry => entry.requestId === receipt.answerId);
     assert.equal(input?.reason, 'dispatch-expired');
   } finally { f.service.close(); }
 });
@@ -1417,8 +1420,8 @@ test('busy after entering the operation is not mistaken for a lock timeout', asy
   f.service.close();
 });
 
-test('queued input answers a waiting question and cannot cross cancellation or task replacement', async () => {
-  const f = await fixture();
+test('queued input leaves a waiting question open and cannot cross task replacement', async () => {
+  const f = await fixture({ modernPrompt: true });
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   await f.service.send({ name: 'artist', message: 'initial' }, extra(A));
   const record = f.record(); let release;
@@ -1428,13 +1431,15 @@ test('queued input answers a waiting question and cannot cross cancellation or t
   await f.service.send({ name: 'artist', message: 'answer' }, extra(A));
   await f.service.send({ name: 'artist', message: 'next supplement' }, extra(A));
   release(); await held; await f.service.poll(record.agentId);
-  assert.equal(f.sessions.get(record.sessionId).questions[0].state, 'answered');
-  assert.equal(f.record().task.answers[0].message, 'answer');
+  assert.equal(f.sessions.get(record.sessionId).questions[0].state, 'pending');
+  assert.equal(f.record().task.answers.length, 0);
+  await f.service.answer({ name: 'artist', message: 'explicit answer', questionId: 'q' }, extra(A));
   assert.equal(f.sends.some(item => item.message === 'next supplement'), false);
   f.finish();
   await f.service.poll(record.agentId);
-  await f.service.poll(record.agentId);
-  assert.deepEqual(f.sends.slice(1).map(item => item.message), ['Answer: answer', 'next supplement']);
+  f.finish(); await f.service.poll(record.agentId);
+  f.finish(); await f.service.poll(record.agentId);
+  assert.deepEqual(f.sends.slice(1).map(item => item.message), ['Answer: explicit answer', 'answer', 'next supplement']);
   const stale = f.record();
   assert.equal(f.store.enqueueSupplement(stale, 'request-stale', 'must not send'), true);
   const newer = f.record(); newer.task.taskId = 'task-new'; f.store.save(newer);
@@ -1597,18 +1602,6 @@ test('send returns a compact receipt for a rich active task and preserves errors
   const unknown = await f.service.send({ name: 'artist', message: 'retry uncertain' }, extra(A));
   assert.equal(unknown.accepted, false);
   assert.equal(unknown.error.code, 'send-unknown');
-  failure = undefined;
-  f.sessions.get(f.record().sessionId).questions = [{ id: 'q', message: 'question', state: 'pending' }];
-  const answerReceipt = await f.service.send({ name: 'artist', message: 'answer' }, extra(A));
-  assert.equal(answerReceipt.name, 'artist');
-  assert.equal(answerReceipt.answered, true);
-  assert.equal(answerReceipt.state, 'resuming');
-  assert.equal(answerReceipt.actualModel, 'test');
-  assert.equal(answerReceipt.delivery, 'answer-pending');
-  assert.equal(answerReceipt.accepted, false);
-  assert.equal(answerReceipt.queued, true);
-  assert.equal(answerReceipt.mode, 'steer');
-  assert.match(answerReceipt.requestId, /^request-/);
   } finally { f.service.close(); }
 });
 
@@ -2119,7 +2112,7 @@ test('a busy lock freezes the current pin for queued input and a later pin chang
 });
 
 test('a pending question freezes the answer selection before its continuation dispatch', async () => {
-  const f = await fixture();
+  const f = await fixture({ modernPrompt: true });
   try {
     f.catalog(MULTI_MODEL_CATALOG);
     await f.service.create({ name: 'artist', lifetime: 'persistent', model: 'ALPHA' }, extra(A));
@@ -2129,22 +2122,22 @@ test('a pending question freezes the answer selection before its continuation di
     await f.service.poll(record.agentId);
     assert.equal(f.record().state, 'awaiting_input');
 
-    const answered = await f.service.send({ name: 'artist', message: 'yes', model: 'BETA' }, extra(A));
+    const answered = await f.service.answer({ name: 'artist', message: 'yes', questionId: 'question-model' }, extra(A));
     assert.equal(answered.answered, true);
-    assert.equal(answered.actualModel, 'beta-mini');
+    assert.equal(answered.actualModel, 'alpha-pro');
     const answer = f.record().task.answers[0];
-    assert.deepEqual(answer.modelSelection,
-      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
+    assert.deepEqual([answer.modelSelection.provider, answer.modelSelection.model, answer.modelSelection.reasoningEffort],
+      ['fixture', 'alpha-pro', 'max']);
     // The continuation waits for the live turn to end; a later pin change must not
     // rewrite the answer intent already accepted.
     f.finish();
     const later = f.record();
-    later.modelPin = { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'max' };
+    later.modelPin = { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' };
     f.store.save(later);
     await f.service.poll(record.agentId);
     const dispatch = f.record().task.dispatches.find(item => item.kind === 'answer');
-    assert.deepEqual(dispatch.model,
-      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
+    assert.deepEqual([dispatch.model.provider, dispatch.model.model, dispatch.model.reasoningEffort],
+      ['fixture', 'alpha-pro', 'max']);
   } finally { f.service.close(); }
 });
 

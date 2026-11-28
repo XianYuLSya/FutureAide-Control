@@ -352,15 +352,23 @@ export function compactBoardPost(result = {}) {
     ? result.woken
     : Array.isArray(result.routed)
       ? result.routed
-        .filter(entry => entry && (entry.action === 'woken' || entry.action === 'revived'))
+        .filter(entry => ['woken', 'revived', 'woken-urgent', 'preempted'].includes(entry?.action))
         .map(entry => entry.name ?? entry.agentPath ?? entry.mention)
         .filter(Boolean)
       : [];
+  const routed = result.routed ?? [];
+  const deferred = routed.filter(entry => entry.action === 'deferred').map(entry => entry.agentPath ?? entry.name);
+  const preempted = routed.filter(entry => entry.action === 'preempted').map(entry => entry.agentPath ?? entry.name);
   return {
     posted: result.posted === true,
     ...(seq !== undefined ? { seq } : {}),
     mentions,
     woken,
+    ...(deferred.length ? { deferred } : {}),
+    ...(preempted.length ? { preempted } : {}),
+    ...(routed.some(entry => ['preempted', 'woken-urgent'].includes(entry.action)) ? {
+      routed: routed.map(({ action, agentPath, name, mention }) => ({ action, name: agentPath ?? name ?? mention })),
+    } : {}),
     ...errorFields(result),
   };
 }
@@ -424,6 +432,8 @@ export function compactTeamManage(result = {}) {
     ok,
     ...(summary ? { summary } : {}),
     ...(mergedFiles !== undefined ? { mergedFiles } : {}),
+    ...(result.action === "merge" ? { applied: result.applied === true, worktreeRemoved: result.worktreeRemoved === true,
+      recordClosed: result.recordClosed === true, recordCloseRequired: result.recordCloseRequired === true, stage: result.stage } : {}),
     ...(affected !== undefined ? { affected } : {}),
     ...(strays !== undefined ? { strays } : {}),
     ...(result.taskKey ? { taskKey: result.taskKey } : {}),

@@ -87,11 +87,7 @@ import { modelCatalogSummary } from './model-selection.mjs';
 
 export const TARGETS = Object.freeze(['dsh', 'codex-desktop', 'codex-cli', 'claude-cli', 'agy-cli']);
 export const DEFAULT_TARGET = 'dsh';
-// A target an older build offered and this one no longer does. Roster records that
-// carry it are read-only history: nothing can be created on it, and no local work is
-// ever attempted for it. It stays outside TARGETS so creation rejects it outright,
-// while reads keep working — dropping the value entirely would make every read of
-// such a record throw and take list, status, wait and the monitor sweep down with it.
+// Explicitly retired application targets retained in roster history.
 export const REMOVED_TARGETS = Object.freeze(['claude-desktop']);
 // Older roster records carry no target and keep the DSH behavior they were
 // created with. Native identifiers stay internal: the contract only ever moves
@@ -120,10 +116,11 @@ export function normalizeTarget(value) {
   if (!TARGETS.includes(value)) throw invalidTarget(value);
   return value;
 }
+// Older roster entries can reference an unavailable backend. Keep them readable.
+export const isUnavailableStoredTarget = target => typeof target === 'string' && target.length > 0 && !TARGETS.includes(target);
 export function targetOf(record) {
   const value = record?.target;
-  if (REMOVED_TARGETS.includes(value)) return value;
-  return normalizeTarget(value);
+  return isUnavailableStoredTarget(value) ? value : normalizeTarget(value);
 }
 
 // Display name of the application behind a target, used in user-facing text.
@@ -187,7 +184,8 @@ export async function diagnoseTarget(target, { adapters = {}, record = {}, reque
     // the IDs, any resolved route summary, and the actual reason a turn cannot start.
     return { ready: false, present: true, reason: reason(error),
       ...(error?.route ? { route: error.route } : {}),
-      ...(wanted === 'claude-cli' || wanted === 'codex-cli' || wanted === 'agy-cli' ? await readStatusModels(() => backend.models()) : {}) };
+      ...(['claude-cli', 'codex-cli', 'agy-cli'].includes(wanted)
+        ? await readStatusModels(() => backend.models()) : {}) };
   }
   const capabilities = { methods: probe?.methods ?? [], treeProtocol: probe?.treeProtocol ?? null,
     reportProtocol: probe?.reportProtocol ?? null,

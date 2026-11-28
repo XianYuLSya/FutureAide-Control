@@ -1,3 +1,4 @@
+import { answerCliQuestions } from './cli-question-selection.mjs';
 // Headless Codex CLI (`codex-cli`) backend implementing all 15 `BACKEND_METHODS`.
 // Mirrors `claude-cli-backend.mjs` with FAswitch active-profile/proxy routing and
 // manual port-binding override via `src/cli-proxy.mjs`.
@@ -212,10 +213,12 @@ export function createCodexCliBackend(record, deps = {}) {
       return { sessionId: load().sessionId, modelRequestsStarted: 0 };
     },
 
-    async beginTask() {
+    async beginTask({ readOnly } = {}) {
       const value = state();
       await refresh(value);
       const taskId = load().task?.taskId;
+      const constrained = readOnly === true || load().readOnlyScout === true;
+      if (constrained && value.readOnly !== true) { value.readOnly = true; save(value); }
       if (taskId !== value.taskId) {
         value.taskId = taskId;
         value.answered = [];
@@ -300,23 +303,11 @@ export function createCodexCliBackend(record, deps = {}) {
       return { messages: messages.slice(-maxMessages), hasMore, ...(failure ? { failure } : {}) };
     },
 
-    async answer({ answerId, message }) {
-      const value = state();
-      if (value.answers[answerId]) return value.answers[answerId];
-      const pending = (await submissions(value)).questions.filter(q => q.state === 'pending');
-      if (!pending.length) throw fail('question-not-pending', 'There is no unanswered question for this task.');
-      const ids = pending.map(q => q.id);
-      value.answered.push(...ids);
-      const result = {
-        consumedQuestionIds: ids,
-        continuation: `Parent answer:\n${message}\nContinue the same task.`,
-      };
-      value.answers[answerId] = result;
-      save(value);
-      return result;
+    async answer(input) {
+      return answerCliQuestions(input, { value: state(), load, submissions, save });
     },
 
-    async deliver({ requestId, message, model, explicitModel, timeoutMs, timeoutMinutes, writeBlockReason } = {}) {
+    async deliver({ requestId, message, model, explicitModel, timeoutMs, timeoutMinutes, writeBlockReason, readOnly } = {}) {
       if (!message?.trim() || !requestId || (explicitModel === true && !model?.model) || (model && !model.model)) {
         throw fail('invalid-dispatch', 'A request id, message and consistent model selection are required.', { terminal: true });
       }
@@ -368,7 +359,8 @@ export function createCodexCliBackend(record, deps = {}) {
           message,
           model: model?.model,
           effort: model?.reasoningEffort,
-          reportConfig,
+          reportConfig: { ...reportConfig, callerEnv: { ...reportConfig?.callerEnv, FUTUREAIDE_MANAGED_TARGET: 'codex-cli' } },
+          readOnly: readOnly === true || value.readOnly === true || current.readOnlyScout === true || reportConfig?.readOnly === true,
           requestId,
           agentId: current.agentId,
           taskId: current.task?.taskId,
@@ -445,6 +437,44 @@ export function createCodexCliBackend(record, deps = {}) {
       throw fail('model-selection-unsupported', 'Codex CLI applies an explicit model selection when a turn starts.');
     },
 
+    async preemptTurn(_record, { expectedRequestId } = {}) {
+      const value = state();
+      const request = value.requests[expectedRequestId];
+      const refused = { ok: false, stopped: false, sessionId: null, sessionResumable: false, sessionCwd: null };
+      if (!expectedRequestId || !request || request.taskId !== load().task?.taskId) return refused;
+      if (value.active !== expectedRequestId && (value.active || Object.keys(value.requests).at(-1) !== expectedRequestId
+          || !(request.preempted || request.terminal))) return refused;
+
+      if (request.preempted) return request.preempted;
+      const dir = directory(expectedRequestId);
+      let stopped;
+      try { stopped = await runner.cancelCodexTurn(dir, { expectedRequestId }); }
+      catch (error) {
+        if (error.code === 'preempt-cage-still-running') return refused;
+        throw error;
+      }
+      if (stopped?.stopped !== true || stopped.ok === false) return refused;
+      let native;
+      try { native = await runner.readCodexTurn(dir); }
+      catch (error) {
+        if (error.code !== 'codex-turn-not-found') throw error;
+      }
+      // Preserve native session evidence without settling the parent task.
+      const sessionId = native?.threadId ?? value["threadId"] ?? null;
+      const sessionResumable = Boolean(sessionId && (Boolean(sessionId)));
+      if (sessionResumable) {
+        value["threadId"] = sessionId;
+        value.started = true;
+      } else {
+        delete value["threadId"];
+        delete value.started;
+      }
+      value.sessionCwd = sessionResumable ? (native?.sessionCwd ?? value.sessionCwd ?? load().workspace) : undefined;
+      request.preempted = { ok: true, stopped: true, sessionId, sessionResumable, sessionCwd: value.sessionCwd ?? null };
+      delete value.active;
+      save(value);
+      return request.preempted;
+    },
     cancel,
 
     async destroy() {
@@ -459,7 +489,7 @@ export function createCodexCliBackend(record, deps = {}) {
   };
 
   if (deps.withHostLock) {
-    for (const method of ['beginTask', 'observe', 'answer', 'deliver', 'receipt', 'turn', 'model', 'cancel', 'destroy']) {
+    for (const method of ['beginTask', 'observe', 'answer', 'deliver', 'receipt', 'turn', 'model', 'preemptTurn', 'cancel', 'destroy']) {
       const action = backend[method];
       backend[method] = (...args) => deps.withHostLock(() => action(...args), { key: load().agentId });
     }

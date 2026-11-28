@@ -26,7 +26,8 @@ import { appendFile, open, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { buildCliProxyEnv, checkProxyReachable } from './cli-proxy.mjs';
+import { buildCliProxyEnv, checkProxyReachable, redactProxyCredentials } from './cli-proxy.mjs';
+import { managedCliEnv } from './managed-cli-policy.mjs';
 import { attachCurrentProcessToJobCage, killProcessCage } from './process-cage.mjs';
 import {
   CANCEL_CONFIRM_MS, CLAUDE_TURN_FILES, CLAUDE_WORKER_ERROR_PREFIX, WORKER_HEARTBEAT_MS,
@@ -160,7 +161,7 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
         stopError: {
           code: 'proxy-unavailable',
           notSent: true,
-          message: `Required proxy ${route.proxyUrl} is unreachable (${proxy.error || 'TCP probe failed'}); Claude CLI was not spawned.`,
+          message: `Required proxy ${redactProxyCredentials(route.proxyUrl)} is unreachable (${redactProxyCredentials(proxy.error || 'TCP probe failed')}); Claude CLI was not spawned.`,
         },
       });
     }
@@ -176,10 +177,10 @@ export async function runClaudeTurn({ directory, spawn: spawnImpl = spawn, sleep
   });
   const closeAll = () => Promise.allSettled([stdin.close(), stdout.close(), stderr.close(), drain.close()]);
 
-  const childEnv = buildCliProxyEnv(env, route);
+  const childEnv = buildCliProxyEnv(managedCliEnv(env), route);
   for (const extraEnv of [turn.reportConfig?.callerEnv, turn.callerEnv, turn.reportConfig?.env]) {
     if (extraEnv && typeof extraEnv === 'object' && !Array.isArray(extraEnv)) {
-      for (const [key, val] of Object.entries(extraEnv)) {
+      for (const [key, val] of Object.entries(managedCliEnv(extraEnv))) {
         if (val !== undefined && val !== null) childEnv[key] = String(val);
       }
     }

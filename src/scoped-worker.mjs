@@ -171,20 +171,21 @@ try {
   if (config.teamBoard === true) {
     try {
       const { boardRoutes } = await import('./team-board.mjs');
-      board = boardRoutes(store);
+      board = boardRoutes(store, { teamConfigPath: config.teamConfigPath });
     } catch (error) {
       trace(`board not mounted: ${error?.code ?? error?.message ?? 'unknown'}`);
       process.stderr.write(`[futureaide-monitor] team board not mounted: ${error?.code ?? error?.message ?? 'unknown'}\n`);
     }
   }
   const port = reportPort(config);
-  const reportOptions = { store, port, management: scopedManagement({ service }), ...(board ? { board } : {}),
+  const reportOptions = { store, port, teamConfigPath: config.teamConfigPath, management: scopedManagement({ service }), ...(board ? { board } : {}),
     onCliSubmission: async payload => {
       await service.handleCliSubmission?.(payload);
       if (payload?.agentId && hints.queued(payload.agentId)) signal();
     },
     runtimeDir: config.stateDirectory,
     ...(config.antigravityCallerTokenFile ? { antigravityCallerTokenFile: config.antigravityCallerTokenFile } : {}),
+    managedCliTokenFile: process.env.FUTUREAIDE_MANAGED_CLI_TOKEN_FILE,
     canStart: () => ownsLease() && store.leaseHeld(MONITOR_READY_LEASE, holder), log: message => trace(`report: ${message}`) };
   function reportNotReady(code) {
     if (reportProblem === code) return;

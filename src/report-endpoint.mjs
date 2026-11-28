@@ -93,7 +93,7 @@ async function health(port, { fetchImpl = globalThis.fetch, timeoutMs = REPORT_H
  * probe() can call it safely. With `expectedRoster`, a service that answers for a
  * different roster (or names none) is not ready.
  */
-export async function readReportStatus({ port = reportPort(), expectedRoster, fetchImpl, timeoutMs } = {}) {
+export async function readReportStatus({ port = reportPort(), expectedRoster, fetchImpl, timeoutMs, requireManagement = false } = {}) {
   const probe = await health(port, { fetchImpl, timeoutMs });
   if (!probe.ok) return { port, url: reportUrl(port), ready: false, hosting: 'none', reason: probe.reason };
   const info = probe.info;
@@ -101,6 +101,10 @@ export async function readReportStatus({ port = reportPort(), expectedRoster, fe
   if (expectedRoster !== undefined && info.roster !== expectedRoster) {
     return { port, url: reportUrl(port), ready: false, hosting, health: info,
       reason: { code: 'report-service-foreign-roster', message: `Port ${port} answers for a different roster; it was not reused.` } };
+  }
+  if (requireManagement && info.management !== true) {
+    return { port, url: reportUrl(port), ready: false, hosting,
+      reason: { code: 'report-service-callback-only', message: 'The roster listener does not host management tools.' } };
   }
   return { port, url: reportUrl(port), ready: true, hosting, health: info };
 }
@@ -112,7 +116,7 @@ export async function readReportStatus({ port = reportPort(), expectedRoster, fe
  * @returns {{port:number,url:string,ready:boolean,started?:boolean,reason?:object}}
  */
 export async function ensureReportService({ store, port = reportPort(), timeoutMs = 1500, fetchImpl, management, board,
-  onCliSubmission, runtimeDir, antigravityCallerTokenFile, canStart = () => true, log = () => {} } = {}) {
+  onCliSubmission, runtimeDir, antigravityCallerTokenFile, managedCliTokenFile, teamConfigPath, canStart = () => true, log = () => {} } = {}) {
   const expectedRoster = rosterIdentity(store);
   const checkedPort = isReportServiceListening(port) ? hosted.port : port;
   if (isReportServiceListening(port) && typeof onCliSubmission === 'function') {
@@ -130,10 +134,11 @@ export async function ensureReportService({ store, port = reportPort(), timeoutM
       // management mounts the shared management tools on the same MCP server; the
       // report surface owns that hook and adds no service or database of its own.
       const holder = { onCliSubmission };
-      const service = await startReportService({ store, port, log,
+      const service = await startReportService({ store, port, log, teamConfigPath,
         onCliSubmission: payload => holder.onCliSubmission?.(payload),
         ...(runtimeDir ? { runtimeDir } : {}),
         ...(antigravityCallerTokenFile ? { antigravityCallerTokenFile } : {}),
+        ...(managedCliTokenFile ? { managedCliTokenFile } : {}),
         ...(management ? { management } : {}), ...(board ? { board } : {}) });
       hosted = { requestedPort: port, port: service.port ?? port, service,
         get onCliSubmission() { return holder.onCliSubmission; },

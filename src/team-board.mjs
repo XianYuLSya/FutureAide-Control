@@ -3,22 +3,17 @@
 // body: one read of the roster projections and, at most, one directory listing of the
 // local Claude session titles per request.
 //
-// The shape is the one in docs/grill/Boss协议/团队看板/样例数据.json, minus `machine`
-// (that block is the export script's machine snapshot; the board never looks at it).
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { classifyManagedRole, normalizeRoleKey, resolveRoleDefaults } from './team-config-defaults.mjs';
 
 export const BOARD_PATH = '/board';
 export const BOARD_DATA_PATH = '/board/data';
 // A name nobody touched for this long is history, not a live seat on the board.
 const WINDOW_MS = 36 * 3600 * 1000;
 const ROLE_TEXT_CHARS = 400, ACTIVITY_CHARS = 80, TASK_CHARS = 90, SUMMARY_CHARS = 140;
-// Same vocabulary the approved export used: the first task names the seat's role.
-const ROLE_WORDS = [['独立审查员', '独立审查员'], ['审查员', '独立审查员'], ['团队长', '团队长'], ['规划师', '规划师'],
-  ['设计师', '设计师'], ['前端工程师', '前端工程师'], ['后端工程师', '后端工程师'], ['产品经理', '产品经理'],
-  ['调查员', '调查员'], ['秘书', '秘书']];
 
 const first = (text, limit) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, limit);
 
@@ -29,11 +24,18 @@ function localTime(iso) {
     { timeZone: 'America/New_York', hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
 
-function roleOf(name, text) {
-  const value = String(text ?? '').slice(0, ROLE_TEXT_CHARS);
-  return (ROLE_WORDS.find(([word]) => value.includes(word))
-    ?? ROLE_WORDS.find(([word]) => String(name ?? '').includes(word.slice(0, 2)))
-    ?? [null, '未标注'])[1];
+function roleOf(row, roleOptions) {
+  const task = String(row.firstTaskMessage ?? row.task ?? '').slice(0, ROLE_TEXT_CHARS);
+  const stated = row.role ?? /^(?:\s*角色[:：]\s*|\s*你是\s*)([^，。,:：\n]+)/u.exec(task)?.[1]?.trim();
+  const candidate = normalizeRoleKey(stated ?? row.name);
+  if (candidate) {
+    try {
+      const preset = resolveRoleDefaults(candidate, roleOptions);
+      if (preset.matched) return preset.roleKey;
+    } catch { /* An unreadable external role table does not prevent viewing the roster. */ }
+    if (stated || classifyManagedRole(candidate, roleOptions) !== 'base') return candidate;
+  }
+  return '未标注';
 }
 
 /** The folder a project path ends in: the page shows it when a chat has no title. */
@@ -61,11 +63,11 @@ export function claudeTitles({ root = process.env.CLAUDE_CONFIG_DIR || path.join
 }
 
 /** One name as the board shows it, from the snapshot row the store already projected. */
-export function boardName(row) {
+export function boardName(row, roleOptions) {
   return {
     id: row.id,
     name: row.name,
-    role: roleOf(row.name, `${row.firstTaskMessage ?? ''} ${row.task ?? ''}`),
+    role: roleOf(row, roleOptions),
     target: row.target ?? 'dsh',
     model: row.taskModel ?? row.selectionModel ?? null,
     effort: row.taskEffort ?? row.selectionEffort ?? null,
@@ -88,11 +90,11 @@ export function boardName(row) {
  * `store.boardSnapshot()` (a projection the roster already caches), and the 36-hour
  * window is applied here so that an old row never forces the projection to rebuild.
  */
-export function boardData(store, { titles = claudeTitles(), now = Date.now() } = {}) {
+export function boardData(store, { titles = claudeTitles(), now = Date.now(), teamConfigPath } = {}) {
   const snapshot = store.boardSnapshot();
   const since = new Date(now - WINDOW_MS).toISOString();
   const rows = snapshot.filter(row => typeof row.updatedAt === 'string' && row.updatedAt > since);
-  const names = rows.map(boardName);
+  const names = rows.map(row => boardName(row, { teamConfigPath }));
   const mine = new Map();
   rows.forEach((row, index) => {
     if (!mine.has(row.owner)) mine.set(row.owner, []);
@@ -150,7 +152,7 @@ export function boardData(store, { titles = claudeTitles(), now = Date.now() } =
 export function boardPageFile({ here = path.dirname(fileURLToPath(import.meta.url)) } = {}) {
   const candidates = [
     path.join(here, '..', 'assets', 'team-board', 'index.html'),
-    path.join(here, '..', 'docs', 'grill', 'Boss协议', '团队看板', '小看板.html'),
+    path.join(here, '..', 'docs', 'team-board', 'index.html'),
   ];
   return candidates.find(file => { try { return statSync(file).isFile(); } catch { return false; } });
 }
@@ -159,13 +161,13 @@ export function boardPageFile({ here = path.dirname(fileURLToPath(import.meta.ur
  * The two read-only routes, as one object the HTTP listener can mount. The page is
  * returned byte for byte; the data never carries the export script's `machine` block.
  */
-export function boardRoutes(store, { titles = claudeTitles, now = Date.now, pageFile = boardPageFile } = {}) {
+export function boardRoutes(store, { titles = claudeTitles, now = Date.now, pageFile = boardPageFile, teamConfigPath } = {}) {
   return {
     page() {
       const file = pageFile();
       if (!file) return undefined;
       return { body: readFileSync(file), type: 'text/html; charset=utf-8' };
     },
-    data() { return boardData(store, { titles: titles(), now: now() }); },
+    data() { return boardData(store, { titles: titles(), now: now(), teamConfigPath }); },
   };
 }

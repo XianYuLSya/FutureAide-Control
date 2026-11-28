@@ -11,7 +11,8 @@ import { appendFile, open, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
-import { buildCliProxyEnv, checkProxyReachable } from './cli-proxy.mjs';
+import { buildCliProxyEnv, checkProxyReachable, redactProxyCredentials } from './cli-proxy.mjs';
+import { managedCliEnv } from './managed-cli-policy.mjs';
 import { attachCurrentProcessToJobCage, killProcessCage } from './process-cage.mjs';
 import {
   CANCEL_CONFIRM_MS,
@@ -44,7 +45,13 @@ async function readJsonOptional(filename) {
 }
 
 async function readInitialState(directory, turn) {
-  try { return JSON.parse(await readFile(path.join(directory, CODEX_TURN_FILES.state), 'utf8')); }
+  try {
+    const state = JSON.parse(await readFile(path.join(directory, CODEX_TURN_FILES.state), 'utf8'));
+    if (!Object.hasOwn(turn, 'requestId') || state.requestId !== turn.requestId) {
+      throw Object.assign(new Error('The Codex state belongs to another turn.'), { code: 'codex-turn-mismatch' });
+    }
+    return state;
+  }
   catch (error) {
     if (error?.code !== 'ENOENT') throw error;
     return createCodexTurnState({
@@ -205,7 +212,7 @@ export async function runCodexTurn({
         preflightError: {
           code: 'proxy-unavailable',
           notSent: true,
-          message: `Required proxy ${route.proxyUrl} is unreachable (${proxy.error || 'TCP probe failed'}); codex.exe was not spawned.`,
+          message: `Required proxy ${redactProxyCredentials(route.proxyUrl)} is unreachable (${redactProxyCredentials(proxy.error || 'TCP probe failed')}); codex.exe was not spawned.`,
         },
       });
     }
@@ -223,6 +230,7 @@ export async function runCodexTurn({
       model: turn.model,
       effort: turn.effort,
       reportConfig: turn.reportConfig,
+      readOnly: turn.readOnly === true,
       turnDir: directory,
     });
 
@@ -232,10 +240,10 @@ export async function runCodexTurn({
   const drain = createStdoutReader(directory, state);
   const closeAll = () => Promise.allSettled([stdin.close(), stdout.close(), stderr.close(), drain.close()]);
 
-  const childEnv = buildCliProxyEnv(env, route);
+  const childEnv = buildCliProxyEnv(managedCliEnv(env), route);
   for (const extraEnv of [turn.reportConfig?.callerEnv, turn.callerEnv, turn.reportConfig?.env]) {
     if (extraEnv && typeof extraEnv === 'object' && !Array.isArray(extraEnv)) {
-      for (const [key, val] of Object.entries(extraEnv)) {
+      for (const [key, val] of Object.entries(managedCliEnv(extraEnv))) {
         if (val !== undefined && val !== null) childEnv[key] = String(val);
       }
     }

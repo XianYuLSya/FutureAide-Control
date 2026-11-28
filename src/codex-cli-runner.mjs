@@ -20,6 +20,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { buildCliProxyEnv, resolveCliRoute } from './cli-proxy.mjs';
+import { managedCliEnv } from './managed-cli-policy.mjs';
 import { killProcessCage } from './process-cage.mjs';
 import { replaceStateFile } from './replace-state-file.mjs';
 
@@ -447,6 +448,7 @@ export function buildCodexCliArgs({
   model,
   effort,
   reportConfig,
+  readOnly = false,
   turnDir,
 } = {}) {
   const args = ['exec'];
@@ -454,6 +456,9 @@ export function buildCodexCliArgs({
     args.push('resume');
   }
   args.push('--json', '--skip-git-repo-check');
+  if (readOnly) {
+    args.push(...(resume && threadId ? ['-c', 'sandbox_mode="read-only"'] : ['--sandbox', 'read-only']));
+  }
   if (!resume && workspace) {
     args.push('--cd', String(workspace));
   }
@@ -809,6 +814,7 @@ export async function startCodexTurn({
   effort,
   reportConfig,
   callerEnv,
+  readOnly = false,
   requestId,
   agentId,
   taskId,
@@ -837,7 +843,7 @@ export async function startCodexTurn({
   });
   const fingerprint = createHash('sha256').update(JSON.stringify({
     workspace, fullPrompt, model: model ?? null, effort: effort ?? null,
-    threadId: threadId ?? null, resume, command: spec,
+    threadId: threadId ?? null, resume, readOnly, command: spec,
   })).digest('hex');
 
   await mkdir(directory, { recursive: true });
@@ -883,6 +889,7 @@ export async function startCodexTurn({
     timeoutMs: resolveTurnTimeoutMs({ timeoutMs, timeoutMinutes, config }),
     reportConfig: reportConfig ?? null,
     callerEnv: resolvedCallerEnv,
+    readOnly,
     route: route ?? null,
     command: spec.command,
     prefixArgs: spec.prefixArgs,
@@ -894,7 +901,7 @@ export async function startCodexTurn({
   await writeJsonFile(directory, CODEX_TURN_FILES.turn, turn);
   await writeJsonFile(directory, CODEX_TURN_FILES.state, state);
 
-  const workerEnv = buildCliProxyEnv(env, route);
+  const workerEnv = buildCliProxyEnv(managedCliEnv(env), route);
   const worker = await spawnWorker(directory, { env: workerEnv, route });
   const claimedTurn = await readJson(path.join(directory, CODEX_TURN_FILES.turn));
   const workerPid = (Number.isSafeInteger(claimedTurn?.workerPid) && claimedTurn.workerPid > 0)
@@ -909,7 +916,7 @@ export async function startCodexTurn({
 async function readTerminalSnapshot(directory, turn) {
   const terminal = await readJson(path.join(directory, CODEX_TURN_FILES.terminal));
   if (!terminal || terminal.phase !== 'exited' || !TERMINAL_STATES.includes(terminal.state)) return undefined;
-  if (turn?.requestId && terminal.requestId && terminal.requestId !== turn.requestId) return undefined;
+  if (!turn || !Object.hasOwn(turn, 'requestId') || terminal.requestId !== turn.requestId) return undefined;
   return terminal;
 }
 
@@ -920,6 +927,9 @@ async function readTurnState(directory, turn, { checkTerminal = false } = {}) {
     const terminal = await readTerminalSnapshot(directory, turn);
     if (terminal) return terminal;
     throw error;
+  }
+  if (state && (!turn || !Object.hasOwn(turn, 'requestId') || state.requestId !== turn.requestId)) {
+    return readTerminalSnapshot(directory, turn);
   }
   if (checkTerminal && !TERMINAL_STATES.includes(state?.state)) {
     return await readTerminalSnapshot(directory, turn) ?? state;
@@ -983,7 +993,7 @@ export async function readCodexTurn(directory, { isAlive = processAlive } = {}) 
   let reported = state.state === undefined ? 'running' : state.state;
   let error = state.error ?? undefined;
   if (!TERMINAL_STATES.includes(reported)) {
-    if (marker?.stopped === true && !alivePids.length) {
+    if (marker?.requestId === turn?.requestId && marker?.stopped === true && !alivePids.length) {
       reported = 'cancelled';
       error = undefined;
     } else if (alivePids.length) {
@@ -1108,7 +1118,7 @@ async function markCancelled(directory, state) {
   });
 }
 
-export async function cancelCodexTurn(directory, {
+export async function cancelCodexTurn(directory, { expectedRequestId,
   isAlive = processAlive,
   killTree = killProcessTree,
   killCage = killTree === killProcessTree ? killProcessCage : async () => ({ ok: true, killed: [] }),
@@ -1116,6 +1126,18 @@ export async function cancelCodexTurn(directory, {
   confirmMs = CANCEL_CONFIRM_MS,
 } = {}) {
   const turn = await readJson(path.join(directory, CODEX_TURN_FILES.turn));
+  if (expectedRequestId !== undefined && turn?.requestId !== expectedRequestId) {
+    return { ok: false, stopped: false, note: 'The original turn request does not match.' };
+  }
+  // A native session survives multiple turns. Only use this turn's directory
+  // and request ID when preempting, including for orphan discovery.
+  const stopCage = async options => {
+    const result = await killCage(expectedRequestId === undefined ? options : { ...options, sessionId: undefined });
+    if (expectedRequestId !== undefined && result?.ok === false) {
+      throw fail('preempt-cage-still-running', 'The original process cage could not be reaped.');
+    }
+    return result;
+  };
   const state = await readTurnState(directory, turn, { checkTerminal: true });
   const pids = {
     worker: recordedWorkerPid(turn, state),
@@ -1131,7 +1153,7 @@ export async function cancelCodexTurn(directory, {
   const sessionId = state?.sessionId ?? turn?.sessionId ?? null;
   const markers = {
     directory,
-    threadId: state?.threadId ?? turn?.threadId ?? null,
+    threadId: expectedRequestId === undefined ? state?.threadId ?? turn?.threadId ?? null : undefined,
     requestId,
     startedAt: state?.startedAt ?? turn?.startedAt ?? null,
   };
@@ -1150,7 +1172,7 @@ export async function cancelCodexTurn(directory, {
       }
       if (ours.length) {
         for (const pid of ours) await killTree(pid);
-        await killCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
+        await stopCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
         const deadline = Date.now() + confirmMs;
         let stillOurs = ours.filter(pid => isAlive(pid));
         while (stillOurs.length && Date.now() < deadline) {
@@ -1163,7 +1185,7 @@ export async function cancelCodexTurn(directory, {
         }
         return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [] };
       }
-      await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+      await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
       const nonReused = surviving.filter(pid => isAlive(pid) && !reused.includes(pid));
       if (nonReused.length) {
         return { ok: false, cancelled: false, stopped: false, state: state.state, pids, remaining: nonReused,
@@ -1171,12 +1193,12 @@ export async function cancelCodexTurn(directory, {
       }
       return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [] };
     }
-    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [] };
   }
 
   if (!recorded.length) {
-    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     return { ok: false, cancelled: false, stopped: false, state: 'running', pids, remaining: [],
       note: 'Worker has not recorded any pid yet; retry cancel shortly.' };
   }
@@ -1184,7 +1206,7 @@ export async function cancelCodexTurn(directory, {
   await writeJsonFile(directory, CODEX_TURN_FILES.cancel, { requestId, requestedAt, stopped: null, pids });
   const targets = alive();
   if (!targets.length) {
-    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     const latest = await readTurnState(directory, turn, { checkTerminal: true });
     const current = TERMINAL_STATES.includes(latest?.state) ? latest.state : 'cancelled';
     if (!TERMINAL_STATES.includes(latest?.state) && (latest ?? state)) {
@@ -1210,7 +1232,7 @@ export async function cancelCodexTurn(directory, {
   }
 
   for (const pid of ours) await killTree(pid);
-  await killCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
+  await stopCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
   const blocking = () => recorded.filter(pid => isAlive(pid) && !reused.includes(pid));
   const deadline = Date.now() + confirmMs;
   let remaining = blocking();

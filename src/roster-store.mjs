@@ -4,10 +4,17 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { answerOutcome } from './cleanup-input-receipts.mjs';
 import { REPORT_BODY_RETENTION_MS } from './report-delivery.mjs';
+import { classifyManagedRole } from './team-config-defaults.mjs';
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 const noticeMilliseconds = value => Number.isFinite(value) ? value
   : Number.isFinite(Date.parse(value ?? '')) ? Date.parse(value) : 0;
+
+export const activeManagedRequestId = task => task?.preemption?.requestId ?? task?.dispatches?.at(-1)?.requestId;
+
+// A lost HTTP acknowledgement and its SQLite retry share the submissions primary key.
+const managedQuestionId = (agentId, taskId, requestId, message) => 'submission-ask-' + createHash('sha256')
+  .update(JSON.stringify([agentId, taskId, requestId, message])).digest('hex');
 
 /** The id a stored ask or report carries once it is a question or report of its task. */
 export const submissionRef = id => `submission:${id}`;
@@ -128,11 +135,12 @@ export function writeDeliveredReceipts(db, record, retentionMs = 7 * 24 * 60 * 6
 
 /** One small local database serializes overlapping MCP and recovery-worker calls. */
 export class RosterStore {
-  constructor(filename) {
+  constructor(filename, { teamConfigPath } = {}) {
     if (filename !== ':memory:') mkdirSync(path.dirname(filename), { recursive: true });
     // Canonical absolute location. Its hash is this roster's identity — a public
     // name for the database, never a credential.
     this.location = filename === ':memory:' ? ':memory:' : path.resolve(filename);
+    this.teamConfigPath = teamConfigPath;
     this.db = new DatabaseSync(filename);
     // WAL with synchronous=NORMAL: a commit no longer flushes the disk; the WAL is
     // synced at each checkpoint. The roster stays consistent after a crash, and a
@@ -197,6 +205,12 @@ export class RosterStore {
         createdAt TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS team_board_by_owner ON team_board_messages(rootOwner, seq);
+      CREATE TABLE IF NOT EXISTS team_board_routes (
+        rootOwner TEXT NOT NULL, seq INTEGER NOT NULL, targetAgent TEXT NOT NULL,
+        taskId TEXT, requestId TEXT NOT NULL, urgent INTEGER NOT NULL, status TEXT NOT NULL,
+        body TEXT NOT NULL, PRIMARY KEY(rootOwner,seq,targetAgent), UNIQUE(requestId)
+      );
+      CREATE INDEX IF NOT EXISTS team_board_routes_target ON team_board_routes(targetAgent,status,urgent,seq);
       CREATE TABLE IF NOT EXISTS team_agent_stubs (
         agentId TEXT PRIMARY KEY,
         rootOwner TEXT NOT NULL,
@@ -244,6 +258,10 @@ export class RosterStore {
     this.addTextColumn('task_keys', 'failureReason');
     this.addTextColumn('task_keys', 'release');
     this.addTextColumn('report_bodies', 'encoding');
+    this.addTextColumn('team_agent_stubs', 'readOnlyScout', 'INTEGER');
+    this.addTextColumn('team_board_messages', 'urgent', 'INTEGER');
+    this.addTextColumn('team_board_messages', 'authorTaskId');
+    this.addTextColumn('team_board_messages', 'authorRequestId');
     // Only now can the debt index name the notice column. A roster from an older build
     // gains that column on the line above; a new one created it with the table.
     this.db.exec(`CREATE INDEX IF NOT EXISTS submissions_debt ON submissions(agent, task)
@@ -462,9 +480,11 @@ export class RosterStore {
       const ready = this.db.prepare(`SELECT 1 FROM agents WHERE id=? AND owner=? AND name=?
         AND coalesce(json_extract(body,'$.closed'),0)=0
         AND json_extract(body,'$.task.taskId') IS ? AND json_extract(body,'$.state')=?
+        AND json_extract(body,'$.task.preemptionEpoch') IS ?
+        AND json_type(body,'$.task.preemption') IS NULL AND json_type(body,'$.worktreeMerge') IS NULL
         AND NOT EXISTS (SELECT 1 FROM submissions WHERE agent=agents.id
           AND task=json_extract(agents.body,'$.task.taskId') AND ${submissionDebtSql()})`)
-        .get(record.agentId, record.ownerId, record.name, previous.task?.taskId ?? null, previous.state);
+        .get(record.agentId, record.ownerId, record.name, previous.task?.taskId ?? null, previous.state, previous.task?.preemptionEpoch ?? null);
       if (ready) {
         if (snapshot) {
           const current = this.get(record.agentId);
@@ -472,7 +492,7 @@ export class RosterStore {
           if (nativeQuestions.length) snapshot.nativeQuestions = nativeQuestions;
           this.appendHistory(record.agentId, snapshot);
         }
-        this.save(record);
+        this.save(record, { expectedTurn: previous });
         if (record.task?.requestId) this.saveTaskKey(record.ownerId, record.agentId, record.task.requestId, record.task.taskId);
       }
       this.db.exec('COMMIT');
@@ -1160,7 +1180,7 @@ export class RosterStore {
     return this.db.prepare('SELECT 1 AS found FROM agents WHERE id=? AND owner=? AND name=?')
       .get(record.agentId, record.ownerId, record.name) !== undefined;
   }
-  save(record, { dispatch = false } = {}) {
+  save(record, { dispatch = false, expectedTurn = record } = {}) {
     if (record.task?.taskId) {
       const prior = this.get(record.agentId);
       captureNativeQuestionHistory(record, prior?.ownerId === record.ownerId ? prior : undefined);
@@ -1171,7 +1191,7 @@ export class RosterStore {
     // expression index, which is the single largest cost of a quiet round.
     const cached = this.bodies.get(record.agentId);
     const candidate = JSON.stringify(record);
-    if (!dispatch && cached !== undefined && cached.text === candidate && this.stillPresent(record)) return true;
+    if (!dispatch && cached !== undefined && cached.text === candidate && this.stillCurrentTurn(record)) return true;
     record.updatedAt = new Date().toISOString();
     if (this.woken.has(record.agentId)) delete record.sleep;
     // A plain second serialisation: a body can carry a nested updatedAt of its own, and
@@ -1206,7 +1226,7 @@ export class RosterStore {
     // Dispatch preparation and receipts can outlive the name's lease. Check the
     // task and its terminal state in the same write that merges the record.
     const fence = dispatch ? `
-      AND json_extract(body,'$.task.taskId')=?5
+      AND json_extract(body,'$.task.taskId')=?7
       AND coalesce(json_extract(body,'$.closed'),0)=0
       AND coalesce(json_extract(body,'$.state'),'') NOT IN ('failed','cancelled','completed')
       AND coalesce(json_extract(body,'$.task.state'),'') NOT IN ('failed','cancelled','completed')
@@ -1223,9 +1243,20 @@ export class RosterStore {
       WHEN coalesce(json_extract(body,'$.autoCleanupClosed'),0)=1
       THEN json_set(${merged},'$.closed',json('true'),'$.autoCleanupClosed',json('true'))
       ELSE ${merged} END
-      WHERE id=?2 AND owner=?3 AND name=?4 AND json_type(body,'$.cleanupRosterTicket') IS NULL ${fence} RETURNING body`)
-      .get(body, record.agentId, record.ownerId, record.name, ...(dispatch ? [record.task?.taskId ?? null] : []));
+      WHERE id=?2 AND owner=?3 AND name=?4 AND json_type(body,'$.cleanupRosterTicket') IS NULL
+        AND json_extract(body,'$.task.preemptionEpoch') IS ?5
+        AND (?5 IS NULL OR json_extract(body,'$.task.taskId') IS ?6)
+        AND (json_extract(body,'$.task.taskId') IS NOT json_extract(?1,'$.task.taskId')
+          OR json_extract(body,'$.task.dispatches[#-1].requestId') IS NULL
+          OR EXISTS (SELECT 1 FROM json_each(?1,'$.task.dispatches') AS input
+            WHERE json_extract(input.value,'$.requestId')=json_extract(body,'$.task.dispatches[#-1].requestId')))
+        AND (json_type(body,'$.worktreeMerge') IS NULL OR json_extract(body,'$.worktreeMerge.key')=?8)
+        ${fence} RETURNING body`)
+      .get(body, record.agentId, record.ownerId, record.name, expectedTurn.task?.preemptionEpoch ?? null,
+        expectedTurn.task?.taskId ?? null, record.task?.taskId ?? null, expectedTurn.worktreeMerge?.key ?? null);
     if (dispatch && !result) return false;
+    if (!result && this.stillPresent(record)
+        && (!this.stillCurrentTurn(record) || this.get(record.agentId)?.worktreeMerge)) return false;
     if (!result && this.db.prepare("SELECT 1 FROM agents WHERE id=? AND json_type(body,'$.cleanupRosterTicket') IS NOT NULL").get(record.agentId))
       throw Object.assign(new Error('This subagent is closed by a roster cleanup ticket.'), { code: 'cleanup-claimed' });
     if (!result) throw new Error('This subagent instance has already been removed.');
@@ -1242,20 +1273,39 @@ export class RosterStore {
     const changed = this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.task.cancelRequested',json('true'),'$.task.cancelPending',json('true'),'$.task.cancelTreeSettled',json('false'),'$.state','running'),'$.nextAttemptAt')
       WHERE id=? AND owner=? AND name=? AND json_extract(body,'$.sessionId')=? AND json_extract(body,'$.task.taskId')=?
       AND coalesce(json_extract(body,'$.closed'),0)=0 AND coalesce(json_extract(body,'$.state'),'') NOT IN ('cleaning','cleanup_failed')
+      AND json_type(body,'$.worktreeMerge') IS NULL
+      AND json_type(body,'$.task.preemption') IS NULL
+      AND json_extract(body,'$.task.preemptionEpoch') IS ?
       -- A round whose thread cannot be found was already marked failed: cancelling it
       -- would only pull it back to running for a tree no read can confirm.
       AND NOT (json_extract(body,'$.state')='failed'
         AND coalesce(json_extract(body,'$.task.treeUnavailable'),'')='codex-thread-not-found')`)
-      .run(record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId).changes === 1;
+      .run(record.agentId, record.ownerId, record.name, record.sessionId, record.task?.taskId,
+        record.task?.preemptionEpoch ?? null).changes === 1;
     if (changed) this.touched(record.agentId);
     return changed;
   }
-  requestCleanup(record) {
-    const changed = this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.state','cleaning','$.closed',json('true')),'$.sleep','$.error','$.nextAttemptAt')
+  requestCleanup(record, verified = [], { discardWorktree = false } = {}) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (!this.cleanupTreeMatches(record, verified)) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+      const current = this.get(record.agentId);
+      const changed = this.db.prepare(`UPDATE agents SET body=json_remove(json_set(body,'$.state','cleaning','$.closed',json('true')),'$.sleep','$.error','$.nextAttemptAt')
       WHERE id=? AND owner=? AND json_extract(body,'$.sessionId')=? AND json_type(body,'$.cleanupRosterTicket') IS NULL`)
-      .run(record.agentId, record.ownerId, record.sessionId).changes === 1;
-    if (changed) this.touched(record.agentId);
-    return changed;
+        .run(record.agentId, record.ownerId, record.sessionId).changes === 1;
+      if (changed) {
+        for (const child of this.descendantsOf([record.agentId])) {
+          this.db.prepare(`UPDATE agents SET body=json_set(body,'$.closed',json('true')) WHERE id=?`).run(child.agentId);
+        }
+        if (discardWorktree) this.db.prepare(`UPDATE agents SET body=json_set(body,'$.discardWorktree',json('true')) WHERE id=?`).run(current.agentId);
+      }
+      this.db.exec('COMMIT');
+      if (changed) this.touched(record.agentId);
+      return changed;
+    } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
   /**
    * What this whole tree — the name and every descendant, read from the roster itself —
@@ -1317,14 +1367,14 @@ export class RosterStore {
     }
     return { pending, blocked };
   }
-  claimAutoCleanup(record) {
+  claimAutoCleanup(record, verified = []) {
     // One transaction for the check and the claim: a child that accepts a message while
     // this runs either lands before the hold (and blocks the delete) or after the tree is
     // closed (and is refused). The root keeps its own cancel and supplement gates.
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const hold = this.autoCleanupHold(record.agentId);
-      if (hold.pending > 0 || hold.blocked > 0) {
+      if (hold.pending > 0 || hold.blocked > 0 || !this.cleanupTreeMatches(record, verified)) {
         this.db.exec('ROLLBACK');
         return false;
       }
@@ -1354,6 +1404,18 @@ export class RosterStore {
       throw error;
     }
   }
+  cleanupTreeMatches(record, verified = []) {
+    const current = this.get(record.agentId);
+    if (!current || current.ownerId !== record.ownerId || current.task?.taskId !== record.task?.taskId
+        || current.task?.preemption || current.cleanupRosterTicket) return false;
+    const members = [current, ...this.descendantsOf([record.agentId])];
+    const proof = new Map(verified.map(member => [member.agentId, JSON.stringify(member)]));
+    if (verified.length && (members.length !== proof.size || members.some(member => proof.get(member.agentId) !== JSON.stringify(member)))) return false;
+    return members.every(member => {
+      if (member.task?.preemption || member.cleanupRosterTicket) return false;
+      return !(member.worktreePath || member.unmergedWorktree || member.worktreeMerge) || proof.has(member.agentId);
+    });
+  }
   confirmCancel(record, result = {}) {
     const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.task.cancelAccepted',json('true'),'$.task.cancelPending',json(?))
       WHERE id=? AND json_extract(body,'$.task.taskId')=? AND json_extract(body,'$.task.cancelRequested')=1`)
@@ -1363,11 +1425,14 @@ export class RosterStore {
   }
   // Update only the error, and never overwrite a different error that a later
   // attempt already recorded, so a delayed spawn failure cannot mask new state.
-  setError(id, error) {
+  setError(id, error, expected) {
     const body = JSON.stringify(error);
     const changed = this.db.prepare(`UPDATE agents SET body=json_set(body,'$.error',json(?)) WHERE id=?
-      AND (json_type(body,'$.error') IS NULL OR json_extract(body,'$.error.code')=json_extract(?,'$.code'))`)
-      .run(body, id, body).changes === 1;
+      AND (json_type(body,'$.error') IS NULL OR json_extract(body,'$.error.code')=json_extract(?,'$.code'))
+      AND (?=0 OR (json_extract(body,'$.task.taskId') IS ? AND json_extract(body,'$.task.preemptionEpoch') IS ?
+        AND json_extract(body,'$.task.dispatches[#-1].requestId') IS ?))`)
+      .run(body, id, body, Number(Boolean(expected)), expected?.task?.taskId ?? null,
+        expected?.task?.preemptionEpoch ?? null, expected?.task?.dispatches?.at(-1)?.requestId ?? null).changes === 1;
     if (changed) this.touched(id);
   }
   claimLease(key, holder, leaseMs) {
@@ -1587,10 +1652,10 @@ export class RosterStore {
     this.db.exec('PRAGMA busy_timeout=30000');
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      const written = write();
+      const written = this.stillCurrentTurn(record) && write();
       // The caller's mirror is current only while the row still holds the same task: a
       // worker that was replaced must not write its stale copy over the newer one.
-      if (written && this.stillSameTask(record)) this.save(record);
+      if (written) this.save(record);
       this.db.exec('COMMIT');
       return written;
     } catch (error) {
@@ -1603,6 +1668,55 @@ export class RosterStore {
     return this.db.prepare(`SELECT 1 AS current FROM agents WHERE id=? AND owner=? AND name=?
       AND json_extract(body,'$.task.taskId') IS ?`)
       .get(record.agentId, record.ownerId, record.name, record.task?.taskId ?? null) !== undefined;
+  }
+  stillCurrentTurn(record) {
+    return this.db.prepare(`SELECT 1 FROM agents WHERE id=? AND owner=? AND name=?
+      AND json_extract(body,'$.task.taskId') IS ?
+      AND json_extract(body,'$.task.preemptionEpoch') IS ?
+      AND json_extract(body,'$.task.dispatches[#-1].requestId') IS ?`)
+      .get(record.agentId, record.ownerId, record.name, record.task?.taskId ?? null,
+        record.task?.preemptionEpoch ?? null, record.task?.dispatches?.at(-1)?.requestId ?? null) !== undefined;
+  }
+  beginPreemption(record, route, { stop, oldRequestId }) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const current = this.get(record.agentId);
+      const task = current?.task;
+      if (!task || !this.stillCurrentTurn(record) || task.taskId !== route.taskId
+          || current.closed || current.worktreeMerge || task.cancelRequested || task.result
+          || ['idle', 'completed', 'failed', 'cancelled', 'delivery_pending', 'cleaning'].includes(current.state)
+          || task.reports?.some(report => report.final) || this.hasFinalNotice(record.agentId, task.taskId)
+          || task.dispatches?.at(-1)?.requestId !== oldRequestId) {
+        this.db.exec('ROLLBACK');
+        return undefined;
+      }
+      if (task.preemption) {
+        this.db.exec('ROLLBACK');
+        return task.preemption.requestId === route.requestId ? current : undefined;
+      }
+      const priorEpoch = task.preemptionEpoch;
+      task.preemptionEpoch = route.requestId;
+      task.preemption = { requestId: route.requestId, oldRequestId, stop, priorEpoch };
+      this.db.prepare('UPDATE agents SET body=? WHERE id=?').run(JSON.stringify(current), current.agentId);
+      this.db.exec('COMMIT');
+      this.touched(current.agentId);
+      return current;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  abortPreemption(record) {
+    const migration = record.task?.preemption;
+    if (!migration) return false;
+    const changed = this.db.prepare(`UPDATE agents SET body=CASE WHEN ?1 IS NULL
+      THEN json_remove(body,'$.task.preemption','$.task.preemptionEpoch')
+      ELSE json_set(json_remove(body,'$.task.preemption'),'$.task.preemptionEpoch',?1) END
+      WHERE id=?2 AND json_extract(body,'$.task.taskId')=?3
+        AND json_extract(body,'$.task.preemption.requestId')=?4`)
+      .run(migration.priorEpoch ?? null, record.agentId, record.task.taskId, migration.requestId).changes === 1;
+    if (changed) this.touched(record.agentId);
+    return changed;
   }
   /** Bind a callback to the current task before the shared monitor delivers it. */
   submitParentMessage(agentId, { kind, message, final = false }, cliDispatch) {
@@ -1617,7 +1731,7 @@ export class RosterStore {
           ? record.target !== cliDispatch.target
           : !['claude-cli', 'codex-cli', 'agy-cli'].includes(record.target))
           || task.taskId !== cliDispatch.taskId
-          || task.dispatches?.at(-1)?.requestId !== cliDispatch.requestId))) {
+          || activeManagedRequestId(task) !== cliDispatch.requestId))) {
         throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
       }
       // Callback correctness applies independently of the session cleanup switch.
@@ -1626,6 +1740,12 @@ export class RosterStore {
       }
       if (cliDispatch && ['idle', 'failed'].includes(record.state)) {
         throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
+      }
+      const questionId = kind === 'ask' && cliDispatch
+        ? managedQuestionId(agentId, task.taskId, cliDispatch.requestId, message) : undefined;
+      if (questionId && this.db.prepare('SELECT 1 FROM submissions WHERE id=?').get(questionId)) {
+        this.db.exec('COMMIT');
+        return { accepted: true, name: record.name, taskId: task.taskId, submissionId: questionId, kind };
       }
       if (task.reports?.some(report => report.final) || this.submissions(agentId, task.taskId).some(report => report.final)) {
         throw Object.assign(new Error('This task already submitted its final report.'), { code: 'final-already-submitted' });
@@ -1671,7 +1791,7 @@ export class RosterStore {
           }
         }
       }
-      const id = 'submission-' + randomUUID().replaceAll('-', '');
+      const id = questionId ?? ('submission-' + randomUUID().replaceAll('-', ''));
       this.enqueueSubmission({ id, ownerId: record.ownerId, agentId, taskId: task.taskId, kind, message, final });
       if (record.sleep) this.wake(agentId, task.taskId);
       this.db.exec('COMMIT');
@@ -1719,8 +1839,7 @@ export class RosterStore {
     this.db.exec('PRAGMA busy_timeout=30000');
     this.db.exec('BEGIN IMMEDIATE');
     try {
-      this.save(record);
-      for (const id of ids) this.consumeSubmission(id);
+      if (this.save(record)) for (const id of ids) this.consumeSubmission(id);
       this.db.exec('COMMIT');
     } catch (error) { this.db.exec('ROLLBACK'); throw error; }
   }
@@ -1763,7 +1882,8 @@ export class RosterStore {
       // the tasks said, and it has to happen before the checkpoint below, so the freed
       // cells are overwritten by secure_delete and the old WAL copies are truncated.
       this.db.prepare('DELETE FROM agent_history WHERE agent=?').run(record.agentId);
-      this.db.prepare('DELETE FROM agents WHERE id=? AND owner=?').run(record.agentId, record.ownerId);
+      const removed = this.db.prepare('DELETE FROM agents WHERE id=? AND owner=?').run(record.agentId, record.ownerId).changes;
+      if (!removed) throw Object.assign(new Error('The roster record no longer matches this operation.'), { code: 'agent-not-found' });
       // The per-target host lock is shared with other names and is left to its holder.
       this.db.prepare('DELETE FROM leases WHERE key=? OR key=?').run(record.agentId, `worker:${record.agentId}`);
       this.db.exec('COMMIT');
@@ -1782,6 +1902,10 @@ export class RosterStore {
       this.insert({ agentId: record.agentId, ownerId: record.ownerId, name: record.name, lifetime: record.lifetime,
         ...(record.target ? { target: record.target } : {}),
         workspace: record.workspace, sessionId: record.sessionId, state: 'cleanup_failed', nativeDestroyed: true, history: [],
+        ...(record.parentAgentId ? { parentAgentId: record.parentAgentId } : {}),
+        ...(record.worktreeMerge ? { worktreeMerge: record.worktreeMerge, worktreePath: record.worktreePath,
+          rootWorkspace: record.rootWorkspace, repoRoot: record.repoRoot, callerWorkspace: record.callerWorkspace,
+          ...(record.task ? { task: { taskId: record.task.taskId, state: record.task.state } } : {}) } : {}),
         updatedAt: new Date().toISOString(), error: 'Database cleanup is waiting for another reader. Delete this name again to finish.' });
       throw new Error('The session was removed; local database cleanup is still pending.');
     }
@@ -1816,6 +1940,9 @@ export class RosterStore {
     author = 'Boss',
     authorRole = null,
     authorAgentId = null,
+    authorTaskId = null,
+    authorRequestId = null,
+    urgent = false,
     text,
     mentions = [],
     routed = [],
@@ -1825,25 +1952,38 @@ export class RosterStore {
     if (typeof text !== 'string' || !text.trim()) throw new Error('A non-empty board message is required.');
     const normalizedMentions = Array.isArray(mentions) ? [...new Set(mentions.map(String))] : [];
     const normalizedRouted = Array.isArray(routed) ? routed : [];
-    const info = this.db.prepare(`INSERT INTO team_board_messages(rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt)
-      VALUES (?,?,?,?,?,?,?,?)`).run(
-      rootOwnerId,
-      String(author || 'Boss'),
-      authorRole ?? null,
-      authorAgentId ?? null,
-      text,
-      JSON.stringify(normalizedMentions),
-      JSON.stringify(normalizedRouted),
-      createdAt,
-    );
-    this.settle(info.changes);
-    const seq = Number(info.lastInsertRowid);
+    this.db.exec('BEGIN IMMEDIATE');
+    let seq;
+    try {
+      const info = this.db.prepare(`INSERT INTO team_board_messages(rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt,urgent,authorTaskId,authorRequestId)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(rootOwnerId, String(author || 'Boss'), authorRole, authorAgentId, text,
+          JSON.stringify(normalizedMentions), JSON.stringify(normalizedRouted), createdAt, Number(urgent === true), authorTaskId, authorRequestId);
+      seq = Number(info.lastInsertRowid);
+      for (const route of normalizedRouted) {
+        const agentId = route.targetAgentId ?? route.agentId;
+        if (!agentId || !['deferred', 'queued', 'pending', 'pending-route'].includes(route.action ?? route.status)) continue;
+        const current = this.get(agentId);
+        const taskId = route.taskId ?? current?.task?.taskId ?? null;
+        this.db.prepare(`INSERT OR IGNORE INTO team_board_routes(rootOwner,seq,targetAgent,taskId,requestId,urgent,status,body)
+          VALUES (?,?,?,?,?,?,'pending',?)`).run(rootOwnerId, seq, agentId, taskId,
+            'board-' + randomUUID().replaceAll('-', ''), Number(urgent === true), JSON.stringify(route));
+        if (current?.sleep) this.wake(agentId, current.task?.taskId);
+      }
+      this.db.exec('COMMIT');
+      this.dropProjections();
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
     return {
       seq,
       rootOwnerId,
       author: String(author || 'Boss'),
       authorRole: authorRole ?? null,
       authorAgentId: authorAgentId ?? null,
+      ...(authorTaskId ? { authorTaskId } : {}),
+      ...(authorRequestId ? { authorRequestId } : {}),
+      ...(urgent ? { urgent: true } : {}),
       text,
       mentions: normalizedMentions,
       routed: normalizedRouted,
@@ -1856,10 +1996,10 @@ export class RosterStore {
     const boundedLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 50;
     const cursor = Number.isInteger(afterSeq) && afterSeq > 0 ? afterSeq : 0;
     const rows = cursor > 0
-      ? this.db.prepare(`SELECT seq,rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt
+      ? this.db.prepare(`SELECT seq,rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt,urgent,authorTaskId,authorRequestId
           FROM team_board_messages WHERE rootOwner=? AND seq>? ORDER BY seq ASC LIMIT ?`)
         .all(rootOwnerId, cursor, boundedLimit)
-      : this.db.prepare(`SELECT seq,rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt
+      : this.db.prepare(`SELECT seq,rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt,urgent,authorTaskId,authorRequestId
           FROM team_board_messages WHERE rootOwner=? ORDER BY seq DESC LIMIT ?`)
         .all(rootOwnerId, boundedLimit).reverse();
     const latestRow = this.db.prepare('SELECT coalesce(max(seq),0) AS latestSeq FROM team_board_messages WHERE rootOwner=?')
@@ -1870,12 +2010,59 @@ export class RosterStore {
       author: row.author,
       authorRole: row.authorRole ?? null,
       authorAgentId: row.authorAgentId ?? null,
+      ...(row.authorTaskId ? { authorTaskId: row.authorTaskId } : {}),
+      ...(row.authorRequestId ? { authorRequestId: row.authorRequestId } : {}),
+      ...(row.urgent ? { urgent: true } : {}),
       text: row.text,
       mentions: row.mentions ? JSON.parse(row.mentions) : [],
       routed: row.routed ? JSON.parse(row.routed) : [],
       createdAt: row.createdAt,
     }));
     return { messages, latestSeq: latestRow?.latestSeq ?? 0 };
+  }
+
+  boardRouteAgents() {
+    return this.db.prepare("SELECT DISTINCT targetAgent FROM team_board_routes WHERE status='pending'").all().map(row => row.targetAgent);
+  }
+
+  boardRoutes(agentId) {
+    return this.db.prepare(`SELECT r.*,m.text,m.author,m.authorAgentId,m.authorTaskId,m.authorRequestId
+      FROM team_board_routes AS r JOIN team_board_messages AS m ON m.seq=r.seq
+      WHERE r.targetAgent=? AND r.status='pending' ORDER BY r.urgent DESC,r.seq`).all(agentId)
+      .map(row => ({ ...JSON.parse(row.body), ...row, urgent: Boolean(row.urgent) }));
+  }
+
+  retargetBoardRoutes(previous, replacement, { resumedSession = false } = {}) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const route of this.boardRoutes(previous)) {
+        const message = this.db.prepare("SELECT routed FROM team_board_messages WHERE seq=?").get(route.seq);
+        const items = JSON.parse(message.routed).map(item => (item.targetAgentId ?? item.agentId) === previous
+          ? { ...item, targetAgentId: replacement, taskId: null, revived: true, resumedSession } : item);
+        const body = { ...JSON.parse(route.body), targetAgentId: replacement, revived: true, resumedSession };
+        this.db.prepare("UPDATE team_board_routes SET targetAgent=?,taskId=NULL,body=? WHERE requestId=?")
+          .run(replacement, JSON.stringify(body), route.requestId);
+        this.db.prepare("UPDATE team_board_messages SET routed=? WHERE seq=?").run(JSON.stringify(items), route.seq);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
+
+  finishBoardRoute(route, result) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const changed = this.db.prepare("UPDATE team_board_routes SET status='settled' WHERE requestId=? AND status='pending'").run(route.requestId).changes;
+      if (changed) {
+        const row = this.db.prepare('SELECT routed FROM team_board_messages WHERE seq=?').get(route.seq);
+        const routed = JSON.parse(row.routed).map(item =>
+          (item.targetAgentId ?? item.agentId) === route.targetAgent ? { ...item, ...result } : item);
+        this.db.prepare('UPDATE team_board_messages SET routed=? WHERE seq=?').run(JSON.stringify(routed), route.seq);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   saveAgentStub({
@@ -1889,6 +2076,7 @@ export class RosterStore {
     target,
     workspace = null,
     resumeSessionId = null,
+    readOnlyScout = false,
     model = null,
     lastTaskSummary = null,
     closedAt = new Date().toISOString(),
@@ -1902,8 +2090,8 @@ export class RosterStore {
     this.db.prepare('DELETE FROM team_agent_stubs WHERE rootOwner=? AND (name=? OR agentPath=?)')
       .run(rootOwnerId, name, agentPath || name);
     const res = this.db.prepare(`INSERT OR REPLACE INTO team_agent_stubs(
-      agentId,rootOwner,owner,name,role,agentPath,parentAgentId,target,workspace,resumeSessionId,model,lastTaskSummary,closedAt,expiresAt
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      agentId,rootOwner,owner,name,role,agentPath,parentAgentId,target,workspace,resumeSessionId,readOnlyScout,model,lastTaskSummary,closedAt,expiresAt
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       agentId,
       rootOwnerId,
       ownerId,
@@ -1914,6 +2102,7 @@ export class RosterStore {
       target,
       workspace ?? null,
       resumeSessionId ?? null,
+      Number(readOnlyScout === true),
       model ?? null,
       lastTaskSummary ?? null,
       closedAt,
@@ -1931,7 +2120,20 @@ export class RosterStore {
       WHERE rootOwner=? AND agentPath=? ORDER BY closedAt DESC LIMIT 1`).get(rootOwnerId, wanted);
     const row = byPath ?? this.db.prepare(`SELECT * FROM team_agent_stubs
       WHERE rootOwner=? AND name=? ORDER BY closedAt DESC LIMIT 1`).get(rootOwnerId, wanted);
-    if (!row) return undefined;
+    return row && this.#agentStubFromRow(row);
+  }
+
+  #agentStubFromRow(row) {
+    let readOnlyScout = row.readOnlyScout === 1;
+    if (row.readOnlyScout === null) {
+      // A historical label can outlive the role table that authorized it.
+      const classify = role => classifyManagedRole(role, { teamConfigPath: this.teamConfigPath, allowUnlisted: true });
+      const parent = row.parentAgentId && this.get(row.parentAgentId);
+      const parentRole = parent?.role ?? (row.parentAgentId && this.db.prepare(
+        'SELECT role FROM team_agent_stubs WHERE agentId=? AND rootOwner=?').get(row.parentAgentId, row.rootOwner)?.role);
+      const parentTier = classify(parentRole);
+      readOnlyScout = parentTier === 'review' || (parentTier !== 'lead' && classify(row.role) === 'scout');
+    }
     return {
       agentId: row.agentId,
       rootOwnerId: row.rootOwner,
@@ -1943,6 +2145,7 @@ export class RosterStore {
       target: row.target,
       workspace: row.workspace ?? null,
       resumeSessionId: row.resumeSessionId ?? null,
+      ...(readOnlyScout ? { readOnlyScout: true } : {}),
       model: row.model ?? null,
       lastTaskSummary: row.lastTaskSummary ?? null,
       closedAt: row.closedAt,
@@ -1955,22 +2158,7 @@ export class RosterStore {
     const rows = rootOwnerId
       ? this.db.prepare('SELECT * FROM team_agent_stubs WHERE rootOwner=? ORDER BY closedAt DESC').all(rootOwnerId)
       : this.db.prepare('SELECT * FROM team_agent_stubs ORDER BY closedAt DESC').all();
-    return rows.map(row => ({
-      agentId: row.agentId,
-      rootOwnerId: row.rootOwner,
-      ownerId: row.owner,
-      name: row.name,
-      role: row.role ?? null,
-      agentPath: row.agentPath,
-      parentAgentId: row.parentAgentId ?? null,
-      target: row.target,
-      workspace: row.workspace ?? null,
-      resumeSessionId: row.resumeSessionId ?? null,
-      model: row.model ?? null,
-      lastTaskSummary: row.lastTaskSummary ?? null,
-      closedAt: row.closedAt,
-      expiresAt: row.expiresAt,
-    }));
+    return rows.map(row => this.#agentStubFromRow(row));
   }
 
   deleteAgentStub(agentId) {
@@ -1997,23 +2185,7 @@ export class RosterStore {
     }
     const row = this.db.prepare(`SELECT * FROM team_agent_stubs
       WHERE agentId=? OR agentPath=? OR name=? ORDER BY closedAt DESC LIMIT 1`).get(wanted, wanted, wanted);
-    if (!row) return undefined;
-    return {
-      agentId: row.agentId,
-      rootOwnerId: row.rootOwner,
-      ownerId: row.owner,
-      name: row.name,
-      role: row.role ?? null,
-      agentPath: row.agentPath,
-      parentAgentId: row.parentAgentId ?? null,
-      target: row.target,
-      workspace: row.workspace ?? null,
-      resumeSessionId: row.resumeSessionId ?? null,
-      model: row.model ?? null,
-      lastTaskSummary: row.lastTaskSummary ?? null,
-      closedAt: row.closedAt,
-      expiresAt: row.expiresAt,
-    };
+    return row && this.#agentStubFromRow(row);
   }
 
   reparentAgent(agentId, newParentAgentId = null) {
@@ -2027,6 +2199,9 @@ export class RosterStore {
       if (!record) {
         this.db.exec('ROLLBACK');
         return null;
+      }
+      if (record.worktreeMerge || record.task?.preemption) {
+        throw Object.assign(new Error("Finish the current agent operation before moving it."), { code: "agent-busy" });
       }
       if (targetParent) {
         if (targetParent === agentId) {
@@ -2077,6 +2252,9 @@ export class RosterStore {
         const row = this.db.prepare('SELECT owner, name, body FROM agents WHERE id=?').get(id);
         if (!row) continue;
         const record = JSON.parse(row.body);
+        if (record.worktreeMerge || record.task?.preemption) {
+          throw Object.assign(new Error("Finish the current agent operation before moving it."), { code: "agent-busy" });
+        }
         const oldOwnerId = row.owner;
         const oldName = row.name;
         let nextName = oldName;
@@ -2116,6 +2294,7 @@ export class RosterStore {
     let stubsMoved = 0;
     try {
       for (const oldOwner of owners) {
+        this.db.prepare('UPDATE team_board_routes SET rootOwner=? WHERE rootOwner=?').run(newRootOwnerId, oldOwner);
         boardMoved += this.db.prepare('UPDATE team_board_messages SET rootOwner=? WHERE rootOwner=?')
           .run(newRootOwnerId, oldOwner).changes;
         const stubs = this.db.prepare('SELECT * FROM team_agent_stubs WHERE rootOwner=? OR owner=? ORDER BY closedAt DESC')
@@ -2158,7 +2337,7 @@ export class RosterStore {
     const removed = [];
     const all = this.list();
     for (const record of all) {
-      if (!record || record.cleanupRosterTicket || record.unmergedWorktree === true) continue;
+      if (!record || record.cleanupRosterTicket || record.worktreePath || record.unmergedWorktree || record.worktreeMerge) continue;
       const state = record.state;
       if (!['idle', 'completed', 'failed', 'cancelled'].includes(state)) continue;
       if (this.childrenOf(record.agentId).length > 0) continue;

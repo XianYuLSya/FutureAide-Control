@@ -1,13 +1,13 @@
-# FutureAide Control 详细说明（v2.3.1）
+# FutureAide Control 详细说明（v2.4.0）
 
 本文补充 [README.md](README.md) 未展开的底层机制、参数细节与运行边界。日常使用阅读 README 即可。
 
-## 1. 三端主对话核验与三极无头后端
+## 1. 主对话核验与执行目标
 
 ### 调用方身份核验
 插件在每次工具调用时从传输层核验主对话身份（`antigravity`、`codex`、`claude-desktop` 或受管下级 `managed-cli`）与所属工作区目录，自动隔离不同会话的花名册，**绝不从工具参数接收工作区路径、会话 ID 或桥接凭据**。
 
-### 四类可用执行目标（`target`）
+### 可用执行目标（`target`）
 
 1. **`codex-cli`（默认主力无头后端）**
    - 后台执行 `codex exec --json`（首轮）与 `codex exec resume`（后续轮次/答复续接），挂载当轮专属的极薄回调 MCP 通道。
@@ -30,14 +30,14 @@
 ### 角色原名自动排号与可选预设表
 在 `futureaide_run_agent` 或 `futureaide_create_agent` 中传入 `role`（如 `"backend"`、`"frontend"`、`"lead"`、`"后端"`）：
 - 若省略 `name`，插件在当前主对话花名册内按你传入的 `role` 原名自动递增排号（`backend1`、`backend2`……）；批量 `tasks` 派发时按顺序无碰撞分配，绝不改写你的角色名。
-- 默认直接跟随目标 CLI 自身配置的默认 `model` 与 `effort`；如需自定义角色到后端/模型的映射，可在 `~/.config/futureaide-control/roles.md`（或环境变量 `FUTUREAIDE_ROLES_CONFIG`）放置可选预设表，调用时显式传入的字段优先级最高。
+- 默认直接跟随目标 CLI 自身配置的默认 `model` 与 `effort`；如需自定义角色到后端/模型的映射，可在 `~/.config/futureaide-control/roles.md`（或环境变量 `FUTUREAIDE_ROLES_CONFIG`）放置可选预设表，调用时显式传入的字段优先级更高。
 
 ### 模型与思考强度（`model` / `effort`）
 - `model` 大小写不敏感，优先精确匹配完整模型 ID，其次匹配唯一或首个子串；无法匹配时返回可选模型列表，绝不静默退回默认模型。
 - `effort` 可单独传入；省略时依次读取角色默认、`config.json` 的 `modelDefaultEfforts[modelId]`、`defaultEffort`。模型不支持请求档位时自动收敛到最近支持档，并在 `detail: true` 下保留完整选档证据。
 
 ### Git `worktree` 隔离与一键合入（`merge`）
-- 派单时设置 `worktree: true`，插件在项目 `.work/worktrees/<名字>-<短哈希>` 下创建独立 Git 工作树，将该成员的工作目录切换到隔离树内执行。
+- 派单时设置 `worktree: true`，插件在项目 `.work/worktrees/<名字>-<短哈希>` 下创建独立 Git 工作树，将该成员的工作目录切换到隔离树内执行。可传完整提交 `baseSha` 固定基线，批量项可以覆盖外层 SHA。
 - 验收通过后调用 `futureaide_team({ action: "merge", target: "后端1" })`，插件将隔离工作树中的新增/修改/删除变更合回主工作区，随后移除临时 `worktree` 目录并标记合入完成，精简回执返回 `{ action: "merge", ok: true, summary, mergedFiles }`。
 
 ### 单次执行超时护栏（`timeout_minutes`）
@@ -55,7 +55,7 @@
 
 ### 忙时 `mode` 与 `delivery` 状态说明
 - `mode` 支持省略、`"steer"`（插进当前活动轮）与 `"queue"`（排到当前轮结束后单独开下一轮）。
-- 无头 CLI（`codex-cli`、`claude-cli`、`agy-cli`）在运行中仅支持轮间排队，忙时显式传 `mode: "steer"` 会立即拒绝并返回 `mode-unsupported` 与 `supportedModes: ["queue"]`。
+- 无头 CLI（`codex-cli`、`claude-cli`、`agy-cli`）在运行中仅支持轮间排队，忙时显式传 `mode: "steer"` 会返回 `mode-unsupported` 与 `supportedModes: ["queue"]`。
 - 当存在待答提问时，显式 `mode: "queue"` 只排入后续补充，绝不代答问题。
 
 ---
@@ -76,7 +76,17 @@
 
 ## 5. 团队黑板、整队治理与代理防跑偏
 
+### 托管 CLI 工具权限
+
+普通开发与调查成员可以问答、反馈和读写黑板。审查员（`reviewer` / `审查员`）还可以派新的只读 Codex CLI 调查员（`scout` / `调查员`），并查询、答复或取消这些调查员子树的任务。团队长/领队（`lead` / `团队长`）可以在自己的后代范围内派单和治理。回环服务按当前任务和轮次核验身份，桌面与托管 CLI 各用独立凭据。
+
+### 精确答复
+
+`futureaide_answer_agent` 接收 `question_id` 或 `questionIds`。两者选一，数组内每个 ID 都须唯一且仍待答。省略选择器只答最早一条。CLI 等价入口为 `team answer NAME --message TEXT --question-id ID`，可重复传 `--question-id`。普通补充与黑板消息保留待答问题。
+
 ### 团队会议室黑板（`futureaide_board_post` / `futureaide_board_read`）
+
+主对话可以对本队成员发送 `urgent: true`，托管团队长、领队和审查员限自己的后代。发帖前核验本帖全部点名对象。紧急消息可打断无头 CLI 当前轮，在同一任务继续，原待答问题保持待答。`board post MESSAGE --urgent --conv ID` 为命令行入口。
 - 同一项目团队共享会议室消息流（`seq` 单调递增）。
 - 发言中带 `@成员名` 或 `@团队长1/后端2` 时，插件自动解析跨级路径：对空闲成员发起新轮唤醒，对已完成退出的成员按原会话历史复活续跑，并在精简回执的 `woken` 数组中列出实际唤醒名单。
 
@@ -85,7 +95,7 @@
 | `action` | 关键参数 | 作用说明 |
 |---|---|---|
 | `"adopt"` | `target?: "auto" \| 名字`, `parent?`, `message?` | 接班收编同项目下旧会话遗留的整支队伍，或将指定散人拉入当前团队 |
-| `"kick"` | `target`, `keep_children?: boolean` | 移除成员；默认 `keep_children: true` 保留其下属并自动提拔挂到上级名下，`false` 则连同整棵子树一并终止 |
+| `"kick"` | `target`, `keep_children?: boolean`, `discard_worktree?: boolean` | 移除成员；默认 `keep_children: true` 保留其下属并自动提拔挂到上级名下，`false` 则连同整棵子树一并终止 |
 | `"reparent"` | `target`, `parent: 名字 \| null` | 调整成员汇报上级（传 `null` 挂回 Boss 根下） |
 | `"resume"` | `target`, `message?` | 在 FAswitch 切号、网络闪断或卡顿后，带着原上下文原地断点续跑 |
 | `"strays"` | — | 列出父节点已关闭/缺失或原主会话失联超时形成的无主散人 |
@@ -93,7 +103,7 @@
 | `"merge"` | `target` | 将成员隔离 `worktree` 的文件变更合回主工作区并清理临时工作树 |
 
 ### CLI 端口代理门禁（`futureaide_cli_proxy`）
-- 支持对 `"codex-cli"`、`"claude-cli"`、`"agy-cli"` 或 `"all"` 查看（`status`）或绑定（`bind`）代理规格：端口号（如 `17913`）、完整代理 URL（`http://` / `socks5://`）、`"faswitch"`（自动跟随 FAswitch 激活档案并校验 `profile_id` 一致性）或 `"direct"`（显式直连）。
+- 支持对 `codex-cli`、`claude-cli`、`agy-cli` 或 `all` 查看（`status`）或绑定（`bind`）代理。绑定值 `faswitch` 跟随激活档案，`direct` 启用直连。
 - 只要解析出代理地址，每次拉起无头 CLI 前都会执行本地 TCP 连通性探针，**探针不通或档案错位立即拒绝启动（Fail-Closed）**，绝不退回裸奔直连。
 
 ### 本地只读状态看板（可选）

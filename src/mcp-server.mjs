@@ -28,8 +28,11 @@ import {
 } from './tool-view.mjs';
 import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
 import { TARGETS } from './agent-backend.mjs';
-import { RosterStore, isCancelledRound } from './roster-store.mjs';
+import { createCliCallbackServer, runCliCallbackBridge } from './cli-callback-bridge.mjs';
+import { authorizeManagedTool, managedBindingFromEnv, managedToolNames, mergeRunTaskDefaults, restrictManagedRoster } from './managed-cli-policy.mjs';
+import { normalizeQuestionIds } from './cli-question-selection.mjs';
 
+const SERVER_VERSION = '2.4.0';
 const recentErrors = new Map();
 
 
@@ -98,6 +101,9 @@ const boardMessage = z.string().min(1).max(4000)
   .describe('Message to post to the team board; @后端1 or @团队长1/后端2 wakes or revives mentioned members.');
 const mode = z.enum(['steer', 'queue']).optional()
   .describe('Busy-time input mode: omit for target default, "steer" for active turn, or "queue" for next turn (unsupported modes return mode-unsupported with supportedModes).');
+const baseSha = z.string().regex(/^(?:[a-f\d]{40}|[a-f\d]{64})$/i).optional()
+  .describe('Full commit SHA for a new worktree. Omit to use the current checkout HEAD.');
+const questionId = z.string().min(1).max(512);
 const runTaskItem = z.object({
   name: name.optional(),
   role,
@@ -107,8 +113,10 @@ const runTaskItem = z.object({
   target: z.enum(TARGETS).optional(),
   lifetime: z.enum(['once', 'persistent']).optional(),
   worktree,
+  baseSha,
   timeout_minutes: timeoutMinutes,
   proxy: cliProxySpec,
+  mode,
 });
 const runTasks = z.array(runTaskItem).min(1).max(20).optional()
   .describe('Batch dispatch: 1–20 subagent tasks to launch in parallel with one merged wakeCmd.');
@@ -147,7 +155,7 @@ function forwardCreationArgs({ detail: _detail, worktree: wt, workspace_mode, ti
 async function runSingleOrBatch(service, args, extra) {
   if (Array.isArray(args.tasks)) {
     for (const item of args.tasks) {
-      requireNameOrRole({ name: item.name ?? args.name, role: item.role ?? args.role });
+      requireNameOrRole(mergeRunTaskDefaults(args, item));
     }
     const forwarded = forwardCreationArgs(args);
     try {
@@ -160,17 +168,7 @@ async function runSingleOrBatch(service, args, extra) {
       const errors = [];
       for (const item of forwarded.tasks) {
         try {
-          const single = await service.run({
-            ...(forwarded.role ? { role: forwarded.role } : {}),
-            ...(forwarded.model ? { model: forwarded.model } : {}),
-            ...(forwarded.effort ? { effort: forwarded.effort } : {}),
-            ...(forwarded.target ? { target: forwarded.target } : {}),
-            ...(forwarded.lifetime ? { lifetime: forwarded.lifetime } : {}),
-            ...(forwarded.worktree !== undefined ? { worktree: forwarded.worktree, workspaceMode: forwarded.workspaceMode } : {}),
-            ...(forwarded.timeoutMinutes !== undefined ? { timeoutMinutes: forwarded.timeoutMinutes } : {}),
-            ...(forwarded.proxy !== undefined ? { proxy: forwarded.proxy } : {}),
-            ...item,
-          }, extra);
+          const single = await service.run(mergeRunTaskDefaults(forwarded, item), extra);
           items.push(single);
           if (single?.error) errors.push({ name: single.name, error: single.error });
         } catch (itemErr) {
@@ -244,9 +242,9 @@ function compactOutput(value, smaller) {
  * @param {object} server MCP server to register on.
  * @param {{service: Function|object, extraFor?: Function, diagnostics?: object}} options
  */
-function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics } = {}) {
+function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics, toolNames, roleOptions } = {}) {
   const resolve = typeof service === 'function' ? service : async () => service;
-  return (tool, description, inputSchema, action, readOnly = false, destructive = false, view) => server.registerTool(tool, {
+  return (tool, description, inputSchema, action, readOnly = false, destructive = false, view) => toolNames && !toolNames.includes(tool) ? undefined : server.registerTool(tool, {
     description, inputSchema,
     annotations: { readOnlyHint: readOnly, destructiveHint: destructive, idempotentHint: readOnly, openWorldHint: !readOnly },
   }, async (args, extra) => {
@@ -270,6 +268,12 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
         trusted = { ...((await extraFor(extra)) ?? extra) };
       }
 
+      const authorize = resolved => {
+        const caller = trusted[TRUSTED_CALLER];
+        if (caller?.source === 'managed-cli') {
+          trusted[TRUSTED_CALLER] = authorizeManagedTool(resolved.store, caller, tool, args, roleOptions);
+        }
+      };
       let result;
       if (isFeedback) {
         let timer;
@@ -277,6 +281,7 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
         const work = (async () => {
           const resolved = await resolve();
           if (Date.now() >= deadline) return { saved: false, code: 'feedback-unavailable' };
+          authorize(resolved);
           trusted.feedbackScope = resolved.feedbackScope?.(tool, args, trusted) ?? '';
           started = true;
           return action(resolved, args, trusted);
@@ -290,8 +295,12 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
         clearTimeout(timer);
       } else {
         const resolved = await resolve();
+        authorize(resolved);
         trusted.feedbackScope = resolved.feedbackScope?.(tool, args, trusted) ?? '';
         result = await action(resolved, args, trusted);
+        if (tool === 'futureaide_list_agents' && trusted[TRUSTED_CALLER]?.source === 'managed-cli') {
+          result = restrictManagedRoster(resolved.store, trusted[TRUSTED_CALLER], result, roleOptions);
+        }
       }
       if (!isFeedback && result?.error) {
         applyDispatchScope(trusted);
@@ -314,7 +323,7 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
           ? (view.detail ? boundedOutput(view.detail(result, args)) : boundedOutput(result))
           : compactOutput(view(result, args), view.reduced ? () => view.reduced(result, args) : undefined);
       return { content: [{ type: 'text', text }],
-        ...(result?.error || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
+        ...(result?.error || result?.ok === false || result?.ready === false || result?.created === false || (result?.deleted === false && result?.queued !== true) ? { isError: true } : {}) };
     } catch (error) {
       if (trusted && !isFeedback) {
         applyDispatchScope(trusted);
@@ -347,21 +356,22 @@ export function registerScopedTools(server, options = {}) {
     register(tool, description, inputSchema, action, true, false, view);
   register('futureaide_feedback', 'Record a plugin bug ("problem") or usability issue ("friction") in the local feedback inbox.', { ...feedbackSchema, name: name.optional() }, (s, a, e) => s.submitCallerFeedback(a, e, recentError(e, a.name), e.feedbackDeadline));
   registerView('futureaide_status', 'Check caller verification, backend readiness, active proxy routes, and available model IDs.', { detail }, (s, _a, e) => s.status(e), compactStatus);
-  register('futureaide_cli_proxy', 'Inspect ("status") or bind ("bind") proxy routes for headless codex-cli / claude-cli / agy-cli backends (port, URL, "faswitch", or "direct").', {
+  register('futureaide_cli_proxy', 'Inspect ("status") or bind ("bind") proxy routes for headless codex-cli / claude-cli / agy-cli backends.', {
     action: z.enum(['status', 'bind']).optional().describe('Operation: "status" (default) or "bind".'),
-    target: z.enum(['codex-cli', 'claude-cli', 'agy-cli', 'all']).optional().describe('Target CLI backend: "codex-cli", "claude-cli", "agy-cli", or "all" (default).'),
+    target: z.enum(['codex-cli', 'claude-cli', 'agy-cli', 'all']).optional().describe('Target CLI backend or "all" (default).'),
     proxy: cliProxySpec,
   }, (s, a, e) => s.manageCliProxy({
     action: a.action ?? 'status',
     target: a.target ?? 'all',
     ...(a.proxy !== undefined ? { proxy: a.proxy } : {}),
   }, e));
-  register('futureaide_run_agent', 'Create (if new) and dispatch headless CLI subagents in one call when FutureAide cross-client delegation is requested (do not override an existing project workflow or native subagent skill unless FutureAide is requested): pass role or name with message, or pass tasks: [...] to launch up to 20 subagents in parallel. Omitted model/effort follow the target CLI default; set worktree: true for an isolated git worktree, and run wakeCmd in background to wait without polling. For an active name, mode ("steer" | "queue") controls busy delivery (unsupported modes return mode-unsupported with supportedModes).', {
+  register('futureaide_run_agent', 'Create and dispatch headless CLI agents when FutureAide is requested. Honor existing project workflows and native subagent skills otherwise. Pass role or name with message, or up to 20 parallel tasks. Omitted model/effort follow CLI defaults. Use worktree:true for isolation and run wakeCmd in the background to wait without polling. For an active name, mode=steer|queue controls delivery; unsupported modes return mode-unsupported and supportedModes.', {
     name: name.optional(),
     role,
     message: message.optional(),
     tasks: runTasks,
     worktree,
+    baseSha,
     timeout_minutes: timeoutMinutes,
     proxy: cliProxySpec,
     ...modelOptions,
@@ -376,6 +386,7 @@ export function registerScopedTools(server, options = {}) {
     name: name.optional(),
     role,
     worktree,
+    baseSha,
     proxy: cliProxySpec,
     ...modelOptions,
     lifetime: z.enum(['once', 'persistent']),
@@ -386,7 +397,11 @@ export function registerScopedTools(server, options = {}) {
     return s.create(forwardCreationArgs(a), e);
   }, false, false, compactCreate);
   register('futureaide_send_agent', 'Send a new task or supplement to an existing subagent by name or team path (e.g. "团队长1/后端1"), optionally updating model or effort. Omit mode for target default, pass "steer" for the active turn, or "queue" for the next turn (unsupported modes return mode-unsupported with supportedModes).', { name: agentPathName, message, ...modelOptions, mode, detail }, (s, a, e) => s.send({ name: a.name, message: a.message, ...(a.model !== undefined ? { model: a.model } : {}), ...(a.effort !== undefined ? { effort: a.effort } : {}), ...(a.mode !== undefined ? { mode: a.mode } : {}) }, e), false, false, compactSend);
-  register('futureaide_answer_agent', 'Answer a subagent’s pending ask_parent question by name or team path (e.g. "团队长1/后端1") so its current task continues.', { name: agentPathName, message, detail }, (s, a, e) => s.answer({ name: a.name, message: a.message }, e), false, false, compactAnswer);
+  register('futureaide_answer_agent', 'Answer a subagent’s pending ask_parent question by name or team path (e.g. "团队长1/后端1") so its current task continues.', { name: agentPathName, message, question_id: questionId.optional(), questionIds: z.array(questionId).min(1).optional(), detail },
+  (s, a, e) => {
+    const questionIds = normalizeQuestionIds({ questionId: a.question_id, questionIds: a.questionIds });
+    return s.answer({ name: a.name, message: a.message, ...(questionIds ? { questionIds } : {}) }, e);
+  }, false, false, compactAnswer);
   registerView('futureaide_list_agents', 'List subagents concisely in three scopes: "team" (current team hierarchy, live activity, and stalled warnings), "agent" (single member questions, report, and changed files), or "all" (all active teams grouped by caller).', {
     scope: listScope, name: listName, role: listRole, state: listState, detail,
   }, (s, a, e) => s.list(e, {
@@ -407,8 +422,9 @@ export function registerScopedTools(server, options = {}) {
   } : extra), compactWait);
   register('futureaide_board_post', 'Post to the team meeting board; @后端1 or @团队长1/后端2 mentions wake or revive the target member to reply.', {
     message: boardMessage,
+    urgent: z.boolean().optional().describe('Prioritize mentioned descendants immediately. Requires authority over every mention.'),
     detail,
-  }, (s, a, e) => s.postBoard({ message: a.message }, e), false, false, compactBoardPost);
+  }, (s, a, e) => s.postBoard({ message: a.message, ...(a.urgent !== undefined ? { urgent: a.urgent } : {}) }, e), false, false, compactBoardPost);
   registerView('futureaide_board_read', 'Read recent messages from the team meeting board.', {
     limit: z.number().int().min(1).max(100).optional().describe('Maximum board messages to return (1–100).'),
     after_seq: z.number().int().min(0).optional().describe('Return only messages with seq greater than after_seq.'),
@@ -423,6 +439,7 @@ export function registerScopedTools(server, options = {}) {
       .describe('Target member name, team path (e.g. "团队长1/后端1"), or "auto" for adopt.'),
     parent: z.string().max(160).nullable().optional()
       .describe('New parent name/path for reparent or adopt, or null to attach directly at the team root.'),
+    discard_worktree: z.boolean().optional().describe('Explicitly discard the protected worktree when removing a member.'),
     keep_children: z.boolean().optional()
       .describe('For kick: true (default) promotes children to upper parent; false terminates the entire subtree.'),
     message: z.string().min(1).max(20000).optional()
@@ -433,6 +450,7 @@ export function registerScopedTools(server, options = {}) {
     target: a.target,
     parent: a.parent,
     keepChildren: a.keep_children,
+    ...(a.discard_worktree !== undefined ? { discardWorktree: a.discard_worktree } : {}),
     message: a.message,
   }, e), false, false, compactTeamManage);
   registerView('futureaide_read_report', 'Read paginated raw report text by task_key and submission_ref when an exact unclipped page is needed.', {
@@ -449,7 +467,8 @@ export function registerScopedTools(server, options = {}) {
     node: z.string().min(1).max(200).optional().describe('Read only this tree node by name or team path from list.'),
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), compactInspect);
   register('futureaide_cancel_agent', 'Cancel the active task and descendants of a named or path-addressed subagent while preserving session context.', { name: agentPathName }, (s, a, e) => s.cancel(a, e), false, true);
-  register('futureaide_delete_agent', 'Close and remove a named or path-addressed subagent and its owned descendants while keeping project files.', { name: agentPathName }, (s, a, e) => s.delete(a, e), false, true);
+  register('futureaide_delete_agent', 'Close and remove a named or path-addressed subagent and its owned descendants while keeping project files.', { name: agentPathName, discard_worktree: z.boolean().optional() },
+  (s, a, e) => s.delete({ name: a.name, ...(a.discard_worktree !== undefined ? { discardWorktree: a.discard_worktree } : {}) }, e), false, true);
   return server;
 }
 
@@ -460,7 +479,11 @@ export function registerScopedTools(server, options = {}) {
  */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics,
   configReady, inputSignal, env = process.env } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '2.3.0' });
+  if (env.FUTUREAIDE_MANAGED_CLI === '1') {
+    return createCliCallbackServer({ ...managedBindingFromEnv(env), roster: env.FUTUREAIDE_ROSTER_PATH,
+      configFile: configPath ?? env.FUTUREAIDE_CONFIG, env }).server;
+  }
+  const server = new McpServer({ name: 'futureaide-control', version: SERVER_VERSION });
   let servicePromise;
   const service = () => servicePromise ??= (configReady ?? loadConfig(configPath)).then(async config => {
     const value = scopedFactory(config);
@@ -483,28 +506,8 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
     monitorHealth.unref();
     return value;
   });
-  const isManagedCli = env?.FUTUREAIDE_MANAGED_CLI === '1';
-  const managedExtraFor = isManagedCli
-    ? extra => ({
-      ...extra,
-      [TRUSTED_CALLER]: {
-        source: 'managed-cli',
-        nativeSessionId: env.FUTUREAIDE_PARENT_AGENT_ID || 'managed-cli',
-        parentAgentId: env.FUTUREAIDE_PARENT_AGENT_ID,
-        ownerId: env.FUTUREAIDE_CALLER_OWNER_ID,
-        workspace: env.FUTUREAIDE_CALLER_WORKSPACE,
-      },
-    })
-    : undefined;
-  registerScopedTools(server, {
-    service,
-    diagnostics,
-    inputSignal,
-    ...(managedExtraFor ? { extraFor: managedExtraFor } : {}),
-  });
-  if (!isManagedCli) {
-    registerParentTools(server, { service, diagnostics });
-  }
+  registerScopedTools(server, { service, diagnostics, inputSignal });
+  registerParentTools(server, { service, diagnostics });
   // Restore the shared listener on connection even before the first tool call.
   void service().catch(() => {});
   return server;
@@ -532,23 +535,8 @@ export async function claudeTrustedCaller({ trusted, caller, extra } = {}) {
   const value = (typeof trusted === 'function' ? await trusted(extra) : undefined)
     ?? (typeof caller === 'function' ? await caller(extra) : undefined);
   if (value?.source === 'managed-cli') {
-    const parentAgentId = typeof (value.parentAgentId ?? value.callerAgentId) === 'string'
-      ? (value.parentAgentId ?? value.callerAgentId).trim()
-      : '';
-    const ownerId = typeof value.ownerId === 'string' ? value.ownerId.trim() : '';
-    const workspace = value.workspace ?? value.cwd;
-    if (!parentAgentId && !ownerId) {
-      throw Object.assign(new Error('The calling managed CLI session could not be verified.'),
-        { code: 'calling-context-unavailable' });
-    }
-    return {
-      source: 'managed-cli',
-      ...(parentAgentId ? { parentAgentId, callerAgentId: parentAgentId } : {}),
-      ...(ownerId ? { ownerId } : {}),
-      nativeSessionId: parentAgentId || ownerId,
-      ...(typeof workspace === 'string' && workspace ? { workspace } : {}),
-      ...(value.label ? { label: value.label } : {}),
-    };
+    if (value.callerAgentId && value.callerTaskId && value.callerRequestId) return value;
+    throw Object.assign(new Error('The calling managed CLI dispatch could not be verified.'), { code: 'permission-denied' });
   }
   if (value?.source === 'antigravity') {
     const conversationId = value.conversationId ?? value.nativeSessionId ?? value.sessionId;
@@ -583,14 +571,31 @@ export async function claudeTrustedCaller({ trusted, caller, extra } = {}) {
  * @param {{service: object}} options The monitor's existing service instance.
  */
 export function scopedManagement({ service } = {}) {
-  return ({ server, caller, trusted, waitSignal } = {}) => registerScopedTools(server, {
-    service,
-    extraFor: async extra => ({
+  return ({ server, caller, trusted, waitSignal, managedCaller, roleOptions } = {}) => {
+    const extraFor = async extra => ({
       [TRUSTED_CALLER]: await claudeTrustedCaller({ trusted, caller, extra }),
       signal: waitSignal && extra.signal ? AbortSignal.any([extra.signal, waitSignal]) : waitSignal ?? extra.signal,
       _meta: { progressToken: extra._meta?.progressToken }, sendNotification: extra.sendNotification,
-    }),
-  });
+    });
+    registerScopedTools(server, { service, extraFor, roleOptions,
+      ...(managedCaller ? { toolNames: managedToolNames(managedCaller.callerRole, roleOptions) } : {}) });
+    if (managedCaller) {
+      const store = service.store;
+      const { callerAgentId: agentId, callerTaskId: taskId, callerRequestId: requestId, target } = managedCaller;
+      registerParentTools(server, { extraFor, service: {
+        store,
+        submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId, target }),
+        submitManagedFeedback: (input, _extra, error, deadline) => {
+          const record = store.get(agentId);
+          return submitFeedback(input, {
+            source: target, caller: store.owner(record.ownerId)?.source ?? null,
+            target, name: record.name, error: feedbackRecordError(record, error),
+          }, { deadline });
+        },
+      } });
+    }
+    return server;
+  };
 }
 
 /**
@@ -600,7 +605,7 @@ export function scopedManagement({ service } = {}) {
  * @returns {McpServer} Unconnected MCP server.
  */
 export function makeServer(control, { configPath, controlFactory = createControl, peersFactory = createPeers } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.2.0' });
+  const server = new McpServer({ name: 'futureaide-control', version: SERVER_VERSION });
   const profileName = z.string().regex(PROFILE_NAME_PATTERN).describe('Named project connection. Use the same profile on every call for this task.');
   const profile = profileName.optional().describe('Named project connection. Omit to use the unchanged default connection.');
   const resolveControl = async name => name === undefined && control ? control : controlFactory(await loadConfig(configPath, name));
@@ -745,48 +750,12 @@ export function makeServer(control, { configPath, controlFactory = createControl
  * is shared by every stdio entry point: see src/stdio-exit.mjs.
  */
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  if (process.argv[2] === '--claude-cli-reports' || process.argv[2] === '--codex-cli-reports') {
-    const cliTarget = process.argv[2] === '--codex-cli-reports' ? 'codex-cli' : 'claude-cli';
-    // This server belongs to a single headless CLI process (claude -p or codex exec).
-    // The runner sets the route in its MCP config, outside the prompt and tool argument schemas.
-    const [roster, agentId, taskId, requestId, fifth, sixth] = process.argv.slice(3);
-    // Older dispatches supplied only the cleanup flag in the fifth slot.
-    const configFile = fifth === '--no-idle-session-cleanup' ? undefined : fifth;
-    const mode = fifth === '--no-idle-session-cleanup' ? fifth : sixth;
-    if (!roster || !agentId || !taskId || !requestId) throw new Error(`Missing managed ${cliTarget} dispatch.`);
-    const store = new RosterStore(roster);
-    const server = new McpServer({ name: 'futureaide', version: '1.0.0' });
-    registerParentTools(server, {
-      extraFor: extra => ({
-        ...extra,
-        [TRUSTED_CALLER]: { source: cliTarget, nativeSessionId: agentId + ':' + taskId + ':' + requestId },
-      }),
-      service: {
-        submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId, target: cliTarget }),
-        submitManagedFeedback: (input, _extra, error, deadline) => {
-          const record = store.get(agentId);
-          if (!record || record.closed || record.target !== cliTarget || record.task?.taskId !== taskId
-              || record.task?.dispatches?.at(-1)?.requestId !== requestId || ['idle', 'failed'].includes(record.state)
-              || isCancelledRound(record) || record.task.reports?.some(report => report.final)
-              || store.submissions(agentId, taskId).some(report => report.final)) {
-            throw Object.assign(new Error('This caller has no active managed task for this dispatch.'),
-              { code: 'submission-not-owned' });
-          }
-          return submitFeedback(input, {
-            source: cliTarget,
-            caller: store.owner(record.ownerId)?.source ?? null,
-            target: cliTarget,
-            name: record.name ?? null,
-            error: feedbackRecordError(record, error),
-          }, { configFile, deadline });
-        },
-      },
-    });
-    const transport = new StdioServerTransport();
-    if (mode !== '--no-idle-session-cleanup') {
-      exitWhenInputCloses({ transport, close: () => server.close() });
-    }
-    await server.connect(transport);
+  const managed = managedBindingFromEnv();
+  if (['--claude-cli-reports', '--codex-cli-reports', '--agy-cli-reports'].includes(process.argv[2])) {
+    await runCliCallbackBridge();
+  } else if (process.env.FUTUREAIDE_MANAGED_CLI === '1') {
+    await runCliCallbackBridge(['--' + (managed.target ?? 'codex-cli') + '-reports',
+      process.env.FUTUREAIDE_ROSTER_PATH, managed.agentId, managed.taskId, managed.requestId, process.env.FUTUREAIDE_CONFIG]);
   } else {
     const diagnostics = createMcpDiagnostics();
     const legacy = process.env.FUTUREAIDE_LEGACY_TOOLS === '1';

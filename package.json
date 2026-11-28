@@ -1,6 +1,6 @@
 {
   "name": "futureaide-control",
-  "version": "2.3.1",
+  "version": "2.4.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -29,6 +29,23 @@
   "engines": {
     "node": ">=24.14.0"
   },
+  "files": [
+    ".claude-plugin/plugin.json",
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    "assets/",
+    "dsh-plugin/",
+    "docs/agent-auto-cleanup.md",
+    "fixtures/",
+    "scripts/",
+    "skills/",
+    "src/",
+    "install.ps1",
+    "recover.cmd",
+    "CHANGELOG.md",
+    "REFERENCE.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
   "scripts": {
     "test": "node --test",
     "start": "node src/mcp-server.mjs"

@@ -1,3 +1,4 @@
+import { managedCliEnv, managedToolNames } from './managed-cli-policy.mjs';
 // Headless Claude Code turns for the FutureAide shared state machine.
 //
 // Claude Desktop exposes no external session API, so a FutureAide target that runs
@@ -51,7 +52,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
-import { buildCliProxyEnv, checkProxyReachable, resolveCliRoute } from './cli-proxy.mjs';
+import { buildCliProxyEnv, checkProxyReachable, redactProxyCredentials, resolveCliRoute } from './cli-proxy.mjs';
 import { killProcessCage } from './process-cage.mjs';
 import { replaceStateFile } from './replace-state-file.mjs';
 
@@ -223,9 +224,9 @@ export const mcpToolName = (server, tool) => 'mcp__' + server + '__' + tool;
  * @param {string} server MCP server name from mcpConfig.
  * @returns {string[]} Exact allowedTools values.
  */
-export function allowedCallbackTools(server = DEFAULT_MCP_SERVER_NAME) {
+export function allowedCallbackTools(server = DEFAULT_MCP_SERVER_NAME, role, roleOptions) {
   const name = String(server || DEFAULT_MCP_SERVER_NAME);
-  return [...REQUIRED_MCP_TOOLS, 'feedback'].map(tool => mcpToolName(name, tool));
+  return managedToolNames(role, roleOptions).map(tool => mcpToolName(name, tool));
 }
 
 /** The one MCP server name a config may declare, so no other server gets a say. */
@@ -874,7 +875,7 @@ function startDetachedWorker(directory, { env = process.env } = {}) {
 export async function startClaudeTurn(input = {}, deps = {}) {
   const {
     directory, cli, workspace, sessionId, resume = false, message, model, effort,
-    mcpConfig, name, callerEnv, reportConfig, route: explicitRoute, config,
+    mcpConfig, name, role, requestId: originalRequestId, callerEnv, reportConfig, route: explicitRoute, config,
     timeoutMs, timeoutMinutes,
   } = input;
   if (typeof directory !== 'string' || !directory.trim() || !path.isAbsolute(directory)) {
@@ -906,7 +907,7 @@ export async function startClaudeTurn(input = {}, deps = {}) {
       const check = await (deps.checkProxy ?? checkProxyReachable)(explicitRoute.proxyUrl);
       if (!check.ok) {
         throw fail('proxy-unavailable',
-          `Bound proxy ${explicitRoute.proxyUrl} is unreachable (${check.error || 'TCP probe failed'}); nothing was dispatched.`,
+          `Bound proxy ${redactProxyCredentials(explicitRoute.proxyUrl)} is unreachable (${redactProxyCredentials(check.error || 'TCP probe failed')}); nothing was dispatched.`,
           { terminal: true, notSent: true, route: { ...explicitRoute, ok: false, proxyReachable: false } });
       }
       resolvedRoute = { ...explicitRoute, ok: true, proxyReachable: true };
@@ -928,7 +929,7 @@ export async function startClaudeTurn(input = {}, deps = {}) {
     }
   }
 
-  const requestId = createHash('sha256').update(JSON.stringify([directory, workspace, sessionId, message])).digest('hex');
+  const requestId = originalRequestId ?? createHash('sha256').update(JSON.stringify([directory, workspace, sessionId, message])).digest('hex');
   const fingerprint = createHash('sha256').update(JSON.stringify({
     workspace, sessionId, resume: resume === true, message, model: modelValue ?? null,
     effort: effortValue ?? null, name: nameValue ?? null, command,
@@ -946,15 +947,21 @@ export async function startClaudeTurn(input = {}, deps = {}) {
     claimed = false;
   }
   if (!claimed) {
-    const owner = await readJson(ownerFile);
-    if (owner?.fingerprint !== fingerprint) {
-      throw fail('claude-request-conflict', 'This directory already belongs to a different request; give each request its own private directory.');
-    }
-    // Another dispatcher claimed this directory a moment ago. Wait for its record instead of
-    // starting a second CLI process: that wait is what makes a re-read idempotent.
-    let current = await readClaudeTurn(directory, deps).catch(() => undefined);
-    for (let attempt = 0; !current && attempt < 100; attempt++) {
-      await delay(20);
+    // The exclusive create makes the owner file visible before its JSON is written.
+    // Verify the completed claim before accepting the other dispatcher's turn.
+    let owner;
+    let current;
+    for (let attempt = 0; !current && attempt <= 100; attempt++) {
+      if (attempt) await delay(20);
+      if (owner === undefined) {
+        owner = await readJson(ownerFile).catch(error => {
+          if (!(error instanceof SyntaxError)) throw error;
+        });
+        if (owner === undefined) continue;
+        if (owner?.fingerprint !== fingerprint) {
+          throw fail('claude-request-conflict', 'This directory already belongs to a different request; give each request its own private directory.');
+        }
+      }
       current = await readClaudeTurn(directory, deps).catch(() => undefined);
     }
     if (!current) {
@@ -1004,7 +1011,9 @@ export async function startClaudeTurn(input = {}, deps = {}) {
       args: claudeTurnArguments({
         sessionId, resume: resume === true, model: modelValue, effort: effortValue,
         systemPrompt: claudeSystemPrompt({ serverName, name: nameValue }),
-        mcpFile, allowedTools: mcpFile ? allowedCallbackTools(serverName) : undefined,
+        mcpFile, allowedTools: mcpFile ? allowedCallbackTools(serverName, role, {
+          teamConfigPath: config?.teamConfigPath, env: { ...process.env, ...resolvedCallerEnv },
+        }) : undefined,
         name: nameValue,
       }),
       selectedModel: modelValue ?? null, selectedEffort: effortValue ?? null,
@@ -1047,7 +1056,7 @@ export async function startClaudeTurn(input = {}, deps = {}) {
     throw fail(blocked, state.error.message, { terminal: true, notSent: true });
   }
 
-  const workerEnv = buildCliProxyEnv(baseEnv, resolvedRoute);
+  const workerEnv = buildCliProxyEnv(managedCliEnv(baseEnv), resolvedRoute);
   let worker;
   try {
     worker = await (deps.spawnWorker ?? startDetachedWorker)(directory, { env: workerEnv, route: resolvedRoute });
@@ -1093,6 +1102,9 @@ async function readTurnState(directory, turn, { checkTerminal = false } = {}) {
     const terminal = await readTerminalSnapshot(directory, turn);
     if (terminal) return terminal;
     throw error;
+  }
+  if (state && (!turn || !Object.hasOwn(turn, 'requestId') || state.requestId !== turn.requestId)) {
+    return readTerminalSnapshot(directory, turn);
   }
   if (checkTerminal && !TERMINAL_STATES.includes(state?.state)) {
     return await readTerminalSnapshot(directory, turn) ?? state;
@@ -1153,7 +1165,7 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
   let error = state.error ?? undefined;
   let orphaned;
   if (!TERMINAL_STATES.includes(reported)) {
-    if (marker?.stopped === true && !alivePids.length) {
+    if (marker?.requestId === turn?.requestId && marker?.stopped === true && !alivePids.length) {
       // Only a cancel that was confirmed against the whole tree makes a dead worker's turn
       // read as cancelled.
       reported = 'cancelled'; error = undefined;
@@ -1318,10 +1330,21 @@ async function markCancelled(directory, state) {
  * @param {object} [deps] Test seams: isAlive, killTree, commandLines (pid → {text, ok}).
  * @returns {Promise<{cancelled: boolean, stopped: boolean, state: string, pids: object, remaining: number[], note?: string}>}
  */
-export async function cancelClaudeTurn(directory, { isAlive = processAlive, killTree = stopClaudeTree,
+export async function cancelClaudeTurn(directory, { expectedRequestId, isAlive = processAlive, killTree = stopClaudeTree,
   killCage = killTree === stopClaudeTree ? killProcessCage : async () => ({ ok: true, killed: [] }),
   commandLines = readCommandLines } = {}) {
   const turn = await readJson(path.join(directory, CLAUDE_TURN_FILES.turn));
+  if (expectedRequestId !== undefined && turn?.requestId !== expectedRequestId) {
+    return { ok: false, stopped: false, note: 'The original turn request does not match.' };
+  }
+  // A native session survives multiple turns. Scope preemption to this request.
+  const stopCage = async options => {
+    const result = await killCage(expectedRequestId === undefined ? options : { ...options, sessionId: undefined });
+    if (expectedRequestId !== undefined && result?.ok === false) {
+      throw fail('preempt-cage-still-running', 'The original process cage could not be reaped.');
+    }
+    return result;
+  };
   const state = await readTurnState(directory, turn, { checkTerminal: true });
   const pids = { worker: recordedWorkerPid(turn, state),
     claude: Number.isSafeInteger(state?.pid) && state.pid > 0 ? state.pid : null };
@@ -1334,7 +1357,7 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
   const requestedAt = new Date().toISOString();
   const requestId = state?.requestId ?? turn?.requestId ?? null;
   const sessionId = state?.sessionId ?? turn?.sessionId ?? null;
-  const markers = { directory, sessionId, requestId };
+  const markers = { directory, sessionId: expectedRequestId === undefined ? sessionId : undefined, requestId };
 
   if (TERMINAL_STATES.includes(state?.state)) {
     const surviving = alive();
@@ -1350,7 +1373,7 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
       }
       if (ours.length) {
         for (const pid of ours) await killTree(pid);
-        await killCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
+        await stopCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
         const deadline = Date.now() + CANCEL_CONFIRM_MS;
         let stillOurs = ours.filter(pid => isAlive(pid));
         while (stillOurs.length && Date.now() < deadline) {
@@ -1363,7 +1386,7 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
         }
         return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [] };
       }
-      const swept = await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+      const swept = await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
       const stillSurviving = surviving.filter(pid => isAlive(pid) && !reused.includes(pid));
       if (stillSurviving.length) {
         return { ok: false, cancelled: false, stopped: false, state: state.state, pids, remaining: stillSurviving,
@@ -1372,14 +1395,14 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
       return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [],
         ...(state.state === 'cancelled' || swept.killed?.length ? {} : { note: 'This turn already ended; nothing was killed.' }) };
     }
-    const swept = await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    const swept = await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [],
       ...(state.state === 'cancelled' || swept.killed?.length ? {} : { note: 'This turn already ended; nothing was killed.' }) };
   }
 
   if (!recorded.length) {
     // The claim exists but the worker never recorded a pid: it may be starting right now.
-    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     return { ok: false, cancelled: false, stopped: false, state: 'running', pids, remaining: [],
       note: 'The worker has not recorded any process yet, so nothing can be confirmed stopped. Retry cancel shortly.' };
   }
@@ -1388,10 +1411,10 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
   const targets = alive();
   if (!targets.length) {
     // Every recorded process is already gone: sweep any broken-chain orphans, then record stopped.
-    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     const latest = await readTurnState(directory, turn, { checkTerminal: true });
     const current = TERMINAL_STATES.includes(latest?.state) ? latest.state : 'cancelled';
-    if (!TERMINAL_STATES.includes(latest?.state)) await markCancelled(directory, latest ?? state);
+    if (!TERMINAL_STATES.includes(latest?.state)) await markCancelled(directory, latest ?? state ?? createClaudeTurnState({ requestId, sessionId, workspace: turn?.workspace }));
     await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel, { requestId, requestedAt, stopped: true, remaining: [], pids });
     return { ok: true, cancelled: current === 'cancelled', stopped: true, state: current, pids, remaining: [] };
   }
@@ -1421,7 +1444,7 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
   }
 
   for (const pid of ours) await killTree(pid);
-  await killCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
+  await stopCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
   // A reused pid is another program and never blocks a stop; anything else still running does.
   const blocking = () => recorded.filter(pid => isAlive(pid) && !reused.includes(pid));
   const deadline = Date.now() + CANCEL_CONFIRM_MS;
@@ -1450,6 +1473,6 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
     return { ok: true, cancelled: latest.state === 'cancelled', stopped: true, state: latest.state, pids, remaining: [], ...reusedNote };
   }
   await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel, { requestId, requestedAt, stopped: true, remaining: [], pids });
-  await markCancelled(directory, latest ?? state);
+  await markCancelled(directory, latest ?? state ?? createClaudeTurnState({ requestId, sessionId, workspace: turn?.workspace }));
   return { ok: true, cancelled: true, stopped: true, state: 'cancelled', pids, remaining: [], ...reusedNote };
 }

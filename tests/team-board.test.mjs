@@ -149,7 +149,7 @@ test('the page comes from the build first, then from the approved design in docs
   await mkdir(base, { recursive: true });
   const root = await mkdtemp(path.join(base, 'board-page-'));
   const built = path.join(root, 'assets', 'team-board', 'index.html');
-  const designed = path.join(root, 'docs', 'grill', 'Boss协议', '团队看板', '小看板.html');
+  const designed = path.join(root, 'docs', 'team-board', 'index.html');
   await mkdir(path.dirname(designed), { recursive: true });
   await writeFile(designed, '<html>design</html>', 'utf8');
   assert.equal(boardPageFile({ here: path.join(root, 'src') }), designed,
@@ -168,7 +168,7 @@ test('a development tree reads the approved design while no asset is packaged', 
   const base = path.join(here, '..', '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const root = await mkdtemp(path.join(base, 'board-devpage-'));
-  const designed = path.join(root, 'docs', 'grill', 'Boss协议', '团队看板', '小看板.html');
+  const designed = path.join(root, 'docs', 'team-board', 'index.html');
   const built = path.join(root, 'assets', 'team-board', 'index.html');
   await mkdir(path.dirname(designed), { recursive: true });
   await writeFile(designed, '<html>design</html>', 'utf8');

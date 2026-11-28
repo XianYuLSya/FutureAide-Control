@@ -152,6 +152,7 @@ function assess(tree, data, ownerDeleted, now, config, natives, states) {
   }
   for (const record of tree) {
     const task = record.task;
+    if (record.worktreePath || record.unmergedWorktree || record.worktreeMerge) return {safe:false,reason:"worktree-retained"};
     const archivedSupplement=record.state==='supplement_blocked' && record.lifetime==='once' && task?.state==='completed';
     if (!['idle','failed','cancelled','completed'].includes(record.state) && !archivedSupplement && !(ownerDeleted && task?.finishedAt)) return {safe:false,reason:'roster-state-not-settled'};
     if (record.closed || record.cleanupRosterTicket) return {safe:false,reason:'roster-already-closed'};

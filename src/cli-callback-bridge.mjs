@@ -1,7 +1,6 @@
-// Ultra-thin zero-heavy-dependency MCP callback bridge for headless CLI subagents
-// (`codex-cli` and `claude-cli`).
-//
-// Exposes only `ask_parent`, `report_parent`, and `feedback` over stdio JSON-RPC.
+// MCP callback bridge for the four headless CLI backends.
+// The roster controls which tools are available for this dispatch. The bridge
+// forwards authorized management calls to the matching loopback listener.
 // Never imports `scoped-agents`, `peers`, `codex-ipc`, or `dsh`.
 // Pushes `ask_parent` / `report_parent` straight to `POST /futureaide/cli-callback`
 // on 127.0.0.1 (<10ms zero-polling wakeup), and falls back seamlessly to local
@@ -15,21 +14,16 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
-import { RosterStore, isCancelledRound } from './roster-store.mjs';
+import { loadManagedRosterConfig } from './config.mjs';
+import { RosterStore } from './roster-store.mjs';
+import { readReportStatus } from './report-endpoint.mjs';
+import { authorizeManagedTool, managedBoardRoutes, managedTokenFile, MANAGED_TOKEN_FILENAME,
+  managedToolNames, verifyManagedCaller, managedBindingFromEnv } from './managed-cli-policy.mjs';
 import { exitWhenInputCloses } from './stdio-exit.mjs';
 
 export const CLI_CALLBACK_PATH = '/futureaide/cli-callback';
 export const MCP_HTTP_PATH = '/mcp';
 export const DEFAULT_REPORT_PORT = 17654;
-const TOKEN_FILENAME = 'antigravity-caller.json';
-
-const LEAF_ONLY_ROLES = new Set([
-  'worker', 'builder', 'developer', 'engineer', 'coder', 'implementer',
-  'frontend', 'frontend-engineer', 'backend', 'backend-engineer', 'designer', 'ui',
-  'researcher', 'investigator', 'scout', 'qa', 'tester',
-  '前端', '前端工程师', '后端', '后端工程师', '设计', '设计师', '调查', '调研', '调查员', '开发', '工程师',
-]);
-
 const BOARD_TOOLS = [
   {
     name: 'futureaide_board_post',
@@ -38,7 +32,8 @@ const BOARD_TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        message: { type: 'string', minLength: 1, maxLength: 8000, description: 'Board message text (use @name to wake teammates).' },
+        message: { type: 'string', minLength: 1, maxLength: 4000, description: 'Board message text (use @name to wake teammates).' },
+        urgent: { type: 'boolean', description: 'Prioritize mentioned descendants immediately.' },
         detail: { type: 'boolean' },
       },
       required: ['message'],
@@ -60,35 +55,11 @@ const BOARD_TOOLS = [
   },
 ];
 
-const LEAD_FORWARDED_TOOL_NAMES = new Set([
-  'futureaide_board_post',
-  'futureaide_board_read',
-  'futureaide_run_agent',
-  'futureaide_create_agent',
-  'futureaide_wait_agents',
-  'futureaide_list_agents',
-  'futureaide_answer_agent',
-  'futureaide_send_agent',
-  'futureaide_team',
-  'futureaide_inspect_agent',
-  'futureaide_agent_changes',
-  'futureaide_read_report',
-  'futureaide_cancel_agent',
-  'futureaide_delete_agent',
-]);
-
-function isLeafOnlyRole(rawRole) {
-  if (typeof rawRole !== 'string' || !rawRole.trim()) return false;
-  const cleaned = rawRole.replace(/（[^（）]*）|\([^()]*\)/g, '').replace(/-?\d+$/u, '').trim().toLowerCase();
-  return LEAF_ONLY_ROLES.has(cleaned);
-}
-
 function postManagedMcpRpc({
   port,
   token,
-  parentAgentId,
-  ownerId,
-  workspace,
+  binding,
+  rosterId,
   method,
   params,
   timeoutMs = 60000,
@@ -103,9 +74,11 @@ function postManagedMcpRpc({
     accept: 'application/json, text/event-stream',
     authorization: `Bearer ${token}`,
     'x-futureaide-caller': 'managed-cli',
-    ...(parentAgentId ? { 'x-futureaide-parent-agent-id': parentAgentId } : {}),
-    ...(ownerId ? { 'x-futureaide-owner-id': ownerId } : {}),
-    ...(workspace ? { 'x-futureaide-workspace-b64': Buffer.from(workspace, 'utf8').toString('base64') } : {}),
+    'x-futureaide-roster-id': rosterId,
+    'x-futureaide-agent-id': binding.agentId,
+    'x-futureaide-task-id': binding.taskId,
+    'x-futureaide-request-id': binding.requestId,
+    'x-futureaide-target': binding.target,
   };
   return new Promise(resolve => {
     let settled = false;
@@ -119,9 +92,12 @@ function postManagedMcpRpc({
       port,
       path: MCP_HTTP_PATH,
       method: 'POST',
+      agent: false,
       headers,
       ...(timeoutMs > 0 ? { timeout: timeoutMs } : {}),
     }, res => {
+      res.once('error', () => finish(null));
+      res.once('aborted', () => finish(null));
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
       res.on('end', () => {
@@ -213,31 +189,27 @@ export function rosterIdentityFromPath(filename) {
 }
 
 async function readCallerTokenInfo(roster, explicitTokenFile, env = process.env) {
-  const candidate = explicitTokenFile
-    || (typeof env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE === 'string' && env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE.trim()
-      ? env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE.trim()
-      : undefined)
-    || (roster && roster !== ':memory:' ? path.join(path.dirname(path.resolve(roster)), TOKEN_FILENAME) : undefined);
-  if (!candidate) return null;
-  try {
-    const parsed = JSON.parse(await readFile(candidate, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch {
-    return null;
+  const rosterDir = roster && roster !== ':memory:' ? path.dirname(path.resolve(roster)) : null;
+  const candidates = [
+    env.FUTUREAIDE_MANAGED_CLI_TOKEN_FILE,
+    managedTokenFile(explicitTokenFile || env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE),
+    rosterDir && path.join(rosterDir, MANAGED_TOKEN_FILENAME),
+    rosterDir && path.basename(rosterDir).toLowerCase() === 'scoped'
+      && path.join(path.dirname(rosterDir), MANAGED_TOKEN_FILENAME),
+  ];
+  const expectedRoster = rosterIdentityFromPath(roster);
+  for (const candidate of new Set(candidates.filter(Boolean))) {
+    try {
+      const value = JSON.parse(await readFile(candidate, 'utf8'));
+      if (value?.roster === expectedRoster && typeof value.token === 'string' && value.token) return value;
+    } catch { /* A new listener can publish the file on its next attempt. */ }
   }
+  return null;
 }
 
 function resolveCallbackPort(explicitPort, tokenInfo, env = process.env) {
-  if (Number.isInteger(explicitPort) && explicitPort > 0 && explicitPort <= 65535) return explicitPort;
-  const rawEnv = env.FUTUREAIDE_REPORT_PORT;
-  if (rawEnv !== undefined && rawEnv !== '') {
-    const parsed = Number.parseInt(rawEnv, 10);
-    if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) return parsed;
-  }
-  if (Number.isInteger(tokenInfo?.port) && tokenInfo.port > 0 && tokenInfo.port <= 65535) {
-    return tokenInfo.port;
-  }
-  return DEFAULT_REPORT_PORT;
+  return [explicitPort, tokenInfo?.port, Number(env.FUTUREAIDE_REPORT_PORT), DEFAULT_REPORT_PORT]
+    .find(port => Number.isInteger(port) && port > 0 && port <= 65535);
 }
 
 const AUTHORITATIVE_REJECTION_CODES = new Set([
@@ -287,11 +259,14 @@ export function postCliCallback({
       port,
       path: CLI_CALLBACK_PATH,
       method: 'POST',
+      agent: false,
       headers,
       timeout: timeoutMs,
     }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
+      res.once('aborted', () => finish(null, null));
+      res.once('error', () => finish(null, null));
       res.on('end', () => {
         let parsed = null;
         try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { parsed = null; }
@@ -391,6 +366,7 @@ export function createCliCallbackServer({
   token,
   tokenFile,
   env = process.env,
+  log = () => {},
 } = {}) {
   if (!roster || !agentId || !taskId || !requestId) {
     throw new Error(`Missing managed ${target} dispatch.`);
@@ -404,54 +380,85 @@ export function createCliCallbackServer({
 
   const server = new Server(
     { name: 'futureaide', version: '1.0.0' },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: {} }, instructions: 'Use ask_parent for questions and report_parent with final: true for the completed task.' },
   );
 
   const managedEnabled = env?.FUTUREAIDE_MANAGED_CLI === '1';
-  const callerRole = env?.FUTUREAIDE_CALLER_ROLE ?? '';
-  const allowLeadTools = managedEnabled && !isLeafOnlyRole(callerRole);
-  const parentAgentId = (typeof env?.FUTUREAIDE_PARENT_AGENT_ID === 'string' && env.FUTUREAIDE_PARENT_AGENT_ID.trim())
-    ? env.FUTUREAIDE_PARENT_AGENT_ID.trim()
-    : agentId;
-  const ownerId = typeof env?.FUTUREAIDE_CALLER_OWNER_ID === 'string' ? env.FUTUREAIDE_CALLER_OWNER_ID.trim() : '';
-  const callerWorkspace = typeof env?.FUTUREAIDE_CALLER_WORKSPACE === 'string' ? env.FUTUREAIDE_CALLER_WORKSPACE.trim() : '';
-  let cachedLeadTools = null;
+  const configuredRoles = managedEnabled && configFile && !env.FUTUREAIDE_ROLES_CONFIG?.trim()
+    ? loadManagedRosterConfig(configFile, roster).then(config => config.teamConfigPath, () => undefined) : undefined;
+  const roleOptionsForCall = async () => ({ env, teamConfigPath: await configuredRoles });
+  const binding = { agentId, taskId, requestId, target };
+  const localBinding = { ...managedBindingFromEnv(env, target), ...binding };
+  const rosterId = rosterIdentityFromPath(roster);
+  const baseTools = [...TOOLS, ...BOARD_TOOLS];
+  let lastDiagnostic;
 
   const resolveLoopbackAuth = async () => {
-    const tokenInfo = token ? { token } : await readCallerTokenInfo(roster, tokenFile, env);
-    return {
-      port: resolveCallbackPort(port, tokenInfo, env),
-      token: token ?? tokenInfo?.token,
-    };
-  };
-
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
-    if (!managedEnabled) return { tools: TOOLS };
-    if (!allowLeadTools) return { tools: [...TOOLS, ...BOARD_TOOLS] };
-    const auth = await resolveLoopbackAuth();
-    if (auth.token) {
-      const rpc = await postManagedMcpRpc({
-        port: auth.port,
-        token: auth.token,
-        parentAgentId,
-        ownerId,
-        workspace: callerWorkspace,
-        method: 'tools/list',
-        params: {},
-        timeoutMs: 3000,
-      });
-      const remoteTools = rpc?.body?.result?.tools;
-      if (Array.isArray(remoteTools) && remoteTools.length > 0) {
-        cachedLeadTools = remoteTools.filter(t => LEAD_FORWARDED_TOOL_NAMES.has(t?.name));
+    let tokenInfo = await readCallerTokenInfo(roster, tokenFile, env);
+    if (!tokenInfo && !tokenFile && configFile) {
+      const config = await loadManagedRosterConfig(configFile, roster).catch(() => undefined);
+      if (config?.antigravityCallerTokenFile) {
+        tokenInfo = await readCallerTokenInfo(roster, config.antigravityCallerTokenFile, env);
       }
     }
-    return { tools: [...TOOLS, ...(cachedLeadTools ?? BOARD_TOOLS)] };
-  });
+    if (!token && !tokenInfo?.token) return { code: 'managed-cli-token-unavailable' };
+    const portNumber = resolveCallbackPort(port, tokenInfo, env);
+    const status = await readReportStatus({ port: portNumber, expectedRoster: rosterId, requireManagement: true });
+    if (!status.ready) return { code: status.reason.code, statusCode: status.reason.status };
+    return { port: portNumber, token: token ?? tokenInfo.token };
+  };
+  const diagnose = (code, status) => {
+    const diagnostic = code + (status ? ' (HTTP ' + status + ')' : '');
+    if (diagnostic !== lastDiagnostic) log(diagnostic);
+    lastDiagnostic = diagnostic;
+  };
+  const throughLoopback = async (method, params) => {
+    const options = { binding, rosterId, method, params,
+      timeoutMs: params.name === 'futureaide_wait_agents' ? 0 : method === 'tools/list' ? 3000 : 60000 };
+    let auth = await resolveLoopbackAuth();
+    if (!auth.token) return auth;
+    let rpc = await postManagedMcpRpc({ ...options, ...auth });
+    if (rpc?.statusCode === 401) {
+      const current = await resolveLoopbackAuth();
+      if (current.token && (current.token !== auth.token || current.port !== auth.port)) {
+        auth = current;
+        rpc = await postManagedMcpRpc({ ...options, ...current });
+      }
+    }
+    if (rpc?.statusCode === 401) return { code: 'managed-cli-token-rejected', statusCode: 401 };
+    if (!rpc?.body) return { code: 'report-service-invalid-rpc', statusCode: rpc?.statusCode, uncertain: true };
+    return { rpc };
+  };
 
-  server.setRequestHandler(CallToolRequestSchema, async request => {
-    const toolName = request.params?.name;
-    const args = request.params?.arguments ?? {};
+  const listTools = async () => {
+    if (!managedEnabled) return TOOLS;
+    let allowed;
+    const roleOptions = await roleOptionsForCall();
+    try { allowed = managedToolNames(verifyManagedCaller(getStore(), localBinding).callerRole, roleOptions); }
+    catch { return []; }
+    if (allowed.length === baseTools.length) return baseTools;
+    const result = await throughLoopback('tools/list', {});
+    const remote = result.rpc?.body?.result?.tools;
+    if (Array.isArray(remote)) {
+      lastDiagnostic = undefined;
+      const localNames = new Set(baseTools.map(tool => tool.name));
+      return [...baseTools, ...remote.filter(tool => allowed.includes(tool.name) && !localNames.has(tool.name))];
+    }
+    diagnose(result.code ?? 'report-service-invalid-rpc', result.statusCode ?? result.rpc?.statusCode);
+    return baseTools;
+  };
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await listTools() }));
+
+  const callTool = async (toolName, args = {}) => {
     try {
+      const roleOptions = await roleOptionsForCall();
+      const store = getStore();
+      const caller = managedEnabled
+        ? verifyManagedCaller(store, localBinding, { allowFinal: toolName === 'report_parent' && args.final === true })
+        : undefined;
+      if (caller && !managedToolNames(caller.callerRole, roleOptions).includes(toolName)) {
+        throw Object.assign(new Error('This tool is outside the caller’s managed role.'), { code: 'permission-denied' });
+      }
       if (toolName === 'ask_parent') {
         const receipt = await submitCliCallback({
           roster, agentId, taskId, requestId, target,
@@ -468,66 +475,52 @@ export function createCliCallbackServer({
         });
         return { content: [{ type: 'text', text: JSON.stringify(receipt) }] };
       }
-      if (managedEnabled && (toolName === 'futureaide_board_post' || toolName === 'futureaide_board_read' || (allowLeadTools && LEAD_FORWARDED_TOOL_NAMES.has(toolName)))) {
-        const auth = await resolveLoopbackAuth();
-        if (auth.token) {
-          const isWait = toolName === 'futureaide_wait_agents';
-          const rpc = await postManagedMcpRpc({
-            port: auth.port,
-            token: auth.token,
-            parentAgentId,
-            ownerId,
-            workspace: callerWorkspace,
-            method: 'tools/call',
-            params: { name: toolName, arguments: args },
-            timeoutMs: isWait ? 0 : 60000,
-          });
-          if (rpc?.body?.result) return rpc.body.result;
-          if (rpc?.body?.error) {
-            throw Object.assign(new Error(rpc.body.error.message ?? 'Remote MCP error.'), {
-              code: rpc.body.error.data?.code ?? 'mcp-error',
-            });
-          }
+      if (caller && toolName !== 'feedback') {
+        const verified = authorizeManagedTool(store, caller, toolName, args, roleOptions);
+        const boardPost = toolName === 'futureaide_board_post';
+        if (boardPost && (typeof args.message !== 'string' || !args.message.trim() || args.message.length > 4000
+            || (args.urgent !== undefined && typeof args.urgent !== 'boolean'))) {
+          throw Object.assign(new Error('Provide a board message of 1–4000 characters and a boolean urgent flag.'), { code: 'invalid-arguments' });
         }
-        // Offline fallback for board read/post when HTTP service is not running
+        const result = await throughLoopback('tools/call', { name: toolName, arguments: args });
+        if (result.rpc?.body?.result) return result.rpc.body.result;
+        if (result.rpc?.body?.error) {
+          throw Object.assign(new Error('The loopback service rejected this call.'), {
+            code: result.rpc.body.error.data?.code ?? 'mcp-error',
+          });
+        }
+        if (boardPost && result.uncertain) {
+          throw Object.assign(new Error('The board post may already have been saved.'), { code: 'write-outcome-unknown' });
+        }
         if (toolName === 'futureaide_board_read') {
-          const store = getStore();
-          const rec = store.get(agentId);
-          const rootId = rec?.ownerId ?? ownerId;
-          const messages = store.listTeamBoardMessages(rootId, {
-            limit: args.limit ?? 30,
-            ...(args.after_seq !== undefined ? { afterSeq: args.after_seq } : {}),
-          });
-          return { content: [{ type: 'text', text: JSON.stringify({ messages }) }] };
+          const board = store.listBoardMessages(verified.rootOwnerId, { limit: args.limit, afterSeq: args.after_seq });
+          return { content: [{ type: 'text', text: JSON.stringify({ rootOwnerId: verified.rootOwnerId, ...board }) }] };
         }
-        if (toolName === 'futureaide_board_post') {
-          const store = getStore();
-          const rec = store.get(agentId);
-          const rootId = rec?.ownerId ?? ownerId;
-          const author = rec?.name ?? 'member';
-          const saved = store.appendTeamBoardMessage({
-            rootOwnerId: rootId,
-            author,
-            text: String(args.message ?? ''),
-            mentions: [],
+        if (boardPost) {
+          // Recheck after the asynchronous probe before writing a local post.
+          const current = authorizeManagedTool(store, verified, toolName, args, roleOptions);
+          const { mentions, routed } = managedBoardRoutes(store, current, args, roleOptions);
+          const saved = store.postBoardMessage({
+            rootOwnerId: current.rootOwnerId, author: current.callerName,
+            authorRole: current.callerRole, authorAgentId: current.callerAgentId,
+            authorTaskId: current.callerTaskId, authorRequestId: current.callerRequestId,
+            text: args.message, mentions, routed, urgent: args.urgent === true,
           });
-          return { content: [{ type: 'text', text: JSON.stringify({ posted: true, seq: saved.seq, mentions: [], woken: [] }) }] };
+          return { content: [{ type: 'text', text: JSON.stringify({
+            posted: true, seq: saved.seq, mentions, woken: [], deferred: routed.filter(route => route.action === 'deferred'), routed,
+          }) }] };
         }
+        diagnose(result.code, result.statusCode);
         throw Object.assign(new Error('FutureAide loopback management service is not reachable.'), {
-          code: 'report-service-unavailable',
+          code: result.uncertain && !['futureaide_wait_agents', 'futureaide_read_report', 'futureaide_list_agents',
+            'futureaide_inspect_agent', 'futureaide_agent_changes'].includes(toolName)
+            ? 'write-outcome-unknown' : 'report-service-unavailable',
         });
       }
       if (toolName === 'feedback') {
         const deadline = Date.now() + 2000;
-        const store = getStore();
+        verifyManagedCaller(store, localBinding);
         const record = store.get(agentId);
-        if (!record || record.closed || record.target !== target || record.task?.taskId !== taskId
-            || record.task?.dispatches?.at(-1)?.requestId !== requestId || ['idle', 'failed'].includes(record.state)
-            || isCancelledRound(record) || record.task.reports?.some(report => report.final)
-            || store.submissions(agentId, taskId).some(report => report.final)) {
-          throw Object.assign(new Error('This caller has no active managed task for this dispatch.'),
-            { code: 'submission-not-owned' });
-        }
         const { feedbackRecordError, submitFeedback } = await import('./feedback-client.mjs');
         const activeErr = recentErr && Date.now() - Date.parse(recentErr.at) <= 900000 ? recentErr : null;
         const saved = await submitFeedback(
@@ -564,24 +557,28 @@ export function createCliCallbackServer({
         }],
       };
     }
-  });
+  };
+  server.setRequestHandler(CallToolRequestSchema, request => callTool(request.params?.name, request.params?.arguments));
 
-  const close = async () => {
-    try { await server.close(); } catch {}
+  const closeStore = () => {
     if (lazyStore) {
       try { lazyStore.close(); } catch {}
       lazyStore = null;
     }
   };
 
-  return { server, close };
+  server.onclose = closeStore;
+  const close = async () => {
+    try { await server.close(); } finally { closeStore(); }
+  };
+  return { server, close, listTools, callTool };
 }
 
 export async function runCliCallbackBridge(argv = process.argv.slice(2), env = process.env) {
   let cliTarget = 'codex-cli';
   let rest = argv;
-  if (argv[0] === '--claude-cli-reports' || argv[0] === '--codex-cli-reports') {
-    cliTarget = argv[0] === '--codex-cli-reports' ? 'codex-cli' : 'claude-cli';
+  if (['--claude-cli-reports', '--codex-cli-reports', '--agy-cli-reports'].includes(argv[0])) {
+    cliTarget = argv[0].slice(2, -'-reports'.length);
     rest = argv.slice(1);
   }
   const [roster, agentId, taskId, requestId, fifth, sixth] = rest;
@@ -593,8 +590,9 @@ export async function runCliCallbackBridge(argv = process.argv.slice(2), env = p
     taskId: taskId || env.FUTUREAIDE_TASK_ID,
     requestId: requestId || env.FUTUREAIDE_RUN_ID,
     target: cliTarget,
-    configFile,
+    configFile: configFile || env.FUTUREAIDE_CONFIG,
     env,
+    log: message => process.stderr.write('[futureaide] ' + message + '\n'),
   });
   const transport = new StdioServerTransport();
   if (cleanupFlag !== '--no-idle-session-cleanup') {

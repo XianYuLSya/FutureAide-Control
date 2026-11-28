@@ -2,22 +2,22 @@
 
 # FutureAide Control
 
-**Antigravity · Codex · Claude 跨端无头子代理军团控制器（v2.3.1）**
+**Antigravity · Codex · Claude 跨端无头子代理军团控制器（v2.4.0）**
 
-只要开着 **Antigravity（反重力）、Codex 或 Claude** 任意一个主对话，就能按需调遣 **`codex-cli`、`claude-cli`、`agy-cli` 三大无头 CLI 军团**在后台并行干活（与你原有的项目工作流或原生子代理和平共存，绝不强行接管覆盖）。
+只要开着 **Antigravity（反重力）、Codex 或 Claude** 任意一个主对话，就能按需调遣 **`codex-cli`、`claude-cli`、`agy-cli`** 在后台并行干活（与你原有的项目工作流或原生子代理和平共存，绝不强行接管覆盖）。
 
 不用多开一堆桌面窗口，不用传项目路径和内部会话 ID，更不用建临时 txt 传信文件——只给角色标签和一句话，插件按原名自动排工号、默认沿用你本机 CLI 自己的默认模型、切独立 Git 分支、锁代理端口；下属遇到卡点秒级问回原聊天，交完终报自动销户清场。
 
-[核心亮点](#v23-核心亮点) · [三端与三极架构](#三端主对话--三极无头军团) · [快速开始](#快速开始) · [实战用法](#实战用法) · [工具一览](#工具一览) · [常见问题](#常见问题) · [详细说明](REFERENCE.md) · [更新记录](CHANGELOG.md)
+[核心亮点](#v23-核心亮点) · [主对话与执行目标](#主对话与执行目标) · [快速开始](#快速开始) · [实战用法](#实战用法) · [工具一览](#工具一览) · [常见问题](#常见问题) · [详细说明](REFERENCE.md) · [更新记录](CHANGELOG.md)
 
 QQ 交流群：259109974
 
 ---
 
-## V2.3 核心亮点
+## 核心亮点
 
-1. **三足鼎立全无头互调（`codex-cli` · `claude-cli` · `agy-cli`）**
-   Antigravity、Codex、Claude 三大客户端任意一个都能坐镇主对话，跨模型家族调起后台无头 `codex-cli`、`claude-cli`、`agy-cli`（另可选附着 `codex-desktop` 原生会话）。写后端用 GPT、画界面用 Claude、做异构审查用反重力，一套接口全打通。
+1. **跨客户端无头调度**
+   Antigravity、Codex、Claude 三个客户端都能坐镇主对话，调起四个无头后端，也可附着 `codex-desktop` 原生会话。
 2. **2 参数极简派单 + 批量并发 + `worktree` 独立分支**
    只填 `{ role: "后端", message: "..." }` 两个参数，按原名自动排号为 `后端1`、`后端2`，未指定模型时直接跟随你本机 CLI 自身的默认模型与推理强度（也支持在 `~/.config/futureaide-control/roles.md` 自建角色预设表）；传 `tasks: [...]` 一把并发拉起最多 20 名子代理，加 `worktree: true` 自动切出隔离 Git 工作树互不抢文件，还支持 `timeout_minutes`（1–240 分钟）单次限时兜底。
 3. **`<50ms` 极薄回调桥 + 全局 `futureaide-wait` 零打扰唤醒**
@@ -29,11 +29,11 @@ QQ 交流群：259109974
 6. **`futureaide_team` 一刀统管整队生命周期与 `worktree` 一键合并**
    一个工具搞定全部带队难题：主对话重开后一键接班收编旧队（`adopt`）、撤掉卡壳团队长但保留并提拔其下属（`kick`，默认 `keep_children: true`）、跨级调岗（`reparent`）、巡检清扫无主散人池（`strays` / `sweep`）、FAswitch 切号后免报错断点续跑（`resume`），以及把成员的隔离 `worktree` 代码一键合回主工作区并拆树（`merge`）。
 7. **CLI 端口代理硬锁防跑偏 + 实时 Token 账单与卡死黄灯**
-   `futureaide_cli_proxy` 为 `codex-cli`、`claude-cli`、`agy-cli` 独立绑定端口或联动 FAswitch 当前档案——启动前先做 TCP 探活与档案一致性核验，不通或错位当场拦截，绝不悄悄直连跑偏；极简视图实时展示如 `"18s · 14.2k tok"` 的紧凑耗时/Token 账单角标、过滤废话后的真实执行步骤，以及静默超时 `stalled: true` 卡顿预警（另可开启内置本地只读 `/board` 状态页）。
+   `futureaide_cli_proxy` 可独立绑定无头后端的端口。无头后端也可联动 FAswitch 当前档案。极简视图显示执行步骤、耗时和 Token 用量，长时间静默时显示 `stalled: true`。
 
 ---
 
-## 三端主对话 × 三极无头军团
+## 主对话与执行目标
 
 主对话身份与当前项目目录由插件自动核验，创建成员时用 `role` 自动路由或显式指定一次 `target`，之后全程按名字（如 `后端1`）或团队路径（如 `团队长1/后端1`）操作：
 
@@ -70,7 +70,7 @@ Set-Location D:\Tools\FutureAide-Control
 
 > 检查 FutureAide Control 是否就绪。
 
-模型会调用 `futureaide_status({})`：返回 `ready: true` 即可看到当前识别到的客户端会话、三大无头 CLI 就绪状态、代理路由及可用模型列表。
+调用 `futureaide_status({})` 查看当前客户端会话、各执行目标的就绪状态、代理路由和可用模型。
 
 升级时在原目录执行 `git pull` 并重跑 `.\install.ps1` 即可（建议先让在途任务收尾，若升级后旧后台监工仍在运行，结束 `scoped-worker.mjs` 进程后下次调用会自动拉起新版）。
 
@@ -106,6 +106,8 @@ futureaide_run_agent({
 拿到回执后**不需要循环轮询**：主对话直接把 `wakeCmd` 放到后台运行（或调用 `futureaide_wait_agents({ taskKeys: ["tk-..."] })`），等 `后端1` 提问或交终报时会自动唤醒，直接拿到内联事件与耗时/Token 账单（如 `"usage": "18s · 14.2k tok"`）。
 
 ### 2. 批量并发派单 + `worktree` 隔离分支 + 一键合入
+
+`worktree: true` 可搭配 `baseSha` 指定完整 Git 提交 SHA。批量任务默认继承外层 SHA，各项也能单独指定。删除成员或 `kick` 时，`discard_worktree: true` 明确授权丢弃受保护的工作树。
 
 多人同时改同一仓库怕冲突？开启 `worktree: true`，每人领一棵独立 Git 工作树，还能用 `timeout_minutes` 设好超时护栏：
 
@@ -160,7 +162,7 @@ futureaide_team({ action: "sweep" })
 防止无头 CLI 走错节点或漏回直连：
 
 ```text
-# 查看三大无头 CLI 当前代理路由与 FAswitch 档案对齐状态
+# 查看各无头 CLI 当前代理路由
 futureaide_cli_proxy({ action: "status" })
 
 # 为 agy-cli 显式锁死本地代理端口（或传 "faswitch" / "direct"）
@@ -173,7 +175,7 @@ futureaide_cli_proxy({ action: "bind", target: "agy-cli", proxy: 17913 })
 
 | `mode` | 行为说明 |
 |---|---|
-| 省略 | 按目标原生习惯处理：`codex-desktop` 插入当前活动轮；无头 CLI（`codex-cli` / `claude-cli` / `agy-cli`）排在当前轮结束后下一轮执行 |
+| 省略 | `codex-desktop` 插入当前活动轮，四个无头 CLI 都排在当前轮结束后执行 |
 | `"steer"` | 明确要求插进当前正在执行的轮次；若当前空闲则直接开新一轮 |
 | `"queue"` | 明确排在当前轮之后单独开下一轮；注意当成员有待答提问时，显式 `"queue"` 只排补充、绝不代答问题 |
 
@@ -193,15 +195,15 @@ futureaide_cli_proxy({ action: "bind", target: "agy-cli", proxy: 17913 })
 
 | 工具 | 用途 |
 |---|---|
-| `futureaide_status` | 核验当前主对话身份、三大无头 CLI 与桌面目标就绪状态、代理路由及可用模型 |
+| `futureaide_status` | 核验当前主对话身份、各执行目标就绪状态、代理路由及可用模型 |
 | `futureaide_cli_proxy` | 查看（`status`）或绑定（`bind`）`codex-cli` / `claude-cli` / `agy-cli` / `all` 代理出口 |
 | `futureaide_run_agent` | 一步创建并派单（支持 `role` 2 参数极简派单、`tasks` 20 路并发、`worktree: true`、`timeout_minutes`、`mode`） |
 | `futureaide_create_agent` | 预留角色或具名成员而不立即启动模型轮次 |
 | `futureaide_send_agent` | 向已有成员（支持 `团队长1/后端1` 跨级路径）追加任务或补充说明，可更新模型/强度与 `mode` |
-| `futureaide_answer_agent` | 按名字或跨级路径回答成员的 `ask_parent` 待答提问，原任务继续推进 |
+| `futureaide_answer_agent` | 按名字或跨级路径答复 `ask_parent`。用 `question_id` 或 `questionIds` 点选，省略时只答最早一条 |
 | `futureaide_list_agents` | 三档极简名单：`team`（本队层级树、真实动作、`stalled` 预警、`usage` 账单）、`agent`（单人详情）、`all`（全机总览） |
 | `futureaide_wait_agents` | 按 `taskKeys`（或 `names`）阻塞等待提问或终报，支持 `barrier: "all" \| "any"` 与游标续等 |
-| `futureaide_board_post` | 在团队会议室黑板发言，`@后端1` 或 `@团队长1/后端2` 自动跨级唤醒或复活对应成员 |
+| `futureaide_board_post` | 在团队会议室黑板发言，`@后端1` 或 `@团队长1/后端2` 自动跨级唤醒或复活对应成员。Boss 和有权限的上级可传 `urgent: true` 优先送达，待答提问保持待答 |
 | `futureaide_board_read` | 按条数或 `after_seq` 增量读取团队会议室黑板记录 |
 | `futureaide_team` | 整队治理：`adopt`（收编）、`kick`（撤将留兵/强停）、`reparent`（调岗）、`resume`（续跑）、`strays` / `sweep`（散人巡检清扫）、`merge`（合入 `worktree` 并拆树） |
 | `futureaide_read_report` | 当超长报告需要逐字分页读取原文时，按 `task_key` 与 `submission_ref` 分页拉取 |

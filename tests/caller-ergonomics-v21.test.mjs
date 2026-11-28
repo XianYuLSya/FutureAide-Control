@@ -338,8 +338,8 @@ test('2. scoped-agents minimal { role, message } auto-defaults, worktree:true, b
   assert.match(legacyRun.wakeCmd, /^futureaide-wait --conv "conv-v21-main" --keys "[^"]+"$/);
 
   // 2b. Minimal create({ role, lifetime }) & run({ role, target, message }) follow backend default models without renaming role
-  const secCreated = await service.create({ role: '秘书', lifetime: 'persistent' }, caller);
-  assert.equal(secCreated.name, '秘书1');
+  const secCreated = await service.create({ role: '文档员', lifetime: 'persistent' }, caller);
+  assert.equal(secCreated.name, '文档员1');
   assert.equal(secCreated.target, 'codex-cli');
   assert.equal(secCreated.lifetime, 'persistent');
 
@@ -499,7 +499,7 @@ test('3. install-plugin generates zero-warning futureaide-wait.cmd & futureaide.
   assert.deepEqual(parsedBoth.results.map(r => r.message).sort(), ['后端1完工', '后端2完工']);
 
   // Question wake via ANTIGRAVITY_CONVERSATION_ID env fallback + --names
-  const qRun = await service.run({ role: '秘书', message: '核对排期' }, caller);
+  const qRun = await service.run({ role: '文档员', message: '核对排期' }, caller);
   const secRec = service.store.list().find(r => r.name === qRun.name);
   await service.poll(secRec.agentId);
   const secDisp = mock.dispatches.find(d => d.agentId === secRec.agentId);
@@ -517,7 +517,7 @@ test('3. install-plugin generates zero-warning futureaide-wait.cmd & futureaide.
   assert.equal(parsedQ.done, false);
   assert.equal(parsedQ.timedOut, false);
   assert.equal(parsedQ.questions?.length, 1);
-  assert.equal(parsedQ.questions[0].name, '秘书1');
+  assert.equal(parsedQ.questions[0].name, '文档员1');
   assert.equal(parsedQ.questions[0].message, '排期选周三还是周五？');
 });
 

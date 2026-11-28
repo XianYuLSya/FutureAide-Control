@@ -415,7 +415,8 @@ process.stdout.write(JSON.stringify({
   // Substring 'neon' + effort 'xhigh' resolves cleanly to 'gemini-4-neon-xhigh' and omits conflicting --effort
   const runReceipt = await service.run({
     name: 'brain-lead',
-    role: 'agy',
+    role: '团队长',
+    target: 'agy-cli',
     lifetime: 'persistent',
     model: 'neon',
     effort: 'xhigh',
@@ -496,7 +497,7 @@ process.stdout.write(JSON.stringify({
       FUTUREAIDE_PARENT_REQUEST_ID: 'req-offline-1',
       FUTUREAIDE_CALLER_OWNER_ID: childRecord.ownerId,
     }),
-    `managed-cli:${childRecord.agentId}:${childRecord.ownerId}`,
+    undefined,
   );
 
   // Put an active task on sub-worker and submit report_parent while HTTP loopback is OFFLINE
@@ -1249,23 +1250,32 @@ process.stdout.write(JSON.stringify({
     target: 'agy-cli',
     lifetime: 'persistent',
   }, extra);
-  const leadRec = service.store.list().find(r => r.name === '团队长1');
-  assert.ok(leadRec);
+  await service.create({ name: 'builder1', role: 'builder', target: 'agy-cli', lifetime: 'persistent' }, extra);
+  const bindFixtureTurn = name => {
+    const record = service.store.list().find(r => r.name === name);
+    const requestId = 'req-bridge-' + record.agentId;
+    const taskId = 'task-bridge-' + record.agentId;
+    const bound = { ...record, state: 'running', task: { taskId, dispatches: [{ requestId }] } };
+    service.store.save(bound);
+    return bound;
+  };
+  const leadRec = bindFixtureTurn('团队长1');
+  const leafRec = bindFixtureTurn('builder1');
 
-  const connectBridgeClient = async (role) => {
+  const connectBridgeClient = async (record) => {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const bridge = createCliCallbackServer({
       roster: service.store.location,
-      agentId: leadRec.agentId,
-      taskId: 'task-bridge-check',
-      requestId: 'req-bridge-check',
-      target: 'codex-cli',
+      agentId: record.agentId,
+      taskId: record.task.taskId,
+      requestId: record.task.dispatches.at(-1).requestId,
+      target: record.target,
       port: freePort,
       env: {
         FUTUREAIDE_MANAGED_CLI: '1',
-        FUTUREAIDE_CALLER_ROLE: role,
-        FUTUREAIDE_PARENT_AGENT_ID: leadRec.agentId,
-        FUTUREAIDE_CALLER_OWNER_ID: leadRec.ownerId,
+        FUTUREAIDE_CALLER_ROLE: record.role,
+        FUTUREAIDE_PARENT_AGENT_ID: record.agentId,
+        FUTUREAIDE_CALLER_OWNER_ID: record.ownerId,
         FUTUREAIDE_CALLER_WORKSPACE: repoDir,
         FUTUREAIDE_REPORT_PORT: String(freePort),
       },
@@ -1283,7 +1293,7 @@ process.stdout.write(JSON.stringify({
   };
 
   // 1) Leaf builder ('builder') sees 3 callback tools + 2 board tools (5 total, zero bloat) and can post/read board
-  const leafSession = await connectBridgeClient('builder');
+  const leafSession = await connectBridgeClient(leafRec);
   try {
     const leafTools = (await leafSession.client.listTools()).tools.map(item => item.name);
     assert.deepEqual(leafTools.sort(), [
@@ -1308,7 +1318,7 @@ process.stdout.write(JSON.stringify({
   }
 
   // 2) Lead ('团队长') sees full forwarded team tools and can actually create a child subagent under itself!
-  const leadSession = await connectBridgeClient('团队长');
+  const leadSession = await connectBridgeClient(leadRec);
   try {
     const leadTools = (await leadSession.client.listTools()).tools.map(item => item.name);
     assert.ok(leadTools.includes('futureaide_run_agent'), 'Lead CLI worker must see futureaide_run_agent');

@@ -11,7 +11,8 @@ import { appendFile, open, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
-import { buildCliProxyEnv, checkProxyReachable } from './cli-proxy.mjs';
+import { buildCliProxyEnv, checkProxyReachable, redactProxyCredentials } from './cli-proxy.mjs';
+import { managedCliEnv } from './managed-cli-policy.mjs';
 import { attachCurrentProcessToJobCage, killProcessCage } from './process-cage.mjs';
 import {
   AGY_TURN_FILES,
@@ -21,9 +22,11 @@ import {
   applyAgyLine,
   agyTurnOutcome,
   buildAgyCliArgs,
+  confirmTurnCage,
   createAgyTurnState,
   isAgyStateFileBusy,
   killProcessTree,
+  persistTurnCleanupPending,
   resolveTurnTimeoutMs,
   writeJsonFile,
 } from './agy-cli-runner.mjs';
@@ -187,14 +190,14 @@ export async function runAgyTurn({
   });
   let child;
   const finish = async options => {
-    const outcome = await finalize(directory, state, { ...options, retryMs: statePublishRetryMs });
-    await killCage({
+    const stopped = await confirmTurnCage(killCage, {
       pids: Number.isSafeInteger(child?.pid) && child.pid > 0 ? [child.pid] : [],
       turnDir: directory,
       runId: turn.requestId ?? turn.taskId ?? undefined,
       sessionId: turn.sessionId ?? undefined,
-    }).catch(() => undefined);
-    return outcome;
+    });
+    if (!stopped) throw await persistTurnCleanupPending(directory, state, 'agy', 'Antigravity CLI');
+    return finalize(directory, state, { ...options, retryMs: statePublishRetryMs });
   };
 
   turn.workerPid = Number.isSafeInteger(process.pid) ? process.pid : (turn.workerPid ?? null);
@@ -213,7 +216,7 @@ export async function runAgyTurn({
         preflightError: {
           code: 'proxy-unavailable',
           notSent: true,
-          message: `Required proxy ${route.proxyUrl} is unreachable (${proxy.error || 'TCP probe failed'}); agy was not spawned.`,
+          message: `Required proxy ${redactProxyCredentials(route.proxyUrl)} is unreachable (${redactProxyCredentials(proxy.error || 'TCP probe failed')}); agy was not spawned.`,
         },
       });
     }
@@ -237,10 +240,10 @@ export async function runAgyTurn({
   const drain = createStdoutReader(directory, state);
   const closeAll = () => Promise.allSettled([stdout.close(), stderr.close(), drain.close()]);
 
-  const childEnv = buildCliProxyEnv(env, route);
+  const childEnv = buildCliProxyEnv(managedCliEnv(env), route);
   for (const extraEnv of [turn.reportConfig?.callerEnv, turn.callerEnv, turn.reportConfig?.env]) {
     if (extraEnv && typeof extraEnv === 'object' && !Array.isArray(extraEnv)) {
-      for (const [key, val] of Object.entries(extraEnv)) {
+      for (const [key, val] of Object.entries(managedCliEnv(extraEnv))) {
         if (val !== undefined && val !== null) childEnv[key] = String(val);
       }
     }

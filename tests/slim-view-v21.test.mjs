@@ -362,7 +362,8 @@ test('MCP server supports batch tasks, worktree boolean, slim views with detail:
   const { tools } = await mcp.client.listTools();
   for (const tool of tools) {
     const fields = Object.keys(tool.inputSchema.properties ?? {});
-    assert.ok(!fields.some(f => /id$|workspace|profile|callback|address/.test(f)), `${tool.name} has forbidden schema field: ${fields}`);
+    const callerFields = fields.filter(field => tool.name !== 'futureaide_answer_agent' || field !== 'question_id');
+    assert.ok(!callerFields.some(f => /id$|workspace|profile|callback|address/.test(f)), `${tool.name} has forbidden schema field: ${callerFields}`);
     if (tool.name.startsWith('futureaide_')) {
       assert.doesNotMatch(tool.description, /\bDSH\b|\bdsh\b/, `${tool.name} description must not contain obsolete DSH prose`);
       assert.ok(tool.description.length <= 500, `${tool.name} description should be concise (got ${tool.description.length} chars)`);

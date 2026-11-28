@@ -18,6 +18,33 @@ import net from 'node:net';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
+function stripUrlUserInfo(candidate) {
+  const url = new URL(candidate);
+  if (!url.username && !url.password) return candidate;
+  url.username = '';
+  url.password = '';
+  const authority = candidate.slice(candidate.indexOf('://') + 3);
+  return /[/\\?#]/.test(authority) ? url.href : url.href.replace(/\/$/, '');
+}
+
+/** Remove proxy URL user information wherever a route is displayed. */
+export function redactProxyCredentials(value) {
+  let text = String(value);
+  // WHATWG URLs can escape raw whitespace in userinfo. Parse a standalone URL
+  // before extracting URL candidates from free-form diagnostics.
+  if (/^(?:https?|socks(?:4a?|5h?)?):\/\//i.test(text)) {
+    try { text = stripUrlUserInfo(text); } catch { /* Fall through for diagnostics and invalid URLs. */ }
+  }
+  return text.replace(/\b(?:https?|socks(?:4a?|5h?)?):\/\/(?:(?!(?:https?|socks(?:4a?|5h?)?):\/\/)(?:'[^'\r\n]*'|[^\s<>]))+/gi,
+    candidate => {
+      try { return stripUrlUserInfo(candidate); }
+      catch {
+        // Invalid input and surrounding log punctuation must not reveal credentials.
+        return candidate.replace(/^(.*?:\/\/)[^/\\?#]*@/, '$1');
+      }
+    });
+}
+
 const PROXY_ENV_KEY = /^(?:http|https|all|no)_proxy$/i;
 const DIRECT_VALUES = new Set(['direct', 'none', 'off', 'false']);
 
@@ -88,7 +115,7 @@ export function normalizeProxySpec(value) {
     let parsed;
     try { parsed = new URL(trimmed); }
     catch {
-      throw Object.assign(new Error(`Invalid proxy URL: ${trimmed}`), { code: 'invalid-proxy-config' });
+      throw Object.assign(new Error(`Invalid proxy URL: ${redactProxyCredentials(trimmed)}`), { code: 'invalid-proxy-config' });
     }
     if (!['http:', 'https:', 'socks5:', 'socks5h:', 'socks4:', 'socks:'].includes(parsed.protocol)) {
       throw Object.assign(new Error(`Unsupported proxy protocol: ${parsed.protocol}`), { code: 'invalid-proxy-config' });
@@ -97,7 +124,7 @@ export function normalizeProxySpec(value) {
       ? Number.parseInt(parsed.port, 10)
       : (parsed.protocol === 'https:' ? 443 : parsed.protocol === 'http:' ? 80 : NaN);
     if (!parsed.hostname || !Number.isInteger(port) || port < 1 || port > 65535) {
-      throw Object.assign(new Error(`Proxy URL must specify a valid host and port: ${trimmed}`), { code: 'invalid-proxy-config' });
+      throw Object.assign(new Error(`Proxy URL must specify a valid host and port: ${redactProxyCredentials(trimmed)}`), { code: 'invalid-proxy-config' });
     }
     return { mode: 'proxy', proxyUrl: trimmed, port };
   }
@@ -129,7 +156,7 @@ export async function checkProxyReachable(proxyUrl, { timeoutMs = 1500 } = {}) {
     ? Number.parseInt(parsed.port, 10)
     : (parsed.protocol === 'https:' ? 443 : parsed.protocol === 'http:' ? 80 : NaN);
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
-    return { ok: false, host: host || null, port: null, error: `Proxy URL must include a valid host and port: ${proxyUrl}` };
+    return { ok: false, host: host || null, port: null, error: `Proxy URL must include a valid host and port: ${redactProxyCredentials(proxyUrl)}` };
   }
   const boundedTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 1500;
   return new Promise(resolve => {
@@ -278,7 +305,6 @@ function findManualOverride(target, config, env) {
       return { raw: config[key], from: `config:${key}` };
     }
   }
-  return undefined;
 }
 
 /**
@@ -333,7 +359,7 @@ export async function resolveCliRoute({
         proxyReachable: false,
         profileName: null,
         profileId: null,
-        error: `Bound proxy ${spec.proxyUrl} (${manual.from}) is unreachable: ${probe.error}`,
+        error: `Bound proxy ${redactProxyCredentials(spec.proxyUrl)} (${manual.from}) is unreachable: ${redactProxyCredentials(probe.error)}`,
       };
     }
     return {
@@ -364,7 +390,7 @@ export async function resolveCliRoute({
         ok: false,
         code: 'proxy-unavailable',
         proxyReachable: false,
-        error: `FAswitch profile ${faswitch.profileName ?? faswitch.profileId ?? ''} proxy ${faswitch.proxyUrl} is unreachable: ${probe.error}`,
+        error: `FAswitch profile ${faswitch.profileName ?? faswitch.profileId ?? ''} proxy ${redactProxyCredentials(faswitch.proxyUrl)} is unreachable: ${redactProxyCredentials(probe.error)}`,
       };
     }
     return { ...faswitch, ok: true, proxyReachable: true };
@@ -439,6 +465,7 @@ export function buildCliProxyEnv(baseEnv = process.env, route = {}) {
     if (/^no_proxy$/i.test(key) && typeof value === 'string' && value.trim()) {
       existingNoProxy = existingNoProxy ? `${existingNoProxy},${value.trim()}` : value.trim();
     }
+    if (/^futureaide_antigravity_caller_token_file$/i.test(key)) continue;
     if (stripExisting && PROXY_ENV_KEY.test(key)) continue;
     if (value !== undefined) result[key] = value;
   }
@@ -473,7 +500,7 @@ export function publicRouteSummary(route) {
     ...(profile ? { profile } : {}),
     ...(route.profileId ? { profileId: route.profileId } : {}),
     ...(route.port ? { port: route.port } : {}),
-    ...(route.proxyUrl ? { proxy: route.proxyUrl } : {}),
+    ...(route.proxyUrl ? { proxy: redactProxyCredentials(route.proxyUrl) } : {}),
     ...(route.node ? { node: route.node } : {}),
     ...(route.configuredVia ? { configuredVia: route.configuredVia } : {}),
     ...(route.proxyReachable !== undefined && route.proxyReachable !== null ? { proxyReachable: route.proxyReachable } : {}),

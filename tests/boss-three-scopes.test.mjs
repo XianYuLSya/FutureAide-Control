@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -7,11 +7,12 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
-import { makeScopedServer } from '../src/mcp-server.mjs';
+import { makeScopedServer, scopedManagement } from '../src/mcp-server.mjs';
 import { TRUSTED_CALLER } from '../src/calling-context.mjs';
+import { RosterStore } from '../src/roster-store.mjs';
 import { compactAgent, compactCreate, compactList, compactWait } from '../src/tool-view.mjs';
 import { startAntigravityCallerBridge } from '../src/antigravity-caller-bootstrap.mjs';
-import { startHttpService } from '../src/claude-report-server.mjs';
+import { startHttpService, startReportService } from '../src/claude-report-server.mjs';
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -325,45 +326,79 @@ test('MCP create/run/list/wait/board/cli_proxy forward new contracts and validat
   assert.deepEqual(proxyBind, { ok: true, action: 'bind', target: 'codex-cli', proxy: 17913 });
 });
 
-test('FUTUREAIDE_MANAGED_CLI=1 injects TRUSTED_CALLER and omits duplicate ask_parent/report_parent', async (t) => {
+test('FUTUREAIDE_MANAGED_CLI=1 requires a dispatch and exposes tools for a verified lead', async (t) => {
+  const managedEnv = { FUTUREAIDE_MANAGED_CLI: '1', FUTUREAIDE_PARENT_AGENT_ID: 'agent-lead-001' };
+  assert.throws(() => makeScopedServer({ env: managedEnv }), /Missing managed codex-cli dispatch\./);
+
+  const workspace = await withTempDir(t);
+  const store = new RosterStore(path.join(workspace, 'roster.sqlite'));
+  const tokenFile = path.join(workspace, 'desktop-token.json');
+  const teamConfigPath = path.join(workspace, 'roles.md');
+  const ownerId = 'owner-root-boss';
+  await writeFile(teamConfigPath, [
+    '| 团队长 | gpt-5.4 | codex-cli |',
+    '| 发布协调 / 领队 | gpt-5.4 | codex-cli |',
+    '| 审核专员 | gpt-5.4 | codex-cli |',
+    '| 调研专员 | gpt-5.4 | codex-cli persistent |',
+  ].join('\n'));
   let capturedCaller = null;
-  const mockService = {
-    async resume() {},
+  const service = {
+    store,
     async run(args, extra) {
       capturedCaller = extra[TRUSTED_CALLER];
       return { created: true, accepted: true, name: args.name ?? '后端1', state: 'running' };
     },
   };
-
-  const mcp = await connectMcp(mockService, {
-    env: {
-      FUTUREAIDE_MANAGED_CLI: '1',
-      FUTUREAIDE_PARENT_AGENT_ID: 'agent-lead-001',
-      FUTUREAIDE_CALLER_OWNER_ID: 'owner-root-boss',
-      FUTUREAIDE_CALLER_WORKSPACE: 'D:\\Work\\demo-workspace',
-    },
-  });
-  t.after(() => mcp.close());
-
-  const { tools } = await mcp.client.listTools();
-  const names = tools.map(item => item.name);
-  assert.equal(names.includes('ask_parent'), false, 'ask_parent must not be registered on managed-cli server');
-  assert.equal(names.includes('report_parent'), false, 'report_parent must not be registered on managed-cli server');
-  assert.equal(names.includes('futureaide_run_agent'), true);
-  assert.equal(names.includes('futureaide_board_post'), true);
-
-  const ran = await mcp.client.callTool({
-    name: 'futureaide_run_agent',
-    arguments: { role: '后端', message: '处理子任务' },
-  });
-  assert.notEqual(ran.isError, true);
-  assert.deepEqual(capturedCaller, {
-    source: 'managed-cli',
-    nativeSessionId: 'agent-lead-001',
-    parentAgentId: 'agent-lead-001',
-    ownerId: 'owner-root-boss',
-    workspace: 'D:\\Work\\demo-workspace',
-  });
+  try {
+    const report = await startReportService({ store, port: 0, teamConfigPath,
+      antigravityCallerTokenFile: tokenFile, management: scopedManagement({ service }) });
+    try {
+      for (const [index, role] of ['团队长', '发布协调', '审核专员'].entries()) {
+        const agentId = 'agent-lead-' + index;
+        const taskId = 'task-lead-' + index;
+        const requestId = 'request-lead-' + index;
+        const name = role + '1';
+        store.insert({ agentId, name, role, ownerId, workspace, target: 'codex-cli', state: 'running',
+          task: { taskId, state: 'running', dispatches: [{ requestId }] } });
+        const mcp = await connectMcp(service, { env: {
+          ...managedEnv,
+          FUTUREAIDE_PARENT_AGENT_ID: agentId,
+          FUTUREAIDE_PARENT_TASK_ID: taskId,
+          FUTUREAIDE_PARENT_REQUEST_ID: requestId,
+          FUTUREAIDE_ROSTER_PATH: store.location,
+          FUTUREAIDE_ROLES_CONFIG: teamConfigPath,
+          FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE: tokenFile,
+        } });
+        try {
+          const { tools } = await mcp.client.listTools();
+          const names = tools.map(item => item.name);
+          assert.equal(names.length, new Set(names).size);
+          for (const tool of ['ask_parent', 'report_parent', 'feedback', 'futureaide_board_post',
+            'futureaide_board_read', 'futureaide_run_agent']) assert.ok(names.includes(tool), tool);
+          const reviewer = role === '审核专员';
+          assert.equal(names.includes('futureaide_team'), !reviewer);
+          if (reviewer) {
+            const denied = await mcp.client.callTool({
+              name: 'futureaide_run_agent',
+              arguments: { role: '调研专员', message: 'Read only' },
+            });
+            assert.equal(JSON.parse(denied.content[0].text).error.code, 'permission-denied');
+          }
+          const ran = await mcp.client.callTool({
+            name: 'futureaide_run_agent',
+            arguments: { role: reviewer ? '调研专员' : '后端', ...(reviewer ? { lifetime: 'once' } : {}), message: '处理子任务' },
+          });
+          assert.notEqual(ran.isError, true, ran.content[0].text);
+          assert.deepEqual(capturedCaller, {
+            source: 'managed-cli', nativeSessionId: agentId, callerAgentId: agentId, parentAgentId: agentId,
+            callerTaskId: taskId, callerRequestId: requestId, callerRole: role, target: 'codex-cli',
+            ownerId, workspace, rootOwnerId: ownerId, callerName: name,
+            ...(reviewer ? { readOnlyScout: true } : {}),
+          });
+        } finally { await mcp.close(); }
+      }
+    } finally { await report.close(); }
+  } finally { store.close(); }
 });
 
 // ---------------------------------------------------------------------------

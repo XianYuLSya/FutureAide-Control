@@ -596,21 +596,22 @@ test('an earlier queued input keeps its frozen selection when the name pin chang
 });
 
 test('a Codex record ignores its legacy dataRoot and keeps working', async () => {
+  const legacyDataRoot = path.resolve('fixture-codex-legacy-data');
   const f = await fixture({ adapters: { 'codex-desktop': record => {
     const backend = desktopAdapter([]);
     backend.record = record;
-    backend.probe = async () => ({ identity: { application: 'codex-desktop', home: 'C:/Users/x/.codex' },
+    backend.probe = async () => ({ identity: { application: 'codex-desktop', home: legacyDataRoot },
       methods: ['create', 'observe', 'deliver'], treeProtocol: 1, reportProtocol: 1 });
     return backend;
   } } });
   try {
     await f.service.create({ name: 'partner', lifetime: 'persistent', target: 'codex-desktop' }, extra(A));
     const record = f.record('partner');
-    record.host = { application: 'codex-desktop', dataRoot: 'D:/Work/tools/codexX' };
+    record.host = { application: 'codex-desktop', dataRoot: legacyDataRoot };
     f.store.save(record);
     await f.service.send({ name: 'partner', message: 'continue' }, extra(A));
     await f.service.poll(record.agentId);
-    assert.equal(f.record('partner').host.dataRoot, 'D:/Work/tools/codexX', 'the legacy row is not migrated');
+    assert.equal(f.record('partner').host.dataRoot, legacyDataRoot, 'the legacy row is not migrated');
     assert.equal(f.record('partner').error, undefined, 'the monitor cwd is irrelevant to Codex ownership');
   } finally { f.service.close(); }
 });

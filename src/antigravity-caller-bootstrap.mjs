@@ -31,7 +31,7 @@ import {
   RootsListChangedNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { loadConfig } from './config.mjs';
-import { submitCliCallback } from './cli-callback-bridge.mjs';
+import { createCliCallbackServer } from './cli-callback-bridge.mjs';
 import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
 import { reportPort, rosterIdentity } from './report-endpoint.mjs';
 import { RosterStore } from './roster-store.mjs';
@@ -169,10 +169,7 @@ export function parseBootstrapArgs(argv = process.argv.slice(2)) {
  * Extract Antigravity conversation ID from incoming MCP request `_meta` or environment.
  */
 export function resolveConversationId(request, extra, env = process.env) {
-  const managed = resolveManagedCliBinding(env);
-  if (managed) {
-    return `managed-cli:${managed.agentId}${managed.ownerId ? `:${managed.ownerId}` : ''}`;
-  }
+  if (env.FUTUREAIDE_MANAGED_CLI === '1') return undefined;
   const meta = request?.params?._meta ?? extra?._meta;
   const fromMeta = typeof meta?.['antigravity.google/conversation_id'] === 'string'
     ? meta['antigravity.google/conversation_id'].trim() : '';
@@ -578,17 +575,27 @@ export async function startAntigravityCallerBridge({
   timeoutMs = 60000,
   log = message => process.stderr.write(`[${BOOTSTRAP_NAME}] ${message}\n`),
 } = {}) {
+  if (env.FUTUREAIDE_MANAGED_CLI === '1') {
+    const binding = resolveManagedCliBinding(env);
+    if (!binding) throw new Error('Missing managed Antigravity CLI dispatch.');
+    const config = await load(configPath).catch(() => undefined);
+    const roster = binding.roster ?? (config?.stateDirectory && path.join(config.stateDirectory, 'roster.sqlite'));
+    const bridge = createCliCallbackServer({ ...binding, roster, configFile: configPath,
+      tokenFile: tokenFile ?? config?.antigravityCallerTokenFile, port, env, log });
+    const tools = await bridge.listTools();
+    return { ...bridge, tools: tools.length, ready: tools.length > 0, port,
+      fetchTools: bridge.listTools, listRemoteTools: async () => ({ ok: true, tools: await bridge.listTools() }),
+      idleSessionCleanup: config?.idleSessionCleanup !== false };
+  }
   let nextRpcId = 1;
   const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 4 });
   const activeWaits = new Set();
-  const managedBinding = resolveManagedCliBinding(env);
   const explicitWorkspace = (typeof env?.ANTIGRAVITY_WORKSPACE === 'string' && env.ANTIGRAVITY_WORKSPACE.trim())
     ? env.ANTIGRAVITY_WORKSPACE.trim()
-    : managedBinding?.workspace;
+    : undefined;
   let cachedRootWorkspace;
   let rootWorkspaceChecked = false;
   let store;
-  let fallbackRosterStore;
 
   const currentEndpoint = () => resolveEndpoint({ configPath, tokenFile, port, env, load, read });
 
@@ -809,65 +816,17 @@ export async function startAntigravityCallerBridge({
 
   let cachedTools = [];
 
-  const withManagedParentTools = toolsList => {
-    if (!managedBinding) return toolsList;
-    const filtered = (Array.isArray(toolsList) ? toolsList : [])
-      .filter(tool => tool?.name !== 'ask_parent' && tool?.name !== 'report_parent');
-    return [...filtered, ...MANAGED_PARENT_TOOLS];
-  };
-
   const fetchTools = async (req, extra) => {
     const listed = await listRemoteTools(req, extra);
     if (!listed.ok) {
       log(`${listed.code}: ${listed.message}`);
-      return withManagedParentTools(cachedTools);
+      return cachedTools;
     }
     cachedTools = listed.tools;
-    return withManagedParentTools(listed.tools);
+    return listed.tools;
   };
 
   const callTool = async (name, args, req, extra) => {
-    if (managedBinding && (name === 'ask_parent' || name === 'report_parent')) {
-      try {
-        const endpoint = await currentEndpoint();
-        const rosterPath = managedBinding.roster
-          || (endpoint.config?.stateDirectory ? path.join(endpoint.config.stateDirectory, 'roster.sqlite') : undefined);
-        if (!rosterPath) {
-          return failure('calling-context-unavailable', 'Managed CLI roster path is unavailable.', { operation: name });
-        }
-        const getFallbackStore = () => {
-          if (endpoint.config?.stateDirectory) {
-            const existing = getStore(endpoint.config);
-            if (existing) return existing;
-          }
-          fallbackRosterStore ??= new RosterStore(rosterPath);
-          return fallbackRosterStore;
-        };
-        const receipt = await submitCliCallback({
-          roster: rosterPath,
-          agentId: managedBinding.agentId,
-          taskId: managedBinding.taskId,
-          requestId: managedBinding.requestId,
-          target: managedBinding.target,
-          kind: name === 'ask_parent' ? 'ask' : 'report',
-          message: args?.message,
-          final: name === 'report_parent' ? args?.final === true : false,
-          port: endpoint.port,
-          token: endpoint.token,
-          tokenFile: endpoint.tokenFile,
-          env,
-          getStore: getFallbackStore,
-        });
-        return { content: [{ type: 'text', text: JSON.stringify(receipt) }] };
-      } catch (error) {
-        return failure(
-          error?.code ?? 'operation-failed',
-          String(error?.message ?? error),
-          { operation: name },
-        );
-      }
-    }
-
     const conversationId = resolveConversationId(req, extra, env);
     if (!conversationId) {
       return failure(
@@ -1083,9 +1042,7 @@ export async function startAntigravityCallerBridge({
   server = createForwardServer({
     fetchTools,
     callTool,
-    instructions: managedBinding
-      ? `${INSTRUCTIONS}\n\nManaged CLI child mode active: call ask_parent to ask your parent a question, and call report_parent(message, final=true) to deliver your final report.`
-      : INSTRUCTIONS,
+    instructions: INSTRUCTIONS,
     onRootsChanged: () => {
       cachedRootWorkspace = undefined;
       rootWorkspaceChecked = false;
@@ -1106,11 +1063,8 @@ export async function startAntigravityCallerBridge({
     for (const controller of activeWaits) controller.abort();
     httpAgent.destroy();
     const activeStore = store;
-    const activeFallback = fallbackRosterStore;
     store = undefined;
-    fallbackRosterStore = undefined;
     try { activeStore?.close?.(); } catch { /* ignore */ }
-    try { activeFallback?.close?.(); } catch { /* ignore */ }
   };
 
   return {

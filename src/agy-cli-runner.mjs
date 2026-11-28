@@ -14,7 +14,8 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { buildCliProxyEnv, resolveCliRoute } from './cli-proxy.mjs';
+import { buildCliProxyEnv, redactProxyCredentials, resolveCliRoute } from './cli-proxy.mjs';
+import { managedCliEnv } from './managed-cli-policy.mjs';
 import { killProcessCage } from './process-cage.mjs';
 import { replaceStateFile } from './replace-state-file.mjs';
 
@@ -922,7 +923,7 @@ export async function startAgyTurn({
   await writeJsonFile(directory, AGY_TURN_FILES.turn, turn);
   await writeJsonFile(directory, AGY_TURN_FILES.state, state);
 
-  const workerEnv = buildCliProxyEnv(env, route);
+  const workerEnv = buildCliProxyEnv(managedCliEnv(env), route);
   const worker = await spawnWorker(directory, { env: workerEnv, route });
   const claimedTurn = await readJson(path.join(directory, AGY_TURN_FILES.turn));
   const workerPid = (Number.isSafeInteger(claimedTurn?.workerPid) && claimedTurn.workerPid > 0)
@@ -937,7 +938,7 @@ export async function startAgyTurn({
 async function readTerminalSnapshot(directory, turn) {
   const terminal = await readJson(path.join(directory, AGY_TURN_FILES.terminal));
   if (!terminal || terminal.phase !== 'exited' || !TERMINAL_STATES.includes(terminal.state)) return undefined;
-  if (turn?.requestId && terminal.requestId && terminal.requestId !== turn.requestId) return undefined;
+  if (!turn || !Object.hasOwn(turn, 'requestId') || terminal.requestId !== turn.requestId) return undefined;
   return terminal;
 }
 
@@ -949,29 +950,57 @@ async function readTurnState(directory, turn, { checkTerminal = false } = {}) {
     if (terminal) return terminal;
     throw error;
   }
+  if (state && (!turn || !Object.hasOwn(turn, 'requestId') || state.requestId !== turn.requestId)) {
+    return readTerminalSnapshot(directory, turn);
+  }
   if (checkTerminal && !TERMINAL_STATES.includes(state?.state)) {
     return await readTerminalSnapshot(directory, turn) ?? state;
   }
   return state;
 }
 
-async function workerLostError(directory, message) {
+async function workerLostError(directory, message, target) {
   const stderr = await readFile(path.join(directory, AGY_TURN_FILES.workerStderr), 'utf8').catch(() => '');
-  const diagnostic = stderr.split(/\r?\n/).find(line => line.startsWith(AGY_WORKER_ERROR_PREFIX))
-    ?.slice(AGY_WORKER_ERROR_PREFIX.length, AGY_WORKER_ERROR_PREFIX.length + 400);
-  return { code: 'agy-turn-worker-lost', message: diagnostic ? `${message} Worker error: ${diagnostic}` : message };
+  const prefix = target + '-worker: ';
+  const diagnostic = stderr.split(/\r?\n/).find(line => line.startsWith(prefix))?.slice(prefix.length, prefix.length + 400);
+  return { code: target.replace(/-cli$/, '') + '-turn-worker-lost',
+    message: diagnostic ? message + ' Worker error: ' + redactProxyCredentials(diagnostic) : message };
+}
+
+export async function confirmTurnCage(killCage, options) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const proof = await Promise.resolve().then(() => killCage(options)).catch(() => undefined);
+    if (proof?.ok === true) return true;
+    if (attempt < 2) await delay(100);
+  }
+  return false;
+}
+
+export async function persistTurnCleanupPending(directory, state, hostCode, host) {
+  const error = fail(hostCode + '-cage-unverified', host + ' process cleanup could not be confirmed.');
+  const heartbeatAt = new Date().toISOString();
+  Object.assign(state, { state: 'running', phase: 'cleanup-pending', cleanupPending: true, heartbeatAt,
+    error: { code: error.code, message: error.message } });
+  await writeJsonFile(directory, AGY_TURN_FILES.state, state, { mode: 0o600, retryMs: 5000 });
+  return error;
 }
 
 export async function readAgyTurn(directory, { isAlive = processAlive } = {}) {
+  const target = 'agy-cli';
+  const host = 'Antigravity CLI';
   const turn = await readJson(path.join(directory, AGY_TURN_FILES.turn));
+  const marker = await readJson(path.join(directory, AGY_TURN_FILES.cancel));
+  const sameMarker = Boolean(marker && turn && Object.hasOwn(turn, 'requestId') && marker.requestId === turn.requestId);
   let state = await readTurnState(directory, turn);
   const alive = !state && Number.isSafeInteger(turn?.workerPid) && isAlive(turn.workerPid);
   if (!state && turn && !alive) state = await readTurnState(directory, turn, { checkTerminal: true });
   if (!state) {
-    if (!turn) throw fail('agy-turn-not-found', `No Antigravity CLI turn is recorded in ${directory}.`);
+    if (!turn) throw fail(target.replace(/-cli$/, '') + '-turn-not-found', `No ${host} turn is recorded in ${directory}.`);
+    const pending = sameMarker && marker.cleanupPending === true;
+    const stopped = sameMarker && marker.stopped === true && !alive;
     return {
       directory,
-      state: alive ? 'running' : 'failed',
+      state: pending || alive ? 'running' : stopped ? 'cancelled' : 'failed',
       requestId: turn.requestId ?? null,
       sessionId: turn.sessionId ?? null,
       conversationId: turn.conversationId ?? null,
@@ -981,8 +1010,8 @@ export async function readAgyTurn(directory, { isAlive = processAlive } = {}) {
       messages: [],
       messagesDropped: 0,
       sessionStarted: false,
-      ...(alive ? {} : {
-        error: await workerLostError(directory, 'The detached Antigravity CLI worker exited before writing state.json.'),
+      ...(pending ? { cleanupPending: true, error: marker.error } : alive || stopped ? {} : {
+        error: await workerLostError(directory, `The detached ${host} worker exited before writing state.json.`, target),
       }),
       workerPid: turn.workerPid ?? null,
       agyPid: null,
@@ -993,7 +1022,6 @@ export async function readAgyTurn(directory, { isAlive = processAlive } = {}) {
     };
   }
 
-  const marker = await readJson(path.join(directory, AGY_TURN_FILES.cancel));
   const workerPid = recordedWorkerPid(turn, state);
   const agyPid = Number.isSafeInteger(state.pid) && state.pid > 0 ? state.pid : null;
   const owned = [...new Set([workerPid, agyPid].filter(pid => pid !== null))];
@@ -1010,8 +1038,14 @@ export async function readAgyTurn(directory, { isAlive = processAlive } = {}) {
 
   let reported = state.state === undefined ? 'running' : state.state;
   let error = state.error ?? undefined;
-  if (!TERMINAL_STATES.includes(reported)) {
-    if (marker?.stopped === true && !alivePids.length) {
+  const stopped = sameMarker && marker.stopped === true;
+  const cleanupPending = !stopped && (state.cleanupPending === true
+    || (sameMarker && marker.cleanupPending === true));
+  if (cleanupPending) {
+    reported = 'running';
+    error = state.cleanupPending ? state.error : marker.error;
+  } else if (!TERMINAL_STATES.includes(reported)) {
+    if (stopped && !alivePids.length) {
       reported = 'cancelled';
       error = undefined;
     } else if (alivePids.length) {
@@ -1019,17 +1053,18 @@ export async function readAgyTurn(directory, { isAlive = processAlive } = {}) {
     } else if (owned.length) {
       reported = 'failed';
       error = await workerLostError(directory,
-        'The detached Antigravity CLI worker exited without recording a final state, and no owned process remains.');
+        `The detached ${host} worker exited without recording a final state, and no owned process remains.`, target);
     } else if (!fresh) {
       reported = 'failed';
       error = await workerLostError(directory,
-        'The detached Antigravity CLI worker missed its heartbeat window and is treated as gone.');
+        `The detached ${host} worker missed its heartbeat window and is treated as gone.`, target);
     }
   }
 
   return {
     directory,
     state: reported === 'completed' ? 'ended' : reported,
+    ...(cleanupPending ? { cleanupPending: true } : {}),
     requestId: state.requestId ?? turn?.requestId ?? null,
     sessionId: state.sessionId ?? turn?.sessionId ?? null,
     conversationId: state.conversationId ?? turn?.conversationId ?? null,
@@ -1037,6 +1072,8 @@ export async function readAgyTurn(directory, { isAlive = processAlive } = {}) {
     requestedModel: state.requestedModel ?? turn?.model ?? null,
     actualEffort: state.actualEffort ?? state.requestedEffort ?? turn?.effort ?? null,
     usage: state.usage ?? null,
+    ...(state.usageDetails ? { usageDetails: state.usageDetails } : {}),
+    ...(state.sessionCwd ? { sessionCwd: state.sessionCwd } : {}),
     messages: state.messages ?? [],
     messagesDropped: state.messagesDropped ?? 0,
     ...(error ? { error } : {}),
@@ -1129,6 +1166,7 @@ async function markCancelled(directory, state) {
     ...state,
     state: 'cancelled',
     phase: 'exited',
+    cleanupPending: false,
     updatedAt: time,
     heartbeatAt: time,
     endedAt: state.endedAt ?? time,
@@ -1136,7 +1174,17 @@ async function markCancelled(directory, state) {
   });
 }
 
-export async function cancelAgyTurn(directory, {
+export async function cancelAgyTurn(directory, options = {}) {
+  try { return await stopAgyTurn(directory, options); }
+  catch (error) {
+    if (error?.code !== 'preempt-cage-still-running' && error?.code !== 'turn-cage-unverified') throw error;
+    if (options.expectedRequestId !== undefined) throw error;
+    return { ok: false, cancelled: false, stopped: false, cleanupPending: true, state: 'running',
+      pids: error.pids, remaining: error.remaining, note: error.message };
+  }
+}
+
+async function stopAgyTurn(directory, { expectedRequestId,
   isAlive = processAlive,
   killTree = killProcessTree,
   killCage = killTree === killProcessTree ? killProcessCage : async () => ({ ok: true, killed: [] }),
@@ -1144,6 +1192,10 @@ export async function cancelAgyTurn(directory, {
   confirmMs = CANCEL_CONFIRM_MS,
 } = {}) {
   const turn = await readJson(path.join(directory, AGY_TURN_FILES.turn));
+  if (expectedRequestId !== undefined && turn?.requestId !== expectedRequestId) {
+    return { ok: false, stopped: false, note: 'The original turn request does not match.' };
+  }
+  // A native session survives multiple turns. Scope preemption to this request.
   const state = await readTurnState(directory, turn, { checkTerminal: true });
   const pids = {
     worker: recordedWorkerPid(turn, state),
@@ -1157,9 +1209,25 @@ export async function cancelAgyTurn(directory, {
   const requestedAt = new Date().toISOString();
   const requestId = state?.requestId ?? turn?.requestId ?? null;
   const sessionId = state?.sessionId ?? turn?.sessionId ?? null;
+  const marker = await readJson(path.join(directory, AGY_TURN_FILES.cancel));
+  const pendingStop = marker?.requestId === requestId && marker?.cleanupPending === true;
+  const cleanupCode = expectedRequestId === undefined ? 'turn-cage-unverified' : 'preempt-cage-still-running';
+  const writeStop = (stopped, remaining = [], fields = {}) => writeJsonFile(directory, AGY_TURN_FILES.cancel,
+    { requestId, requestedAt, stopped, remaining, pids, ...fields });
+  const unverifiedStop = async (remaining, message) => {
+    await writeStop(false, remaining, { cleanupPending: true, error: { code: cleanupCode, message } });
+    return { ok: false, cancelled: false, stopped: false, cleanupPending: true, state: 'running', pids, remaining, note: message };
+  };
+  const stopCage = async options => {
+    const proved = await confirmTurnCage(killCage,
+      expectedRequestId === undefined ? options : { ...options, sessionId: undefined });
+    if (proved) return;
+    const pending = await unverifiedStop(alive(), 'The original process cage could not be reaped.');
+    throw fail(cleanupCode, pending.note, { pids, remaining: pending.remaining });
+  };
   const markers = {
     directory,
-    conversationId: state?.conversationId ?? turn?.conversationId ?? null,
+    conversationId: expectedRequestId === undefined ? state?.conversationId ?? turn?.conversationId ?? null : undefined,
     requestId,
     startedAt: state?.startedAt ?? turn?.startedAt ?? null,
   };
@@ -1178,7 +1246,7 @@ export async function cancelAgyTurn(directory, {
       }
       if (ours.length) {
         for (const pid of ours) await killTree(pid);
-        await killCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
+        await stopCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
         const deadline = Date.now() + confirmMs;
         let stillOurs = ours.filter(pid => isAlive(pid));
         while (stillOurs.length && Date.now() < deadline) {
@@ -1186,39 +1254,40 @@ export async function cancelAgyTurn(directory, {
           stillOurs = ours.filter(pid => isAlive(pid));
         }
         if (stillOurs.length) {
-          return { ok: false, cancelled: false, stopped: false, state: state.state, pids, remaining: stillOurs,
-            note: `Processes still alive after terminal cleanup: ${stillOurs.join(', ')}.` };
+          return unverifiedStop(stillOurs, `Processes still alive after terminal cleanup: ${stillOurs.join(', ')}.`);
         }
+        if (pendingStop) await writeStop(true);
         return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [] };
       }
-      await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+      await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
       const nonReused = surviving.filter(pid => isAlive(pid) && !reused.includes(pid));
       if (nonReused.length) {
-        return { ok: false, cancelled: false, stopped: false, state: state.state, pids, remaining: nonReused,
-          note: 'Turn already ended; recorded processes are still alive and will not be killed by recycled pid.' };
+        return unverifiedStop(nonReused, 'Recorded processes are still alive and their ownership could not be verified.');
       }
+      if (pendingStop) await writeStop(true);
       return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [] };
     }
-    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    if (pendingStop) await writeStop(true);
     return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [] };
   }
 
-  if (!recorded.length) {
-    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+  if (!recorded.length && !state?.cleanupPending && !pendingStop) {
+    await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     return { ok: false, cancelled: false, stopped: false, state: 'running', pids, remaining: [],
       note: 'Worker has not recorded any pid yet; retry cancel shortly.' };
   }
 
-  await writeJsonFile(directory, AGY_TURN_FILES.cancel, { requestId, requestedAt, stopped: null, pids });
+  if (!pendingStop) await writeStop(null);
   const targets = alive();
   if (!targets.length) {
-    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    await stopCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     const latest = await readTurnState(directory, turn, { checkTerminal: true });
     const current = TERMINAL_STATES.includes(latest?.state) ? latest.state : 'cancelled';
     if (!TERMINAL_STATES.includes(latest?.state) && (latest ?? state)) {
       await markCancelled(directory, latest ?? state);
     }
-    await writeJsonFile(directory, AGY_TURN_FILES.cancel, { requestId, requestedAt, stopped: true, remaining: [], pids });
+    await writeStop(true);
     return { ok: true, cancelled: current === 'cancelled', stopped: true, state: current, pids, remaining: [] };
   }
 
@@ -1232,13 +1301,11 @@ export async function cancelAgyTurn(directory, {
     else reused.push(pid);
   }
   if (!ours.length && !reused.length) {
-    await writeJsonFile(directory, AGY_TURN_FILES.cancel, { requestId, requestedAt, stopped: false, remaining: targets, pids });
-    return { ok: false, cancelled: false, stopped: false, state: 'running', pids, remaining: targets,
-      note: `Process identity for (${targets.join(', ')}) could not be verified, so nothing was killed.` };
+    return unverifiedStop(targets, `Process identity for (${targets.join(', ')}) could not be verified, so nothing was killed.`);
   }
 
   for (const pid of ours) await killTree(pid);
-  await killCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
+  await stopCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
   const blocking = () => recorded.filter(pid => isAlive(pid) && !reused.includes(pid));
   const deadline = Date.now() + confirmMs;
   let remaining = blocking();
@@ -1247,13 +1314,11 @@ export async function cancelAgyTurn(directory, {
     remaining = blocking();
   }
   if (remaining.length) {
-    await writeJsonFile(directory, AGY_TURN_FILES.cancel, { requestId, requestedAt, stopped: false, remaining, pids });
-    return { ok: false, cancelled: false, stopped: false, state: 'running', pids, remaining,
-      note: `Processes still alive after kill attempt: ${remaining.join(', ')}.` };
+    return unverifiedStop(remaining, `Processes still alive after kill attempt: ${remaining.join(', ')}.`);
   }
 
   const latest = await readTurnState(directory, turn, { checkTerminal: true });
-  await writeJsonFile(directory, AGY_TURN_FILES.cancel, { requestId, requestedAt, stopped: true, remaining: [], pids });
+  await writeStop(true);
   if (!TERMINAL_STATES.includes(latest?.state) && (latest ?? state)) {
     await markCancelled(directory, latest ?? state);
   }

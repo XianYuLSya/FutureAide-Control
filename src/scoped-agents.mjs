@@ -5456,16 +5456,19 @@ export function createScopedAgents(config, {
         Object.assign(status, { contextVerified: true, workspace: owner.workspace, ...await returnChannel(owner),
           agents: typeof store.count === 'function' ? store.count(owner.ownerId) : store.list(owner.ownerId).length });
       } catch (error) { status.contextError = safeError(error); }
+      const dshDisabled = Array.isArray(config.disabledTargets) && config.disabledTargets.includes('dsh');
       let client, host;
-      try {
-        client = clientFactory(config);
-        host = await client.hostStatus();
-        status.dshConnected = METHODS.every(method => host.methods?.includes(method));
-        status.treeProtocolReady = host.treeProtocol === TREE_PROTOCOL;
-        status.reportProtocolReady = host.reportProtocol === REPORT_PROTOCOL;
-        if (!status.dshConnected) status.hostError = { message: 'Install the current managed DSH bridge.' };
-        else if (!status.treeProtocolReady) status.hostError = safeError(treeProtocolError());
-      } catch (error) { status.hostError = safeError(error); }
+      if (!dshDisabled) {
+        try {
+          client = clientFactory(config);
+          host = await client.hostStatus();
+          status.dshConnected = METHODS.every(method => host.methods?.includes(method));
+          status.treeProtocolReady = host.treeProtocol === TREE_PROTOCOL;
+          status.reportProtocolReady = host.reportProtocol === REPORT_PROTOCOL;
+          if (!status.dshConnected) status.hostError = { message: 'Install the current managed DSH bridge.' };
+          else if (!status.treeProtocolReady) status.hostError = safeError(treeProtocolError());
+        } catch (error) { status.hostError = safeError(error); }
+      }
       status.ready = status.contextVerified && status.returnChannel === 'chat-verified' && status.dshConnected
         && status.treeProtocolReady === true && status.reportProtocolReady === true;
       // Catalog probes do not reserve a name or start a model turn.
@@ -5490,20 +5493,25 @@ export function createScopedAgents(config, {
       const dshChoices = summary => config.dshDefaultModelOnly !== true ? summary
         : { ...summary, models: summary.defaultModel ? [summary.defaultModel] : [], modelLocked: true };
       const [dshModels, codexEntry, codexCliEntry, claudeEntry, agyEntry] = await Promise.all([
-        host ? readStatusModels(() => controlFactory(config, { client }).models()).then(dshChoices) : emptyCatalog,
+        !dshDisabled && host ? readStatusModels(() => controlFactory(config, { client }).models()).then(dshChoices) : emptyCatalog,
         readCodexStatus(),
         probeAdapter({ ...codexProbe, target: 'codex-cli' }),
         probeAdapter({ ...codexProbe, target: 'claude-cli' }),
         probeAdapter({ ...codexProbe, target: 'agy-cli' }),
       ]);
       status.backends = {
-        dsh: { ...dshDiagnostics(host, status), ...dshModels },
+        ...(dshDisabled ? {} : { dsh: { ...dshDiagnostics(host, status), ...dshModels } }),
         'codex-desktop': { ...emptyCatalog, ...codexEntry, ...(codexEntry.ready
           ? { ...codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)), evidence: 'native-rpc' } : {}) },
         'codex-cli': { ...emptyCatalog, ...codexCliEntry },
         'claude-cli': { ...emptyCatalog, ...claudeEntry },
         'agy-cli': { ...emptyCatalog, ...agyEntry },
       };
+      if (dshDisabled) {
+        delete status.dshConnected;
+        status.ready = status.contextVerified && status.returnChannel === 'chat-verified'
+          && Boolean(codexCliEntry.ready || claudeEntry.ready || agyEntry.ready || codexEntry.ready);
+      }
       return status;
     },
     async create({ name, role, lifetime: rawLifetime, target: rawTarget, model: rawModel, effort: rawEffort, worktree, workspaceMode, workspace_mode, proxy, timeoutMinutes, timeoutMs, _revivedSessionId } = {}, extra) {

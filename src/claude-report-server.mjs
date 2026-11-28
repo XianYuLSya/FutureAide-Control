@@ -21,9 +21,13 @@
 // approval noise, no failing server icon), so registering this service at the
 // workspace level shows the user's own chats nothing to approve.
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
+import { homedir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -58,6 +62,53 @@ The caller is identified from this connection itself: no session id, chat id, na
  * carrying no token and no image name. The verified binding rides along so a
  * later call can resume straight from the roster.
  */
+const antigravitySummaryCache = new Map();
+
+function lookupAntigravitySummary(conversationId) {
+  if (typeof conversationId !== 'string' || !conversationId.trim() || conversationId === '__discovery__') {
+    return undefined;
+  }
+  const id = conversationId.trim();
+  const cached = antigravitySummaryCache.get(id);
+  if (cached && Date.now() - cached.at < 30000) return cached.value;
+  const appDataDir = (typeof process.env.ANTIGRAVITY_APP_DATA_DIR === 'string' && process.env.ANTIGRAVITY_APP_DATA_DIR.trim())
+    ? process.env.ANTIGRAVITY_APP_DATA_DIR.trim()
+    : path.join(homedir(), '.gemini', 'antigravity');
+  const dbPath = path.join(appDataDir, 'conversation_summaries.db');
+  if (!existsSync(dbPath)) return undefined;
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare(
+      'SELECT title, workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1',
+    ).get(id);
+    if (!row) return undefined;
+    let workspace;
+    if (typeof row.workspace_uris === 'string' && row.workspace_uris.trim()) {
+      const uris = JSON.parse(row.workspace_uris);
+      if (Array.isArray(uris)) {
+        for (const u of uris) {
+          if (typeof u !== 'string' || !u.trim()) continue;
+          if (/^file:\/\//i.test(u.trim())) {
+            try { workspace = path.resolve(fileURLToPath(u.trim())); break; } catch { /* ignore */ }
+          } else if (path.isAbsolute(u.trim())) {
+            workspace = path.resolve(u.trim());
+            break;
+          }
+        }
+      }
+    }
+    const title = typeof row.title === 'string' && row.title.trim() ? row.title.trim() : undefined;
+    const value = workspace || title ? { ...(workspace ? { workspace } : {}), ...(title ? { title } : {}) } : undefined;
+    if (value?.workspace) antigravitySummaryCache.set(id, { at: Date.now(), value });
+    return value;
+  } catch {
+    return undefined;
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
+
 export function trustedContextOf(caller) {
   if (!caller || typeof caller !== 'object') return undefined;
   if (caller.source === 'managed-cli') {
@@ -79,15 +130,21 @@ export function trustedContextOf(caller) {
   if (caller.source === 'antigravity') {
     if (typeof caller.conversationId !== 'string' || !caller.conversationId.trim()) return undefined;
     const conversationId = caller.conversationId.trim();
-    const workspace = typeof caller.workspace === 'string' && caller.workspace.trim()
+    let workspace = typeof caller.workspace === 'string' && caller.workspace.trim()
       ? caller.workspace.trim()
       : (typeof caller.cwd === 'string' && caller.cwd.trim() ? caller.cwd.trim() : undefined);
+    let label = caller.label;
+    if (!workspace || /[\\/]\.gemini[\\/]config[\\/]plugins([\\/]|$)/i.test(workspace)) {
+      const summary = lookupAntigravitySummary(conversationId);
+      if (summary?.workspace) workspace = summary.workspace;
+      if (!label && summary?.title) label = summary.title;
+    }
     return {
       source: 'antigravity',
       conversationId,
       nativeSessionId: conversationId,
       ...(workspace ? { workspace } : {}),
-      ...(caller.label ? { label: caller.label } : {}),
+      ...(label ? { label } : {}),
     };
   }
   if (typeof caller.sessionId !== 'string' || typeof caller.cwd !== 'string') return undefined;

@@ -143,24 +143,34 @@ async function resolveClaudeOwner(caller, { knownOwner, verifyClaude, bindOwner 
 async function resolveAntigravityOwner(caller, { knownOwner, defaultWorkspace } = {}) {
   const conversationId = (caller.conversationId ?? caller.nativeSessionId).trim();
   const ownerId = ownerIdForSource('antigravity', conversationId);
-  if (knownOwner) {
-    const knownId = String(knownOwner.conversationId ?? knownOwner.nativeSessionId ?? '').trim();
-    if (knownOwner.ownerId !== ownerId || knownId.toLowerCase() !== conversationId.toLowerCase()) {
-      throw new Error('Saved Antigravity conversation ownership does not match the caller.');
-    }
-    return knownOwner;
-  }
   const candidateWorkspace = caller.workspace ?? defaultWorkspace;
   let workspace;
   if (typeof candidateWorkspace === 'string' && path.isAbsolute(candidateWorkspace)) {
     try { workspace = await realpath(candidateWorkspace); }
     catch { workspace = path.resolve(candidateWorkspace); }
   }
+  if (knownOwner) {
+    const knownId = String(knownOwner.conversationId ?? knownOwner.nativeSessionId ?? '').trim();
+    if (knownOwner.ownerId !== ownerId || knownId.toLowerCase() !== conversationId.toLowerCase()) {
+      throw new Error('Saved Antigravity conversation ownership does not match the caller.');
+    }
+    const isPluginFallbackDir = typeof knownOwner.workspace === 'string'
+      && /[\\/]\.gemini[\\/]config[\\/]plugins([\\/]|$)/i.test(knownOwner.workspace);
+    if ((!knownOwner.workspace || isPluginFallbackDir) && workspace && !/[\\/]\.gemini[\\/]config[\\/]plugins([\\/]|$)/i.test(workspace)) {
+      return {
+        ...knownOwner,
+        workspace,
+        ...(caller.label && !knownOwner.label ? { label: caller.label } : {}),
+      };
+    }
+    return knownOwner;
+  }
   return {
     ownerId,
     source: 'antigravity',
     conversationId,
     ...(workspace ? { workspace } : {}),
+    ...(caller.label ? { label: caller.label } : {}),
     createdAt: new Date().toISOString(),
   };
 }

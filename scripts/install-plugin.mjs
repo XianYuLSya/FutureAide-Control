@@ -249,7 +249,7 @@ export async function installAntigravityPlugin({
     name: PLUGIN,
     displayName: 'FutureAide Control',
     version,
-    description: 'Manage named DSH, Codex Desktop, and Claude CLI subagents from Antigravity via FutureAide Control.',
+    description: 'Manage headless Codex CLI, Claude CLI, and Antigravity CLI (agy-cli) subagents with team board & worktree governance via FutureAide Control.',
   });
   await writeJson(path.join(pluginRoot, 'mcp_config.json'), {
     mcpServers: {
@@ -452,7 +452,10 @@ export async function installPlugin({
       shims = await installCliShims({ sourceRoot, configFile, ...(binDir ? { binDir } : {}) });
     } catch (error) { shims = { registered: false, reason: error.message, ...(error.code ? { code: error.code } : {}) }; }
   }
-  const host = skipHost ? { ready: false, skipped: true } : await connectHost({ configFile, dshHome });
+  const dshDisabled = Array.isArray(saved.disabledTargets) && saved.disabledTargets.includes('dsh');
+  const host = (skipHost || dshDisabled)
+    ? { ready: false, skipped: true, ...(dshDisabled && !skipHost ? { reason: 'dsh-disabled' } : {}) }
+    : await connectHost({ configFile, dshHome });
   return {
     installed: true, pluginId, packageRoot: sourceRoot, configFile,
     codex: { registered: true, cacheRoot, currentChatLoaded: false }, claude, antigravity, shims, host,

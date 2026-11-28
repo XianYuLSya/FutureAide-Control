@@ -16,9 +16,12 @@
 //      or `antigravityColdStartMonitor: false` in config.json.
 //   5. Supports streaming SSE + `notifications/progress` forwarding for `futureaide_wait_agents`
 //      and bounded 2s timeout handling for `futureaide_feedback`.
+import { existsSync } from 'node:fs';
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -191,6 +194,51 @@ export function rootUriToPath(uri) {
     catch { return undefined; }
   }
   return path.isAbsolute(trimmed) ? path.resolve(trimmed) : undefined;
+}
+
+const conversationSummaryCache = new Map();
+
+/**
+ * Look up the active workspace (and title) of an Antigravity conversation from
+ * `~/.gemini/antigravity/conversation_summaries.db` when `ANTIGRAVITY_WORKSPACE`
+ * is not explicitly provided (e.g. global plugin MCP spawn).
+ */
+export function resolveAntigravityConversationInfo(conversationId, { env = process.env, summaryDbPath } = {}) {
+  if (typeof conversationId !== 'string') return undefined;
+  const id = conversationId.trim();
+  if (!id || id === '__discovery__' || id.startsWith('managed-cli:')) return undefined;
+  const cached = conversationSummaryCache.get(id);
+  if (cached && Date.now() - cached.at < 30000) return cached.value;
+
+  const appDataDir = (typeof env?.ANTIGRAVITY_APP_DATA_DIR === 'string' && env.ANTIGRAVITY_APP_DATA_DIR.trim())
+    ? env.ANTIGRAVITY_APP_DATA_DIR.trim()
+    : path.join(homedir(), '.gemini', 'antigravity');
+  const dbPath = summaryDbPath || path.join(appDataDir, 'conversation_summaries.db');
+  if (!existsSync(dbPath)) return undefined;
+
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+    const row = db.prepare(
+      'SELECT title, workspace_uris FROM conversation_summaries WHERE conversation_id = ? LIMIT 1',
+    ).get(id);
+    if (!row) return undefined;
+    let workspace;
+    if (typeof row.workspace_uris === 'string' && row.workspace_uris.trim()) {
+      const uris = JSON.parse(row.workspace_uris);
+      if (Array.isArray(uris)) {
+        workspace = uris.map(rootUriToPath).find(Boolean);
+      }
+    }
+    const title = typeof row.title === 'string' && row.title.trim() ? row.title.trim() : undefined;
+    const value = workspace || title ? { ...(workspace ? { workspace } : {}), ...(title ? { title } : {}) } : undefined;
+    if (value?.workspace) conversationSummaryCache.set(id, { at: Date.now(), value });
+    return value;
+  } catch {
+    return undefined;
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
 }
 
 /**
@@ -668,8 +716,10 @@ export async function startAntigravityCallerBridge({
   };
 
   let server;
-  const resolveWorkspace = async () => {
+  const resolveWorkspace = async conversationId => {
     if (explicitWorkspace) return explicitWorkspace;
+    const fromSummary = resolveAntigravityConversationInfo(conversationId, { env })?.workspace;
+    if (fromSummary) return fromSummary;
     if (rootWorkspaceChecked) return cachedRootWorkspace ?? cwd;
     if (server && typeof server.listRoots === 'function' && server.getClientCapabilities?.()?.roots) {
       try {
@@ -717,7 +767,7 @@ export async function startAntigravityCallerBridge({
     let endpoint = prepared.endpoint;
     const canWake = allowColdStart(endpoint.config);
     const conversationId = resolveConversationId(req, extra, env) ?? '__discovery__';
-    const workspace = await resolveWorkspace();
+    const workspace = await resolveWorkspace(conversationId);
     const attempt = async targetEndpoint => sendRpc(targetEndpoint, conversationId, workspace, 'tools/list', {});
     try {
       let response = await attempt(endpoint);
@@ -849,7 +899,7 @@ export async function startAntigravityCallerBridge({
         try {
           const prepared = await prepareEndpoint();
           if (!prepared.ok || expired) return unavailable();
-          const workspace = await resolveWorkspace();
+          const workspace = await resolveWorkspace(conversationId);
           sent = true;
           const response = await sendRpc(prepared.endpoint, conversationId, workspace, 'tools/call',
             { name, arguments: args ?? {} }, { requestTimeoutMs: 2000 });
@@ -869,7 +919,7 @@ export async function startAntigravityCallerBridge({
     }
     let endpoint = prepared.endpoint;
     const canWake = allowColdStart(endpoint.config);
-    const workspace = await resolveWorkspace();
+    const workspace = await resolveWorkspace(conversationId);
 
     if (name === 'futureaide_wait_agents') {
       const controller = new AbortController();

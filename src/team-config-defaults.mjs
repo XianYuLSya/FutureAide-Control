@@ -13,6 +13,9 @@ export function defaultTeamConfigPath(env = process.env) {
 }
 
 export const FALLBACK_ROLE_DEFAULTS = Object.freeze({
+  主策: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'once' }),
+  审查官: Object.freeze({ target: 'agy-cli', model: 'gemini-4-neon-high', effort: 'high', lifetime: 'once' }),
+  执行师: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
   外置大脑: Object.freeze({ target: 'agy-cli', model: 'gemini-4-neon-high', effort: 'high', lifetime: 'once' }),
   秘书: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'persistent' }),
   '秘书：改条文': Object.freeze({ target: 'claude-cli', model: 'claude-opus-5-5', effort: 'max', lifetime: 'once' }),
@@ -34,6 +37,23 @@ export const DEFAULT_HEADLESS_FALLBACK = Object.freeze({
 });
 
 const ROLE_ALIASES = Object.freeze({
+  主策: '主策',
+  '主策/领队': '主策',
+  '主策 / 领队': '主策',
+  主策领队: '主策',
+  领队: '主策',
+  策划: '主策',
+  策划师: '主策',
+  架构师: '主策',
+  'planner-lead': '主策',
+  执行: '执行师',
+  执行师: '执行师',
+  builder: '执行师',
+  前端执行师: '前端工程师',
+  后端执行师: '后端工程师',
+  审查官: '审查官',
+  探子: '调查员',
+  scout: '调查员',
   秘书: '秘书',
   secretary: '秘书',
   '秘书：改条文': '秘书：改条文',

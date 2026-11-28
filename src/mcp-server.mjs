@@ -531,6 +531,25 @@ function registerParentTools(server, options) {
 export async function claudeTrustedCaller({ trusted, caller, extra } = {}) {
   const value = (typeof trusted === 'function' ? await trusted(extra) : undefined)
     ?? (typeof caller === 'function' ? await caller(extra) : undefined);
+  if (value?.source === 'managed-cli') {
+    const parentAgentId = typeof (value.parentAgentId ?? value.callerAgentId) === 'string'
+      ? (value.parentAgentId ?? value.callerAgentId).trim()
+      : '';
+    const ownerId = typeof value.ownerId === 'string' ? value.ownerId.trim() : '';
+    const workspace = value.workspace ?? value.cwd;
+    if (!parentAgentId && !ownerId) {
+      throw Object.assign(new Error('The calling managed CLI session could not be verified.'),
+        { code: 'calling-context-unavailable' });
+    }
+    return {
+      source: 'managed-cli',
+      ...(parentAgentId ? { parentAgentId, callerAgentId: parentAgentId } : {}),
+      ...(ownerId ? { ownerId } : {}),
+      nativeSessionId: parentAgentId || ownerId,
+      ...(typeof workspace === 'string' && workspace ? { workspace } : {}),
+      ...(value.label ? { label: value.label } : {}),
+    };
+  }
   if (value?.source === 'antigravity') {
     const conversationId = value.conversationId ?? value.nativeSessionId ?? value.sessionId;
     const workspace = value.workspace ?? value.cwd;

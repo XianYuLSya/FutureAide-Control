@@ -2158,7 +2158,7 @@ export class RosterStore {
     const removed = [];
     const all = this.list();
     for (const record of all) {
-      if (!record || record.cleanupRosterTicket) continue;
+      if (!record || record.cleanupRosterTicket || record.unmergedWorktree === true) continue;
       const state = record.state;
       if (!['idle', 'completed', 'failed', 'cancelled'].includes(state)) continue;
       if (this.childrenOf(record.agentId).length > 0) continue;

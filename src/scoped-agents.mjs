@@ -1292,6 +1292,7 @@ export function createScopedAgents(config, {
       const base = {
         FUTUREAIDE_MANAGED_CLI: '1',
         FUTUREAIDE_PARENT_AGENT_ID: current.agentId ?? record.agentId,
+        ...((current.role ?? record.role) ? { FUTUREAIDE_CALLER_ROLE: String(current.role ?? record.role) } : {}),
         ...(current.task?.taskId ? { FUTUREAIDE_PARENT_TASK_ID: current.task.taskId } : {}),
         ...(requestId ? { FUTUREAIDE_PARENT_REQUEST_ID: requestId } : {}),
         FUTUREAIDE_CALLER_OWNER_ID: current.ownerId ?? record.ownerId,
@@ -4198,6 +4199,26 @@ export function createScopedAgents(config, {
         return publicResult(record);
       }
       if (realTreeSettled) {
+        if (record.lifetime === 'once' && record.workspaceMode === 'worktree' && record.worktreePath) {
+          const wtPath = path.resolve(record.worktreePath);
+          const wtExists = await lstat(wtPath).then(s => s.isDirectory()).catch(() => false);
+          if (wtExists) {
+            const [{ stdout: porcelain }, { stdout: wtHead }] = await Promise.all([
+              execFileAsync('git', ['-C', wtPath, 'status', '--porcelain'], { encoding: 'utf8', windowsHide: true }).catch(() => ({ stdout: '' })),
+              execFileAsync('git', ['-C', wtPath, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true }).catch(() => ({ stdout: '' })),
+            ]);
+            const hasDirtyFiles = Boolean(String(porcelain ?? '').trim());
+            const headTrimmed = String(wtHead ?? '').trim();
+            const hasCommitsAhead = Boolean(record.worktreeBaseHead && headTrimmed && headTrimmed !== record.worktreeBaseHead);
+            if (hasDirtyFiles || hasCommitsAhead) {
+              record.unmergedWorktree = true;
+              record.state = 'idle';
+              delete task.autoCleanupPending;
+              store.save(record);
+              return publicResult(record);
+            }
+          }
+        }
         if (store.claimAutoCleanup(record)) return clearRecord(record, { autoClaimed: true });
         const latest = store.get(record.agentId);
         if (latest?.task?.taskId === task.taskId && latest.task.cancelRequested) {
@@ -7965,6 +7986,7 @@ export function createScopedAgents(config, {
         });
 
         const fresh = store.get(record.agentId) ?? record;
+        const wasDeferredOnceCleanup = fresh.lifetime === 'once' && fresh.unmergedWorktree === true;
         const updated = {
           ...fresh,
           workspace: repoRoot,
@@ -7973,9 +7995,13 @@ export function createScopedAgents(config, {
         };
         delete updated.worktreePath;
         delete updated.worktreeBaseHead;
+        delete updated.unmergedWorktree;
         store.db.prepare('UPDATE agents SET body=? WHERE id=?').run(JSON.stringify(updated), updated.agentId);
         store.touched(updated.agentId);
         forgetBackend(updated);
+        if (wasDeferredOnceCleanup && config.agentAutoCleanup !== false) {
+          await clearRecord(updated, { autoClaimed: true }).catch(() => {});
+        }
         wakeWaiters();
 
         const summary = mergeOutcome.mergedFiles.length

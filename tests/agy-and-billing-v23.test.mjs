@@ -1148,3 +1148,229 @@ process.stdout.write(JSON.stringify({
   assert.equal(resolvedBackend.target, 'agy-cli');
   await killProcessCage({ pids: [] });
 });
+
+// ---------------------------------------------------------------------------
+// 5. Managed CLI role-tiered bridge (lead dispatch + leaf board) & once+worktree retention
+// ---------------------------------------------------------------------------
+
+test('P0 regression: managed CLI bridge exposes board tools to leaf roles & team tools to lead roles, and once+worktree retains dirty worktrees until merge', async t => {
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
+  const { createCliCallbackServer } = await import('../src/cli-callback-bridge.mjs');
+
+  const root = await makeTempDir(t, 'p0-seams-');
+  const repoDir = path.join(root, 'repo');
+  const stateDir = path.join(root, 'state');
+  const binDir = path.join(root, 'bin');
+  await initTempGitRepo(repoDir);
+  await mkdir(stateDir, { recursive: true });
+  await mkdir(binDir, { recursive: true });
+
+  const mockAgyJs = path.join(binDir, 'mock-agy-once-wt.mjs');
+  await writeFile(mockAgyJs, `
+import { execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+import path from 'node:path';
+
+const args = process.argv.slice(2);
+if (args.includes('--version')) { process.stdout.write('1.5.18\\n'); process.exit(0); }
+if (args[0] === 'models') { process.stdout.write('gemini-4-neon-high\\tGemini 4 Neon (High)\\n'); process.exit(0); }
+
+const pIdx = args.indexOf('-p');
+const prompt = pIdx >= 0 ? (args[pIdx + 1] || '') : '';
+if (prompt.includes('ONCE_DIRTY_WORKTREE')) {
+  writeFileSync(path.join(process.cwd(), 'src', 'once-feature.js'), 'export const preservedFromOnce = true;\\n', 'utf8');
+}
+
+execFileSync(process.execPath, ['-e', \`
+  import { submitCliCallback } from ${JSON.stringify(new URL('../src/cli-callback-bridge.mjs', import.meta.url).href)};
+  import { RosterStore } from ${JSON.stringify(new URL('../src/roster-store.mjs', import.meta.url).href)};
+  const store = new RosterStore(process.env.FUTUREAIDE_ROSTER_PATH);
+  await submitCliCallback({
+    roster: process.env.FUTUREAIDE_ROSTER_PATH,
+    agentId: process.env.FUTUREAIDE_PARENT_AGENT_ID,
+    taskId: process.env.FUTUREAIDE_PARENT_TASK_ID,
+    requestId: process.env.FUTUREAIDE_PARENT_REQUEST_ID,
+    target: 'agy-cli',
+    kind: 'report',
+    message: 'Once worktree task finished',
+    final: true,
+    port: Number(process.env.FUTUREAIDE_REPORT_PORT || 0),
+    getStore: () => store,
+  });
+  store.close();
+\`], { env: process.env, windowsHide: true });
+
+process.stdout.write(JSON.stringify({ event: 'init', conversation_id: 'once-wt-1', init: { model: 'gemini-4-neon-high' } }) + '\\n');
+process.stdout.write(JSON.stringify({
+  event: 'result',
+  result: { conversation_id: 'once-wt-1', status: 'SUCCESS', response: 'ok', duration_seconds: 0.5, usage: { input_tokens: 40, output_tokens: 10, total_tokens: 50 } },
+}) + '\\n');
+`, 'utf8');
+
+  const freePort = await new Promise((resolve, reject) => {
+    const srv = http.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+    srv.on('error', reject);
+  });
+
+  const configPath = path.join(root, 'config.json');
+  await writeFile(configPath, JSON.stringify({
+    workspace: repoDir,
+    stateDirectory: stateDir,
+    reportPort: freePort,
+    agyCliPath: mockAgyJs,
+    cliRoutes: { 'agy-cli': 'direct' },
+    disabledTargets: ['dsh'],
+    idleSessionCleanup: false,
+  }, null, 2), 'utf8');
+
+  const config = await loadConfig(configPath);
+  const service = createScopedAgents(config, { startSharedMonitor: async () => true });
+  t.after(() => service.close());
+
+  const reportServer = await startReportService({
+    port: freePort,
+    runtimeDir: stateDir,
+    store: service.store,
+    management: scopedManagement({ service }),
+  });
+  t.after(async () => { await reportServer.close().catch(() => {}); });
+
+  const extra = agyCallerExtra('boss-p0-conv', repoDir);
+
+  // Part A: Create a persistent lead agent and verify createCliCallbackServer role-tiered tools over /mcp!
+  await service.create({
+    name: '主策1',
+    role: '主策',
+    target: 'agy-cli',
+    lifetime: 'persistent',
+  }, extra);
+  const leadRec = service.store.list().find(r => r.name === '主策1');
+  assert.ok(leadRec);
+
+  const connectBridgeClient = async (role) => {
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const bridge = createCliCallbackServer({
+      roster: service.store.location,
+      agentId: leadRec.agentId,
+      taskId: 'task-bridge-check',
+      requestId: 'req-bridge-check',
+      target: 'codex-cli',
+      port: freePort,
+      env: {
+        FUTUREAIDE_MANAGED_CLI: '1',
+        FUTUREAIDE_CALLER_ROLE: role,
+        FUTUREAIDE_PARENT_AGENT_ID: leadRec.agentId,
+        FUTUREAIDE_CALLER_OWNER_ID: leadRec.ownerId,
+        FUTUREAIDE_CALLER_WORKSPACE: repoDir,
+        FUTUREAIDE_REPORT_PORT: String(freePort),
+      },
+    });
+    await bridge.server.connect(serverTransport);
+    const client = new Client({ name: 'test-cli-worker', version: '1.0.0' }, { capabilities: {} });
+    await client.connect(clientTransport);
+    return {
+      client,
+      close: async () => {
+        await client.close().catch(() => {});
+        await bridge.close().catch(() => {});
+      },
+    };
+  };
+
+  // 1) Leaf builder ('执行师') sees 3 callback tools + 2 board tools (5 total, zero bloat) and can post/read board
+  const leafSession = await connectBridgeClient('执行师');
+  try {
+    const leafTools = (await leafSession.client.listTools()).tools.map(item => item.name);
+    assert.deepEqual(leafTools.sort(), [
+      'ask_parent',
+      'feedback',
+      'futureaide_board_post',
+      'futureaide_board_read',
+      'report_parent',
+    ]);
+    const postRes = await leafSession.client.callTool({
+      name: 'futureaide_board_post',
+      arguments: { message: 'Interface schema locked at v2' },
+    });
+    assert.ok(!postRes.isError, `Expected leaf board_post ok, got ${JSON.stringify(postRes)}`);
+    const readRes = await leafSession.client.callTool({
+      name: 'futureaide_board_read',
+      arguments: { limit: 10 },
+    });
+    assert.ok(JSON.stringify(readRes).includes('Interface schema locked at v2'));
+  } finally {
+    await leafSession.close();
+  }
+
+  // 2) Lead planner ('主策') sees full forwarded team tools and can actually create a child subagent under itself!
+  const leadSession = await connectBridgeClient('主策');
+  try {
+    const leadTools = (await leadSession.client.listTools()).tools.map(item => item.name);
+    assert.ok(leadTools.includes('futureaide_run_agent'), 'Lead CLI worker must see futureaide_run_agent');
+    assert.ok(leadTools.includes('futureaide_team'), 'Lead CLI worker must see futureaide_team');
+    assert.ok(leadTools.includes('futureaide_wait_agents'), 'Lead CLI worker must see futureaide_wait_agents');
+    assert.ok(leadTools.includes('futureaide_board_post'), 'Lead CLI worker must see futureaide_board_post');
+
+    const childSpawnRes = await leadSession.client.callTool({
+      name: 'futureaide_create_agent',
+      arguments: {
+        name: '执行师-child',
+        role: '执行师',
+        target: 'agy-cli',
+        lifetime: 'persistent',
+      },
+    });
+    assert.ok(!childSpawnRes.isError, `Expected lead child spawn ok, got ${JSON.stringify(childSpawnRes)}`);
+    const spawnedChild = service.store.list().find(r => r.name === '执行师-child');
+    assert.ok(spawnedChild, 'Managed CLI lead spawned child subagent');
+    assert.equal(spawnedChild.parentAgentId, leadRec.agentId, 'Child subagent parentAgentId points to 主策1');
+  } finally {
+    await leadSession.close();
+  }
+
+  // Part B: `lifetime: 'once'` + `worktree: true` with modified files MUST retain worktree until `merge`!
+  const onceRun = await service.run({
+    name: 'once-wt-builder',
+    role: '执行师',
+    target: 'agy-cli',
+    lifetime: 'once',
+    worktree: true,
+    message: 'ONCE_DIRTY_WORKTREE',
+  }, extra);
+
+  const retainedRec = await pollUntil(async () => {
+    const rec = service.store.list().find(r => r.name === 'once-wt-builder');
+    if (!rec) return null;
+    await service.poll(rec.agentId);
+    await service.wait({ taskKeys: [onceRun.taskKey], timeoutSeconds: 0 }, extra);
+    await service.flushSettlements?.();
+    await service.poll(rec.agentId);
+    const after = service.store.get(rec.agentId);
+    return after?.state === 'idle' && after?.unmergedWorktree === true ? after : null;
+  }, { label: 'once+worktree retained in idle with unmergedWorktree=true' });
+
+  const onceWtPath = retainedRec.worktreePath;
+  assert.ok(onceWtPath && (await lstat(onceWtPath)).isDirectory(), 'Dirty once worktree directory must survive final report');
+  assert.ok(!retainedRec.closed, 'Agent must stay open until worktree is merged');
+
+  // Even stale GC must NOT delete an unmerged worktree!
+  const gcSweep = service.store.gcStaleAgents({ nowMs: Date.now() + 24 * 3600 * 1000 });
+  assert.ok(!gcSweep.some(r => r.agentId === retainedRec.agentId), 'gcStaleAgents must skip unmergedWorktree records');
+
+  // Now merge `once-wt-builder` -> harvests `src/once-feature.js` AND completes deferred `once` cleanup!
+  const onceMergeRes = await service.manageTeam({ action: 'merge', target: 'once-wt-builder' }, extra);
+  assert.equal(onceMergeRes.ok, true);
+  assert.deepEqual(onceMergeRes.mergedFiles, ['src/once-feature.js']);
+  assert.equal(
+    (await readFile(path.join(repoDir, 'src', 'once-feature.js'), 'utf8')).replace(/\r\n/g, '\n'),
+    'export const preservedFromOnce = true;\n',
+  );
+  await assert.rejects(() => lstat(onceWtPath), { code: 'ENOENT' });
+  const postMergeRec = service.store.get(retainedRec.agentId);
+  assert.ok(!postMergeRec || postMergeRec.closed === true, 'Deferred once cleanup closes/removes agent after merge');
+});

@@ -427,9 +427,56 @@ export async function startHttpService({ port = DEFAULT_PORT, host = '127.0.0.1'
     const agyConvHeader = headerString(req.headers, 'x-antigravity-conversation-id');
     const callerHeader = headerString(req.headers, 'x-futureaide-caller')?.trim().toLowerCase();
     const isAntigravityRequest = agyConvHeader !== undefined || callerHeader === 'antigravity';
+    const isManagedCliRequest = !isAntigravityRequest && callerHeader === 'managed-cli';
 
     let caller = null;
-    if (isAntigravityRequest) {
+    if (isManagedCliRequest) {
+      if (!isLoopbackRemote(req.socket?.remoteAddress)) {
+        stats.unidentified += 1;
+        sendJson(res, 403, {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32001, message: 'Managed CLI authentication is permitted only on loopback.', data: { code: 'loopback-only' } },
+        });
+        return;
+      }
+      if (!verifyAntigravityBearerToken(headerString(req.headers, 'authorization'), callerToken)) {
+        stats.unidentified += 1;
+        sendJson(res, 401, {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32001, message: 'Unauthorized managed CLI caller: valid Bearer token is required.', data: { code: 'managed-cli-auth-required' } },
+        });
+        return;
+      }
+      const parentAgentId = headerString(req.headers, 'x-futureaide-parent-agent-id')?.trim() ?? '';
+      const ownerId = headerString(req.headers, 'x-futureaide-owner-id')?.trim() ?? '';
+      if (!parentAgentId && !ownerId) {
+        stats.unidentified += 1;
+        sendJson(res, 400, {
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32602, message: 'Missing x-futureaide-parent-agent-id or x-futureaide-owner-id header.', data: { code: 'invalid-managed-cli-caller' } },
+        });
+        return;
+      }
+      const rawWorkspaceB64 = headerString(req.headers, 'x-futureaide-workspace-b64')?.trim();
+      let rawWorkspace;
+      if (rawWorkspaceB64) {
+        try { rawWorkspace = Buffer.from(rawWorkspaceB64, 'base64').toString('utf8').trim(); }
+        catch { rawWorkspace = undefined; }
+      }
+      if (!rawWorkspace) {
+        rawWorkspace = headerString(req.headers, 'x-futureaide-workspace')?.trim();
+      }
+      caller = {
+        source: 'managed-cli',
+        ...(parentAgentId ? { parentAgentId } : {}),
+        ...(ownerId ? { ownerId } : {}),
+        ...(rawWorkspace ? { workspace: rawWorkspace } : {}),
+      };
+      stats.identified += 1;
+    } else if (isAntigravityRequest) {
       if (!isLoopbackRemote(req.socket?.remoteAddress)) {
         stats.unidentified += 1;
         sendJson(res, 403, {

@@ -237,7 +237,7 @@ test('V2.3 compact usage formatting outputs concise cost string only when positi
   });
 });
 
-test('V2.3 manifests, README, CHANGELOG, REFERENCE, and SKILL are aligned at 2.3.0 and respect standalone open-source boundaries', async () => {
+test('V2.3 manifests, README, CHANGELOG, REFERENCE, and SKILL are aligned at 2.3.1 and respect standalone open-source boundaries', async () => {
   const [pkgRaw, codexPluginRaw, claudePluginRaw, readme, changelog, reference, skill] = await Promise.all([
     readPluginFile('package.json'),
     readPluginFile('.codex-plugin/plugin.json'),
@@ -252,9 +252,9 @@ test('V2.3 manifests, README, CHANGELOG, REFERENCE, and SKILL are aligned at 2.3
   const codexPlugin = JSON.parse(codexPluginRaw);
   const claudePlugin = JSON.parse(claudePluginRaw);
 
-  assert.equal(pkg.version, '2.3.0');
-  assert.equal(codexPlugin.version, '2.3.0');
-  assert.equal(claudePlugin.version, '2.3.0');
+  assert.equal(pkg.version, '2.3.1');
+  assert.equal(codexPlugin.version, '2.3.1');
+  assert.equal(claudePlugin.version, '2.3.1');
 
   for (const manifest of [pkg, codexPlugin, claudePlugin]) {
     assert.match(manifest.description, /Antigravity/i);
@@ -284,13 +284,15 @@ test('V2.3 manifests, README, CHANGELOG, REFERENCE, and SKILL are aligned at 2.3
     assert.ok(readme.includes(feature), `README.md is missing V2.3 highlight: ${feature}`);
   }
 
+  assert.match(changelog, /^## 2\.3\.1 \(2026-11-28\)/m);
   assert.match(changelog, /^## 2\.3\.0 \(2026-11-28\)/m);
   assert.match(reference, /agy-cli/);
   assert.match(reference, /timeout_minutes/);
   assert.match(reference, /"merge"/);
+  assert.match(skill, /Do not override the user's existing workflow/i);
 
-  // Standalone open-source hygiene: public docs & manifests must not leak external private canvas names
-  const privateCanvasPattern = /\u0070\u0072\u006f\u006a\u0065\u0063\u0074-\u006d\u0061\u0070|\u81ea\u7531\u753b\u5e03|\u753b\u5e03\s*Team|\u0034\u0037\u0033\u0033\u0030/i;
+  // Standalone open-source hygiene: public docs & manifests must not leak external private canvas or workflow names
+  const privateCanvasPattern = /\u0070\u0072\u006f\u006a\u0065\u0063\u0074-\u006d\u0061\u0070|\u81ea\u7531\u753b\u5e03|\u753b\u5e03\s*Team|\u0034\u0037\u0033\u0033\u0030|\u0077\u006f\u0072\u006b-\u0077\u006f\u0072\u006b\u0066\u006c\u006f\u0077|\u56e2\u961f\u914d\u7f6e\.md/i;
   for (const [docName, content] of [
     ['package.json', pkgRaw],
     ['.codex-plugin/plugin.json', codexPluginRaw],

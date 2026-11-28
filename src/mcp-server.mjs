@@ -74,7 +74,7 @@ function applyDispatchScope(extra) {
 }
 const name = z.string().min(1).max(80).describe('Subagent name in this chat (e.g. "后端1", "团队长1").');
 const agentPathName = z.string().min(1).max(160).describe('Subagent name or cross-level team path (e.g. "后端1" or "团队长1/后端1").');
-const role = z.string().min(1).max(40).optional().describe('Role label (e.g. "后端", "前端", "团队长", "调查员"). Auto-numbers name (后端1, 后端2) and applies 团队配置.md defaults.');
+const role = z.string().min(1).max(40).optional().describe('Optional role label (e.g. "backend", "frontend", "lead", "researcher"). Auto-numbers name as-is (backend1, backend2) when name is omitted.');
 const worktree = z.boolean().optional().describe('Create an isolated git worktree when true (default false shares the current project folder).');
 const timeoutMinutes = z.number().int().min(1).max(240).optional().describe('Optional execution timeout in minutes (1–240).');
 const cliProxySpec = z.union([z.number().int(), z.string()]).optional().describe('Optional CLI proxy override: port (e.g. 7890), proxy URL, "faswitch", or "direct".');
@@ -356,7 +356,7 @@ export function registerScopedTools(server, options = {}) {
     target: a.target ?? 'all',
     ...(a.proxy !== undefined ? { proxy: a.proxy } : {}),
   }, e));
-  register('futureaide_run_agent', 'Create (if new) and dispatch subagents in one call: pass role or name with message, or pass tasks: [...] to launch up to 20 subagents in parallel. Role defaults resolve from 团队配置.md; set worktree: true for an isolated git worktree, and run wakeCmd in background to wait without polling. For an active name, mode ("steer" | "queue") controls busy delivery (unsupported modes return mode-unsupported with supportedModes).', {
+  register('futureaide_run_agent', 'Create (if new) and dispatch headless CLI subagents in one call when FutureAide cross-client delegation is requested (do not override an existing project workflow or native subagent skill unless FutureAide is requested): pass role or name with message, or pass tasks: [...] to launch up to 20 subagents in parallel. Omitted model/effort follow the target CLI default; set worktree: true for an isolated git worktree, and run wakeCmd in background to wait without polling. For an active name, mode ("steer" | "queue") controls busy delivery (unsupported modes return mode-unsupported with supportedModes).', {
     name: name.optional(),
     role,
     message: message.optional(),
@@ -368,11 +368,11 @@ export function registerScopedTools(server, options = {}) {
     lifetime: z.enum(['once', 'persistent']).optional()
       .describe('Session lifetime: "once" (default, auto-cleans after final report) or "persistent" (reusable across tasks).'),
     target: z.enum(TARGETS).optional()
-      .describe('Execution backend for a new name (e.g. "codex-cli", "claude-cli", "agy-cli", "codex-desktop"). Omit to use role default or codex-cli.'),
+      .describe('Execution backend for a new name (e.g. "codex-cli", "claude-cli", "agy-cli", "codex-desktop"). Omit to use preset or codex-cli.'),
     mode,
     detail,
   }, (s, a, e) => runSingleOrBatch(s, a, e), false, false, compactRun);
-  register('futureaide_create_agent', 'Reserve a named or role-numbered subagent without starting a turn. Supports role defaults from 团队配置.md, target ("codex-cli" | "claude-cli" | "agy-cli" | "codex-desktop"), model/effort, worktree isolation, and proxy binding.', {
+  register('futureaide_create_agent', 'Reserve a named or role-numbered subagent without starting a turn. Supports target ("codex-cli" | "claude-cli" | "agy-cli" | "codex-desktop"), optional model/effort (follows target CLI default when omitted), worktree isolation, and proxy binding.', {
     name: name.optional(),
     role,
     worktree,
@@ -422,7 +422,7 @@ export function registerScopedTools(server, options = {}) {
     target: z.string().min(1).max(160).optional()
       .describe('Target member name, team path (e.g. "团队长1/后端1"), or "auto" for adopt.'),
     parent: z.string().max(160).nullable().optional()
-      .describe('New parent name/path for reparent or adopt, or null to attach directly under Boss.'),
+      .describe('New parent name/path for reparent or adopt, or null to attach directly at the team root.'),
     keep_children: z.boolean().optional()
       .describe('For kick: true (default) promotes children to upper parent; false terminates the entire subtree.'),
     message: z.string().min(1).max(20000).optional()

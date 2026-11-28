@@ -1,21 +1,21 @@
 ---
 name: futureaide-control
-description: Use named headless Codex CLI, Claude CLI, Antigravity CLI (agy-cli), and Codex Desktop subagents from an Antigravity, Codex Desktop, or Claude Desktop chat in the current project. Assign single or parallel batch work by role, isolate branches with Git worktrees, receive inline questions and reports, coordinate via the team board, and govern the team lifecycle.
+description: Dispatch and coordinate named headless Codex CLI, Claude CLI, Antigravity CLI (agy-cli), and Codex Desktop subagents when cross-client CLI delegation or FutureAide team coordination is requested. Coexists peacefully with existing user workflows and native subagents.
 ---
 
 # FutureAide Control
 
-Use this plugin's `futureaide_*` MCP tools for delegated subagent work in the current project. Caller identity and workspace are verified automatically; never pass workspace paths, session/agent IDs, profiles, or communication txt files.
+Use this plugin's `futureaide_*` MCP tools when the user requests FutureAide, cross-client headless CLI subagents (`codex-cli`, `claude-cli`, `agy-cli`), isolated Git `worktree` parallel fleets, or team board coordination. **Do not override the user's existing workflow or native subagent skills**: if the user's prompt, `CLAUDE.md` / `AGENTS.md` / `GEMINI.md`, or active workflow skill already specifies its own workflow or native subagent mechanism without asking for FutureAide, follow the user's workflow. Caller identity and workspace are verified automatically; never pass workspace paths, session/agent IDs, profiles, or communication txt files.
 
-## Backends & Role Defaults
+## Backends & Role Numbering
 
 - **Three headless CLI backends (`codex-cli`, `claude-cli`, `agy-cli`) + optional `codex-desktop`**:
   - `target: "codex-cli"` (default) runs `codex exec --json` / `codex exec resume` headlessly through the verified proxy route.
   - `target: "claude-cli"` runs `claude -p` headlessly with turn-scoped `ask_parent` / `report_parent` callbacks.
   - `target: "agy-cli"` runs headless Antigravity CLI turns under the same process cage, callback bridge, and proxy guard.
   - `target: "codex-desktop"` attaches to a FAswitch-launched Codex Desktop app-server RPC session when desktop thread interaction is explicitly needed.
-- **Role auto-numbering & `团队配置.md` defaults**:
-  - Pass `role` (such as `"后端"`, `"前端"`, `"团队长"`, `"调查员"`, `"秘书"`) and `message` on `futureaide_run_agent` or `futureaide_create_agent`; `name` is auto-numbered (`后端1`, `后端2`) and `target`, `model`, `effort`, and `lifetime` resolve from `~/.config/work-workflow/团队配置.md` unless overridden.
+- **Role auto-numbering & CLI defaults**:
+  - Pass `role` (such as `"backend"`, `"frontend"`, `"lead"`, `"researcher"`, or `"后端"`) and `message` on `futureaide_run_agent` or `futureaide_create_agent`; `name` is auto-numbered as-is (`backend1`, `backend2`) without renaming your roles, and omitted `model` / `effort` follow the target CLI's own configured defaults (optional user role presets can be placed in `~/.config/futureaide-control/roles.md`).
   - Set `worktree: true` when parallel subagents edit overlapping modules so each receives an isolated Git worktree, and pass optional `timeout_minutes` (`1`–`240`) to bound execution time.
 
 ## Dispatch, Batch Launch & Zero-Poll Waiting
@@ -24,7 +24,7 @@ Use this plugin's `futureaide_*` MCP tools for delegated subagent work in the cu
    - Single: `futureaide_run_agent({ role: "后端", message: "...", worktree?: true, timeout_minutes?: 30 })` returns `{ name, role, spec, taskKey, wakeCmd, worktreePath?, usage? }`.
    - Batch: `futureaide_run_agent({ tasks: [{ role: "后端", message: "..." }, { role: "后端", message: "...", worktree: true }] })` allocates collision-free names sequentially, launches up to 20 subagents in parallel, and returns `{ agents, wakeCmd }`.
 2. **Reserve without starting (`futureaide_create_agent`)**:
-   - `futureaide_create_agent({ role: "秘书", lifetime: "persistent" })` reserves a subagent before sending work.
+   - `futureaide_create_agent({ role: "lead", lifetime: "persistent" })` reserves a subagent before sending work.
 3. **Wait without polling (`wakeCmd` / `futureaide_wait_agents`)**:
    - Run the returned `wakeCmd` (`futureaide-wait ...`) as a background command (`WaitMsBeforeAsync: 500`), or call `futureaide_wait_agents({ taskKeys, barrier: "all" | "any" })`.
    - `futureaide_wait_agents` returns slim inline events `{ events: [{ name, role, type, message, usage? }], timedOut, nextCursor? }` directly when subagents call `ask_parent` or `report_parent(final: true)`. Use `futureaide_read_report` only when exact paginated raw characters are needed.
@@ -37,7 +37,7 @@ Use this plugin's `futureaide_*` MCP tools for delegated subagent work in the cu
 `futureaide_run_agent` (on an existing name) and `futureaide_send_agent` accept optional `mode` (`"steer"` | `"queue"`):
 - Omitting `mode` uses the target's native behavior: Codex Desktop steers into the active turn; headless CLI targets (`codex-cli`, `claude-cli`, `agy-cli`) queue between turns.
 - `"steer"` targets the active turn; `"queue"` waits for the active turn to finish and starts the next turn alone. With no active turn, both start a turn.
-- Headless CLI targets queue supplements between turns: Codex CLI, Antigravity CLI, and Claude CLI refuses explicit `steer` while busy (`Claude CLI refuses explicit \`steer\` while busy`), returning `mode-unsupported` with `target` and `supportedModes`.
+- Headless CLI targets queue supplements between turns: Codex CLI, Antigravity CLI, and Claude CLI refuses explicit `steer` while busy, returning `mode-unsupported` with `target` and `supportedModes`.
 - Pending questions are answered by `futureaide_answer_agent`, omitted `mode`, or explicit `steer`; explicit `queue` never answers a pending question.
 - Pass `detail: true` on `run`, `send`, `answer`, or `inspect` (`inputs`) to inspect raw `delivery` routes (`local-pending`, `after-current`, `current-turn`, `new-turn`, `answer-pending`, `answered`, `accepted-route-unknown`, `unknown`, `blocked`).
 
@@ -57,11 +57,11 @@ Use this plugin's `futureaide_*` MCP tools for delegated subagent work in the cu
 - **Team governance (`futureaide_team`) & cross-level paths**:
   - `futureaide_team({ action: "adopt", target?: "auto" | "后端1", parent? })` takes over an orphaned same-project team on session handover or pulls a stray agent into this team.
   - `futureaide_team({ action: "kick", target, keep_children?: true | false })` removes a member while keeping and promoting its children by default (`keep_children: true`), or terminates its whole subtree (`keep_children: false`).
-  - `futureaide_team({ action: "reparent", target, parent })` moves a member under a new lead or `null` (Boss root); `action: "resume"` continues interrupted or switched-account work; `action: "strays"` / `"sweep"` lists or cleans unclaimed stray agents.
+  - `futureaide_team({ action: "reparent", target, parent })` moves a member under a new lead or `null` (team root); `action: "resume"` continues interrupted or switched-account work; `action: "strays"` / `"sweep"` lists or cleans unclaimed stray agents.
   - `futureaide_team({ action: "merge", target })` merges an isolated member Git worktree back into the main workspace and removes the worktree cleanly, returning `{ action: "merge", ok, summary, mergedFiles }`.
   - `futureaide_answer_agent`, `futureaide_send_agent`, `futureaide_cancel_agent`, and `futureaide_delete_agent` accept cross-level paths up to 160 chars (such as `"团队长1/后端1"`).
 - **CLI proxy guard (`futureaide_cli_proxy`)**:
-  - `futureaide_cli_proxy({ action: "status" | "bind", target?: "codex-cli" | "claude-cli" | "agy-cli" | "all", proxy? })` inspects or locks proxy ports (`7890`, URL, `"faswitch"`, or `"direct"`).
+  - `futureaide_cli_proxy({ action: "status" | "bind", target?: "codex-cli" | "claude-cli" | "agy-cli" | "all", proxy? })` inspects or locks proxy routes (`7890`, URL, `"faswitch"`, or `"direct"`).
 - **Feedback (`futureaide_feedback` / `feedback`)**:
   - Record plugin bugs (`kind: "problem"`) or friction (`kind: "friction"`) to the local inbox; triage via `node src/cli.mjs feedback-pending --config CONFIG`.
 

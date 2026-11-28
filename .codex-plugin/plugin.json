@@ -1,6 +1,6 @@
 {
   "name": "futureaide-control",
-  "version": "2.3.0",
+  "version": "2.3.1",
   "description": "Cross-client headless subagent controller for Antigravity, Codex, and Claude: dispatch codex-cli, claude-cli, and agy-cli fleets by role or name with <50ms callbacks, isolated git worktrees, team board @mentions, proxy locks, and live token billing.",
   "author": {
     "name": "FutureAide"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "FutureAide Control",
     "shortDescription": "Antigravity / Codex / Claude 跨端调度 codex-cli、claude-cli、agy-cli 无头子代理军团。",
-    "longDescription": "在 Antigravity、Codex 或 Claude 主对话中按角色或名字调度 codex-cli、claude-cli、agy-cli 三极无头军团。自动读取团队配置排号（后端1、后端2），支持最多 20 路并发与 Git worktree 独立分支、一键合入拆树、<50ms 极薄回调桥与 futureaide-wait 零轮询唤醒、Win32 Job Object 零孤儿进程笼、团队会议室 @ 跨级直问、整队接班收编与 FAswitch 切号续跑、CLI 代理防跑偏硬锁及实时 Token 账单。适用于 Windows，需 Node.js 24.14+。QQ 交流群：259109974。",
+    "longDescription": "在 Antigravity、Codex 或 Claude 主对话中按需调度 codex-cli、claude-cli、agy-cli 三极无头军团（不覆盖用户原有工作流与原生子代理）。支持角色自动排号、最多 20 路并发与 Git worktree 独立分支、一键合入拆树、<50ms 极薄回调桥与 futureaide-wait 零轮询唤醒、Win32 Job Object 零孤儿进程笼、团队会议室 @ 跨级直问、整队接班收编与 FAswitch 切号续跑、CLI 代理防跑偏硬锁及实时 Token 账单。适用于 Windows，需 Node.js 24.14+。QQ 交流群：259109974。",
     "developerName": "FutureAide",
     "category": "Productivity",
     "capabilities": [

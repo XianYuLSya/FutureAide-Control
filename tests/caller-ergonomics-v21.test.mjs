@@ -234,63 +234,32 @@ function createMockCliAdapters({ startDelayMs = 0 } = {}) {
   };
 }
 
-test('1. team-config-defaults parses real and custom 团队配置.md with mtimeMs hot cache and role aliases', async t => {
+test('1. team-config-defaults leaves model/effort null when no roles.md exists and parses custom roles.md with mtimeMs hot cache', async t => {
   clearTeamConfigCache();
-  const realPath = path.join(homedir(), '.config', 'work-workflow', '团队配置.md');
-  const hasReal = await lstat(realPath).then(s => s.isFile()).catch(() => false);
-  if (hasReal) {
-    const loaded = loadTeamConfigDefaults({ teamConfigPath: realPath });
-    assert.equal(loaded.source, 'file');
-  }
-
-  for (const role of ['后端', '后端工程师']) {
-    const d = resolveRoleDefaults(role);
-    assert.deepEqual(
-      { target: d.target, model: d.model, effort: d.effort, lifetime: d.lifetime },
-      { target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' },
-    );
-  }
-  for (const role of ['团队长', '规划师', '主策']) {
-    const d = resolveRoleDefaults(role);
-    assert.deepEqual(
-      { target: d.target, model: d.model, effort: d.effort, lifetime: d.lifetime },
-      { target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'once' },
-    );
-  }
-  for (const role of ['审查官', '审查员', '独立审查员', '严谨龙']) {
-    const d = resolveRoleDefaults(role);
-    assert.deepEqual(
-      { target: d.target, model: d.model, effort: d.effort, lifetime: d.lifetime },
-      { target: 'codex-cli', model: 'gpt-6.2-astra', effort: 'max', lifetime: 'once' },
-    );
-  }
-  const sec = resolveRoleDefaults('秘书');
-  assert.deepEqual(
-    { target: sec.target, model: sec.model, effort: sec.effort, lifetime: sec.lifetime },
-    { target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'persistent' },
-  );
-  const inv = resolveRoleDefaults('调查员');
-  assert.deepEqual(
-    { target: inv.target, model: inv.model, effort: inv.effort, lifetime: inv.lifetime },
-    { target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' },
-  );
-  for (const role of ['前端', '前端工程师', '设计师']) {
-    const d = resolveRoleDefaults(role);
-    assert.deepEqual(
-      { target: d.target, model: d.model, effort: d.effort, lifetime: d.lifetime },
-      { target: 'claude-cli', model: 'claude-opus-5-5', effort: 'max', lifetime: 'once' },
-    );
-  }
-
-  // Custom teamConfigPath injection + mtimeMs hot reload check
   const dir = await makeTempDir(t, 'team-cfg-');
-  const customMd = path.join(dir, '团队配置.md');
+  const absentPath = path.join(dir, 'absent-roles.md');
+
+  for (const role of ['后端', 'planner', 'reviewer', 'builder', 'frontend']) {
+    const d = resolveRoleDefaults(role, { teamConfigPath: absentPath });
+    assert.deepEqual(
+      { target: d.target, model: d.model, effort: d.effort, lifetime: d.lifetime, roleKey: d.roleKey, matched: d.matched },
+      { target: 'codex-cli', model: null, effort: null, lifetime: 'once', roleKey: role, matched: false },
+    );
+  }
+  assert.equal(resolveRoleDefaults('claude', { teamConfigPath: absentPath }).target, 'claude-cli');
+  assert.equal(resolveRoleDefaults('agy', { teamConfigPath: absentPath }).target, 'agy-cli');
+
+  // Custom roles.md injection + mtimeMs hot reload check
+  const customMd = path.join(dir, 'roles.md');
   await writeFile(customMd, [
-    '| 角色 | 模型 | 怎么派 |',
+    '| Role | Model | Target |',
     '|---|---|---|',
-    '| 后端工程师 | Codex GPT-6.2-Sol，xhigh | 无头 `codex-cli`（`once`） |',
-    '| 前端工程师 | Claude Sonnet 5.5，high | 无头 `claude-cli` |',
+    '| 后端 | gpt-6.2-sol, xhigh | codex-cli (once) |',
+    '| 前端 | Claude Sonnet 5.5, high | claude-cli |',
   ].join('\n'), 'utf8');
+
+  const loaded = loadTeamConfigDefaults({ teamConfigPath: customMd });
+  assert.equal(loaded.source, 'file');
 
   const first = resolveRoleDefaults('后端', { teamConfigPath: customMd });
   assert.equal(first.model, 'gpt-6.2-sol');
@@ -302,9 +271,9 @@ test('1. team-config-defaults parses real and custom 团队配置.md with mtimeM
 
   // Update file and advance mtimeMs -> cache refreshes automatically
   await writeFile(customMd, [
-    '| 角色 | 模型 | 怎么派 |',
+    '| Role | Model | Target |',
     '|---|---|---|',
-    '| 后端工程师 | Codex GPT-6.1-Terra，high | 无头 `codex-cli`（`persistent`） |',
+    '| 后端 | gpt-6.1-terra, high | codex-cli (persistent) |',
   ].join('\n'), 'utf8');
   const future = new Date(Date.now() + 5000);
   await utimes(customMd, future, future);
@@ -313,7 +282,7 @@ test('1. team-config-defaults parses real and custom 团队配置.md with mtimeM
   assert.equal(reloaded.model, 'gpt-6.1-terra');
   assert.equal(reloaded.effort, 'high');
   assert.equal(reloaded.lifetime, 'persistent');
-  assert.ok(Object.keys(parseTeamConfigMarkdown('| 角色 | 模型 | 怎么派 |\n|---|---|---|\n')).length === 0);
+  assert.ok(Object.keys(parseTeamConfigMarkdown('| Role | Model | Target |\n|---|---|---|\n')).length === 0);
 });
 
 test('2. scoped-agents minimal { role, message } auto-defaults, worktree:true, batch tasks concurrency, wakeCmd, and legacy dsh compatibility', async t => {
@@ -350,6 +319,7 @@ test('2. scoped-agents minimal { role, message } auto-defaults, worktree:true, b
     startSharedMonitor: async () => true,
     backendAdapters: mock.adapters,
     clientFactory: () => dshApi,
+    teamConfigPath: path.join(dir, 'absent-roles.md'),
     controlFactory: () => ({
       async models() { return { default: { provider: 'dsh', model: 'dsh-default' }, routableProviders: ['dsh'], groups: [{ id: 'dsh', models: [{ id: 'dsh-default', reasoningEfforts: ['high', 'max'] }] }] }; },
       async selectModel() { return { accepted: true }; },
@@ -367,15 +337,13 @@ test('2. scoped-agents minimal { role, message } auto-defaults, worktree:true, b
   assert.equal(dshCreated, 1);
   assert.match(legacyRun.wakeCmd, /^futureaide-wait --conv "conv-v21-main" --keys "[^"]+"$/);
 
-  // 2b. Minimal create({ role }) & run({ role, message }) auto-fill from 团队配置.md
-  const secCreated = await service.create({ role: '秘书' }, caller);
+  // 2b. Minimal create({ role, lifetime }) & run({ role, target, message }) follow backend default models without renaming role
+  const secCreated = await service.create({ role: '秘书', lifetime: 'persistent' }, caller);
   assert.equal(secCreated.name, '秘书1');
   assert.equal(secCreated.target, 'codex-cli');
   assert.equal(secCreated.lifetime, 'persistent');
-  assert.equal(secCreated.actualModel, 'gpt-6.2-sol');
-  assert.equal(secCreated.selectedEffort, 'high');
 
-  const feRun = await service.run({ role: '前端', message: '搭建登录表单' }, caller);
+  const feRun = await service.run({ role: '前端', target: 'claude-cli', message: '搭建登录表单' }, caller);
   assert.equal(feRun.name, '前端1');
   assert.equal(feRun.target, 'claude-cli');
   assert.equal(feRun.lifetime, 'once');
@@ -383,7 +351,7 @@ test('2. scoped-agents minimal { role, message } auto-defaults, worktree:true, b
   assert.equal(feRun.selectedEffort, 'max');
   assert.equal(feRun.wakeCmd, `futureaide-wait --conv "conv-v21-main" --keys "${feRun.taskKey}"`);
 
-  // Explicit overrides take precedence over role defaults
+  // Explicit overrides take precedence over CLI defaults
   const overrideRun = await service.run({
     role: '后端',
     model: 'gpt-6.2-sol',
@@ -407,7 +375,7 @@ test('2. scoped-agents minimal { role, message } auto-defaults, worktree:true, b
     tasks: [
       { role: '后端', message: '并发子包A' },
       { role: '后端', message: '并发子包B', worktree: false },
-      { role: '设计', message: '并发设计包C', worktree: false },
+      { role: '设计', target: 'claude-cli', message: '并发设计包C', worktree: false },
     ],
   }, caller);
   assert.equal(batchRes.batch, true);

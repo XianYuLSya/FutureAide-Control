@@ -24,10 +24,10 @@ export const DEFAULT_REPORT_PORT = 17654;
 const TOKEN_FILENAME = 'antigravity-caller.json';
 
 const LEAF_ONLY_ROLES = new Set([
-  '执行', '执行师', 'builder',
-  '前端', '前端工程师', '前端执行师', 'frontend', 'frontend-engineer', '设计', '设计师', 'designer',
-  '后端', '后端工程师', '后端执行师', 'backend', 'backend-engineer',
-  '调查', '调研', '调查员', '探子', '红队', 'researcher', 'scout',
+  'worker', 'builder', 'developer', 'engineer', 'coder', 'implementer',
+  'frontend', 'frontend-engineer', 'backend', 'backend-engineer', 'designer', 'ui',
+  'researcher', 'investigator', 'scout', 'qa', 'tester',
+  '前端', '前端工程师', '后端', '后端工程师', '设计', '设计师', '调查', '调研', '调查员', '开发', '工程师',
 ]);
 
 const BOARD_TOOLS = [

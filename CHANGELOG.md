@@ -1,11 +1,16 @@
 # 更新记录
 
+## 2.3.1 (2026-11-28) · 尊重用户既有工作流与移除内置角色模型硬编码
+
+- **工作流和平共存（不抢管用户原有工作流）**：更新 `SKILL.md` 与 MCP 工具说明——当用户的提示词、`CLAUDE.md` / `AGENTS.md` / `GEMINI.md` 或已安装的第三方工作流 Skill 已有自己的流程或原生子代理规则且未点名使用 FutureAide 时，严格遵守用户原有工作流，不再默认强行接管子代理委派。
+- **移除外部工作流路径与内置模型硬编码**：移除对外部工作流配置文件路径的引用及内置硬编码角色别名/模型表；传入 `role` 时严格保留原名自动排号（如 `planner` → `planner1`），未显式传 `model` / `effort` 时一律跟随用户本机对应 CLI 自身的默认模型与推理强度（可选自定义角色预设改为 `~/.config/futureaide-control/roles.md`）。
+
 ## 2.3.0 (2026-11-28) · 三端三极全无头军团、隔离分支一键合入与实时 Token 账单
 
 本版完成从早期桌面单点桥接到 **Antigravity / Codex / Claude 三端主对话 × `codex-cli` / `claude-cli` / `agy-cli` 三极无头 CLI 军团** 的完整架构升级（早期 DSH 目标正式退居底层历史兼容）：
 
 - **三足鼎立全无头互调（新增 `agy-cli`）**：在无头 `codex-cli`、`claude-cli` 基础上正式接入无头反重力后端 `agy-cli`（另保留按需附着 `codex-desktop` 原生 RPC），Antigravity、Codex、Claude 三端主对话均可按同一套工具跨模型家族自由混编调度。
-- **2 参数极简派单、批量并发与 `timeout_minutes` 护栏**：`futureaide_run_agent` 与 `futureaide_create_agent` 支持只传 `role` + `message`，自动读取 `~/.config/work-workflow/团队配置.md` 选定后端、模型与强度并自动排号（如 `后端1`、`后端2`）；支持 `tasks: [...]` 单次并发派发最多 20 名成员，并新增可选 `timeout_minutes`（1–240 分钟）单次执行限时保护。
+- **2 参数极简派单、批量并发与 `timeout_minutes` 护栏**：`futureaide_run_agent` 与 `futureaide_create_agent` 支持只传 `role` + `message` 按角色自动排号（如 `后端1`、`后端2`）；支持 `tasks: [...]` 单次并发派发最多 20 名成员，并新增可选 `timeout_minutes`（1–240 分钟）单次执行限时保护。
 - **Git `worktree` 独立分支与 `merge` 一键合入拆树**：并行派单支持 `worktree: true` 自动分配独立 Git 工作树防文件踩踏；`futureaide_team` 新增 `action: "merge"`，验收后一键将成员 `worktree` 改动合回主工作区并清理临时工作树，精简视图直接回显 `mergedFiles` 与 `summary`。
 - **`<50ms` 极薄回调桥 + `futureaide-wait` 零打扰唤醒**：无头 CLI 提问（`ask_parent`）与终报（`report_parent`）经本地极薄回调桥 `<50ms` 入库，派单回执返回合并 `wakeCmd`（`futureaide-wait`），支持 `barrier: "all" | "any"` 零轮询阻塞等待与内联正文直读。
 - **Win32 Job Object 内核进程笼 + 自动 GC**：无头 CLI 子进程树统一纳入 Windows Job Object 内核级进程笼，取消、超时或宿主退出时连根终止后台孙进程，实现 **0 孤儿进程残留**；一次性成员交付终报后自动清场。

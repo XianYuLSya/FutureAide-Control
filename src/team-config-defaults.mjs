@@ -1,99 +1,27 @@
-// Read-only parser and mtimeMs-cached resolver for `~/.config/work-workflow/团队配置.md`.
-// Maps human role labels (such as "后端", "前端", "团队长", "秘书", "调查员", "审查员", "设计师", "规划师")
-// to { target, model, effort, lifetime } defaults without mutating any user configuration.
+// Optional user-owned role preset resolver (`~/.config/futureaide-control/roles.md`
+// or `FUTUREAIDE_ROLES_CONFIG`).
+//
+// By default (when no user preset file exists), `role` only auto-numbers the subagent
+// name as-is (e.g. "backend" -> "backend1", "后端" -> "后端1") and leaves `model` and
+// `effort` unset (`null`) so every turn follows the user's own configured CLI defaults.
 import { readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
 export function defaultTeamConfigPath(env = process.env) {
-  if (typeof env?.WORK_WORKFLOW_TEAM_CONFIG === 'string' && env.WORK_WORKFLOW_TEAM_CONFIG.trim()) {
-    return path.resolve(env.WORK_WORKFLOW_TEAM_CONFIG.trim());
+  if (typeof env?.FUTUREAIDE_ROLES_CONFIG === 'string' && env.FUTUREAIDE_ROLES_CONFIG.trim()) {
+    return path.resolve(env.FUTUREAIDE_ROLES_CONFIG.trim());
   }
-  return path.join(homedir(), '.config', 'work-workflow', '团队配置.md');
+  return path.join(homedir(), '.config', 'futureaide-control', 'roles.md');
 }
 
-export const FALLBACK_ROLE_DEFAULTS = Object.freeze({
-  主策: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'once' }),
-  审查官: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-astra', effort: 'max', lifetime: 'once' }),
-  执行师: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
-  外置大脑: Object.freeze({ target: 'agy-cli', model: 'gemini-4-neon-high', effort: 'high', lifetime: 'once' }),
-  秘书: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'persistent' }),
-  '秘书：改条文': Object.freeze({ target: 'claude-cli', model: 'claude-opus-5-5', effort: 'max', lifetime: 'once' }),
-  团队长: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'once' }),
-  规划师: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'once' }),
-  设计师: Object.freeze({ target: 'claude-cli', model: 'claude-opus-5-5', effort: 'max', lifetime: 'once' }),
-  前端工程师: Object.freeze({ target: 'claude-cli', model: 'claude-opus-5-5', effort: 'max', lifetime: 'once' }),
-  后端工程师: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
-  独立审查员: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-astra', effort: 'max', lifetime: 'once' }),
-  调查员: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
-  产品经理: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
-});
+export const FALLBACK_ROLE_DEFAULTS = Object.freeze({});
 
 export const DEFAULT_HEADLESS_FALLBACK = Object.freeze({
   target: 'codex-cli',
-  model: 'gpt-6.1-terra',
-  effort: 'high',
+  model: null,
+  effort: null,
   lifetime: 'once',
-});
-
-const ROLE_ALIASES = Object.freeze({
-  主策: '主策',
-  '主策/领队': '主策',
-  '主策 / 领队': '主策',
-  主策领队: '主策',
-  领队: '主策',
-  策划: '主策',
-  策划师: '主策',
-  架构师: '主策',
-  'planner-lead': '主策',
-  执行: '执行师',
-  执行师: '执行师',
-  builder: '执行师',
-  前端执行师: '前端工程师',
-  后端执行师: '后端工程师',
-  审查官: '审查官',
-  探子: '调查员',
-  scout: '调查员',
-  秘书: '秘书',
-  secretary: '秘书',
-  '秘书：改条文': '秘书：改条文',
-  '秘书:改条文': '秘书：改条文',
-  团队长: '团队长',
-  组长: '团队长',
-  'team-lead': '团队长',
-  lead: '团队长',
-  规划: '规划师',
-  规划师: '规划师',
-  planner: '规划师',
-  设计: '设计师',
-  设计师: '设计师',
-  designer: '设计师',
-  前端: '前端工程师',
-  前端工程师: '前端工程师',
-  frontend: '前端工程师',
-  'frontend-engineer': '前端工程师',
-  后端: '后端工程师',
-  后端工程师: '后端工程师',
-  backend: '后端工程师',
-  'backend-engineer': '后端工程师',
-  审查: '审查官',
-  审查员: '审查官',
-  独立审查员: '审查官',
-  严谨龙: '审查官',
-  reviewer: '审查官',
-  调查: '调查员',
-  调研: '调查员',
-  调查员: '调查员',
-  红队: '调查员',
-  researcher: '调查员',
-  产品: '产品经理',
-  产品经理: '产品经理',
-  pm: '产品经理',
-  'product-manager': '产品经理',
-  外置大脑: '外置大脑',
-  'external-brain': '外置大脑',
-  antigravity: '外置大脑',
-  agy: '外置大脑',
 });
 
 const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
@@ -112,12 +40,17 @@ function normalizeRoleKey(rawRole) {
   if (typeof rawRole !== 'string') return '';
   const cleaned = stripParenthetical(rawRole)
     .replace(/`/g, '')
-    .replace(/:/g, '：')
     .trim();
   if (!cleaned) return '';
-  const withoutTrailingDigits = cleaned.replace(/-?\d+$/u, '').trim() || cleaned;
-  const lower = withoutTrailingDigits.toLowerCase();
-  return ROLE_ALIASES[withoutTrailingDigits] ?? ROLE_ALIASES[lower] ?? withoutTrailingDigits;
+  return cleaned.replace(/-?\d+$/u, '').trim() || cleaned;
+}
+
+function inferCliBrandTarget(roleKey) {
+  const lower = String(roleKey ?? '').trim().toLowerCase();
+  if (lower === 'agy' || lower === 'antigravity' || lower === 'agy-cli') return 'agy-cli';
+  if (lower === 'claude' || lower === 'claude-cli') return 'claude-cli';
+  if (lower === 'codex' || lower === 'codex-cli') return 'codex-cli';
+  return null;
 }
 
 function extractTarget(dispatchCell, primaryModelClause) {
@@ -131,11 +64,9 @@ function extractTarget(dispatchCell, primaryModelClause) {
   return null;
 }
 
-function extractLifetime(dispatchCell, canonicalRole) {
+function extractLifetime(dispatchCell) {
   const dispatch = String(dispatchCell ?? '');
   if (/\bpersistent\b/i.test(dispatch)) return 'persistent';
-  if (/\bonce\b/i.test(dispatch)) return 'once';
-  if (canonicalRole === '秘书') return 'persistent';
   return 'once';
 }
 
@@ -144,13 +75,9 @@ function extractModelAndEffort(modelCell, target) {
   const clauses = stripped.split(/[；;]/).map(part => part.trim()).filter(Boolean);
   for (const clause of clauses) {
     let model = null;
-    const slugMatch = /\b((?:gpt|claude|gemini)-[a-z0-9][a-z0-9.-]*)\b/i.exec(clause);
+    const slugMatch = /\b((?:gpt|claude|gemini|o\d)-[a-z0-9][a-z0-9.-]*)\b/i.exec(clause);
     if (slugMatch) {
       model = slugMatch[1].toLowerCase();
-    } else if (/\bgemini\s+neon\b|\bneon\b/i.test(clause)) {
-      model = 'gemini-4-neon-high';
-    } else if (/\bgemini\s+carbon\b|\bcarbon\b/i.test(clause)) {
-      model = 'gemini-4-carbon-high';
     } else {
       const claudeHuman = /\bclaude\s+(opus|sonnet|haiku|fable)\s+([0-9]+(?:\.[0-9]+)*)\b/i.exec(clause);
       if (claudeHuman) {
@@ -169,18 +96,15 @@ function extractModelAndEffort(modelCell, target) {
     }
     const resolvedTarget = target
       ?? (model.startsWith('gemini-') ? 'agy-cli' : model.startsWith('claude-') ? 'claude-cli' : 'codex-cli');
-    if (!effort) {
-      effort = resolvedTarget === 'claude-cli' ? 'max' : 'high';
-    }
     return { model, effort, inferredTarget: resolvedTarget };
   }
   return null;
 }
 
 /**
- * Pure parser for `团队配置.md` markdown table content.
+ * Pure parser for optional user `roles.md` markdown table content (`| Role | Model | Target |`).
  * @param {string} markdown
- * @returns {Record<string, {target: string, model: string, effort: string, lifetime: 'once'|'persistent'}>}
+ * @returns {Record<string, {target: string, model: string|null, effort: string|null, lifetime: 'once'|'persistent'}>}
  */
 export function parseTeamConfigMarkdown(markdown) {
   const parsed = {};
@@ -189,28 +113,26 @@ export function parseTeamConfigMarkdown(markdown) {
     const line = rawLine.trim();
     if (!line.startsWith('|') || !line.endsWith('|')) continue;
     const cells = line.slice(1, -1).split('|').map(cell => cell.trim());
-    if (cells.length < 3) continue;
-    const [roleCell, modelCell, dispatchCell] = cells;
-    if (!roleCell || roleCell === '角色' || /^[-:\s]+$/.test(roleCell)) continue;
+    if (cells.length < 2) continue;
+    const [roleCell, modelCell = '', dispatchCell = ''] = cells;
+    if (!roleCell || /^(?:role|角色|[-:\s]+)$/i.test(roleCell)) continue;
     const canonicalRole = normalizeRoleKey(roleCell);
-    if (!canonicalRole || canonicalRole === 'Boss') continue;
+    if (!canonicalRole) continue;
 
-    const explicitTarget = extractTarget(dispatchCell, canonicalRole === '外置大脑' ? modelCell : '');
+    const explicitTarget = extractTarget(dispatchCell, modelCell);
     const modelInfo = extractModelAndEffort(modelCell, explicitTarget);
-    if (!modelInfo) continue;
-    const target = explicitTarget ?? modelInfo.inferredTarget;
+    const target = explicitTarget ?? modelInfo?.inferredTarget ?? 'codex-cli';
     if (target !== 'codex-cli' && target !== 'claude-cli' && target !== 'agy-cli') continue;
-    const lifetime = extractLifetime(dispatchCell, canonicalRole);
+    const lifetime = extractLifetime(dispatchCell);
 
     const entry = Object.freeze({
       target,
-      model: modelInfo.model,
-      effort: modelInfo.effort,
+      model: modelInfo?.model ?? null,
+      effort: modelInfo?.effort ?? null,
       lifetime,
     });
     parsed[canonicalRole] = entry;
-    const rawTrimmed = stripParenthetical(roleCell).replace(/`/g, '').trim();
-    if (rawTrimmed && !parsed[rawTrimmed]) parsed[rawTrimmed] = entry;
+    parsed[canonicalRole.toLowerCase()] = entry;
   }
   return parsed;
 }
@@ -222,8 +144,8 @@ export function clearTeamConfigCache() {
 }
 
 /**
- * Load role defaults from `teamConfigPath` with `mtimeMs` + `size` hot caching.
- * Never writes or modifies the file; falls back cleanly to `FALLBACK_ROLE_DEFAULTS` when absent.
+ * Load optional user role presets from `teamConfigPath` with `mtimeMs` + `size` caching.
+ * Never mutates user files; returns an empty preset table when no file exists.
  */
 export function loadTeamConfigDefaults({ teamConfigPath, env = process.env } = {}) {
   const resolvedPath = path.resolve(
@@ -239,12 +161,11 @@ export function loadTeamConfigDefaults({ teamConfigPath, env = process.env } = {
     }
     const content = readFileSync(resolvedPath, 'utf8');
     const parsed = parseTeamConfigMarkdown(content);
-    const roles = { ...FALLBACK_ROLE_DEFAULTS, ...parsed };
     const result = Object.freeze({
       source: 'file',
       path: resolvedPath,
       mtimeMs: info.mtimeMs,
-      roles: Object.freeze(roles),
+      roles: Object.freeze(parsed),
     });
     fileCache.set(resolvedPath, { mtimeMs: info.mtimeMs, size: info.size, result });
     return result;
@@ -259,19 +180,22 @@ export function loadTeamConfigDefaults({ teamConfigPath, env = process.env } = {
 }
 
 /**
- * Resolve `{ target, model, effort, lifetime }` for a role label (or headless fallback).
+ * Resolve `{ target, model, effort, lifetime }` for a role label.
+ * When no user preset matches, keeps `model: null` and `effort: null` so the target CLI's
+ * own configured default model and reasoning effort are used unchanged.
  */
 export function resolveRoleDefaults(role, { teamConfigPath, env = process.env } = {}) {
   const loaded = loadTeamConfigDefaults({ teamConfigPath, env });
   const key = normalizeRoleKey(role);
-  if (key && loaded.roles[key]) {
-    return { ...loaded.roles[key], roleKey: key, matched: true, source: loaded.source };
+  const matchedEntry = key ? (loaded.roles[key] ?? loaded.roles[key.toLowerCase()]) : undefined;
+  if (matchedEntry) {
+    return { ...matchedEntry, roleKey: key, matched: true, source: loaded.source };
   }
-  const fallback = loaded.roles.后端工程师 ?? DEFAULT_HEADLESS_FALLBACK;
+  const brandTarget = inferCliBrandTarget(key);
   return {
-    target: fallback.target ?? DEFAULT_HEADLESS_FALLBACK.target,
-    model: fallback.model ?? DEFAULT_HEADLESS_FALLBACK.model,
-    effort: fallback.effort ?? DEFAULT_HEADLESS_FALLBACK.effort,
+    target: brandTarget ?? DEFAULT_HEADLESS_FALLBACK.target,
+    model: null,
+    effort: null,
     lifetime: 'once',
     roleKey: key || null,
     matched: false,

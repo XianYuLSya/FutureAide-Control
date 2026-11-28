@@ -1,4 +1,4 @@
-# FutureAide Control 详细说明（v2.3.0）
+# FutureAide Control 详细说明（v2.3.1）
 
 本文补充 [README.md](README.md) 未展开的底层机制、参数细节与运行边界。日常使用阅读 README 即可。
 
@@ -27,10 +27,10 @@
 
 ## 2. 角色自动排号、模型选档与隔离分支
 
-### `团队配置.md` 联动与自动排号
-在 `futureaide_run_agent` 或 `futureaide_create_agent` 中传入 `role`（如 `"后端"`、`"前端"`、`"团队长"`、`"调查员"`、`"秘书"`）：
-- 若省略 `name`，插件在当前主对话花名册内按角色自动递增排号（`后端1`、`后端2`……）；批量 `tasks` 派发时按顺序无碰撞分配。
-- 自动从 `~/.config/work-workflow/团队配置.md` 解析该角色对应的默认 `target`、`model`、`effort` 与 `lifetime`；调用时显式传入的字段优先级更高。
+### 角色原名自动排号与可选预设表
+在 `futureaide_run_agent` 或 `futureaide_create_agent` 中传入 `role`（如 `"backend"`、`"frontend"`、`"lead"`、`"后端"`）：
+- 若省略 `name`，插件在当前主对话花名册内按你传入的 `role` 原名自动递增排号（`backend1`、`backend2`……）；批量 `tasks` 派发时按顺序无碰撞分配，绝不改写你的角色名。
+- 默认直接跟随目标 CLI 自身配置的默认 `model` 与 `effort`；如需自定义角色到后端/模型的映射，可在 `~/.config/futureaide-control/roles.md`（或环境变量 `FUTUREAIDE_ROLES_CONFIG`）放置可选预设表，调用时显式传入的字段优先级最高。
 
 ### 模型与思考强度（`model` / `effort`）
 - `model` 大小写不敏感，优先精确匹配完整模型 ID，其次匹配唯一或首个子串；无法匹配时返回可选模型列表，绝不静默退回默认模型。

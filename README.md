@@ -2,11 +2,11 @@
 
 # FutureAide Control
 
-**Antigravity · Codex · Claude 跨端无头子代理军团控制器（v2.3.0）**
+**Antigravity · Codex · Claude 跨端无头子代理军团控制器（v2.3.1）**
 
-只要开着 **Antigravity（反重力）、Codex 或 Claude** 任意一个主对话当 Boss，就能按角色或名字直接调遣 **`codex-cli`、`claude-cli`、`agy-cli` 三大无头 CLI 军团**在后台并行干活。
+只要开着 **Antigravity（反重力）、Codex 或 Claude** 任意一个主对话，就能按需调遣 **`codex-cli`、`claude-cli`、`agy-cli` 三大无头 CLI 军团**在后台并行干活（与你原有的项目工作流或原生子代理和平共存，绝不强行接管覆盖）。
 
-不用多开一堆桌面窗口，不用传项目路径和内部会话 ID，更不用建临时 txt 传信文件——只给角色和一句话，插件自动选模型、排工号、切独立 Git 分支、锁代理端口；下属遇到卡点秒级问回原聊天，交完终报自动销户清场。
+不用多开一堆桌面窗口，不用传项目路径和内部会话 ID，更不用建临时 txt 传信文件——只给角色标签和一句话，插件按原名自动排工号、默认沿用你本机 CLI 自己的默认模型、切独立 Git 分支、锁代理端口；下属遇到卡点秒级问回原聊天，交完终报自动销户清场。
 
 [核心亮点](#v23-核心亮点) · [三端与三极架构](#三端主对话--三极无头军团) · [快速开始](#快速开始) · [实战用法](#实战用法) · [工具一览](#工具一览) · [常见问题](#常见问题) · [详细说明](REFERENCE.md) · [更新记录](CHANGELOG.md)
 
@@ -19,7 +19,7 @@ QQ 交流群：259109974
 1. **三足鼎立全无头互调（`codex-cli` · `claude-cli` · `agy-cli`）**
    Antigravity、Codex、Claude 三大客户端任意一个都能坐镇主对话，跨模型家族调起后台无头 `codex-cli`、`claude-cli`、`agy-cli`（另可选附着 `codex-desktop` 原生会话）。写后端用 GPT、画界面用 Claude、做异构审查用反重力，一套接口全打通。
 2. **2 参数极简派单 + 批量并发 + `worktree` 独立分支**
-   只填 `{ role: "后端", message: "..." }` 两个参数，自动匹配预设后端、模型与推理强度并排号为 `后端1`、`后端2`（也支持外部角色预设表随时热改）；传 `tasks: [...]` 一把并发拉起最多 20 名子代理，加 `worktree: true` 自动切出隔离 Git 工作树互不抢文件，还支持 `timeout_minutes`（1–240 分钟）单次限时兜底。
+   只填 `{ role: "后端", message: "..." }` 两个参数，按原名自动排号为 `后端1`、`后端2`，未指定模型时直接跟随你本机 CLI 自身的默认模型与推理强度（也支持在 `~/.config/futureaide-control/roles.md` 自建角色预设表）；传 `tasks: [...]` 一把并发拉起最多 20 名子代理，加 `worktree: true` 自动切出隔离 Git 工作树互不抢文件，还支持 `timeout_minutes`（1–240 分钟）单次限时兜底。
 3. **`<50ms` 极薄回调桥 + 全局 `futureaide-wait` 零打扰唤醒**
    子代理调用 `ask_parent` 提问或 `report_parent(final: true)` 交卷，经本地极薄回调桥 `<50ms` 落库；主对话只需后台挂一条返回的 `wakeCmd`（`futureaide-wait ...`）或调 `futureaide_wait_agents`，平时零 Token 静默等待，一旦有人提问或交终报立刻唤醒并直读正文，中间碎念绝不污染主对话上下文。
 4. **Win32 Job Object 内核进程笼 + 无感自动 GC**

@@ -30,6 +30,8 @@ test('the default skill documents slim V2.1 subagent tools without DSH bloat and
   for (const v23Keyword of ['agy-cli', 'timeout_minutes', 'merge', '18s · 14.2k tok']) {
     assert.ok(skill.includes(v23Keyword), `SKILL.md is missing V2.3 guidance for ${v23Keyword}`);
   }
+  assert.match(skill, /Do not override the user's existing workflow/i);
+  assert.doesNotMatch(skill, /\u0077\u006f\u0072\u006b-\u0077\u006f\u0072\u006b\u0066\u006c\u006f\u0077|\u56e2\u961f\u914d\u7f6e\.md/i);
   assert.match(skill, /references\/legacy-workflows\.md/);
   const legacy = await read('../skills/futureaide-control/references/legacy-workflows.md');
   assert.match(legacy, /futureaide_spawn_agent/);

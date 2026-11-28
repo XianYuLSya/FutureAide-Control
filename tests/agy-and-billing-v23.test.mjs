@@ -232,13 +232,13 @@ test('agy-cli: discovery precedence, real `agy models` parsing, tier-aware argv,
     durationSec: 3.46,
   });
 
-  // Role defaults: 外置大脑 / antigravity / agy -> agy-cli + gemini-4-neon-high, even when 团队配置.md does not exist!
-  const missingTeamConfig = path.join(root, 'nonexistent-team-config.md');
-  for (const roleAlias of ['外置大脑', 'antigravity', 'agy']) {
+  // Brand hint: antigravity / agy -> agy-cli with null model/effort (follows CLI default) when roles.md does not exist!
+  const missingTeamConfig = path.join(root, 'nonexistent-roles.md');
+  for (const roleAlias of ['antigravity', 'agy']) {
     const resolved = resolveRoleDefaults(roleAlias, { teamConfigPath: missingTeamConfig });
     assert.equal(resolved.target, 'agy-cli');
-    assert.equal(resolved.model, 'gemini-4-neon-high');
-    assert.equal(resolved.effort, 'high');
+    assert.equal(resolved.model, null);
+    assert.equal(resolved.effort, null);
     assert.equal(resolved.lifetime, 'once');
   }
 });
@@ -415,7 +415,7 @@ process.stdout.write(JSON.stringify({
   // Substring 'neon' + effort 'xhigh' resolves cleanly to 'gemini-4-neon-xhigh' and omits conflicting --effort
   const runReceipt = await service.run({
     name: 'brain-lead',
-    role: '外置大脑',
+    role: 'agy',
     lifetime: 'persistent',
     model: 'neon',
     effort: 'xhigh',
@@ -1244,12 +1244,12 @@ process.stdout.write(JSON.stringify({
 
   // Part A: Create a persistent lead agent and verify createCliCallbackServer role-tiered tools over /mcp!
   await service.create({
-    name: '主策1',
-    role: '主策',
+    name: '团队长1',
+    role: '团队长',
     target: 'agy-cli',
     lifetime: 'persistent',
   }, extra);
-  const leadRec = service.store.list().find(r => r.name === '主策1');
+  const leadRec = service.store.list().find(r => r.name === '团队长1');
   assert.ok(leadRec);
 
   const connectBridgeClient = async (role) => {
@@ -1282,8 +1282,8 @@ process.stdout.write(JSON.stringify({
     };
   };
 
-  // 1) Leaf builder ('执行师') sees 3 callback tools + 2 board tools (5 total, zero bloat) and can post/read board
-  const leafSession = await connectBridgeClient('执行师');
+  // 1) Leaf builder ('builder') sees 3 callback tools + 2 board tools (5 total, zero bloat) and can post/read board
+  const leafSession = await connectBridgeClient('builder');
   try {
     const leafTools = (await leafSession.client.listTools()).tools.map(item => item.name);
     assert.deepEqual(leafTools.sort(), [
@@ -1307,8 +1307,8 @@ process.stdout.write(JSON.stringify({
     await leafSession.close();
   }
 
-  // 2) Lead planner ('主策') sees full forwarded team tools and can actually create a child subagent under itself!
-  const leadSession = await connectBridgeClient('主策');
+  // 2) Lead ('团队长') sees full forwarded team tools and can actually create a child subagent under itself!
+  const leadSession = await connectBridgeClient('团队长');
   try {
     const leadTools = (await leadSession.client.listTools()).tools.map(item => item.name);
     assert.ok(leadTools.includes('futureaide_run_agent'), 'Lead CLI worker must see futureaide_run_agent');
@@ -1319,16 +1319,16 @@ process.stdout.write(JSON.stringify({
     const childSpawnRes = await leadSession.client.callTool({
       name: 'futureaide_create_agent',
       arguments: {
-        name: '执行师-child',
-        role: '执行师',
+        name: 'worker-child',
+        role: 'builder',
         target: 'agy-cli',
         lifetime: 'persistent',
       },
     });
     assert.ok(!childSpawnRes.isError, `Expected lead child spawn ok, got ${JSON.stringify(childSpawnRes)}`);
-    const spawnedChild = service.store.list().find(r => r.name === '执行师-child');
+    const spawnedChild = service.store.list().find(r => r.name === 'worker-child');
     assert.ok(spawnedChild, 'Managed CLI lead spawned child subagent');
-    assert.equal(spawnedChild.parentAgentId, leadRec.agentId, 'Child subagent parentAgentId points to 主策1');
+    assert.equal(spawnedChild.parentAgentId, leadRec.agentId, 'Child subagent parentAgentId points to 团队长1');
   } finally {
     await leadSession.close();
   }
@@ -1336,7 +1336,7 @@ process.stdout.write(JSON.stringify({
   // Part B: `lifetime: 'once'` + `worktree: true` with modified files MUST retain worktree until `merge`!
   const onceRun = await service.run({
     name: 'once-wt-builder',
-    role: '执行师',
+    role: 'builder',
     target: 'agy-cli',
     lifetime: 'once',
     worktree: true,

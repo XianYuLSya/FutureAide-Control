@@ -250,11 +250,18 @@ test('1. team-config-defaults parses real and custom 团队配置.md with mtimeM
       { target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' },
     );
   }
-  for (const role of ['团队长', '规划师', '审查员', '独立审查员']) {
+  for (const role of ['团队长', '规划师', '主策']) {
     const d = resolveRoleDefaults(role);
     assert.deepEqual(
       { target: d.target, model: d.model, effort: d.effort, lifetime: d.lifetime },
       { target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'once' },
+    );
+  }
+  for (const role of ['审查官', '审查员', '独立审查员', '严谨龙']) {
+    const d = resolveRoleDefaults(role);
+    assert.deepEqual(
+      { target: d.target, model: d.model, effort: d.effort, lifetime: d.lifetime },
+      { target: 'codex-cli', model: 'gpt-6.2-astra', effort: 'max', lifetime: 'once' },
     );
   }
   const sec = resolveRoleDefaults('秘书');

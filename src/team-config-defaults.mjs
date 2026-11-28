@@ -14,7 +14,7 @@ export function defaultTeamConfigPath(env = process.env) {
 
 export const FALLBACK_ROLE_DEFAULTS = Object.freeze({
   主策: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'once' }),
-  审查官: Object.freeze({ target: 'agy-cli', model: 'gemini-4-neon-high', effort: 'high', lifetime: 'once' }),
+  审查官: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-astra', effort: 'max', lifetime: 'once' }),
   执行师: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
   外置大脑: Object.freeze({ target: 'agy-cli', model: 'gemini-4-neon-high', effort: 'high', lifetime: 'once' }),
   秘书: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'persistent' }),
@@ -24,7 +24,7 @@ export const FALLBACK_ROLE_DEFAULTS = Object.freeze({
   设计师: Object.freeze({ target: 'claude-cli', model: 'claude-opus-5-5', effort: 'max', lifetime: 'once' }),
   前端工程师: Object.freeze({ target: 'claude-cli', model: 'claude-opus-5-5', effort: 'max', lifetime: 'once' }),
   后端工程师: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
-  独立审查员: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-sol', effort: 'high', lifetime: 'once' }),
+  独立审查员: Object.freeze({ target: 'codex-cli', model: 'gpt-6.2-astra', effort: 'max', lifetime: 'once' }),
   调查员: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
   产品经理: Object.freeze({ target: 'codex-cli', model: 'gpt-6.1-terra', effort: 'high', lifetime: 'once' }),
 });
@@ -76,10 +76,11 @@ const ROLE_ALIASES = Object.freeze({
   后端工程师: '后端工程师',
   backend: '后端工程师',
   'backend-engineer': '后端工程师',
-  审查: '独立审查员',
-  审查员: '独立审查员',
-  独立审查员: '独立审查员',
-  reviewer: '独立审查员',
+  审查: '审查官',
+  审查员: '审查官',
+  独立审查员: '审查官',
+  严谨龙: '审查官',
+  reviewer: '审查官',
   调查: '调查员',
   调研: '调查员',
   调查员: '调查员',

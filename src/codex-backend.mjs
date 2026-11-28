@@ -1,5 +1,6 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { createCodexHost, emptyProjection, markerLine, CODEX_FILE_COVERAGE } from './codex-host.mjs';
+import { codexCleanupPreflightError } from './agent-backend.mjs';
 import { isCodexReadRetryable, isCodexRpcUnavailable, isCodexThreadMissing, sameWireSelection } from './codex-ipc.mjs';
 import { CODEX_ASK_PARENT_INSTRUCTION, presentedNativeQuestion } from './report-contract.mjs';
 
@@ -606,9 +607,9 @@ export async function createCodexBackend(record, deps = {}) {
   }
   return {
     target: 'codex-desktop', labels: { host: 'Codex Desktop', bridge: 'The Codex Desktop bridge' }, requiredMethods: METHODS,
-    async probe() {
+    async probe(options) {
       const [result, reportStatus] = await Promise.all([
-        host.probe(), deps.readCodexReportStatus?.(load()),
+        host.probe(options), deps.readCodexReportStatus?.(load()),
       ]);
       if (result.missing?.length) throw fail('codex-backend-not-ready', `Missing native Codex capabilities: ${result.missing.join(', ')}.`);
       return { identity: result.identity, methods: METHODS, treeProtocol: 1,
@@ -1151,7 +1152,7 @@ export async function createCodexBackend(record, deps = {}) {
         // A previous delete may have removed the thread before its verification
         // read; the global missing-thread mapping covers both native wordings.
         if (isCodexThreadMissing(error)) return { destroyed: true };
-        throw error;
+        throw codexCleanupPreflightError(error);
       }
       if (!value.binding) return { destroyed: true };
       if (!tree.settled) return { destroyed: false, message: 'The managed Codex tree has not settled.' };

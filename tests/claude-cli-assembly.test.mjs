@@ -20,10 +20,7 @@
 // clean/claude-cli-assembly/ and are kept.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile, spawn } from 'node:child_process';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { pendingFeedback } from '../src/feedback-inbox.mjs';
+import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:net';
 import { promisify } from 'node:util';
@@ -36,9 +33,9 @@ import { ownerIdFor, ownerIdForSource } from '../src/calling-context.mjs';
 import { startHttpService } from '../src/claude-report-server.mjs';
 import { scopedManagement } from '../src/mcp-server.mjs';
 import { connectHttpMcp, callTool } from '../test/assembly/fixture.mjs';
-import { createClaudeCliBackend } from '../src/claude-cli-backend.mjs';
+import { CLAUDE_CLI_MODELS, createClaudeCliBackend } from '../src/claude-cli-backend.mjs';
 import {
-  cancelClaudeTurn, discoverClaudeModels, probeClaudeCli, readClaudeTurn, startClaudeTurn,
+  cancelClaudeTurn, probeClaudeCli, readClaudeTurn, startClaudeTurn,
 } from '../src/claude-cli-runner.mjs';
 import {
   CLI_MODELS, latestTurnDirectory, pidAlive, readInvocations, writeAuthState,
@@ -61,8 +58,6 @@ const runner = {
     exec: (cli, args, execOptions) => execFileAsync(process.execPath, [cli, ...args], execOptions) }),
   startClaudeTurn: (input, deps) => startClaudeTurn({ ...input,
     cli: { command: process.execPath, prefixArgs: [FAKE_CLI] } }, deps),
-  discoverClaudeModels: input => discoverClaudeModels({ ...input,
-    cli: { command: process.execPath, prefixArgs: [FAKE_CLI] } }),
   readClaudeTurn,
   cancelClaudeTurn,
 };
@@ -76,7 +71,7 @@ async function caseDir(label) {
  * A real roster and the real management entry for one case. `steps` is the scripted
  * CLI behaviour; `loggedIn` writes the stand-in's auth state before anything runs.
  */
-async function assembly(label, { steps = [], loggedIn = true, nativeRequestFactory, idleSessionCleanup } = {}) {
+async function assembly(label, { steps = [], loggedIn = true, nativeRequestFactory } = {}) {
   const root = await caseDir(label);
   const workspace = path.join(root, 'workspace');
   const home = path.join(root, 'cli-home');
@@ -102,7 +97,7 @@ async function assembly(label, { steps = [], loggedIn = true, nativeRequestFacto
   const store = new RosterStore(path.join(stateDirectory, 'roster.sqlite'));
   const nativeRequest = nativeRequestFactory?.({ workspace, root, stateDirectory });
   const service = createScopedAgents({
-    stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh', ...(idleSessionCleanup === undefined ? {} : { idleSessionCleanup }),
+    stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh',
   }, {
     store,
     ...(nativeRequest ? { nativeRequest } : { callCodex }),
@@ -249,7 +244,7 @@ test('Claude Desktop calls a named CLI helper over MCP and receives its report i
 
 // --------------------------------------------------------------- acceptance
 
-test('a logged-out CLI refuses the name and does not invent a model catalog', async t => {
+test('a logged-out CLI refuses the name with its own reason while the four models stay listed', async t => {
   const f = await assembly('auth', { loggedIn: false, steps: [] });
   t.after(() => f.close());
 
@@ -259,8 +254,10 @@ test('a logged-out CLI refuses the name and does not invent a model catalog', as
   assert.equal(diagnosed.ready, false);
   assert.equal(diagnosed.reason.code, 'claude-cli-auth-required', JSON.stringify(diagnosed.reason));
   assert.match(diagnosed.reason.message, /claude auth login|sign in/i);
-  assert.deepEqual(diagnosed.models, [], 'a logged-out CLI cannot verify its catalog');
+  assert.deepEqual(diagnosed.models, [...CLAUDE_CLI_MODELS], 'the four declared models are still listed while logged out');
+  assert.equal(diagnosed.models.length, 4);
   assert.equal(diagnosed.defaultModel, null, 'no default model is invented before a real turn reports one');
+  assert.deepEqual([...CLAUDE_CLI_MODELS], [...CLI_MODELS], 'the stand-in and the adapter declare the same catalog');
 
   // Creating a name is refused before the name exists, with that same reason.
   await assert.rejects(() => f.service.create({ name: '待登录', lifetime: 'persistent', target: 'claude-cli' }, extra),
@@ -310,7 +307,7 @@ test('the first dispatch names the session, ask_parent reaches the caller, answe
   assert.ok(first, 'one CLI turn ran');
   assert.ok(first.argv.includes('--session-id'), `the first turn names the conversation: ${JSON.stringify(first.argv)}`);
   assert.equal(first.resumed, false);
-  assert.equal(first.modelFlag, true, 'the discovered default is frozen for the worker');
+  assert.equal(first.modelFlag, false, 'no --model is passed when the caller selected none');
   assert.equal(first.prompt, 'do the work');
   const sessionId = first.sessionId;
   assert.match(sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-/, 'the turn carries a real session UUID');
@@ -382,8 +379,7 @@ test('a Claude CLI final waits for all three supplements in the same session', a
   assert.match(first.calls[0].error.error.message, /end this turn.*next queued message in this conversation/i);
 
   await pollUntil(f, agentId, record => !record || record.state === 'supplement_blocked' || record.state === 'failed',
-    // Three consecutive resumed CLI processes each perform their own settings handshake.
-    { timeoutMs: 90000, message: 'the one-shot final to deliver and clean up' });
+    { message: 'the one-shot final to deliver and clean up' });
   assert.equal(f.record(name), undefined);
   const turns = f.invocations().filter(invocation => invocation.command === 'print');
   assert.deepEqual(turns.map(invocation => invocation.prompt), ['initial task', ...supplements]);
@@ -709,36 +705,4 @@ test('a once name is cleaned up after its final report, while a persistent name 
   assert.equal(await readFile(transcript, 'utf8'), original);
   assert.equal(f.store.get(persistent.agentId), undefined);
   assert.equal((await f.service.list(extra)).items.some(item => item.name === '长期助手'), false);
-});
-
-
-test('production dispatch supplies feedback config and old cleanup flag still works', async t => {
-  const f = await assembly('feedback-production-route', { idleSessionCleanup: false, steps: [{ mode: 'hang', ms: 120000 }] });
-  t.after(() => f.close());
-  await f.service.run({ name: 'feedback helper', target: 'claude-cli', lifetime: 'persistent', message: 'stay running' }, extra);
-  const record = f.record('feedback helper');
-  await pollUntil(f, record.agentId, item => item?.state === 'running', { message: 'feedback task started' });
-  let turn;
-  const until = Date.now() + 20000;
-  while (Date.now() < until) { turn = await f.turnState(record); if (turn && await readJsonFile(path.join(turn.directory, 'mcp.json'))) break; await sleep(100); }
-  const generated = await readJsonFile(path.join(turn.directory, 'mcp.json'));
-  const route = generated.mcpServers.futureaide;
-  const configFile = path.join(f.stateDirectory, 'config.json');
-  assert.equal(route.args[6], configFile);
-  assert.equal(route.args[7], '--no-idle-session-cleanup');
-  const client = new Client({name:'production-route-test',version:'1'});
-  await client.connect(new StdioClientTransport({ command: route.command, args: route.args }));
-  try {
-    const receipt = await client.callTool({name:'feedback',arguments:{kind:'problem',message:'production dispatch feedback'}});
-    assert.equal(JSON.parse(receipt.content[0].text).saved,true,JSON.stringify(receipt));
-    const rows = pendingFeedback(configFile); assert.equal(rows.length,1); assert.equal(rows[0].occurrences[0].name,'feedback helper');
-  } finally { await client.close(); }
-  // Inject a live timer so EOF handling, not Node's natural event-loop exit, decides.
-  const preload = path.join(f.root,'keepalive.cjs'); await writeFile(preload,'setInterval(() => {}, 1000);');
-  const oldArgs = [...route.args.slice(0,6), '--no-idle-session-cleanup'];
-  const proc = spawn(route.command,oldArgs,{stdio:['pipe','pipe','pipe'],env:{...process.env,NODE_OPTIONS:'--require=' + preload},windowsHide:true});
-  proc.stdin.end();
-  await sleep(600);
-  assert.equal(proc.exitCode,null,'legacy no-cleanup flag must leave EOF handling disabled');
-  proc.kill();
 });

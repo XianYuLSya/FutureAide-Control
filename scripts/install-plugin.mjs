@@ -222,6 +222,119 @@ export async function installClaudePlugin({
     ...(update?.updateOutcome ? { updateOutcome: update.updateOutcome } : {}) };
 }
 
+/**
+ * Stage a thin Antigravity global plugin (no runtime copy, only manifest, mcp_config.json,
+ * and skills) using only copies and in-place writes. Never edits ~/.gemini/config/config.json.
+ */
+export async function installAntigravityPlugin({
+  sourceRoot = packageRoot,
+  configFile = path.join(sourceRoot, '.runtime', 'config.json'),
+  antigravityPluginDir,
+  coldStartMonitor = true,
+} = {}) {
+  sourceRoot = path.resolve(sourceRoot);
+  const defaultConfigRoot = path.join(homedir(), '.gemini', 'config');
+  const explicitDir = Boolean(antigravityPluginDir);
+  if (!explicitDir) {
+    const exists = await lstat(defaultConfigRoot).then(stat => stat.isDirectory()).catch(() => false);
+    if (!exists) return { registered: false, reason: 'Antigravity configuration directory (~/.gemini/config) was not found.' };
+  }
+  const pluginRoot = path.resolve(antigravityPluginDir || path.join(defaultConfigRoot, 'plugins', PLUGIN));
+  const { version } = JSON.parse(await readFile(path.join(sourceRoot, 'package.json'), 'utf8'));
+  const bootstrap = path.join(sourceRoot, 'src', 'antigravity-caller-bootstrap.mjs');
+  await lstat(bootstrap);
+  const args = [bootstrap, ...(coldStartMonitor === false ? ['--no-cold-start'] : [])];
+  await copyTree(path.join(sourceRoot, 'skills'), path.join(pluginRoot, 'skills'));
+  await writeJson(path.join(pluginRoot, 'plugin.json'), {
+    name: PLUGIN,
+    displayName: 'FutureAide Control',
+    version,
+    description: 'Manage named DSH, Codex Desktop, and Claude CLI subagents from Antigravity via FutureAide Control.',
+  });
+  await writeJson(path.join(pluginRoot, 'mcp_config.json'), {
+    mcpServers: {
+      futureaide: {
+        command: process.execPath,
+        args,
+        env: { FUTUREAIDE_CONFIG: configFile },
+      },
+    },
+  });
+  return { registered: true, pluginRoot, version };
+}
+
+/**
+ * Generate zero-warning global CLI shims (`futureaide-wait.cmd` and `futureaide.cmd` on Windows,
+ * plus POSIX shell wrappers on Unix) under `~/.local/bin` (or an injected `binDir`).
+ */
+export async function installCliShims({
+  sourceRoot = packageRoot,
+  configFile = path.join(sourceRoot, '.runtime', 'config.json'),
+  binDir = path.join(homedir(), '.local', 'bin'),
+  nodeExecutable = process.execPath,
+} = {}) {
+  sourceRoot = path.resolve(sourceRoot);
+  configFile = path.resolve(configFile);
+  const cliScript = path.join(sourceRoot, 'src', 'cli.mjs');
+  const hasCli = await lstat(cliScript).then(stat => stat.isFile()).catch(() => false);
+  if (!hasCli) {
+    return { registered: false, reason: 'CLI entry (src/cli.mjs) was not found in sourceRoot.' };
+  }
+  const targetBinDir = path.resolve(binDir);
+  await mkdir(targetBinDir, { recursive: true });
+
+  if (process.platform === 'win32') {
+    const waitCmdPath = path.join(targetBinDir, 'futureaide-wait.cmd');
+    const mainCmdPath = path.join(targetBinDir, 'futureaide.cmd');
+    const waitCmd = [
+      '@echo off',
+      'setlocal',
+      `if not defined FUTUREAIDE_CONFIG set "FUTUREAIDE_CONFIG=${configFile}"`,
+      `"${nodeExecutable}" --no-warnings "${cliScript}" wait %*`,
+      'exit /b %ERRORLEVEL%',
+      '',
+    ].join('\r\n');
+    const mainCmd = [
+      '@echo off',
+      'setlocal',
+      `if not defined FUTUREAIDE_CONFIG set "FUTUREAIDE_CONFIG=${configFile}"`,
+      `"${nodeExecutable}" --no-warnings "${cliScript}" %*`,
+      'exit /b %ERRORLEVEL%',
+      '',
+    ].join('\r\n');
+    await writeFile(waitCmdPath, waitCmd, 'utf8');
+    await writeFile(mainCmdPath, mainCmd, 'utf8');
+    return {
+      registered: true,
+      binDir: targetBinDir,
+      files: [waitCmdPath, mainCmdPath],
+    };
+  }
+
+  const waitShPath = path.join(targetBinDir, 'futureaide-wait');
+  const mainShPath = path.join(targetBinDir, 'futureaide');
+  const sq = s => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  const waitSh = [
+    '#!/usr/bin/env sh',
+    `export FUTUREAIDE_CONFIG="\${FUTUREAIDE_CONFIG:-${sq(configFile)}}"`,
+    `exec ${sq(nodeExecutable)} --no-warnings ${sq(cliScript)} wait "$@"`,
+    '',
+  ].join('\n');
+  const mainSh = [
+    '#!/usr/bin/env sh',
+    `export FUTUREAIDE_CONFIG="\${FUTUREAIDE_CONFIG:-${sq(configFile)}}"`,
+    `exec ${sq(nodeExecutable)} --no-warnings ${sq(cliScript)} "$@"`,
+    '',
+  ].join('\n');
+  await writeFile(waitShPath, waitSh, { mode: 0o755 });
+  await writeFile(mainShPath, mainSh, { mode: 0o755 });
+  return {
+    registered: true,
+    binDir: targetBinDir,
+    files: [waitShPath, mainShPath],
+  };
+}
+
 export async function checkRuntime() {
   const [major, minor] = process.versions.node.split('.').map(Number);
   if (major < 24 || (major === 24 && minor < 14)) throw new Error('Node.js 24.14 or newer is required.');
@@ -240,6 +353,10 @@ export async function installPlugin({
   dshHome,
   skipHost = false,
   skipClaude = false,
+  skipAntigravity = false,
+  skipShims = false,
+  antigravityPluginDir,
+  binDir,
   claudeCli,
   verifyRuntime = checkRuntime,
   connectHost = connectDesktop,
@@ -321,11 +438,25 @@ export async function installPlugin({
       claude = await installClaudePlugin({ sourceRoot, configFile, claudeCli: cli, runClaude });
     } catch (error) { claude = { registered: false, reason: error.message, ...(error.code ? { code: error.code } : {}) }; }
   }
+  let antigravity;
+  if (skipAntigravity) antigravity = { registered: false, reason: 'Skipped by --skip-antigravity.' };
+  else {
+    try {
+      antigravity = await installAntigravityPlugin({ sourceRoot, configFile, antigravityPluginDir });
+    } catch (error) { antigravity = { registered: false, reason: error.message, ...(error.code ? { code: error.code } : {}) }; }
+  }
+  let shims;
+  if (skipShims) shims = { registered: false, reason: 'Skipped by --skip-shims.' };
+  else {
+    try {
+      shims = await installCliShims({ sourceRoot, configFile, ...(binDir ? { binDir } : {}) });
+    } catch (error) { shims = { registered: false, reason: error.message, ...(error.code ? { code: error.code } : {}) }; }
+  }
   const host = skipHost ? { ready: false, skipped: true } : await connectHost({ configFile, dshHome });
   return {
     installed: true, pluginId, packageRoot: sourceRoot, configFile,
-    codex: { registered: true, cacheRoot, currentChatLoaded: false }, claude, host,
-    next: 'Reload plugins or start a new Codex chat, then call the agent list tool. Current chat loading and callback delivery are verified separately. In Claude, start a new chat: sessions that are already open do not load the new plugin.',
+    codex: { registered: true, cacheRoot, currentChatLoaded: false }, claude, antigravity, shims, host,
+    next: 'Reload plugins or start a new Codex/Antigravity chat, then call the status or agent list tool. Current chat loading and callback delivery are verified separately. In Claude, start a new chat: sessions that are already open do not load the new plugin.',
   };
 }
 
@@ -357,6 +488,10 @@ if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === imp
     const key = args[index];
     if (key === '--skip-host') options.skipHost = true;
     else if (key === '--skip-claude') options.skipClaude = true;
+    else if (key === '--skip-antigravity') options.skipAntigravity = true;
+    else if (key === '--skip-shims') options.skipShims = true;
+    else if (key === '--antigravity-plugin-dir' && args[index + 1]) options.antigravityPluginDir = args[++index];
+    else if (key === '--bin-dir' && args[index + 1]) options.binDir = args[++index];
     else if (key === '--claude-cli' && args[index + 1]) options.claudeCli = args[++index];
     else if (['--codex-home', '--dsh-home'].includes(key) && args[index + 1]) {
       options[key === '--codex-home' ? 'codexHome' : 'dshHome'] = args[++index];

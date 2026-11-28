@@ -27,6 +27,7 @@ import { exitWhenInputCloses, stdioWaitSignal } from './stdio-exit.mjs';
 
 export const BOOTSTRAP_NAME = 'futureaide-report';
 export const BOOTSTRAP_VERSION = '1.0.0';
+const HEALTH_CONFIRM_TIMEOUT_MS = 5000;
 // Never faster than this: the comparison lists the service's tools over the loopback
 // transport, and a tight loop would poll the monitor for nothing.
 export const TOOL_CHECK_MIN_MS = 30000;
@@ -44,6 +45,17 @@ const failure = (code, message, extra = {}) => ({ isError: true,
  */
 export const READ_ONLY_TOOLS = Object.freeze(['futureaide_status', 'futureaide_list_agents',
   'futureaide_agent_changes', 'futureaide_inspect_agent']);
+
+// The only health causes this bridge may copy into a tool answer. Other errors—
+// for example a transport failure from connectClient—may carry an arbitrary
+// Error.cause object, which must never reach the caller.
+const HEALTH_REASON_CODES = new Set([
+  'report-service-health-timeout',
+  'report-service-connect-failed',
+  'report-service-http-error',
+  'report-service-invalid-health',
+  'report-service-foreign-roster',
+]);
 
 export function mayRetry(name) {
   return READ_ONLY_TOOLS.includes(name);
@@ -109,12 +121,13 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
   let expectedRoster;
   try { expectedRoster = rosterIdentity(state.store); } catch { expectedRoster = undefined; }
 
-  const coded = (code, message) => Object.assign(new Error(message), { code });
-  const serviceReady = async () => {
-    if (!state.config) return false;
-    try { return (await status({ port: state.port, expectedRoster }))?.ready === true; }
-    catch { return false; }
+  const coded = (code, message, cause) => Object.assign(new Error(message), { code, ...(cause ? { cause } : {}) });
+  const probeHealth = async timeoutMs => {
+    if (!state.config) return undefined;
+    try { return await status({ port: state.port, expectedRoster, timeoutMs }) ?? { ready: false }; }
+    catch { return { ready: false, reason: { code: 'report-service-unavailable' } }; }
   };
+  const serviceReady = async () => (await probeHealth())?.ready === true;
   const connectClient = async () => {
     if (state.client) { try { await state.client.close(); } catch { /* already gone */ } state.client = undefined; }
     state.client = await connect(state.url);
@@ -136,7 +149,18 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
       throw coded('configuration-unavailable',
         'This session has no FutureAide configuration, so the tool service cannot be located.');
     }
-    if (await serviceReady()) {
+    // The final probe belongs to this prepare call alone: two concurrent forwards
+    // must never report the other request's last health reason.
+    let health;
+    const readyNow = async timeoutMs => { health = await probeHealth(timeoutMs); return health?.ready === true; };
+    let ready = await readyNow();
+    let waitLeft = waitMs;
+    if (!ready && health?.reason?.code === 'report-service-health-timeout' && waitMs > 0) {
+      const started = Date.now();
+      ready = await readyNow(Math.min(waitMs, HEALTH_CONFIRM_TIMEOUT_MS));
+      waitLeft = Math.max(0, waitMs - (Date.now() - started));
+    }
+    if (ready) {
       if (!state.client) await connectClient();
       return;
     }
@@ -146,11 +170,15 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
     } catch (error) {
       log(`the shared monitor did not start (${error?.code ?? error?.message ?? error})`);
     }
-    const deadline = Date.now() + waitMs;
-    while (Date.now() < deadline && !(await serviceReady())) await pause(pollMs);
-    if (!(await serviceReady())) {
-      throw coded('report-service-unavailable',
-        `The loopback tool service is not reachable on port ${state.port}.`);
+    const deadline = Date.now() + waitLeft;
+    while (!(await readyNow())) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        const cause = HEALTH_REASON_CODES.has(health?.reason?.code) ? health.reason.code : 'report-service-unavailable';
+        throw coded('report-service-unavailable',
+          `The loopback tool service is not reachable on port ${state.port} (last health check: ${cause}).`, cause);
+      }
+      await pause(Math.min(pollMs, remaining));
     }
     await connectClient();
   };
@@ -208,7 +236,12 @@ export async function startColdStartBridge({ configPath = process.env.DSH_CONTRO
       return result;
     }
     try { await prepare(); }
-    catch (error) { return failure(error?.code ?? 'report-service-unavailable', error?.message ?? String(error)); }
+    catch (error) {
+      const cause = HEALTH_REASON_CODES.has(error?.cause) ? error.cause : undefined;
+      return failure(error?.code ?? 'report-service-unavailable',
+        error?.message ?? 'The tool service could not be prepared.',
+        cause ? { cause } : {});
+    }
     if (name === 'futureaide_wait_agents') {
       const controller = new AbortController();
       activeWaits.add(controller);

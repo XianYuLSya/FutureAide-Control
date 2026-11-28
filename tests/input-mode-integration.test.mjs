@@ -19,13 +19,13 @@ const THREAD = '11111111-1111-4111-8111-111111111111';
 const extra = threadId => ({ _meta: { threadId } });
 const MODEL = { provider: 'fixture', model: 'fixture-model', reasoningEffort: 'high' };
 
-async function fixture({ adapters = {}, clientFactory, controlFactory, behavior = {} } = {}) {
+async function fixture({ adapters = {}, clientFactory, controlFactory } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'input-mode-'));
   const store = new RosterStore(':memory:');
-  const runtimeConfig = { stateDirectory, workspace, configFile: path.join(stateDirectory, 'config.json'), target: 'dsh', ...behavior };
-  const dependencies = {
+  const service = createScopedAgents({ stateDirectory, workspace,
+    configFile: path.join(stateDirectory, 'config.json'), target: 'dsh' }, {
     store,
     clientFactory: clientFactory ?? (() => { throw new Error('no DSH host is needed for this case'); }),
     ...(controlFactory ? { controlFactory } : {}),
@@ -37,11 +37,9 @@ async function fixture({ adapters = {}, clientFactory, controlFactory, behavior 
       tools: ['ask_parent', 'report_parent'], sessionVerified: false }),
     startSharedMonitor: () => true,
     removeTree: async () => {},
-  };
-  const service = createScopedAgents(runtimeConfig, dependencies);
-  const reopen = () => createScopedAgents(runtimeConfig, dependencies);
+  });
   const record = name => store.named(ownerIdFor(THREAD), name);
-  return { service, store, stateDirectory, record, runtimeConfig, reopen };
+  return { service, store, stateDirectory, record };
 }
 
 const inputsOf = inspected => inspected.inputs ?? [];
@@ -281,7 +279,7 @@ function fakeDsh() {
   const api = {
     async connectionIdentity() { return { application: 'dsh', dataRoot: 'fixture' }; },
     async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask',
-      'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPromptV2', 'managedPromptReceipt'] }; },
+      'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId,
         { sessionId: input.sessionId, taskId: undefined, model: { ...MODEL }, running: false,
@@ -419,13 +417,12 @@ test('DSH idle: send and same-name run start a turn in both modes', async () => 
 function fakeCodex() {
   const state = { running: false, descendantRunning: false, turnId: undefined, turnSeq: 0, question: undefined };
   const calls = { deliver: [], answer: [], root: 0 };
-  const receipts = new Map();
   const factory = record => ({
     labels: { host: 'Codex Desktop', bridge: 'Codex Desktop fixture' },
     probe: async () => ({ identity: { workspace }, methods: [], treeProtocol: 1, reportProtocol: 1 }),
     create: async () => ({ sessionId: record.sessionId, modelRequestsStarted: 0 }),
     beginTask: async () => ({ treeProtocol: 1, reportProtocol: 1, throughSeq: 0 }),
-    observe: async () => { if (state.observeFailure) throw new Error('native read unavailable'); return ({ sessionId: record.sessionId, taskId: record.task?.taskId,
+    observe: async () => ({ sessionId: record.sessionId, taskId: record.task?.taskId,
       running: state.running || state.descendantRunning,
       questions: state.question ? [{ ...state.question }] : [], reports: [], changes: [], throughSeq: 0,
       tree: { settled: !state.running && !state.descendantRunning, running: state.running || state.descendantRunning,
@@ -433,7 +430,7 @@ function fakeCodex() {
           status: state.running ? 'running' : 'idle', activity: state.running ? 'running' : 'idle',
           changes: [], coverage: 'root' },
         ...(state.descendantRunning ? [{ sessionId: 'child-thread', parentSessionId: record.sessionId,
-          name: 'helper child', status: 'running', activity: 'running', changes: [], coverage: 'child' }] : [])] } }); },
+          name: 'helper child', status: 'running', activity: 'running', changes: [], coverage: 'child' }] : [])] } }),
     history: async () => ({ messages: [], hasMore: false }),
     answer: async ({ answerId, message }) => {
       calls.answer.push({ answerId, message });
@@ -443,18 +440,11 @@ function fakeCodex() {
     },
     deliver: async input => {
       calls.deliver.push({ ...input });
-      if (state.rejectNext) {
-        state.rejectNext = false; receipts.set(input.requestId, { status: 'rejected', notSent: true });
-        throw Object.assign(new Error('lost response to pre-write rejection'), { uncertain: true });
-      }
-      const delivery = state.running ? 'current-turn' : 'new-turn';
-      if (!state.running) { state.running = true; state.turnId = `turn-${++state.turnSeq}`; state.actualEffort = input.model?.reasoningEffort ?? null; }
-      const receipt = { status: 'accepted', accepted: true, delivery, turnId: state.turnId, actualEffort: state.actualEffort, actualEffortSource: 'native-turn-start' };
-      receipts.set(input.requestId, receipt);
-      if (state.loseNext) { state.loseNext = false; throw Object.assign(new Error('lost response after native write'), { uncertain: true }); }
-      return receipt;
+      if (state.running) return { accepted: true, delivery: 'current-turn', turnId: state.turnId };
+      state.running = true; state.turnId = `turn-${++state.turnSeq}`;
+      return { accepted: true, delivery: 'new-turn', turnId: state.turnId };
     },
-    receipt: async ({ requestId }) => receipts.get(requestId),
+    receipt: async () => undefined,
     turn: async () => (state.running ? { state: 'running' } : { state: 'ended', completionReason: { kind: 'completed' } }),
     models: async () => claudeModel(),
     model: async () => MODEL,
@@ -469,9 +459,9 @@ function fakeCodex() {
   return factory;
 }
 
-async function codexFixture(behavior) {
+async function codexFixture() {
   const codex = fakeCodex();
-  const f = await fixture({ adapters: { 'codex-desktop': codex }, behavior });
+  const f = await fixture({ adapters: { 'codex-desktop': codex } });
   return { ...f, codex };
 }
 
@@ -482,99 +472,6 @@ async function startCodex(f, name = 'codex-agent') {
   assert.equal(f.codex.state.running, true, 'the first Codex turn is running');
   return { name, agentId: f.record(name).agentId, turnId: f.codex.state.turnId };
 }
-
-const effortOf = receipt => [receipt.requestedEffort, receipt.selectedEffort, receipt.effortSource, receipt.actualEffort];
-
-test('Codex same-name run, send, answer and queued B retain the explicitly pinned effort', async () => {
-  const f = await codexFixture({ defaultEffort: 'max' });
-  let restarted;
-  try {
-    const name = 'pinned-effort';
-    const first = await f.service.run({ name, target: 'codex-desktop', model: MODEL.model,
-      effort: 'high', message: 'start A' }, extra(THREAD));
-    const agentId = f.record(name).agentId;
-    await f.service.poll(agentId);
-    const turnA = f.codex.state.turnId;
-    assert.deepEqual(effortOf(first).slice(0, 3), ['high', 'high', 'explicit']);
-
-    const queued = await f.service.send({ name, message: 'Q opens B', mode: 'queue' }, extra(THREAD));
-    assert.equal(queued.afterTurnId, turnA);
-    const resumed = await f.service.run({ name, message: 'run joins A' }, extra(THREAD));
-    const sent = await f.service.send({ name, message: 'send joins A' }, extra(THREAD));
-    f.codex.state.question = { id: 'pinned-effort-question', state: 'pending', message: 'Continue?' };
-    const answer = await f.service.answer({ name, message: 'yes' }, extra(THREAD));
-    await f.service.poll(agentId);
-
-    f.codex.state.running = false;
-    f.codex.state.loseNext = true;
-    await f.service.poll(agentId);
-    restarted = f.reopen();
-    await restarted.poll(agentId);
-    const row = inputFor(await restarted.inspect({ name }, extra(THREAD)), queued.requestId);
-    assert.deepEqual({ sameName: [queued, resumed, sent, answer].map(receipt => effortOf(receipt).slice(0, 3)),
-      newTurn: effortOf(row) }, {
-      sameName: Array.from({ length: 4 }, () => ['high', 'high', 'explicit']),
-      newTurn: ['high', 'high', 'explicit', 'high'],
-    });
-    assert.deepEqual([resumed, sent].map(effortOf), Array.from({ length: 2 }, () => ['high', 'high', 'explicit', 'high']));
-    assert.equal(f.codex.calls.deliver.find(input => input.kind === 'answer').model.reasoningEffort, 'high');
-    assert.equal(row.actualEffortSource, 'native-turn-start');
-    assert.equal(row.delivery, 'new-turn');
-    assert.notEqual(row.turnId, turnA);
-    const queuedWrites = f.codex.calls.deliver.filter(input => input.requestId === queued.requestId);
-    assert.deepEqual(queuedWrites.map(input => [input.model.reasoningEffort, input.selectionExplicit]), [['high', false]]);
-  } finally { (restarted ?? f.service).close(); }
-});
-
-test('Codex restores a legacy effort pin and only changes it after an accepted explicit supplement', async () => {
-  const f = await codexFixture({ defaultEffort: 'high' });
-  try {
-    const name = 'change-pinned-effort';
-    await f.service.run({ name, target: 'codex-desktop', model: MODEL.model, effort: 'high', message: 'start A' }, extra(THREAD));
-    const agentId = f.record(name).agentId;
-    await f.service.poll(agentId);
-    const legacy = f.record(name);
-    delete legacy.modelPin.requestedEffort;
-    f.store.save(legacy);
-    assert.deepEqual(effortOf(await f.service.send({ name, message: 'legacy A' }, extra(THREAD))),
-      ['high', 'high', 'explicit', 'high']);
-
-    await assert.rejects(f.service.send({ name, effort: 'max', mode: 'queue', message: 'would change A' }, extra(THREAD)),
-      { code: 'codex-model-change-while-running' });
-    f.codex.state.running = false;
-    f.codex.state.loseNext = true;
-    await f.service.send({ name, effort: 'max', message: 'explicit B' }, extra(THREAD));
-    await f.service.poll(agentId);
-    assert.deepEqual(effortOf(await f.service.run({ name, message: 'inherits recovered B' }, extra(THREAD))),
-      ['max', 'max', 'explicit', 'max']);
-
-    f.codex.state.running = false;
-    await f.service.send({ name, model: MODEL.model, message: 'select a model with no effort' }, extra(THREAD));
-    assert.deepEqual(effortOf(await f.service.send({ name, message: 'inherits default' }, extra(THREAD))),
-      ['high', 'high', 'global-default', 'high']);
-  } finally { f.service.close(); }
-});
-
-test('Codex effort omitted when selecting a model follows the configured defaults', async () => {
-  for (const [modelDefaultEfforts, expected, source] of [
-    [{ [MODEL.model]: 'high' }, 'high', 'model-default'],
-    [{}, 'max', 'global-default'],
-  ]) {
-    const f = await codexFixture({ defaultEffort: 'max', modelDefaultEfforts });
-    try {
-      const name = 'default-effort';
-      await f.service.run({ name, target: 'codex-desktop', model: MODEL.model, message: 'start A' }, extra(THREAD));
-      const agentId = f.record(name).agentId;
-      await f.service.poll(agentId);
-      assert.equal(f.codex.state.actualEffort, expected);
-      const queued = await f.service.send({ name, mode: 'queue', message: 'next turn' }, extra(THREAD));
-      f.codex.state.running = false;
-      await f.service.poll(agentId);
-      const row = inputFor(await f.service.inspect({ name }, extra(THREAD)), queued.requestId);
-      assert.deepEqual(effortOf(row), [expected, expected, source, expected]);
-    } finally { f.service.close(); }
-  }
-});
 
 test('Codex idle: both modes start a turn with no backlog', async () => {
   for (const mode of ['steer', 'queue']) {
@@ -769,65 +666,5 @@ test('Codex answer R and queued Q ready in one poll: R opens B alone, Q opens C 
     assert.equal(f.codex.calls.deliver.filter(call => call.message.includes('R is the answer')).length, 1);
     assert.equal(f.codex.calls.deliver.filter(call => call.message.includes('R is the answer'))[0].message.includes('Q after'), false,
       'B never contained Q');
-  } finally { f.service.close(); }
-});
-
-for (const route of ['steer', 'start']) test(`Codex answer after a lost ${route} response recovers the original native receipt`, async () => {
-  const f = await codexFixture();
-  try {
-    const name = `recover-${route}`;
-    await f.service.create({ name, lifetime: 'persistent', target: 'codex-desktop' }, extra(THREAD));
-    await f.service.send({ name, message: 'begin', effort: 'high' }, extra(THREAD));
-    await f.service.poll(f.record(name).agentId);
-    const turnA = f.codex.state.turnId;
-    f.codex.state.question = { id: 'q-recovery', state: 'pending', message: 'Continue?' };
-    const answer = await f.service.send({ name, message: 'yes' }, extra(THREAD));
-    assert.equal(answer.delivery, 'answer-pending');
-    if (route === 'start') f.codex.state.running = false;
-    f.codex.state.loseNext = true;
-    await f.service.poll(f.record(name).agentId);
-    const restarted = f.reopen();
-    await restarted.poll(f.record(name).agentId);
-    const writes = f.codex.calls.deliver.filter(item => item.kind === 'answer');
-    assert.equal(writes.length, 1);
-    assert.equal(writes[0].requestId, answer.requestId);
-    assert.equal(writes[0].model.requestedEffort, 'max');
-    const row = inputFor(await restarted.inspect({ name }, extra(THREAD)), answer.requestId);
-    assert.equal(row.actualEffort, route === 'steer' ? 'high' : 'max');
-    assert.equal(row.actualEffortSource, 'native-turn-start');
-    assert.equal(row.turnId, route === 'steer' ? turnA : f.codex.state.turnId);
-    assert.equal((await restarted.list(extra(THREAD))).items[0].actualEffort, row.actualEffort);
-  } finally { f.service.close(); }
-});
-
-test('Codex explicit selection is not queued if active observation fails', async () => {
-  const f = await codexFixture();
-  try {
-    const helper = await startCodex(f);
-    const before = f.store.supplementInputs(helper.agentId).length;
-    f.codex.state.observeFailure = true;
-    await assert.rejects(f.service.send({ name: helper.name, message: 'do not queue', effort: 'high' }, extra(THREAD)),
-      error => error.code === 'model-selection-unconfirmed' && error.notSent === true);
-    assert.equal(f.store.supplementInputs(helper.agentId).length, before);
-    assert.equal(f.codex.calls.deliver.length, 1);
-  } finally { f.service.close(); }
-});
-
-test('a recovered not-sent rejection stays failed even if the turn ends', async () => {
-  const f = await codexFixture();
-  try {
-    const helper = await startCodex(f);
-    f.codex.state.question = { id: 'q-rejected', state: 'pending', message: 'Continue?' };
-    const answer = await f.service.send({ name: helper.name, message: 'not written' }, extra(THREAD));
-    f.codex.state.rejectNext = true;
-    await f.service.poll(helper.agentId);
-    f.codex.state.running = false;
-    const restarted = f.reopen();
-    await restarted.poll(helper.agentId);
-    const row = inputFor(await restarted.inspect({ name: helper.name }, extra(THREAD)), answer.requestId);
-    assert.equal(row.accepted, false);
-    assert.equal(row.status, 'blocked');
-    assert.equal(row.actualEffort, null);
-    assert.equal(f.codex.calls.deliver.filter(item => item.kind === 'answer').length, 1);
   } finally { f.service.close(); }
 });

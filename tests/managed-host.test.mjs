@@ -3,11 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { z } from 'zod';
 import { apply, createHostHandler, createManagedHost, CHILD_QUESTION_REFUSAL, ROOT_QUESTION_REFUSAL } from '../src/host-plugin.mjs';
-import { pendingFeedback } from '../src/feedback-inbox.mjs';
-import { installDesktopHostBridge, installHostBridge } from '../src/host-install.mjs';
-import manifest from '../package.json' with { type: 'json' };
 
 // Fixtures remain in the project's clean directory. No test deletes or moves files.
 async function fixture() {
@@ -56,12 +52,7 @@ async function fixture() {
       ['write_file', { name: 'write_file', description: 'Write a file' }],
     ]);
     const guards = [];
-    const tools = { register(definition) {
-      if (!definition.output?.schema || typeof definition.output.render !== 'function') {
-        throw new TypeError(`tool "${definition.name}" must declare output { schema, render, presentationMeta? }`);
-      }
-      definitions.set(definition.name, definition);
-    },
+    const tools = { register: definition => definitions.set(definition.name, definition),
       get: name => definitions.get(name), guard: guard => guards.push(guard), schemas: () => [],
       view: () => ({ restrictableNames: new Set(definitions.keys()) }),
       restrict: ({ deny }) => deny.forEach(name => definitions.delete(name)) };
@@ -104,9 +95,7 @@ async function fixture() {
     failNextRemoval: () => { failRemoval = true; },
     own: (childId, parent) => ownedBy.set(childId, parent),
     create: (context = ctx, options = {}) => createManagedHost(context, { stateDirectory: path.join(root, 'managed'), store, removeDirectory,
-      installDelegation: async agentCtx => {
-        agentCtx.get('tools').register({ name: 'managed_subagent', output: { schema: { type: 'object' }, render: () => [] } });
-      }, ...options }) };
+      installDelegation: async agentCtx => { agentCtx.get('tools').register({name:'managed_subagent'}); }, ...options }) };
 }
 
 const identity = workspace => ({ ownerId: 'owner-a', agentId: 'agent-a', sessionId: 'session-managed-a', workspace, treeProtocol: 1, reportProtocol: 1 });
@@ -156,7 +145,8 @@ test('a bridge locked to the default model refuses every other session selection
   await host.managedCreate(input);
   await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'other', model: 'alpha' } }),
     error => error.controlCode === 'managed-model-locked');
-
+  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } }),
+    error => error.controlCode === 'managed-model-locked', 'the default model with another effort is another choice');
   assert.deepEqual(f.modelSelections, [], 'no refused choice reached the Agent');
   const same = await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model' } });
   assert.equal(same.accepted, true, 'the default itself stays selectable');
@@ -166,7 +156,8 @@ test('a bridge locked to the default model refuses every other session selection
   assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'high' } })).accepted, true);
   assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model' } })).accepted, true,
     'a pin saved without an effort is still the default model');
-  assert.equal((await host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } })).accepted, true);
+  await assert.rejects(host.managedSelectModel({ ...input, selection: { provider: 'provider', model: 'model', reasoningEffort: 'max' } }),
+    error => error.controlCode === 'managed-model-locked');
   assert.equal(f.defaultSaves.length, 0);
 });
 
@@ -199,145 +190,6 @@ test('explicit reports persist across reload and final seals reporting', async (
   assert.equal(new Set(reports.map(item => item.id)).size, 2);
   await assert.rejects(reloaded.managedStatus({ ...input, reportProtocol: undefined }), error => error.controlCode === 'managed-report-protocol-required');
   await assert.rejects(reloaded.managedDestroy({ ...input, reportProtocol: undefined }), error => error.controlCode === 'managed-report-protocol-required');
-});
-
-test('managed feedback records bound task context and recent report failure while waiting', async () => {
-  const f = await fixture(), input = identity(f.workspace), configFile = path.join(f.root, 'config.json');
-  await writeFile(configFile, '{}');
-  const host = f.create(f.ctx, { feedbackNode: process.execPath, feedbackConfigFile: configFile });
-  await host.managedCreate(input);
-  await host.managedBeginTask({ ...input, taskId: 'task-a', feedbackAgentName: '测试助手', feedbackCallerHost: 'codex' });
-  const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
-  await assert.rejects(agent.definitions.get('report_parent').execute({ message: '  ' }, exec), e => e.controlCode === 'invalid-report');
-  await agent.definitions.get('ask_parent').execute({ message: '需要决定' }, exec);
-  assert.equal(agent.guards.map(guard => guard({ agent, name: 'feedback' })).find(Boolean), undefined);
-  const feedback = agent.definitions.get('feedback');
-  const args = { kind: 'problem', message: '报告空白未通过' };
-  const receipt = await feedback.execute(args, exec);
-  const [row] = pendingFeedback(configFile);
-  assert.deepEqual(receipt, { saved: true, id: row.id, count: 1 });
-  assert.deepEqual(z.fromJSONSchema(feedback.output.schema).parse(receipt), receipt);
-  assert.deepEqual(feedback.output.render(args, receipt), [{ type: 'text', text: JSON.stringify(receipt) }]);
-  assert.deepEqual({ source: row.occurrences[0].source, caller: row.occurrences[0].caller, target: row.occurrences[0].target, name: row.occurrences[0].name, version: row.occurrences[0].version },
-    { source: 'dsh', caller: 'codex', target: 'dsh', name: '测试助手', version: manifest.version });
-  assert.equal(row.occurrences[0].error.tool, 'report_parent');
-  assert.equal(row.occurrences[0].error.code, 'invalid-report');
-  await assert.rejects(agent.definitions.get('feedback').execute({ kind: 'problem', message: 'x' }, { agent: {} }), e => e.controlCode === 'managed-task-closed');
-});
-
-test('feedback native hooks preserve awaiting-answer and never persist feedback arguments or result', async () => {
-  const f = await fixture(), input = identity(f.workspace), configFile = path.join(f.root, 'config.json');
-  await writeFile(configFile, '{}');
-  const host = f.create(f.ctx, { feedbackNode: process.execPath, feedbackConfigFile: configFile });
-  await host.managedCreate(input); await host.managedBeginTask({ ...input, taskId: 'task-hooks' });
-  const agent = f.live.get(input.sessionId), exec = { agent, name: 'feedback', concludeTurn() {} };
-  await agent.definitions.get('ask_parent').execute({ message: '需要决定' }, exec);
-  const before = await host.managedStatus(input);
-  assert.equal(before.activity, 'awaiting-answer');
-  const secret = 'e9'.repeat(32), feedbackInput = { kind: 'problem', message: `普通文字 token=${secret}` };
-  const pre = agent.callbacks.get('tools/pre-execute')[0], resultHook = agent.callbacks.get('tools/result')[0];
-  const receipt = await pre({ ...exec, args: feedbackInput }, () => agent.definitions.get('feedback').execute(feedbackInput, exec));
-  assert.equal(receipt.saved, true);
-  resultHook({ ...exec, args: feedbackInput }, { value: { ...receipt, path: path.join(f.workspace, 'should-not-be-change'), operation: 'update', after: secret } });
-  // DSH may emit a generic session event too; that observer may persist only the cursor.
-  agent.callbacks.get('session/event')[0](agent.session, { type: 'tool/call', seq: 42, data: { args: feedbackInput, result: secret } });
-  const after = await host.managedStatus(input);
-  assert.equal(after.activity, 'awaiting-answer');
-  assert.deepEqual(after.questions, before.questions); assert.deepEqual(after.reports, before.reports);
-  assert.deepEqual(after.changes, before.changes);
-  const persisted = JSON.stringify([...f.records.values()]);
-  assert.equal(persisted.includes(secret), false); assert.equal(persisted.includes('普通文字'), false);
-  assert.equal(persisted.includes(receipt.id), false); assert.equal(persisted.includes('should-not-be-change'), false);
-});
-
-test('legacy managed bridge returns feedback unavailable without affecting reports', async () => {
-  const f = await fixture(), input = identity(f.workspace), host = f.create();
-  await host.managedCreate(input); await host.managedBeginTask({ ...input, taskId: 'task-a' });
-  const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
-  const feedback = agent.definitions.get('feedback');
-  const args = { kind: 'problem', message: '问题' };
-  const receipt = await feedback.execute(args, exec);
-  assert.deepEqual(receipt, { saved: false, code: 'feedback-unavailable' });
-  assert.deepEqual(z.fromJSONSchema(feedback.output.schema).parse(receipt), receipt);
-  assert.deepEqual(feedback.output.render(args, receipt), [{ type: 'text', text: JSON.stringify(receipt) }]);
-  assert.equal((await agent.definitions.get('report_parent').execute({ message: '正常报告' }, exec)).accepted, true);
-});
-
-test('installed Desktop and preset bridge configurations actually load and write feedback through the host route', async () => {
-  for (const mode of ['desktop', 'preset']) {
-    const f = await fixture(), configFile = path.join(f.root, 'config.json');
-    const config = { hostBridgeFile: path.join(f.root, 'private', 'bridge.json'), configFile, dataRoot: path.join(f.root, 'dsh') };
-    await writeFile(configFile, '{}');
-    let entry;
-    if (mode === 'desktop') {
-      const profile = path.join(f.root, 'desktop'); await mkdir(profile);
-      await writeFile(path.join(profile, 'package.json'), JSON.stringify({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-web-app'] } } }));
-      await writeFile(path.join(profile, 'cordis.patch.yml'), '[]\n');
-      await installDesktopHostBridge(config, profile);
-      const patch = await readFile(path.join(profile, 'cordis.patch.yml'), 'utf8');
-      const scalar = key => JSON.parse(patch.match(new RegExp(`^\\s+${key}:\\s*("[^\\r\\n]+")$`, 'm'))[1]);
-      entry = { name: scalar('name'), config: { credentialFile: scalar('credentialFile'), feedbackNode: scalar('feedbackNode'), feedbackConfigFile: scalar('feedbackConfigFile') } };
-    } else {
-      const installed = await installHostBridge(config);
-      [entry] = JSON.parse(await readFile(path.join(installed.presetDirectory, 'agent.cordis.yml'), 'utf8'));
-    }
-    const module = await import(entry.name);
-    assert.equal(new URL(entry.name).protocol, 'file:');
-    const delegationEntry = { options: { name: '@deepseek-ai/dsh-tool-subagent' }, moduleNamespace: {}, fiber: { config: { provider: 'fixture' } } };
-    f.services.agentPresets = { generationFor: () => ({ mount: { tree: { entries: () => [delegationEntry] } } }) };
-    f.services.loader = { unwrapExports: value => value };
-    f.services.sessionController.agents.composeAgent = async () => ({ agentPreset: 'fixture', setup: async agentCtx => { agentCtx.plugin = () => ({ await: async () => {} }); } });
-    let handler;
-    const ctx = { ...f.ctx, root: f.ctx, effect() {}, connection: { register(_owner, _route, fn) { handler = fn; return () => {}; } } };
-    await module.apply(ctx, entry.config);
-    const { token } = JSON.parse(await readFile(entry.config.credentialFile, 'utf8'));
-    const input = identity(f.workspace), call = async (method, args) => {
-      const response = await handler(method, { args: { ...args, token } });
-      assert.equal(response.ok, true, JSON.stringify(response)); return response.value;
-    };
-    await call('managedCreate', input);
-    await call('managedBeginTask', { ...input, taskId: 'task-installed', feedbackAgentName: `安装-${mode}`, feedbackCallerHost: 'codex' });
-    const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
-    const receipt = await agent.definitions.get('feedback').execute({ kind: 'friction', message: `安装桥 ${mode}` }, exec);
-    assert.equal(receipt.saved, true);
-    const [row] = pendingFeedback(configFile);
-    assert.equal(row.id, receipt.id); assert.equal(row.occurrences[0].name, `安装-${mode}`);
-    assert.equal(row.occurrences[0].caller, 'codex');
-  }
-});
-
-test('bridge reload adds feedback to a preexisting binding and respects task lifecycle', async () => {
-  const f = await fixture(), input = identity(f.workspace), configFile = path.join(f.root, 'config.json');
-  await writeFile(configFile, '{}');
-  const first = f.create();
-  await first.managedCreate(input); await first.managedBeginTask({ ...input, taskId: 'old-task' });
-  const agent = f.live.get(input.sessionId), exec = { agent, concludeTurn() {} };
-  const runtime = [...f.ctx[Symbol.for('futureaide-control.managed-runtimes')].values()][0];
-  const binding = [...runtime.bindings.values()][0];
-  // Emulate a live agent created by the previous bridge revision.
-  delete binding.feedbackRegistered; delete binding.feedbackTool; agent.definitions.delete('feedback');
-  const reloaded = f.create(f.ctx, { feedbackNode: process.execPath, feedbackConfigFile: configFile });
-  assert.ok(agent.definitions.has('feedback'));
-  assert.equal(f.creations.length, 1);
-  await reloaded.managedBeginTask({ ...input, taskId: 'old-task', feedbackAgentName: '热载助手', feedbackCallerHost: 'codex' });
-  await assert.rejects(agent.definitions.get('report_parent').execute({ message: '  ' }, exec), e => e.controlCode === 'invalid-report');
-  await agent.definitions.get('ask_parent').execute({ message: '等答复' }, exec);
-  assert.equal(agent.guards.map(fn => fn({ agent, name: 'feedback' })).find(Boolean), undefined);
-  const feedback = agent.definitions.get('feedback');
-  assert.equal((await feedback.execute({ kind: 'problem', message: '热载后的问题' }, exec)).saved, true);
-  let rows = pendingFeedback(configFile);
-  assert.equal(rows[0].occurrences[0].name, '热载助手');
-  assert.equal(rows[0].occurrences[0].error.code, 'invalid-report');
-  await reloaded.managedAnswer({ ...input, taskId: 'old-task', answerId: 'answer', message: '继续' });
-  await reloaded.managedBeginTask({ ...input, taskId: 'new-task' });
-  assert.equal((await feedback.execute({ kind: 'problem', message: '新任务问题' }, exec)).saved, true);
-  rows = pendingFeedback(configFile);
-  assert.equal(rows.find(row => row.occurrences[0].message === '新任务问题').occurrences[0].error, null);
-  await agent.definitions.get('report_parent').execute({ message: '完成', final: true }, exec);
-  await assert.rejects(feedback.execute({ kind: 'problem', message: '完成之后' }, exec), e => e.controlCode === 'managed-task-required');
-  await reloaded.managedCancel({ ...input, taskId: 'new-task' });
-  await assert.rejects(feedback.execute({ kind: 'problem', message: '取消之后' }, exec), e => e.controlCode === 'managed-task-closed');
-  assert.equal(pendingFeedback(configFile).length, 2);
 });
 
 test('a final is refused while a steer input still waits for the model’s next step', async () => {
@@ -460,54 +312,6 @@ test('question and answer carry text directly, conclude the waiting turn, and an
   await assert.rejects(host.managedAnswer({ ...answerInput, message: 'different' }), error => error.controlCode === 'managed-answer-conflict');
   await host.managedBeginTask({ ...input, taskId: 'task-b' });
   assert.equal((await host.managedStatus(input)).questions.length, 0);
-});
-
-test('a native answer consumes only the question identity it was given', async () => {
-  const f = await fixture(), host = f.create(), input = identity(f.workspace);
-  await host.managedCreate(input);
-  await host.managedBeginTask({ ...input, taskId: 'task-a' });
-  const agent = f.live.get(input.sessionId);
-  const ask = async message => {
-    await agent.definitions.get('ask_parent').execute({ message }, { agent, concludeTurn() {} });
-    return (await host.managedStatus(input)).questions.find(question => question.message === message);
-  };
-
-  // unchanged: the same question is still pending when the write is checked.
-  const first = await ask('Unchanged question?');
-  const unchanged = await host.managedAnswer({ ...input, taskId: 'task-a', answerId: 'answer-unchanged',
-    message: 'yes', questionIds: [first.id] });
-  assert.equal(unchanged.accepted, true);
-  assert.deepEqual(unchanged.consumedQuestionIds, [first.id]);
-  assert.equal((await host.managedStatus(input)).questions.find(question => question.id === first.id).state, 'answered');
-
-  // replaced: q2 was seen by the caller, but another answer consumed it and q3 is
-  // pending at write time. q3 stays pending and never receives q2's answer text.
-  await host.managedBeginTask({ ...input, taskId: 'task-b' });
-  const second = await ask('Original question?');
-  const other = await host.managedAnswer({ ...input, taskId: 'task-b', answerId: 'answer-other',
-    message: 'another answer', questionIds: [second.id] });
-  assert.equal(other.accepted, true);
-  const third = await ask('Replacement question?');
-  const replaced = await host.managedAnswer({ ...input, taskId: 'task-b', answerId: 'answer-replaced',
-    message: 'old answer text', questionIds: [second.id] });
-  assert.equal(replaced.accepted, false);
-  assert.equal(replaced.notSent, true);
-  assert.deepEqual(replaced.consumedQuestionIds, []);
-  assert.deepEqual(replaced.pendingQuestions, ['Replacement question?']);
-  const afterReplaced = (await host.managedStatus(input)).questions.find(question => question.id === third.id);
-  assert.equal(afterReplaced.state, 'pending');
-  assert.equal(afterReplaced.answer, undefined, 'the replacement never receives the old answer');
-
-  // gone: the named question is no longer pending and nothing is pending now.
-  const thirdAnswer = await host.managedAnswer({ ...input, taskId: 'task-b', answerId: 'answer-third',
-    message: 'third answer', questionIds: [third.id] });
-  assert.equal(thirdAnswer.accepted, true);
-  const gone = await host.managedAnswer({ ...input, taskId: 'task-b', answerId: 'answer-gone',
-    message: 'late answer', questionIds: [third.id] });
-  assert.equal(gone.accepted, false);
-  assert.equal(gone.notSent, true);
-  assert.deepEqual(gone.consumedQuestionIds, []);
-  assert.deepEqual(gone.pendingQuestions, []);
 });
 
 test('native sequence cursors do not require reading a public full events array', async () => {
@@ -858,108 +662,4 @@ test('a managed agent cannot raise a UI question the dispatching chat never sees
   assert.equal(child.agent.guards[0]({ agent: child.agent, name: 'read_file' }), undefined);
   assert.equal(agent.guards[0]({ agent: child.agent, name: 'ask_user_question' }), CHILD_QUESTION_REFUSAL,
     'if the root guard does see a descendant call, it names the parent route');
-});
-
-
-test('managed prompt checks live default and selection at synchronous inbox write and deduplicates', async () => {
-  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
-  await host.managedCreate(input);
-  const selection = { provider: 'provider', model: 'model', reasoningEffort: 'high' };
-  await host.managedSelectModel({ ...input, selection });
-  const agent = f.live.get(input.sessionId), accepted = [];
-  agent.steer = message => accepted.push(message);
-  agent.followup = message => accepted.push(message);
-  let changeBeforeWrite = true;
-  f.services.sessionController.commands = {
-    hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
-    async prompt(request, source) {
-      await Promise.resolve();
-      if (changeBeforeWrite) f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'second' });
-      agent.followup({ source, content: request.content });
-      return { accepted: true };
-    },
-  };
-  const dispatch = { ...input, selection, requestId: 'request-1', mode: 'queue', message: 'business input' };
-  assert.deepEqual(await host.managedPromptV2(dispatch), { accepted: false, status: 'retryable', notSent: true, code: 'managed-model-changed' });
-  assert.equal(accepted.length, 0);
-  changeBeforeWrite = false;
-  f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'model' });
-  const result = await host.managedPromptV2(dispatch);
-  assert.equal(result.accepted, true); assert.deepEqual(result.selected, selection); assert.equal(accepted.length, 1);
-  assert.equal(JSON.stringify([...f.records.values()]).includes('business input'), false, 'bridge metadata does not persist prompt text');
-  f.services.agentDefaultModel.currentSelection = () => ({ provider: 'provider', model: 'second' });
-  const observed = await host.managedPromptReceipt(dispatch);
-  assert.equal(observed.status, 'accepted'); assert.deepEqual(observed.selected, selection);
-  assert.equal((await host.managedPromptReceipt({ ...dispatch, requestId: 'missing' })).status, 'unknown');
-  const duplicate = await host.managedPromptV2(dispatch);
-  assert.equal(duplicate.duplicate, true); assert.deepEqual(duplicate.selected, selection); assert.equal(accepted.length, 1);
-});
-
-
-test('native accepted input without fenced confirmation reports written with unknown selection', async () => {
-  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
-  await host.managedCreate(input);
-  const selection = { provider: 'provider', model: 'model', reasoningEffort: 'high' };
-  await host.managedSelectModel({ ...input, selection });
-  const agent = f.live.get(input.sessionId), accepted = [];
-  agent.steer = message => accepted.push(message); agent.followup = message => accepted.push(message);
-  f.services.sessionController.commands = {
-    hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
-    async prompt(request, source) { accepted.push({ source, content: request.content }); return { accepted: true }; },
-  };
-  const dispatch = { ...input, selection, requestId: 'bypass', mode: 'queue', message: 'business input' };
-  assert.deepEqual((await host.managedPromptV2(dispatch)).selected, null);
-  assert.deepEqual(await host.managedPromptReceipt(dispatch), { status: 'accepted', requestId: 'bypass', selected: null, delivery: null });
-  assert.equal((await host.managedPromptV2(dispatch)).selected, null); assert.equal(accepted.length, 1);
-});
-
-test('loss before confirmed selection persists leaves accepted receipt without guessed effort', async () => {
-  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
-  await host.managedCreate(input);
-  const selection = { provider: 'provider', model: 'model', reasoningEffort: 'high' };
-  await host.managedSelectModel({ ...input, selection });
-  const agent = f.live.get(input.sessionId), accepted = [];
-  agent.steer = message => accepted.push(message); agent.followup = message => accepted.push(message);
-  f.services.sessionController.commands = {
-    hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
-    async prompt(request, source) { agent.followup({ source, content: request.content }); return { accepted: true }; },
-  };
-  const originalWrite = f.store.write;
-  f.store.write = async (key, record) => {
-    if (record.promptSelections?.crash?.confirmedSelection) throw new Error('crash before confirmation');
-    return originalWrite(key, record);
-  };
-  const dispatch = { ...input, selection, requestId: 'crash', mode: 'queue', message: 'business input' };
-  await assert.rejects(host.managedPromptV2(dispatch), /crash before confirmation/);
-  assert.deepEqual(await host.managedPromptReceipt(dispatch), { status: 'accepted', requestId: 'crash', selected: null, delivery: null });
-  assert.equal((await host.managedPromptV2(dispatch)).selected, null); assert.equal(accepted.length, 1);
-});
-
-
-test('managed prompt fences turn identity and records actual delivery', async () => {
-  const f = await fixture(), host = f.create(undefined, { defaultModelOnly: true }), input = identity(f.workspace);
-  await host.managedCreate(input);
-  const high = { provider: 'provider', model: 'model', reasoningEffort: 'high' }, max = { ...high, reasoningEffort: 'max' };
-  await host.managedSelectModel({ ...input, selection: high });
-  const agent = f.live.get(input.sessionId), accepted = [];
-  agent.steer = message => accepted.push(message); agent.followup = message => accepted.push(message);
-  f.services.sessionController.commands = { hasPromptRequest: (_session, id) => accepted.some(m => m.source.rpcId === id),
-    async prompt(request, source) { agent.steer({ source, content: request.content }); return { accepted: true }; } };
-  const inputA = { ...input, requestId: 'turn-race', message: 'task', mode: 'steer', selection: high, startSelection: max, expectedTurn: { throughSeq: 3 } };
-  agent.phase = { kind: 'idle' }; agent.session.seq = 4;
-  assert.deepEqual(await host.managedPromptV2(inputA), { accepted: false, status: 'retryable', notSent: true, code: 'managed-turn-ended' });
-  assert.equal(accepted.length, 0);
-  await host.managedSelectModel({ ...input, selection: max });
-  const started = await host.managedPromptV2({ ...inputA, selection: max, expectedTurn: undefined });
-  assert.equal(started.delivery, 'new-turn'); assert.equal(started.selected.reasoningEffort, 'max');
-  assert.equal((await host.managedPromptReceipt(inputA)).delivery, 'new-turn'); assert.equal(accepted.length, 1);
-  await host.managedSelectModel({ ...input, selection: high });
-  agent.phase = { kind: 'running', abort: new AbortController() }; agent.session.seq = 5; agent.session.events = [{ seq: 4, type: 'assistant/message' }];
-  const joined = await host.managedPromptV2({ ...inputA, requestId: 'joined' });
-  assert.equal(joined.delivery, 'current-turn'); assert.equal(joined.selected.reasoningEffort, 'high');
-  agent.session.events.push({ seq: 5, type: 'turn/end' }, { seq: 6, type: 'turn/start' }); agent.session.seq = 7;
-  assert.equal((await host.managedPromptV2({ ...inputA, requestId: 'changed' })).code, 'managed-turn-changed');
-  assert.equal((await host.managedPromptV2({ ...inputA, requestId: 'unknown', expectedTurn: { throughSeq: null } })).code, 'managed-turn-unknown');
-  agent.phase.abort.abort();
-  assert.equal((await host.managedPromptV2({ ...inputA, requestId: 'aborted' })).code, 'managed-turn-ended');
 });

@@ -15,7 +15,7 @@ export const DSH_MODELS = Object.freeze([
 ]);
 
 export const DSH_METHODS = Object.freeze([
-  'managedCreate', 'managedBeginTask', 'managedStatus', 'managedSelectModel', 'managedPromptV2', 'managedPromptReceipt', 'managedHistory',
+  'managedCreate', 'managedBeginTask', 'managedStatus', 'managedSelectModel', 'managedHistory',
   'managedAnswer', 'managedCancel', 'managedDestroy',
 ]);
 
@@ -112,12 +112,6 @@ export async function startDshFixture({ root, workspace }) {
       case 'managedBeginTask': return { treeProtocol: 1, reportProtocol: 1, throughSeq: 0,
         currentModel: clone(state.currentModel) };
       case 'managedStatus': return managedStatus(args);
-      case 'managedPromptV2': {
-        if (args.selection.model !== state.currentModel.model || args.selection.reasoningEffort !== state.currentModel.reasoningEffort) {
-          return { status: 'retryable', notSent: true };
-        }
-        return { accepted: true, requestId: args.requestId, delivery: 'new-turn', selected: clone(state.currentModel) };
-      }
       case 'managedSelectModel': {
         const selection = clone(args.selection ?? {});
         state.currentModel = selection;

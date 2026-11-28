@@ -14,6 +14,9 @@ const exec = promisify(execFile);
 const samePath = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 const configRoot = env => path.resolve(env.CLAUDE_CONFIG_DIR || path.join(homedir(), '.claude'));
 const json = async file => JSON.parse((await readFile(file, 'utf8')).replace(/^\uFEFF/, ''));
+const inboxBody = message => message.replace(/<\/cross-session-message\b/gi, '<\\/cross-session-message');
+const bodyDigest = body => createHash('sha256').update(body).digest('hex');
+export const claudeInboxBodyHash = message => bodyDigest(inboxBody(message));
 
 function pipeName(value) {
   if (typeof value !== 'string' || !/^\\\\[.?]\\pipe\\(?:LOCAL\\)?[^\\/\r\n\0]+$/i.test(value)) {
@@ -109,7 +112,7 @@ export async function sendClaude(binding, message, { requestId = randomUUID(), t
   });
   if (!/^[a-f0-9]{32}$/i.test(key.peerToken ?? '') || (key.procStartFt ?? key.procStart) !== binding.procStart
       || key.pidDomain !== binding.pidDomain) throw new Error('claude-inbox-key-mismatch');
-  const body = message.replace(/<\/cross-session-message\b/gi, '<\\/cross-session-message');
+  const body = inboxBody(message);
   const frame = { type: 'user', uuid: requestId, priority, from: 'FutureAide Control',
     session_id: binding.sessionId, message: { role: 'user',
       content: `<cross-session-message from-name="FutureAide Control">\n[FutureAide request ${requestId}]\n${body}\n</cross-session-message>` } };
@@ -188,9 +191,25 @@ function envelopeRequestId(value) {
   if (typeof value !== 'string') return undefined;
   return /^<cross-session-message from-name="FutureAide Control">\r?\n\[FutureAide request ([A-Za-z0-9-]{1,100})\]\r?\n/.exec(value)?.[1];
 }
+const inboxRequestLine = /^\[FutureAide request ([A-Za-z0-9-]{1,100})\](\r?\n)/;
 function bodyRequestId(value) {
   if (typeof value !== 'string') return undefined;
-  return /^\[FutureAide request ([A-Za-z0-9-]{1,100})\]\r?\n/.exec(value)?.[1];
+  return inboxRequestLine.exec(value)?.[1];
+}
+
+function peerUserReceipt(event) {
+  const { origin, message } = event;
+  if (event.entrypoint !== 'claude-desktop' || event.isMeta !== true || event.promptSource !== 'system' || event.turnOrigin !== 'peer'
+      || origin?.kind !== 'peer' || origin.from !== 'FutureAide Control' || origin.name !== 'FutureAide Control'
+      || typeof origin.body !== 'string' || message?.role !== 'user' || typeof message.content !== 'string') return undefined;
+  const header = inboxRequestLine.exec(origin.body);
+  if (!header) return undefined;
+  const line = header[2];
+  // Desktop supplies the peer record and inserts its complete envelope on a line
+  // of its own. The text alone does not establish where the message came from.
+  const envelope = ['', '<cross-session-message from-name="FutureAide Control">', origin.body, '</cross-session-message>', ''].join(line);
+  if (!`${line}${message.content}${line}`.includes(envelope)) return undefined;
+  return { requestId: header[1], bodyHash: bodyDigest(origin.body.slice(header[0].length)) };
 }
 
 export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576, sidechain = false } = {}) {
@@ -275,9 +294,10 @@ export async function readClaudeEvents(binding, { offset = 0, maxBytes = 1048576
           stage: 'inserted', timestamp: event.timestamp, seq });
       } else if (event.type === 'user' && typeof event.uuid === 'string'
           && typeof event.message?.content === 'string') {
-        // An idle-session inbox frame retains its UUID as a user message. The
-        // caller matches this against its persisted request IDs, never by text.
-        deliveries.push({ requestId: event.uuid, stage: 'inserted', timestamp: event.timestamp, seq });
+        // Desktop can replace the inbox UUID. Use the native peer insertion in
+        // that case and let the caller verify its exact report body as well.
+        const receipt = peerUserReceipt(event) ?? { requestId: event.uuid };
+        deliveries.push({ ...receipt, stage: 'inserted', timestamp: event.timestamp, seq });
       }
       if (!['user', 'assistant'].includes(event.type)) continue;
       const content = event.message?.content;

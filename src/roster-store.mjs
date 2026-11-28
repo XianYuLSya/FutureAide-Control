@@ -3,8 +3,11 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { answerOutcome } from './cleanup-input-receipts.mjs';
+import { REPORT_BODY_RETENTION_MS } from './report-delivery.mjs';
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+const noticeMilliseconds = value => Number.isFinite(value) ? value
+  : Number.isFinite(Date.parse(value ?? '')) ? Date.parse(value) : 0;
 
 /** The id a stored ask or report carries once it is a question or report of its task. */
 export const submissionRef = id => `submission:${id}`;
@@ -102,14 +105,21 @@ export function writeDeliveredReceipts(db, record, retentionMs = 7 * 24 * 60 * 6
     const delivery = item.delivery ? JSON.parse(item.delivery) : null;
     if (delivery?.state === 'delivered') submissions.set(item.task, { id: item.id, delivery });
   }
-  const update = db.prepare(`UPDATE task_keys SET failureReason=?, finalSubmissionId=?, deliveredAt=?, expiresAt=? WHERE key=? AND owner=? AND agent=?`);
+  const update = db.prepare(`UPDATE task_keys SET failureReason=?, finalSubmissionId=?, deliveredAt=?, expiresAt=?, release=? WHERE key=? AND owner=? AND agent=?`);
   let retained = false;
   for (const key of db.prepare('SELECT * FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL').all(record.ownerId, record.agentId)) {
     const reason = failures.get(key.request) ?? key.failureReason;
-    const report = submissions.get(key.task) ?? (rounds.get(key.task)?.reports ?? []).filter(item => item.final && item.delivery?.state === 'delivered' && item.id).at(-1);
+    const roundReport = (rounds.get(key.task)?.reports ?? []).filter(item => item.final && item.delivery?.state === 'delivered' && item.id).at(-1);
+    const report = submissions.get(key.task) ?? roundReport;
     if (!reason && !report) continue;
     const id = !reason && report ? (report.id.startsWith('submission:') ? report.id.slice(11) : report.id) : null;
-    update.run(reason ?? null, id, id ? report.delivery.deliveredAt ?? null : null, expiresAt, key.key, record.ownerId, record.agentId);
+    const releaseReport = report?.treeRelease ? report : roundReport;
+    const release = !reason && releaseReport?.treeRelease ? JSON.stringify(releaseReport.treeRelease) : null;
+    update.run(reason ?? null, id, id ? report.delivery.deliveredAt ?? null : null, expiresAt, release, key.key, record.ownerId, record.agentId);
+    // The report text lives outside the name row, so cleanup does not take it early:
+    // its entry lives exactly as long as the task receipt that names it.
+    if (key.task) db.prepare(`UPDATE report_bodies SET expires=? WHERE agent=? AND task=?`)
+      .run(expiresAt, record.agentId, key.task);
     retained = true;
   }
   db.prepare('DELETE FROM task_keys WHERE owner=? AND agent=? AND expiresAt IS NULL').run(record.ownerId, record.agentId);
@@ -161,13 +171,50 @@ export class RosterStore {
         created TEXT NOT NULL, state TEXT NOT NULL, consumed TEXT, delivery TEXT);
       CREATE INDEX IF NOT EXISTS submissions_pending ON submissions(agent,task) WHERE state='pending';
       CREATE INDEX IF NOT EXISTS submissions_by_task ON submissions(agent,task);
+      -- The exact original report text, outside the notification queue and the name
+      -- body. A wait event can therefore give a stable page entry without a second
+      -- copy ever entering a summary. Rows survive once-name cleanup until the task
+      -- receipt's own retention ends; see writeDeliveredReceipts.
+      CREATE TABLE IF NOT EXISTS report_bodies (agent TEXT NOT NULL, task TEXT NOT NULL,
+        submission TEXT NOT NULL, owner TEXT NOT NULL, body TEXT NOT NULL, encoding TEXT NOT NULL DEFAULT 'plain',
+        created TEXT NOT NULL, expires TEXT, PRIMARY KEY(agent, task, submission));
       CREATE TABLE IF NOT EXISTS agent_history (agent TEXT NOT NULL, seq INTEGER NOT NULL, body TEXT NOT NULL,
         PRIMARY KEY (agent, seq)) WITHOUT ROWID;
       CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_keys (key TEXT PRIMARY KEY, owner TEXT NOT NULL, agent TEXT NOT NULL,
         request TEXT NOT NULL, task TEXT, finalSubmissionId TEXT, deliveredAt TEXT, expiresAt TEXT,
         UNIQUE(owner,request));
-      CREATE INDEX IF NOT EXISTS task_keys_expiry ON task_keys(expiresAt) WHERE expiresAt IS NOT NULL;`);
+      CREATE INDEX IF NOT EXISTS task_keys_expiry ON task_keys(expiresAt) WHERE expiresAt IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS team_board_messages (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        rootOwner TEXT NOT NULL,
+        author TEXT NOT NULL,
+        authorRole TEXT,
+        authorAgentId TEXT,
+        text TEXT NOT NULL,
+        mentions TEXT NOT NULL DEFAULT '[]',
+        routed TEXT NOT NULL DEFAULT '[]',
+        createdAt TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS team_board_by_owner ON team_board_messages(rootOwner, seq);
+      CREATE TABLE IF NOT EXISTS team_agent_stubs (
+        agentId TEXT PRIMARY KEY,
+        rootOwner TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT,
+        agentPath TEXT NOT NULL,
+        parentAgentId TEXT,
+        target TEXT NOT NULL,
+        workspace TEXT,
+        resumeSessionId TEXT,
+        model TEXT,
+        lastTaskSummary TEXT,
+        closedAt TEXT NOT NULL,
+        expiresAt TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS team_stubs_by_root ON team_agent_stubs(rootOwner, name);
+      CREATE INDEX IF NOT EXISTS team_stubs_expiry ON team_agent_stubs(expiresAt);`);
     // Single-connection caches. They only ever skip work whose result is already
     // known here; every entry is dropped by any write this connection makes to the
     // same row, and projections are keyed by PRAGMA data_version so a commit from
@@ -195,6 +242,8 @@ export class RosterStore {
     this.addTextColumn('submissions', 'delivery');
     this.addTextColumn('task_keys', 'baseline');
     this.addTextColumn('task_keys', 'failureReason');
+    this.addTextColumn('task_keys', 'release');
+    this.addTextColumn('report_bodies', 'encoding');
     // Only now can the debt index name the notice column. A roster from an older build
     // gains that column on the line above; a new one created it with the table.
     this.db.exec(`CREATE INDEX IF NOT EXISTS submissions_debt ON submissions(agent, task)
@@ -270,15 +319,21 @@ export class RosterStore {
   }
 
   owner(id) { const row = this.db.prepare('SELECT body FROM owners WHERE id=?').get(id); return row ? JSON.parse(row.body) : undefined; }
+  listOwners() {
+    return this.db.prepare('SELECT body FROM owners').all().map(row => {
+      try { return JSON.parse(row.body); } catch { return null; }
+    }).filter(Boolean);
+  }
   saveOwner(owner) {
     let saved = this.owner(owner.ownerId);
     if (!saved) {
       this.db.prepare('INSERT OR IGNORE INTO owners(id,body) VALUES (?,?)').run(owner.ownerId, JSON.stringify(owner));
       saved = this.owner(owner.ownerId);
     }
-    // Both sources bind one owner to one chat/session and one project.
+    // All sources bind one owner to one chat/session/conversation and one project.
     const sameCaller = (saved.threadId ?? null) === (owner.threadId ?? null)
-      && (saved.nativeSessionId ?? null) === (owner.nativeSessionId ?? null);
+      && (saved.nativeSessionId ?? null) === (owner.nativeSessionId ?? null)
+      && (saved.conversationId ?? null) === (owner.conversationId ?? null);
     if (!sameCaller || saved.workspace !== owner.workspace) throw new Error('This chat is already bound to another project.');
     return saved;
   }
@@ -316,7 +371,10 @@ export class RosterStore {
   }
   /** Append-only: an earlier task is never rewritten by a later poll. */
   pruneExpiredTaskKeys() {
-    this.db.prepare('DELETE FROM task_keys WHERE expiresAt IS NOT NULL AND expiresAt<=?').run(new Date().toISOString());
+    const at = new Date().toISOString();
+    this.db.prepare('DELETE FROM task_keys WHERE expiresAt IS NOT NULL AND expiresAt<=?').run(at);
+    this.db.prepare('DELETE FROM report_bodies WHERE expires IS NOT NULL AND expires<=?').run(at);
+    this.db.prepare('DELETE FROM team_agent_stubs WHERE expiresAt<=?').run(at);
   }
   saveTaskKey(ownerId, agentId, requestId, taskId = null) {
     // A savepoint also composes with the dispatch transaction that called us.
@@ -381,8 +439,15 @@ export class RosterStore {
     }
     const receipt = !row.expiresAt || !row.finalSubmissionId ? null : Date.parse(row.expiresAt) <= Date.now()
       ? { expired: true, expiresAt: row.expiresAt }
-      : { finalSubmissionId: row.finalSubmissionId, deliveredAt: row.deliveredAt, expiresAt: row.expiresAt };
+      : { finalSubmissionId: row.finalSubmissionId, deliveredAt: row.deliveredAt, expiresAt: row.expiresAt,
+        ...(row.release ? { release: JSON.parse(row.release) } : {}) };
     return { taskKey: row.key, ownerId: row.owner, agentId: row.agent, requestId: row.request, taskId: row.task, baseline: row.baseline ? JSON.parse(row.baseline) : null, failureReason: row.failureReason ?? null, receipt };
+  }
+  resolveTaskKeyAnyOwner(key) {
+    if (typeof key !== 'string' || !key) return null;
+    const row = this.db.prepare('SELECT * FROM task_keys WHERE key=?').get(key);
+    if (!row) return null;
+    return this.resolveTaskKey(row.owner, key);
   }
   appendHistory(agentId, item) {
     const row = this.db.prepare('SELECT coalesce(max(seq),-1)+1 AS seq FROM agent_history WHERE agent=?').get(agentId);
@@ -457,6 +522,7 @@ export class RosterStore {
   boardSnapshot() {
     return this.projection('board', () => this.db.prepare(`
       SELECT a.id AS id, a.owner AS owner, a.name AS name,
+        json_extract(a.body,'$.role') AS role,
         json_extract(a.body,'$.updatedAt') AS updatedAt,
         json_extract(a.body,'$.state') AS state,
         json_extract(a.body,'$.target') AS target,
@@ -468,6 +534,8 @@ export class RosterStore {
         json_extract(a.body,'$.task.modelSelection.effort') AS taskEffort,
         json_extract(a.body,'$.modelSelection.model') AS selectionModel,
         json_extract(a.body,'$.modelSelection.effort') AS selectionEffort,
+        coalesce(json_extract(a.body,'$.task.usage'), json_extract(a.body,'$.usage')) AS taskUsageJson,
+        coalesce(json_extract(a.body,'$.usage'), json_extract(a.body,'$.task.usage')) AS totalUsageJson,
         (SELECT count(*) FROM json_each(json_extract(a.body,'$.observation.questions'))
           WHERE json_extract(value,'$.state')='pending') AS pendingQuestions,
         CASE WHEN json_type(json_extract(a.body,'$.observation.tree.nodes'))='array'
@@ -490,7 +558,20 @@ export class RosterStore {
       FROM agents a
       LEFT JOIN owners o ON o.id = a.owner
       LEFT JOIN backend_state s ON s.agent = a.id
-      WHERE coalesce(json_extract(a.body,'$.closed'),0)=0`).all());
+      WHERE coalesce(json_extract(a.body,'$.closed'),0)=0`).all().map(({ taskUsageJson, totalUsageJson, ...row }) => {
+        let taskUsage = null;
+        let usage = null;
+        if (typeof taskUsageJson === 'string' && taskUsageJson) {
+          try { taskUsage = JSON.parse(taskUsageJson); } catch { taskUsage = null; }
+        }
+        if (typeof totalUsageJson === 'string' && totalUsageJson) {
+          try { usage = JSON.parse(totalUsageJson); } catch { usage = null; }
+        }
+        return {
+          ...row,
+          ...(usage || taskUsage ? { usage: usage ?? taskUsage, taskUsage: taskUsage ?? usage } : {}),
+        };
+      }));
   }
   projection(key, build) {
     const version = this.dataVersion();
@@ -526,14 +607,15 @@ export class RosterStore {
   syncCandidate(record) {
     const cached = this.scans.get('candidates');
     if (!cached || !Array.isArray(cached.rows)) return;
-    const reports = (record.task?.reports ?? []).map(report => ({ delivery: {
+    const reports = (record.task?.reports ?? []).map(report => ({ final: report.final === true, delivery: {
       state: report.delivery?.state ?? '',
       ...(report.delivery?.nextAttemptAt ? { nextAttemptAt: report.delivery.nextAttemptAt } : {}),
-      ...(report.delivery?.waitingForTree ? { waitingForTree: true } : {}) } }));
+      ...(report.delivery?.waitingForTree ? { waitingForTree: true } : {}),
+      ...(report.delivery?.treeReleaseAt ? { treeReleaseAt: report.delivery.treeReleaseAt } : {}) } }));
     const pendingReports = reports.filter(report => !['delivered', 'blocked'].includes(report.delivery.state));
-    // Same rule as the roster sweep: a final waiting for its tree is settled by the sweep
-    // reading that tree, so the cached row must not defer the name either.
-    const waitingForTree = pendingReports.some(report => report.delivery.waitingForTree === true);
+    // A tree-wait notice carries its own bounded release moment. An old row from the
+    // six-hour build has no such moment yet, so it is due at once and the next poll
+    // migrates it; a row with a moment wakes the monitor exactly then, not earlier.
     const previous = cached.rows.find(row => row.agentId === record.agentId);
     const row = {
       agentId: record.agentId, ownerId: record.ownerId, sessionId: record.sessionId, state: record.state,
@@ -541,8 +623,19 @@ export class RosterStore {
       ...(record.callbackBlocked ? { callbackBlocked: true } : {}),
       ...(record.sleep == null ? {} : { sleep: structuredClone(record.sleep) }),
       ...(record.nextAttemptAt == null ? {} : { nextAttemptAt: record.nextAttemptAt }),
-      ...(pendingReports.length && !waitingForTree ? { noticeNextAt: pendingReports.reduce((min, report) =>
-        Math.min(min, report.delivery.nextAttemptAt ?? 0), Infinity) } : {}),
+      ...((() => {
+        const waiting = pendingReports.filter(report => report.delivery.waitingForTree);
+        if (waiting.length) {
+          const releases = waiting.map(report => noticeMilliseconds(report.delivery.treeReleaseAt));
+          // An old tree-wait with no bounded release is due at once; it must not be
+          // deferred by another notice's business backoff.
+          return releases.every(moment => moment > 0) ? { noticeNextAt: Math.min(...releases) } : {};
+        }
+        const moments = pendingReports.map(report => noticeMilliseconds(report.delivery.nextAttemptAt))
+          .filter(moment => moment > 0);
+        return moments.length ? { noticeNextAt: Math.min(...moments) } : {};
+      })()),
+      ...(record.task?.autoCleanupPending ? { autoCleanupPending: true } : {}),
       hasSupplement: previous?.hasSupplement ?? false,
       pendingReports: pendingReports.length,
       ...(record.task?.taskId == null ? {} : { task: { taskId: record.task.taskId, reports,
@@ -975,26 +1068,35 @@ export class RosterStore {
         json_extract(body,'$.task.reports') AS reports, json_extract(body,'$.nextAttemptAt') AS nextAttemptAt,
         json_extract(body,'$.task.cancelRequested') AS cancelRequested,
         json_extract(body,'$.task.cancelVerified') AS cancelVerified,
-        json_extract(body,'$.task.cancelTreeSettled') AS cancelTreeSettled
+        json_extract(body,'$.task.cancelTreeSettled') AS cancelTreeSettled,
+        json_extract(body,'$.task.autoCleanupPending') AS autoCleanupPending
         FROM agents INDEXED BY agents_lifecycle_v2
         WHERE id NOT IN (SELECT id FROM agents WHERE json_extract(body,'$.target')='claude-desktop') ORDER BY name`).all().map(row => {
         const reports = (JSON.parse(row.reports ?? '[]') ?? [])
-          .map(report => ({ delivery: { state: report.delivery?.state ?? '',
+          .map(report => ({ final: report.final === true, delivery: { state: report.delivery?.state ?? '',
             ...(report.delivery?.nextAttemptAt ? { nextAttemptAt: report.delivery.nextAttemptAt } : {}),
-            ...(report.delivery?.waitingForTree ? { waitingForTree: true } : {}) } }));
+            ...(report.delivery?.waitingForTree ? { waitingForTree: true } : {}),
+            ...(report.delivery?.treeReleaseAt ? { treeReleaseAt: report.delivery.treeReleaseAt } : {}) } }));
         const pendingReports = reports.filter(report => !['delivered', 'blocked'].includes(report.delivery.state));
-        // A final still waiting for its tree is settled by the ordinary sweep reading that
-        // tree, so any such notice makes this name due at once: dropping only its own
-        // moment would let another notice's backoff hold the whole observation back.
-        const waitingForTree = pendingReports.some(report => report.delivery.waitingForTree === true);
+        // Same moment rule as the cached sweep row: a tree wait wakes at its own
+        // bounded release, and a legacy six-hour row is due at once for migration.
         return {
           agentId: row.agentId, ownerId: row.ownerId, sessionId: row.sessionId, state: row.state,
           ...(row.closed ? { closed: true } : {}),
           ...(row.callbackBlocked ? { callbackBlocked: true } : {}),
           ...(row.sleep == null ? {} : { sleep: JSON.parse(row.sleep) }),
           ...(row.nextAttemptAt == null ? {} : { nextAttemptAt: row.nextAttemptAt }),
-          ...(pendingReports.length && !waitingForTree ? { noticeNextAt: pendingReports.reduce((min, report) =>
-            Math.min(min, report.delivery.nextAttemptAt ?? 0), Infinity) } : {}),          hasSupplement: supplements.has(`${row.agentId}\n${row.taskId}`),
+          ...((() => {
+            const waiting = pendingReports.filter(report => report.delivery.waitingForTree);
+            if (waiting.length) {
+              const releases = waiting.map(report => noticeMilliseconds(report.delivery.treeReleaseAt));
+              return releases.every(moment => moment > 0) ? { noticeNextAt: Math.min(...releases) } : {};
+            }
+            const moments = pendingReports.map(report => noticeMilliseconds(report.delivery.nextAttemptAt))
+              .filter(moment => moment > 0);
+            return moments.length ? { noticeNextAt: Math.min(...moments) } : {};
+          })()),
+          ...(row.autoCleanupPending ? { autoCleanupPending: true } : {}),          hasSupplement: supplements.has(`${row.agentId}\n${row.taskId}`),
           pendingReports: pendingReports.length,
           ...(row.taskId == null ? {} : { task: { taskId: row.taskId, reports,
             ...(row.cancelRequested ? { cancelRequested: true } : {}),
@@ -1307,8 +1409,86 @@ export class RosterStore {
     const queued = this.db.prepare(`INSERT OR IGNORE INTO submissions(id,owner,agent,task,kind,message,final,created,state,delivery)
       VALUES (?,?,?,?,?,?,?,?,'pending',?)`)
       .run(id, ownerId, agentId, taskId, kind, message, final ? 1 : 0, created, notice).changes === 1;
+    // A report body is durable before any exit can name it. An ask has its own
+    // question notice and never needs a report page.
+    if (kind === 'report') this.saveReportBody({ ownerId, agentId, taskId, submissionId: id, body: message, created });
     this.settle(queued ? 1 : 0);
     return queued;
+  }
+  /**
+   * Store the exact report text under the same submission identity every exit uses.
+   * The first copy is authoritative: a retry of the same identity cannot rewrite it.
+   */
+  saveReportBody({ ownerId, agentId, taskId, submissionId, body, created = new Date().toISOString() }) {
+    if (![ownerId, agentId, taskId, submissionId].every(value => typeof value === 'string' && value)) return false;
+    if (typeof body !== 'string') return false;
+    const at = Number.isFinite(Date.parse(created)) ? new Date(created).toISOString() : new Date().toISOString();
+    // The task receipt is the retention anchor. A historical report with an old
+    // creation time is still readable for seven days from the moment it enters the
+    // body store, rather than expiring before it can be read.
+    const expires = new Date(Math.max(Date.parse(at), Date.now()) + REPORT_BODY_RETENTION_MS).toISOString();
+    // node:sqlite binds TEXT through a C string and truncates at the first NUL.
+    // JSON encodes U+0000 as six characters and brings back the exact string.
+    const encoding = body.includes('\u0000') ? 'json' : 'plain';
+    const stored = encoding === 'json' ? JSON.stringify(body) : body;
+    const inserted = this.db.prepare(`INSERT OR IGNORE INTO report_bodies(agent,task,submission,owner,body,encoding,created,expires)
+      VALUES (?,?,?,?,?,?,?,?)`).run(agentId, taskId, submissionId, ownerId, stored, encoding, at, expires).changes === 1;
+    this.settle(inserted ? 1 : 0);
+    return inserted;
+  }
+  /**
+   * Read one stored body through an owner's task receipt. The owner is part of
+   * every lookup, so another chat cannot address this body even with its ids.
+   */
+  storedReportBody(ownerId, taskKey, submissionId) {
+    if (typeof ownerId !== 'string' || typeof taskKey !== 'string' || typeof submissionId !== 'string') return { error: 'report-body-unavailable' };
+    const mapping = this.resolveTaskKey(ownerId, taskKey);
+    if (!mapping) return { error: 'task-receipt-unavailable' };
+    if (mapping.receipt?.expired) return { error: 'task-receipt-expired' };
+    const read = () => this.db.prepare(`SELECT body,encoding,created,expires FROM report_bodies
+      WHERE owner=? AND agent=? AND task=? AND submission=?`).get(ownerId, mapping.agentId, mapping.taskId, submissionId);
+    let row = read();
+    if (!row) {
+      // Older DSH rows never had a body table. Prefer the exact report already
+      // persisted in the current task or its archived history: the submission column
+      // can be truncated at U+0000. Only then fall back to the submission row.
+      const bare = id => typeof id === 'string' && id.startsWith('submission:') ? id.slice('submission:'.length) : id;
+      const findIn = task => (task?.reports ?? []).find(report => bare(report.id) === submissionId);
+      const current = this.db.prepare('SELECT body FROM agents WHERE id=? AND owner=?').get(mapping.agentId, ownerId);
+      let task;
+      if (current?.body) {
+        try {
+          const parsed = JSON.parse(current.body);
+          if (parsed?.task?.taskId === mapping.taskId) task = parsed.task;
+        } catch { /* a damaged roster is not a body source */ }
+      }
+      if (!task) task = this.historyFor(mapping.agentId).find(item => item.taskId === mapping.taskId);
+      const report = findIn(task);
+      if (report && typeof report.message === 'string') {
+        this.saveReportBody({ ownerId, agentId: mapping.agentId, taskId: mapping.taskId,
+          submissionId, body: report.message, created: report.createdAt ?? task.startedAt });
+        row = read();
+      }
+    }
+    if (!row) {
+      // An old row may predate the body table. Recover its text from the submission
+      // row while it still exists, then keep it under the same identity.
+      const old = this.db.prepare(`SELECT message,created FROM submissions WHERE id=? AND owner=? AND agent=? AND task=?`)
+        .get(submissionId, ownerId, mapping.agentId, mapping.taskId);
+      if (old) {
+        this.saveReportBody({ ownerId, agentId: mapping.agentId, taskId: mapping.taskId,
+          submissionId, body: old.message, created: old.created });
+        row = read();
+      }
+    }
+    if (!row) return { error: 'report-body-unavailable' };
+    if (row.expires && Date.parse(row.expires) <= Date.now()) return { error: 'report-body-expired' };
+    let body = row.body;
+    if (row.encoding === 'json') {
+      try { body = JSON.parse(row.body); } catch { return { error: 'report-body-unavailable' }; }
+      if (typeof body !== 'string') return { error: 'report-body-unavailable' };
+    }
+    return { body, created: row.created, expires: row.expires };
   }
   pendingSubmissions(agentId, taskId) {
     if (taskId !== undefined) return this.submissions(agentId, taskId, true);
@@ -1327,12 +1507,16 @@ export class RosterStore {
     // Earliest notice a name still owes, for whatever round wrote it. A notice of an older
     // round that is waiting for its tree is due at once: that round is over, so an ordinary
     // send may take it now instead of the tree's own six-hour expiry.
+    // A consumed submission in pull_ready state awaits an explicit caller wait/readReport pull
+    // rather than background chat push, so the monitor never spins on it.
     return this.db.prepare(`SELECT s.agent AS agentId,
         min(CASE WHEN s.task<>json_extract(a.body,'$.task.taskId')
               AND json_extract(s.delivery,'$.waitingForTree')=1 THEN 0
             ELSE coalesce(json_extract(s.delivery,'$.nextAttemptAt'),0) END) AS dueAt
       FROM submissions AS s JOIN agents AS a ON a.id=s.agent AND a.owner=s.owner
-      WHERE ${submissionDebtSql('s')} AND coalesce(json_extract(a.body,'$.closed'),0)=0
+      WHERE ${submissionDebtSql('s')}
+        AND NOT (s.state='consumed' AND coalesce(json_extract(s.delivery,'$.state'),'')='pull_ready')
+        AND coalesce(json_extract(a.body,'$.closed'),0)=0
       GROUP BY s.agent`).all();
   }
   /**
@@ -1429,7 +1613,9 @@ export class RosterStore {
     try {
       const record = agentId && this.get(agentId);
       const task = record?.task;
-      if (!task || record.closed || (cliDispatch && (record.target !== 'claude-cli'
+      if (!task || record.closed || (cliDispatch && ((cliDispatch.target
+          ? record.target !== cliDispatch.target
+          : !['claude-cli', 'codex-cli', 'agy-cli'].includes(record.target))
           || task.taskId !== cliDispatch.taskId
           || task.dispatches?.at(-1)?.requestId !== cliDispatch.requestId))) {
         throw Object.assign(new Error('This caller has no active managed task for this dispatch.'), { code: 'submission-not-owned' });
@@ -1625,5 +1811,372 @@ export class RosterStore {
       this.settle(this.db.prepare('DELETE FROM leases WHERE key=? AND holder=?').run(key, holder).changes);
     }
   }
+  postBoardMessage({
+    rootOwnerId,
+    author = 'Boss',
+    authorRole = null,
+    authorAgentId = null,
+    text,
+    mentions = [],
+    routed = [],
+    createdAt = new Date().toISOString(),
+  } = {}) {
+    if (typeof rootOwnerId !== 'string' || !rootOwnerId) throw new Error('rootOwnerId is required.');
+    if (typeof text !== 'string' || !text.trim()) throw new Error('A non-empty board message is required.');
+    const normalizedMentions = Array.isArray(mentions) ? [...new Set(mentions.map(String))] : [];
+    const normalizedRouted = Array.isArray(routed) ? routed : [];
+    const info = this.db.prepare(`INSERT INTO team_board_messages(rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt)
+      VALUES (?,?,?,?,?,?,?,?)`).run(
+      rootOwnerId,
+      String(author || 'Boss'),
+      authorRole ?? null,
+      authorAgentId ?? null,
+      text,
+      JSON.stringify(normalizedMentions),
+      JSON.stringify(normalizedRouted),
+      createdAt,
+    );
+    this.settle(info.changes);
+    const seq = Number(info.lastInsertRowid);
+    return {
+      seq,
+      rootOwnerId,
+      author: String(author || 'Boss'),
+      authorRole: authorRole ?? null,
+      authorAgentId: authorAgentId ?? null,
+      text,
+      mentions: normalizedMentions,
+      routed: normalizedRouted,
+      createdAt,
+    };
+  }
+
+  listBoardMessages(rootOwnerId, { limit = 50, afterSeq = 0 } = {}) {
+    if (typeof rootOwnerId !== 'string' || !rootOwnerId) return { messages: [], latestSeq: 0 };
+    const boundedLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 50;
+    const cursor = Number.isInteger(afterSeq) && afterSeq > 0 ? afterSeq : 0;
+    const rows = cursor > 0
+      ? this.db.prepare(`SELECT seq,rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt
+          FROM team_board_messages WHERE rootOwner=? AND seq>? ORDER BY seq ASC LIMIT ?`)
+        .all(rootOwnerId, cursor, boundedLimit)
+      : this.db.prepare(`SELECT seq,rootOwner,author,authorRole,authorAgentId,text,mentions,routed,createdAt
+          FROM team_board_messages WHERE rootOwner=? ORDER BY seq DESC LIMIT ?`)
+        .all(rootOwnerId, boundedLimit).reverse();
+    const latestRow = this.db.prepare('SELECT coalesce(max(seq),0) AS latestSeq FROM team_board_messages WHERE rootOwner=?')
+      .get(rootOwnerId);
+    const messages = rows.map(row => ({
+      seq: row.seq,
+      rootOwnerId: row.rootOwner,
+      author: row.author,
+      authorRole: row.authorRole ?? null,
+      authorAgentId: row.authorAgentId ?? null,
+      text: row.text,
+      mentions: row.mentions ? JSON.parse(row.mentions) : [],
+      routed: row.routed ? JSON.parse(row.routed) : [],
+      createdAt: row.createdAt,
+    }));
+    return { messages, latestSeq: latestRow?.latestSeq ?? 0 };
+  }
+
+  saveAgentStub({
+    agentId,
+    rootOwnerId,
+    ownerId,
+    name,
+    role = null,
+    agentPath,
+    parentAgentId = null,
+    target,
+    workspace = null,
+    resumeSessionId = null,
+    model = null,
+    lastTaskSummary = null,
+    closedAt = new Date().toISOString(),
+    retentionMs = 2 * 60 * 60 * 1000,
+  } = {}) {
+    if (!agentId || !rootOwnerId || !ownerId || !name || !target) return false;
+    this.pruneExpiredTaskKeys();
+    const expiresAt = new Date(Date.now() + retentionMs).toISOString();
+    // Replace any older stub with the same name under the same root team so `@name`
+    // always addresses the latest finished instance.
+    this.db.prepare('DELETE FROM team_agent_stubs WHERE rootOwner=? AND (name=? OR agentPath=?)')
+      .run(rootOwnerId, name, agentPath || name);
+    const res = this.db.prepare(`INSERT OR REPLACE INTO team_agent_stubs(
+      agentId,rootOwner,owner,name,role,agentPath,parentAgentId,target,workspace,resumeSessionId,model,lastTaskSummary,closedAt,expiresAt
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      agentId,
+      rootOwnerId,
+      ownerId,
+      name,
+      role ?? null,
+      agentPath || name,
+      parentAgentId ?? null,
+      target,
+      workspace ?? null,
+      resumeSessionId ?? null,
+      model ?? null,
+      lastTaskSummary ?? null,
+      closedAt,
+      expiresAt,
+    );
+    this.settle(res.changes);
+    return res.changes > 0;
+  }
+
+  getAgentStub(rootOwnerId, nameOrPath) {
+    if (!rootOwnerId || typeof nameOrPath !== 'string' || !nameOrPath.trim()) return undefined;
+    this.pruneExpiredTaskKeys();
+    const wanted = nameOrPath.trim();
+    const byPath = this.db.prepare(`SELECT * FROM team_agent_stubs
+      WHERE rootOwner=? AND agentPath=? ORDER BY closedAt DESC LIMIT 1`).get(rootOwnerId, wanted);
+    const row = byPath ?? this.db.prepare(`SELECT * FROM team_agent_stubs
+      WHERE rootOwner=? AND name=? ORDER BY closedAt DESC LIMIT 1`).get(rootOwnerId, wanted);
+    if (!row) return undefined;
+    return {
+      agentId: row.agentId,
+      rootOwnerId: row.rootOwner,
+      ownerId: row.owner,
+      name: row.name,
+      role: row.role ?? null,
+      agentPath: row.agentPath,
+      parentAgentId: row.parentAgentId ?? null,
+      target: row.target,
+      workspace: row.workspace ?? null,
+      resumeSessionId: row.resumeSessionId ?? null,
+      model: row.model ?? null,
+      lastTaskSummary: row.lastTaskSummary ?? null,
+      closedAt: row.closedAt,
+      expiresAt: row.expiresAt,
+    };
+  }
+
+  listAgentStubs(rootOwnerId) {
+    this.pruneExpiredTaskKeys();
+    const rows = rootOwnerId
+      ? this.db.prepare('SELECT * FROM team_agent_stubs WHERE rootOwner=? ORDER BY closedAt DESC').all(rootOwnerId)
+      : this.db.prepare('SELECT * FROM team_agent_stubs ORDER BY closedAt DESC').all();
+    return rows.map(row => ({
+      agentId: row.agentId,
+      rootOwnerId: row.rootOwner,
+      ownerId: row.owner,
+      name: row.name,
+      role: row.role ?? null,
+      agentPath: row.agentPath,
+      parentAgentId: row.parentAgentId ?? null,
+      target: row.target,
+      workspace: row.workspace ?? null,
+      resumeSessionId: row.resumeSessionId ?? null,
+      model: row.model ?? null,
+      lastTaskSummary: row.lastTaskSummary ?? null,
+      closedAt: row.closedAt,
+      expiresAt: row.expiresAt,
+    }));
+  }
+
+  deleteAgentStub(agentId) {
+    if (!agentId) return false;
+    const res = this.db.prepare('DELETE FROM team_agent_stubs WHERE agentId=?').run(agentId);
+    this.settle(res.changes);
+    return res.changes > 0;
+  }
+
+  deleteOwnerStubs(rootOwnerId) {
+    if (!rootOwnerId) return 0;
+    const res = this.db.prepare('DELETE FROM team_agent_stubs WHERE rootOwner=? OR owner=?').run(rootOwnerId, rootOwnerId);
+    this.settle(res.changes);
+    return res.changes;
+  }
+
+  findAgentStubGlobal(nameOrId, preferredRootOwnerId) {
+    if (typeof nameOrId !== 'string' || !nameOrId.trim()) return undefined;
+    this.pruneExpiredTaskKeys();
+    const wanted = nameOrId.trim();
+    if (preferredRootOwnerId) {
+      const preferred = this.getAgentStub(preferredRootOwnerId, wanted);
+      if (preferred) return preferred;
+    }
+    const row = this.db.prepare(`SELECT * FROM team_agent_stubs
+      WHERE agentId=? OR agentPath=? OR name=? ORDER BY closedAt DESC LIMIT 1`).get(wanted, wanted, wanted);
+    if (!row) return undefined;
+    return {
+      agentId: row.agentId,
+      rootOwnerId: row.rootOwner,
+      ownerId: row.owner,
+      name: row.name,
+      role: row.role ?? null,
+      agentPath: row.agentPath,
+      parentAgentId: row.parentAgentId ?? null,
+      target: row.target,
+      workspace: row.workspace ?? null,
+      resumeSessionId: row.resumeSessionId ?? null,
+      model: row.model ?? null,
+      lastTaskSummary: row.lastTaskSummary ?? null,
+      closedAt: row.closedAt,
+      expiresAt: row.expiresAt,
+    };
+  }
+
+  reparentAgent(agentId, newParentAgentId = null) {
+    if (typeof agentId !== 'string' || !agentId) return null;
+    const targetParent = typeof newParentAgentId === 'string' && newParentAgentId.trim()
+      ? newParentAgentId.trim()
+      : null;
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const record = this.get(agentId);
+      if (!record) {
+        this.db.exec('ROLLBACK');
+        return null;
+      }
+      if (targetParent) {
+        if (targetParent === agentId) {
+          throw Object.assign(new Error('Cannot reparent a subagent under itself.'), { code: 'reparent-cycle' });
+        }
+        const parentRecord = this.get(targetParent);
+        if (!parentRecord || parentRecord.closed) {
+          throw Object.assign(new Error(`Target parent “${targetParent}” does not exist or is closed.`), { code: 'parent-missing' });
+        }
+        const visited = new Set([agentId]);
+        let cursor = parentRecord;
+        while (cursor) {
+          if (visited.has(cursor.agentId)) {
+            throw Object.assign(new Error('Cannot reparent a subagent under one of its own descendants.'), { code: 'reparent-cycle' });
+          }
+          visited.add(cursor.agentId);
+          cursor = cursor.parentAgentId ? this.get(cursor.parentAgentId) : undefined;
+        }
+        record.parentAgentId = targetParent;
+      } else {
+        delete record.parentAgentId;
+      }
+      record.updatedAt = new Date().toISOString();
+      this.db.prepare('UPDATE agents SET body=? WHERE id=?').run(JSON.stringify(record), agentId);
+      this.db.exec('COMMIT');
+      this.touched(agentId);
+      return record;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  transferAgentsToOwner(agentIds, newOwnerId) {
+    const ids = [...new Set((Array.isArray(agentIds) ? agentIds : []).filter(id => typeof id === 'string' && id))];
+    if (!ids.length || typeof newOwnerId !== 'string' || !newOwnerId) return { moved: [] };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const movingSet = new Set(ids);
+      const usedNames = new Set(
+        this.db.prepare('SELECT id, name FROM agents WHERE owner=?').all(newOwnerId)
+          .filter(row => !movingSet.has(row.id))
+          .map(row => row.name),
+      );
+      const moved = [];
+      const nowIso = new Date().toISOString();
+      for (const id of ids) {
+        const row = this.db.prepare('SELECT owner, name, body FROM agents WHERE id=?').get(id);
+        if (!row) continue;
+        const record = JSON.parse(row.body);
+        const oldOwnerId = row.owner;
+        const oldName = row.name;
+        let nextName = oldName;
+        if (usedNames.has(nextName)) {
+          const base = oldName.replace(/\d+$/u, '') || oldName;
+          let seq = 1;
+          while (usedNames.has(`${base}${seq}`)) seq += 1;
+          nextName = `${base}${seq}`;
+        }
+        usedNames.add(nextName);
+        record.ownerId = newOwnerId;
+        record.name = nextName;
+        record.updatedAt = nowIso;
+        this.db.prepare('UPDATE agents SET owner=?, name=?, body=? WHERE id=?')
+          .run(newOwnerId, nextName, JSON.stringify(record), id);
+        this.db.prepare('UPDATE supplements SET owner=? WHERE agent=?').run(newOwnerId, id);
+        this.db.prepare('UPDATE submissions SET owner=? WHERE agent=?').run(newOwnerId, id);
+        this.db.prepare('UPDATE report_bodies SET owner=? WHERE agent=?').run(newOwnerId, id);
+        this.db.prepare('UPDATE OR IGNORE task_keys SET owner=? WHERE agent=?').run(newOwnerId, id);
+        this.db.prepare('DELETE FROM task_keys WHERE agent=? AND owner<>?').run(id, newOwnerId);
+        moved.push({ agentId: id, oldOwnerId, newOwnerId, oldName, name: nextName });
+      }
+      this.db.exec('COMMIT');
+      for (const item of moved) this.touched(item.agentId);
+      return { moved };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  transferOwnerTeamAssets(oldOwnerIds, newRootOwnerId) {
+    const owners = [...new Set((Array.isArray(oldOwnerIds) ? oldOwnerIds : []).filter(id => typeof id === 'string' && id && id !== newRootOwnerId))];
+    if (!owners.length || typeof newRootOwnerId !== 'string' || !newRootOwnerId) return { boardMoved: 0, stubsMoved: 0 };
+    this.db.exec('BEGIN IMMEDIATE');
+    let boardMoved = 0;
+    let stubsMoved = 0;
+    try {
+      for (const oldOwner of owners) {
+        boardMoved += this.db.prepare('UPDATE team_board_messages SET rootOwner=? WHERE rootOwner=?')
+          .run(newRootOwnerId, oldOwner).changes;
+        const stubs = this.db.prepare('SELECT * FROM team_agent_stubs WHERE rootOwner=? OR owner=? ORDER BY closedAt DESC')
+          .all(oldOwner, oldOwner);
+        for (const stub of stubs) {
+          const conflict = this.db.prepare('SELECT agentId, closedAt FROM team_agent_stubs WHERE rootOwner=? AND name=? AND agentId<>?')
+            .get(newRootOwnerId, stub.name, stub.agentId);
+          if (conflict) {
+            if (String(conflict.closedAt ?? '') >= String(stub.closedAt ?? '')) {
+              this.db.prepare('DELETE FROM team_agent_stubs WHERE agentId=?').run(stub.agentId);
+              continue;
+            }
+            this.db.prepare('DELETE FROM team_agent_stubs WHERE agentId=?').run(conflict.agentId);
+          }
+          stubsMoved += this.db.prepare('UPDATE team_agent_stubs SET rootOwner=?, owner=? WHERE agentId=?')
+            .run(newRootOwnerId, newRootOwnerId, stub.agentId).changes;
+        }
+        this.db.prepare('UPDATE OR IGNORE task_keys SET owner=? WHERE owner=?').run(newRootOwnerId, oldOwner);
+        this.db.prepare('UPDATE report_bodies SET owner=? WHERE owner=?').run(newRootOwnerId, oldOwner);
+      }
+      this.db.exec('COMMIT');
+      this.dropProjections();
+      return { boardMoved, stubsMoved };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /**
+   * Safe background sweep of expired receipts/stubs and settled debt-free zombie agents
+   * whose retention window has elapsed.
+   */
+  gcStaleAgents({
+    onceRetentionMs = 86400000,
+    idleRetentionMs = 43200000,
+    nowMs = Date.now(),
+  } = {}) {
+    this.pruneExpiredTaskKeys();
+    const removed = [];
+    const all = this.list();
+    for (const record of all) {
+      if (!record || record.cleanupRosterTicket) continue;
+      const state = record.state;
+      if (!['idle', 'completed', 'failed', 'cancelled'].includes(state)) continue;
+      if (this.childrenOf(record.agentId).length > 0) continue;
+      const hold = this.autoCleanupHold(record.agentId);
+      if (hold.pending > 0 || hold.blocked > 0) continue;
+      if ((record.observation?.questions ?? []).some(q => q.state === 'pending')) continue;
+      if ((record.task?.reports ?? []).some(r => !['delivered', 'blocked'].includes(r.delivery?.state))) continue;
+      const stamp = Date.parse(record.task?.finishedAt ?? record.updatedAt ?? record.createdAt ?? '');
+      if (!Number.isFinite(stamp)) continue;
+      const threshold = record.lifetime === 'once' ? onceRetentionMs : idleRetentionMs;
+      if (nowMs - stamp < threshold) continue;
+      try {
+        this.remove(record, { deliveredReceipt: true });
+        removed.push({ agentId: record.agentId, ownerId: record.ownerId, name: record.name, target: record.target ?? 'dsh' });
+      } catch { /* busy reader retries on next sweep */ }
+    }
+    return removed;
+  }
+
   close() { this.db.close(); }
 }

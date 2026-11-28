@@ -376,8 +376,13 @@ export async function callCodexOwner(threadId, toolName, args, options = {}) {
   }
   if (rpcEnabled && toolName === 'send_message_to_thread' && typeof args?.prompt === 'string') {
     try {
-      await sendCodexTextNative(threadId, args.prompt, { request: nativeRequest });
-      return { accepted: true, threadId, via: 'native-rpc' };
+      // Keep the native turn/items in the receipt: a caller may only treat an exact
+      // userMessage marker as proof, never the bare RPC success.
+      const sent = await sendCodexTextNative(threadId, args.prompt, { request: nativeRequest });
+      // A definite not-sent/reschedule is not an accepted write. Preserve those
+      // flags so the caller can retry the same notice without treating it as unknown.
+      if (sent?.notSent === true || sent?.reschedule === true) return { ...sent, threadId, via: 'native-rpc' };
+      return { ...sent, accepted: true, threadId, via: 'native-rpc' };
     } catch (error) {
       const { discoveryReason, transportAdmissionFailed } = error ?? {};
       const canFallBack = discoveryReason === 'no-match' || (discoveryReason === undefined && transportAdmissionFailed !== true);
@@ -392,12 +397,27 @@ export async function callCodexOwner(threadId, toolName, args, options = {}) {
 /** Summary turns for an owner chat without hydrating full history. */
 export async function readCodexOwnerTurns(threadId, params = {}, options = {}) {
   const nativeRequest = options.nativeRequest ?? requestCodexNative;
+  const { maxPages = 20, ...pageParams } = params;
+  if (!Number.isInteger(maxPages) || maxPages < 1) throw new TypeError('Codex turn pages must be a positive integer.');
+  const data = [];
+  const cursors = new Set();
+  let cursor = typeof pageParams.cursor === 'string' && pageParams.cursor ? pageParams.cursor : undefined;
+  let pageCount = 0;
+  let last;
   try {
-    return await listCodexTurnsNative(threadId, { ...params, request: nativeRequest });
+    do {
+      last = await listCodexTurnsNative(threadId, { ...pageParams, ...(cursor ? { cursor } : {}), request: nativeRequest });
+      data.push(...(last.data ?? []));
+      pageCount += 1;
+      cursor = typeof last.nextCursor === 'string' && last.nextCursor ? last.nextCursor : undefined;
+      if (cursor && cursors.has(cursor)) throw Object.assign(new Error('Codex repeated a turn-list pagination cursor.'), { code: 'codex-native-rpc-invalid-response' });
+      if (cursor) cursors.add(cursor);
+    } while (cursor && pageCount < maxPages);
   } catch (error) {
     if (isCodexThreadMissing(error)) throw codexThreadNotFound(threadId);
     throw error;
   }
+  return { ...last, data, nextCursor: cursor ?? null, pageCount, truncated: Boolean(cursor) };
 }
 
 /** Full items of one owner turn, used only after a summary has narrowed the search. */

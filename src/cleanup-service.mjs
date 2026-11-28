@@ -39,9 +39,12 @@ export async function defaultAdapters(config) {
   const dsh=createDshCleanup(config),desktop=createDesktopCleanup(config);
   return {dsh,roster:createRosterCleanup(config,{dsh,desktop}),files:createFileCleanup(config,{dsh})};
 }
-async function settings(config) {
-  return {file:await realpath(config.configFile),profile:config.profile??null,state:path.resolve(config.stateDirectory),
-    dsh:await directoryIdentity(config.dshDataRoot),once:config.onceTerminalRetentionMs,idle:config.agentIdleRetentionMs,logs:config.diagnosticRetentionMs,
+async function settings(config, providers=names) {
+  let dsh=null;
+  try { dsh=await directoryIdentity(config.dshDataRoot); }
+  catch(e) { if(providers.includes('dsh') || e.code!=='ENOENT') throw e; }
+  return {file:await realpath(config.configFile).catch(()=>path.resolve(config.configFile)),profile:config.profile??null,state:path.resolve(config.stateDirectory),
+    dsh,once:config.onceTerminalRetentionMs,idle:config.agentIdleRetentionMs,logs:config.diagnosticRetentionMs,
     rulesVersion:1,codexAutoCleanup:config.codexAutoCleanup!==false,graceMs:config.cleanupGraceMs??86400000};
 }
 function verifySnapshot(snapshot) {
@@ -69,12 +72,12 @@ export function createCleanupService(config, adapters) {
       if(Number.isFinite(i.bytes)) row.bytes+=i.bytes; else row.unknownSize++;
       if(row.samples.length<3) row.samples.push(i.name??i.id);
     }
-    const body={version:1,createdAt:new Date().toISOString(),config:await settings(config),providers,coverage,summary,items};
+    const body={version:1,createdAt:new Date().toISOString(),config:await settings(config,providers),providers,coverage,summary,items};
     return {...body,hash:snapshotDigest(body)};
   }
   async function approve(snapshot,decisions) {
     verifySnapshot(snapshot);
-    if(decisions.snapshot!==snapshot.hash || digest(snapshot.config)!==digest(await settings(config))) throw new Error('Approval targets a different snapshot or configuration.');
+    if(decisions.snapshot!==snapshot.hash || digest(snapshot.config)!==digest(await settings(config,snapshot.providers))) throw new Error('Approval targets a different snapshot or configuration.');
     if(!['B','hold'].includes(decisions.remaining)) throw new Error('Explicitly choose B (normal rules) or hold for remaining inventory.');
     if(Object.values(snapshot.coverage).some(c=>!c.complete)) throw new Error('Incomplete inventory may not be activated.');
     const first=new Set(decisions.first??[]),keep=new Set(decisions.keep??[]);
@@ -146,7 +149,7 @@ export function createCleanupService(config, adapters) {
     if(value && (config.agentAutoCleanup!==true || config.cleanupConfigurationError)) throw new Error('Set agentAutoCleanup=true in the approved configuration before enabling.');
     if(value) {
       const binding=await readBinding(config);
-      if(digest(binding.settings)!==digest(await settings(config)))throw new Error('Rules differ from the approved activation.');
+      if(digest(binding.settings)!==digest(await settings(config,binding.providers)))throw new Error('Rules differ from the approved activation.');
       const pending=await authorities(l=>l.info.activated ? null : l.inventoryKeys());
       if(Object.values(pending).some(Boolean)) {
         const current=await preview(binding.providers);
@@ -166,9 +169,56 @@ export function createCleanupService(config, adapters) {
       throw error;
     }
   }
+  async function autoExecuteRules({ diagnosticsOnly = false, limit = Infinity, authorized = async () => true } = {}) {
+    const providers = diagnosticsOnly ? ['files'] : ['roster', 'files'];
+    const batch = await preview(providers, { maintenance: false, diagnosticsOnly });
+    const results = [];
+    for (const i of batch.items) {
+      if (results.length >= limit) break;
+      if (i.provider === 'roster' && i.hasDsh === true) continue;
+      if (i.kind === 'worktree') continue;
+      if (!batch.coverage[i.provider]?.complete) continue;
+      if (i.maintenanceOnly || i.running !== false || !i.eligible) continue;
+      if (config.codexAutoCleanup === false && i.target === 'codex-desktop') continue;
+      const adapter = adapters[i.provider];
+      let current;
+      try { current = await adapter.inspect(i); } catch { continue; }
+      if (current.running !== false || current.eligible !== true || !current.activityVersion || fingerprint(current) !== i.fingerprint) {
+        continue;
+      }
+      let externalGateOpen = false;
+      const revalidate = async () => {
+        externalGateOpen = await authorized(current);
+        return externalGateOpen;
+      };
+      const canDelete = () => externalGateOpen;
+      try {
+        if (!(await revalidate())) continue;
+        const operationToken = randomUUID();
+        const outcome = await adapter.remove(current, {
+          mode: 'rules',
+          observedSince: 0,
+          revalidate,
+          canDelete,
+          operationToken,
+        });
+        results.push({ key: i.key, ...outcome });
+      } catch (e) {
+        results.push({ key: i.key, removed: false, reason: e.message });
+      }
+    }
+    return { items: results, autoMode: true, moreDiagnostics: batch.coverage.files?.moreDiagnostics === true };
+  }
   async function execute(mode,{snapshot,review,readWorktreeReview,worktreeReview,diagnosticsOnly=false,limit=Infinity,authorized=async()=>true}={}) {
     if(config.agentAutoCleanup!==true || config.cleanupConfigurationError) return {enabled:false,items:[]};
-    const binding=await readBinding(config);
+    let binding;
+    try { binding=await readBinding(config); }
+    catch(e) {
+      if(e.code==='ENOENT' && mode==='rules') {
+        return autoExecuteRules({diagnosticsOnly,limit,authorized});
+      }
+      throw e;
+    }
     if(mode==='first'){
       verifySnapshot(snapshot);
       if(binding.snapshot!==snapshot.hash || binding.approval!==review) throw new Error('First-batch approval digest mismatch');
@@ -296,11 +346,20 @@ export function createCleanupService(config, adapters) {
       }
       return status;
     },
-    monitorState:()=>authorities(l=>{
-      const ack=l.acknowledgement();
-      if(ack?.generation!==l.info.generation || ack.pid!==process.pid)l.acknowledge();
-      return !!l.info.enabled;
-    },true,{tolerateUnavailable:true}),
+    monitorState:async()=>{
+      try {
+        return await authorities(l=>{
+          const ack=l.acknowledgement();
+          if(ack?.generation!==l.info.generation || ack.pid!==process.pid)l.acknowledge();
+          return !!l.info.enabled;
+        },true,{tolerateUnavailable:true});
+      } catch(e) {
+        if(e.code==='ENOENT') {
+          return {auto: config.agentAutoCleanup===true && !config.cleanupConfigurationError};
+        }
+        throw e;
+      }
+    },
     async restore(ticket) {
       const binding=await readBinding(config);
       for(const [scope,id] of Object.entries(binding.ids)) {

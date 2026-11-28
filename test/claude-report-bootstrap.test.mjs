@@ -3,10 +3,12 @@
 // monitor is discarded so the next call rebuilds instead of hanging on it.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { mayRetry, READ_ONLY_TOOLS, startColdStartBridge } from '../src/claude-report-bootstrap.mjs';
+import { readReportStatus } from '../src/report-endpoint.mjs';
 
 const config = { configFile: 'D:\\c\\config.json', stateDirectory: 'D:\\c\\state' };
 const TOOLS = [{ name: 'futureaide_status', inputSchema: { type: 'object' } },
@@ -45,7 +47,7 @@ async function bridgeWith(options = {}) {
     load: async () => config,
     storeFor: () => store,
     status: options.status ?? (async () => ({ ready: true })),
-    ensure: async () => { events.push('ensure'); return true; },
+    ensure: async () => { events.push('ensure'); return options.ensure ? options.ensure() : true; },
     connect: async () => { connects += 1; return remotes[Math.min(connects, remotes.length) - 1].client; },
     log: message => events.push(`log:${message}`),
     waitMs: options.waitMs ?? 60, pollMs: 0,
@@ -74,6 +76,96 @@ test('a healthy service is bridged without starting anything', async () => {
     const result = await client.callTool({ name: 'ask_parent', arguments: { message: 'hi' } });
     assert.notEqual(result.isError, true);
     assert.deepEqual(remotes[0].calls.map(call => call.name), ['ask_parent']);
+  } finally { await close(); await bridge.close(); }
+});
+
+test('a single slow health response keeps the live client and forwards a write once', async () => {
+  let slow = false;
+  const budgets = [];
+  const { bridge, remotes, events, connects } = await bridgeWith({
+    status: options => {
+      budgets.push(options.timeoutMs);
+      return readReportStatus({ ...options, fetchImpl: async (_, { signal }) => {
+        if (slow) {
+          slow = false;
+          await new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+        }
+        return Response.json({ ok: true, roster: 'roster-1' });
+      } });
+    },
+  });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    budgets.length = 0;
+    slow = true;
+    const answer = await client.callTool({ name: 'ask_parent', arguments: { message: 'once' } });
+    assert.notEqual(answer.isError, true);
+    assert.deepEqual(budgets, [undefined, 60], 'the confirmation uses the remaining 60 ms wait budget');
+    assert.deepEqual(remotes[0].calls.map(call => call.name), ['ask_parent']);
+    assert.equal(connects(), 1);
+    assert.equal(events.includes('ensure'), false);
+  } finally { await close(); await bridge.close(); }
+});
+
+test('the confirmation can wait for a 4.8-second response without waking the monitor', async () => {
+  const budgets = [];
+  const { bridge, events } = await bridgeWith({
+    waitMs: 10000,
+    status: async options => {
+      budgets.push(options.timeoutMs);
+      if (budgets.length === 1) return { ready: false, reason: { code: 'report-service-health-timeout' } };
+      if (budgets.length !== 2) return { ready: true };
+      return readReportStatus({ ...options, fetchImpl: async (_, { signal }) => {
+        await delay(4813, undefined, { signal });
+        return Response.json({ ok: true, roster: 'roster-1' });
+      } });
+    },
+  });
+  try {
+    assert.equal(bridge.ready, true);
+    assert.deepEqual(budgets.slice(0, 2), [undefined, 5000]);
+    assert.equal(events.includes('ensure'), false);
+  } finally { await bridge.close(); }
+});
+
+test('only an explicit timeout gets one confirmation before asking for the monitor', async () => {
+  for (const [reason, expectedChecks] of [
+    ['report-service-health-timeout', 2],
+    ['report-service-connect-failed', 1],
+    ['report-service-foreign-roster', 1],
+  ]) {
+    let probes = 0, atEnsure;
+    const { bridge } = await bridgeWith({
+      status: async () => {
+        probes++;
+        return atEnsure === undefined ? { ready: false, reason: { code: reason } } : { ready: true };
+      },
+      ensure: () => { atEnsure = probes; return true; },
+    });
+    try {
+      assert.equal(bridge.ready, true);
+      assert.equal(atEnsure, expectedChecks, reason);
+    } finally { await bridge.close(); }
+  }
+});
+
+test('a successful health check after waking the monitor is used immediately', async () => {
+  let replies;
+  const { bridge, events, remotes } = await bridgeWith({
+    status: async () => {
+      if (!replies) return { ready: true };
+      assert.ok(replies.length, 'the successful check should finish preparation');
+      return replies.shift();
+    },
+  });
+  const { client, close } = await roundTrip(bridge.server);
+  try {
+    replies = [{ ready: false, reason: { code: 'report-service-connect-failed' } }, { ready: true }];
+    const answer = await client.callTool({ name: 'ask_parent', arguments: { message: 'once' } });
+    assert.notEqual(answer.isError, true);
+    assert.equal(replies.length, 0);
+    assert.equal(events.filter(event => event === 'ensure').length, 1);
+    assert.equal(remotes[0].calls.length, 1);
   } finally { await close(); await bridge.close(); }
 });
 
@@ -316,63 +408,4 @@ test('a bridge without configuration reports that instead of serving silence', a
     const result = await client.callTool({ name: 'futureaide_status', arguments: {} });
     assert.equal(JSON.parse(result.content[0].text).error.code, 'configuration-unavailable');
   } finally { await close(); await bridge.close(); }
-});
-
-test('feedback lost reply is never replayed and tells secretary to check inbox', async () => {
-  const dead = remote({ tools: [{ name: 'futureaide_feedback', inputSchema: { type: 'object' } }], onCall: async () => { throw Error('lost after write'); } });
-  const { bridge } = await bridgeWith({ remotes: [dead] });
-  const { client, close } = await roundTrip(bridge.server);
-  try {
-    const result = await client.callTool({ name: 'futureaide_feedback', arguments: { kind: 'problem', message: 'lost receipt' } });
-    assert.equal(dead.calls.length, 1);
-    assert.match(result.content[0].text, /write-outcome-unknown/);
-    assert.match(result.content[0].text, /secretary.*inbox.*do not resend/i);
-  } finally { await close(); await bridge.close(); }
-});
-import { mkdtemp } from 'node:fs/promises';
-import os from 'node:os';
-import path from 'node:path';
-import { submitFeedback } from '../src/feedback-client.mjs';
-import { pendingFeedback } from '../src/feedback-inbox.mjs';
-
-test('feedback actually saved before reply loss remains one write', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'feedback-bootstrap-'));
-  const configFile = path.join(root, 'config.json');
-  const dead = remote({ tools: [{ name: 'futureaide_feedback', inputSchema: { type: 'object' } }], onCall: async () => {
-    const saved = await submitFeedback({kind:'problem',message:'response lost after successful save'}, {source:'claude-desktop',caller:'claude-desktop',target:'plugin',name:null,error:null}, {configFile});
-    assert.equal(saved.saved, true);
-    throw Error('connection closed after commit');
-  } });
-  const { bridge } = await bridgeWith({ remotes: [dead] });
-  const { client, close } = await roundTrip(bridge.server);
-  try {
-    const response = await client.callTool({name:'futureaide_feedback',arguments:{kind:'problem',message:'response lost after successful save'}});
-    assert.equal(dead.calls.length, 1);
-    assert.match(response.content[0].text, /write-outcome-unknown/);
-    assert.match(response.content[0].text, /secretary.*inbox.*do not resend/i);
-    const rows = pendingFeedback(configFile); assert.equal(rows.length,1); assert.equal(rows[0].count,1); assert.equal(rows[0].occurrences.length,1);
-    assert.equal(pendingFeedback(configFile)[0].count,1);
-  } finally { await close(); await bridge.close(); }
-});
-
-test('a timed out feedback does not close the shared client or interrupt another write', async () => {
-  let completeFeedback;
-  const slow = new Promise(resolve => { completeFeedback = resolve; });
-  let closed = 0;
-  const remoteServer = remote({ tools: [{name:'futureaide_feedback',inputSchema:{type:'object'}},{name:'futureaide_run_agent',inputSchema:{type:'object'}}], onCall: async request => request.name === 'futureaide_feedback' ? slow : {content:[{type:'text',text:'{"accepted":true}'}]} });
-  remoteServer.client.close = async () => { closed++; };
-  const { bridge } = await bridgeWith({remotes:[remoteServer]});
-  const { client, close } = await roundTrip(bridge.server);
-  try {
-    const pending = client.callTool({name:'futureaide_feedback',arguments:{kind:'problem',message:'wait'}});
-    await new Promise(resolve => setTimeout(resolve,30));
-    const dispatch = await client.callTool({name:'futureaide_run_agent',arguments:{}});
-    assert.equal(JSON.parse(dispatch.content[0].text).accepted,true);
-    const reply = await pending;
-    assert.match(reply.content[0].text,/write-outcome-unknown/); assert.equal(closed,0);
-    completeFeedback({content:[{type:'text',text:'{"saved":true}'}]});
-    await new Promise(resolve => setTimeout(resolve,20)); assert.equal(closed,0);
-    const again = await client.callTool({name:'futureaide_run_agent',arguments:{}});
-    assert.equal(JSON.parse(again.content[0].text).accepted,true);
-  } finally { completeFeedback({}); await close(); await bridge.close(); }
 });

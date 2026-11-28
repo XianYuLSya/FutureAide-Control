@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
 export const RENDERER_DISCOVERY_BUDGET_MS = 10_000;
 const discoveryMessages = {
@@ -67,18 +69,41 @@ $rows = @(foreach ($candidate in $candidates) {
 ConvertTo-Json -InputObject @($rows) -Compress`;
 }
 
+const runFile = promisify(execFile);
+const queryScript = fileURLToPath(new URL('./codex-renderer-query.js', import.meta.url));
+
 async function queryEndpoints(cached, timeout) {
   if (process.platform !== 'win32') throw rendererDiscoveryError('list-failed');
-  const shell = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  return new Promise((resolve, reject) => {
-    execFile(shell, ['-NoProfile', '-NonInteractive', '-Command', rendererQuery(cached)], {
-      timeout, windowsHide: true, encoding: 'utf8', maxBuffer: 65536,
-    }, (error, stdout) => {
-      if (error) return reject(rendererDiscoveryError(error.killed && error.signal === 'SIGTERM' ? 'timeout' : 'list-failed'));
-      try { resolve(JSON.parse(stdout.trim())); }
-      catch { reject(rendererDiscoveryError('list-failed')); }
+  const system = path.win32.join(process.env.SystemRoot || 'C:\\Windows', 'System32');
+  const deadline = performance.now() + timeout;
+  async function run(program, args) {
+    const remaining = Math.ceil(deadline - performance.now());
+    if (remaining <= 0) throw rendererDiscoveryError('timeout');
+    const { stdout } = await runFile(path.win32.join(system, program), args, {
+      timeout: remaining, windowsHide: true, encoding: 'utf8', maxBuffer: 65536,
     });
-  });
+    return stdout.trim();
+  }
+  try {
+    const args = ['//NoLogo', '//E:JScript', queryScript, String(process.pid)];
+    if (cached) args.push(String(cached.pid));
+    const lines = (await run('cscript.exe', args)).split(/\r?\n/);
+    if (lines.pop() === 'OK') {
+      return lines.map(line => {
+        const [pid, port, started, listenerStarted, debugPort] = line.split('\t');
+        return { pid: Number(pid), port: Number(port), started, listenerStarted, debugPort: Number(debugPort) || null };
+      });
+    }
+  } catch (error) {
+    if (error.killed || error.discoveryReason === 'timeout') throw rendererDiscoveryError('timeout');
+  }
+  // Windows Script Host can be disabled by local policy. Retain the original
+  // provider and spend only the time left on this discovery attempt.
+  try {
+    return JSON.parse(await run('WindowsPowerShell/v1.0/powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', rendererQuery(cached)]));
+  } catch (error) {
+    throw rendererDiscoveryError(error.killed || error.discoveryReason === 'timeout' ? 'timeout' : 'list-failed');
+  }
 }
 
 async function readPages(port, timeout, debugPort) {

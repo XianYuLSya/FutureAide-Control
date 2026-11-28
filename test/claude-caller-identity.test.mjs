@@ -13,7 +13,7 @@ import {
 const domain = `win32:${hostname().toLowerCase()}`;
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
 const recordFor = (pid, overrides = {}) => ({
-  pid, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', entrypoint: 'claude-desktop',
+  pid, sessionId, cwd: 'D:\\Work\\demo-workspace', entrypoint: 'claude-desktop',
   pidDomain: domain, procStart: '134381970992798945', name: 'FutureAide 插件生命周期测试',
   messagingSocketPath: '\\\\.\\pipe\\LOCAL\\cc-msg-abc', ...overrides,
 });
@@ -161,7 +161,7 @@ test('a socket caller resolves through the TCP peer and reports how it was found
     // part of the decision.
     image: async pid => (pid === 50124 ? 'claude.exe' : null),
   });
-  assert.deepEqual(caller, { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow',
+  assert.deepEqual(caller, { pid: 50124, sessionId, cwd: 'D:\\Work\\demo-workspace',
     name: 'FutureAide 插件生命周期测试', procStart: '134381970992798945', via: 'pid',
     pidDomain: domain, recordFile: 'D:\\tmp\\claude-config\\sessions\\50124.json',
     directory: 'D:\\tmp\\claude-config\\sessions', socketPath: '\\\\.\\pipe\\local\\cc-msg-abc',

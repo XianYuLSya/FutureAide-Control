@@ -33,7 +33,7 @@ export async function load(url, context, nextLoad) {
     }
     const transport = new URL('./rpc-transport.mjs', import.meta.url).href;
     const source = `import { assemblyRequest } from ${JSON.stringify(transport)};\n`
-      + text.replace(marker, 'const nativeRpc = { request: assemblyRequest, close: () => {}, subscribeRecovery: () => () => {}, ensureProbe: () => {} };');
+      + text.replace(marker, 'const nativeRpc = { request: assemblyRequest, close: () => {} };');
     return { ...actual, format: 'module', source, shortCircuit: true };
   }
   return nextLoad(url, context);

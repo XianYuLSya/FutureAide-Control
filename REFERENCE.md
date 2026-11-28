@@ -1,131 +1,110 @@
-# FutureAide Control 详细说明
+# FutureAide Control 详细说明（v2.3.0）
 
-这里放 [README](README.md) 里没展开的细节。日常使用看 README 就够了。
+本文补充 [README.md](README.md) 未展开的底层机制、参数细节与运行边界。日常使用阅读 README 即可。
 
-## 模型选择
+## 1. 三端主对话核验与三极无头后端
 
-`model` 忽略大小写，先找完全相同的 ID，再选包含该片段的第一项。回执、`list` 和 `wait` 的 `actualModel` 显示解析出的完整 ID。找不到时，错误会列出可选 ID。
+### 调用方身份核验
+插件在每次工具调用时从传输层核验主对话身份（`antigravity`、`codex`、`claude-desktop` 或受管下级 `managed-cli`）与所属工作区目录，自动隔离不同会话的花名册，**绝不从工具参数接收工作区路径、会话 ID 或桥接凭据**。
 
-`effort` 可单传。每个新轮次先用显式强度，再查 `modelDefaultEfforts` 中完整模型 ID，最后取 `defaultEffort`。出厂 6.2 Astra 为 high，其余 max。create 指定的档位留给首次输入。运行中的 Codex 轮次沿用实际档，明确改档须等该轮结束。模型缺档取最近支持档，同距取低。
+### 四类可用执行目标（`target`）
 
-从未指定模型的名字，在下一次输入派出时读取目标应用的默认模型。正在执行的模型请求继续完成，失败任务不会自动重放。同一输入的后台恢复保留最初确定的模型和请求身份。DSH 原生下属的新建与复用仍按它自己的继承和显式选择规则。
+1. **`codex-cli`（默认主力无头后端）**
+   - 后台执行 `codex exec --json`（首轮）与 `codex exec resume`（后续轮次/答复续接），挂载当轮专属的极薄回调 MCP 通道。
+   - 子进程树纳入 Win32 Job Object（`KILL_ON_JOB_CLOSE`），取消、超时或监工退出时整树回收，不留孤儿命令。
+   - 从 JSON 事件流实时提取最新执行步骤（`lastStep`）与 Token 用量（`usage`）。
+2. **`claude-cli`（无头 Claude 后端）**
+   - 后台执行 `claude -p`，以 `--session-id` 初始化、`--resume` 续接同一会话。
+   - 权限固定使用 `--permission-mode auto --permission-prompts none`；仅读取 CLI 自身登录态（`claude auth status`），不读取桌面端凭据缓存。
+3. **`agy-cli`（无头 Antigravity 后端）**
+   - 后台执行反重力无头 CLI 轮次，复用同一套 `<50ms` 回调桥、Job Object 进程笼、Git `worktree` 隔离与 `cli-proxy` 出口门禁。
+4. **`codex-desktop`（按需桌面原生 RPC 后端）**
+   - 经 FAswitch 启动的 Codex 渲染进程调试端口调用原生 `thread/start`、`turn/start`、`turn/steer`、`turn/interrupt`、`thread/delete` RPC，不直读 Codex 私有 SQLite 或 rollout 文件。
 
-DSH 通过本版宿主桥把显式选择应用到该会话。工具提示更新宿主桥时，用本版安装流程同步 DSH 端后再派单。
+> **底层历史兼容（`dsh`）**：早期版本的 `dsh` 目标仅保留底层协议与存量记录只读兼容，不再用于常规新任务派发。
 
-## Codex Desktop 目标
+---
 
-调试端口是 FAswitch 启动时加的，Codex 自身不开，所以 Codex 要由 FAswitch 打开。
+## 2. 角色自动排号、模型选档与隔离分支
 
-插件经主渲染进程的本地调试端口发 `thread/start`、`turn/start`，和界面新建对话走同一个入口。后续发送、补充、打断、删除和观察也走这条 app-server RPC。插件不读 Codex 的数据库、thread history 或 rollout 文件，不读账号凭据，也不启动独立 CLI 或第二个 app-server。
+### `团队配置.md` 联动与自动排号
+在 `futureaide_run_agent` 或 `futureaide_create_agent` 中传入 `role`（如 `"后端"`、`"前端"`、`"团队长"`、`"调查员"`、`"秘书"`）：
+- 若省略 `name`，插件在当前主对话花名册内按角色自动递增排号（`后端1`、`后端2`……）；批量 `tasks` 派发时按顺序无碰撞分配。
+- 自动从 `~/.config/work-workflow/团队配置.md` 解析该角色对应的默认 `target`、`model`、`effort` 与 `lifetime`；调用时显式传入的字段优先级更高。
 
-- 已选模型的名字在 `turn/start` 传入完整模型和推理档位，其余名字由 Codex 决定。
-- `turn/steer` 只补充当前轮次。运行中换模型或档位会报错，等该轮结束后再发送。显式 `mode: "queue"` 不走 steer：当前轮结束后用 `turn/start` 单独开下一轮，第一条输入只有这一条。
-- 权限沿用 Codex 设置。
-- 标题等会话有内容后再用 `thread/name/set` 补上，失败最多重试 5 次，不影响任务。
-- 没有调试端口时，`status` 的 `codex-desktop` 项报 `codex-native-rpc-unavailable`。这时普通 Codex 对话调用 DSH 不受影响。
-- 取消会停下模型这一轮，但 Codex 已经启动的 shell 命令不会被结束。
+### 模型与思考强度（`model` / `effort`）
+- `model` 大小写不敏感，优先精确匹配完整模型 ID，其次匹配唯一或首个子串；无法匹配时返回可选模型列表，绝不静默退回默认模型。
+- `effort` 可单独传入；省略时依次读取角色默认、`config.json` 的 `modelDefaultEfforts[modelId]`、`defaultEffort`。模型不支持请求档位时自动收敛到最近支持档，并在 `detail: true` 下保留完整选档证据。
 
-## Claude CLI 目标
+### Git `worktree` 隔离与一键合入（`merge`）
+- 派单时设置 `worktree: true`，插件在项目 `.work/worktrees/<名字>-<短哈希>` 下创建独立 Git 工作树，将该成员的工作目录切换到隔离树内执行。
+- 验收通过后调用 `futureaide_team({ action: "merge", target: "后端1" })`，插件将隔离工作树中的新增/修改/删除变更合回主工作区，随后移除临时 `worktree` 目录并标记合入完成，精简回执返回 `{ action: "merge", ok: true, summary, mergedFiles }`。
 
-插件运行 `claude -p`，用 `--session-id` 开始会话，用 `--resume` 接续。进程可以脱离调用方的 MCP 连接继续执行。
+### 单次执行超时护栏（`timeout_minutes`）
+- `futureaide_run_agent`（及批量 `tasks` 单项）支持可选 `timeout_minutes`（整数 `1`–`240`），透传为任务级超时上限 `timeoutMinutes`。超时触发后自动终止对应进程笼并标记明确失败原因，防止异常死循环空烧额度。
 
-- **登录：** 只用 CLI 自己的登录，用 `claude auth status` 判断是否就绪。插件不读凭据文件，也不提取 Claude Desktop 的登录缓存。
-- **代理：** 插件不设置、不清除任何代理变量。FAswitch 把当前档案的代理写进 Claude 用户设置，CLI 自己加载。
-- **权限：** 固定用 `--permission-mode auto --permission-prompts none`。这两个参数不可用时报错，不会自动放宽。
-- **模型：** 省略 `model` 时由 CLI 选默认模型，`list`、`wait` 在 CLI 发出 `system/init` 后显示实际模型。支持档位按该模型的 CLI 能力目录确定，`actualEffort` 取执行业务输入的 worker 回读值。
-- **清理：** `once` 收尾和按名字 `delete` 都会停止受管进程、清理插件私有记录。Claude 自己保存的会话历史留在用户目录，删除回执标明 `nativeHistoryPolicy: "retain"`。
+---
 
-## 回报
+## 3. 回调契约、零轮询等待与忙时投递
 
-`report_parent` 要求按 Result / Changes / Verified / Not verified / Decisions 分段，控制在 300 词内，负责汇总的助手提交一份报告。`ask_parent` 要求写清要定的决定、选项和建议。
+### `<50ms` 回调桥与汇报契约
+- 受管成员通过 `ask_parent({ message })` 提交待拍板问题，通过 `report_parent({ message, final })` 提交阶段进展或正式终报（`final: true`）。
+- 普通对话文本或单轮自然结束**绝不**触发完成通知，只有 `report_parent(final: true)` 才代表正式交卷。
+- 存在未答复的 `ask_parent` 提问或尚在投递途中的答复时，无头 CLI 与 Codex 成员提前提交的 `final: true` 会被拦截退回，确保答复不落空。
+- 派单回执自带 `wakeCmd`（`futureaide-wait` CLI 命令）；主对话后台挂载该命令或调用 `futureaide_wait_agents({ taskKeys, barrier: "all" | "any" })` 即可实现零轮询事件唤醒。
 
-普通输出、轮次结束和任务树空闲都不产生回包。DSH 助手一轮结束却没有 final 报告时，插件在同一任务里提醒它一次，提醒后仍没有 final 就停在 `awaiting_report`。失败或取消的轮次不提醒。Codex 目标的补充走自己的持久队列，没有这个提醒。
+### 忙时 `mode` 与 `delivery` 状态说明
+- `mode` 支持省略、`"steer"`（插进当前活动轮）与 `"queue"`（排到当前轮结束后单独开下一轮）。
+- 无头 CLI（`codex-cli`、`claude-cli`、`agy-cli`）在运行中仅支持轮间排队，忙时显式传 `mode: "steer"` 会立即拒绝并返回 `mode-unsupported` 与 `supportedModes: ["queue"]`。
+- 当存在待答提问时，显式 `mode: "queue"` 只排入后续补充，绝不代答问题。
 
-顶层一轮结束不等于整项任务完成。只有顶层助手显式提交 final 报告，插件才在子孙执行和原生通知全部收齐后转发正文，并为一次性助手清理整棵受管树。下属向直接父级汇总，不直接报告给调用方。
+---
 
-助手提问后的答复这样送达：DSH 的 `ask_parent` 当场结束这一轮，答复开启下一轮；Codex 助手提问后可以接着干不依赖答复的部分，答复受理后直接送进它正在跑的那一轮，轮次已结束就开新一轮；Claude CLI 的一轮不能中途插话，答复在这一轮结束后送达。问题还没被回答，或答复已受理但还没送进会话时，Codex 和 Claude CLI 助手提交的 final 报告会被退回，工具结果告诉它先等答复，任务保持打开。任务已经以 final 封口后才来的回答不会再送给助手，`answer` 的回执会写明 `answer-not-delivered`。
+## 4. 极简输出视图与紧凑 Token 账单
 
-普通 Codex 聊天支持后台回包。当前桌面对原生 multi-agent v2 子代理调用者拒绝后台回包，遇到这种拒绝时插件显示 `native-callback-unavailable`，保留未送达的报告和原收件人，不再重复投递。
+为极致节省主对话上下文，所有管理类工具默认返回单行无缩进的精简 JSON（传 `detail: true` 可取回完整原始结构）：
 
-## 列表和查看
+- **紧凑耗时与 Token 账单（`usage`）**：当成员或事件记录了有效耗时（`durationSec > 0`）或 Token 数（`totalTokens > 0`）时，精简视图自动输出紧凑字符串，例如 `"usage": "18s · 14.2k tok"`（百万级自动格式化为 `"1.25M tok"`）；若尚无用量记录则完全省略该字段，零冗余字节。
+- **真实动作过滤与卡顿预警（`activity` / `stalled`）**：`futureaide_list_agents` 自动剥离 `"running"`、`"waiting"` 等无信息量的状态复读，仅保留真实工具/命令步骤（如 `"8s前 · shell:node --test"`）；运行轮次静默超过阈值时自动附带 `"stalled": true`。
+- **三级列表视角（`scope`）**：
+  - `"team"`（默认）：当前主对话的团队树（下属最多展示 30 行紧凑摘要，单行 ≤ 120 字节，超出计入 `{ more: n }`）。
+  - `"agent"`：聚焦单名成员的完整待答问题、最新报告、改动文件清单与上下级位置。
+  - `"all"`：按发起者会话分组展示全机活跃团队。
+- **超长报告分页读取**：若报告原文极长被摘要截断，可用 `futureaide_read_report({ task_key, submission_ref, offset?, limit? })` 按 `nextOffset` 逐页读取完整原文。
 
-看全队用一次 `futureaide_list_agents`：默认只列活跃名字，`failed`、`cancelled`、`cleanup_failed` 等历史不出现；传 `name` 可按名字读一条（包括不活跃记录），传 `state` 列某一状态（`active` 等同默认）。过滤只读名字/状态元数据，不读整棵树，也不跨调用方。有下属的名字返回 `team`，后代每人一行，包含相对根的路径、状态、运行时活动和文件数，文件数封顶时显示 `12+`。最多 30 行，超出以 `{more:n}` 收尾。两个成员同名时第二个起用 `名字#2`、`名字#3`。宿主读不到树时条目带 `treeError` 且没有 `team`，这表示未知，不表示没有下属。
+---
 
-看某个成员的对话用 `futureaide_inspect_agent({name, node})`。`node` 取 `team` 里的路径或成员名，路径优先，被省略成 `…` 的路径按前缀匹配。同名命中多个成员时以 `node-ambiguous` 拒绝并给出可用路径。
+## 5. 团队黑板、整队治理与代理防跑偏
 
-五个读工具和 `futureaide_create_agent` 默认返回精简结构，`detail: true` 时返回完整内容。
+### 团队会议室黑板（`futureaide_board_post` / `futureaide_board_read`）
+- 同一项目团队共享会议室消息流（`seq` 单调递增）。
+- 发言中带 `@成员名` 或 `@团队长1/后端2` 时，插件自动解析跨级路径：对空闲成员发起新轮唤醒，对已完成退出的成员按原会话历史复活续跑，并在精简回执的 `woken` 数组中列出实际唤醒名单。
 
-文件观察优先采用助手原生文件工具的成功结果。shell 写入靠任务前后的 `git status` 比对发现，这类条目标为 `attribution: unconfirmed`：同一时间别的进程或助手的改动也会出现，gitignore 覆盖的路径和非 git 目录看不到。覆盖不全时工具会说明，不把共享项目的全部改动归给某个助手。
+### 整队治理（`futureaide_team`）七大动作
 
-`wait_agents` 遇到已自动退出的名字会返回 `notListed`，完成情况以已收到的结果为准。
+| `action` | 关键参数 | 作用说明 |
+|---|---|---|
+| `"adopt"` | `target?: "auto" \| 名字`, `parent?`, `message?` | 接班收编同项目下旧会话遗留的整支队伍，或将指定散人拉入当前团队 |
+| `"kick"` | `target`, `keep_children?: boolean` | 移除成员；默认 `keep_children: true` 保留其下属并自动提拔挂到上级名下，`false` 则连同整棵子树一并终止 |
+| `"reparent"` | `target`, `parent: 名字 \| null` | 调整成员汇报上级（传 `null` 挂回 Boss 根下） |
+| `"resume"` | `target`, `message?` | 在 FAswitch 切号、网络闪断或卡顿后，带着原上下文原地断点续跑 |
+| `"strays"` | — | 列出父节点已关闭/缺失或原主会话失联超时形成的无主散人 |
+| `"sweep"` | — | 安全清扫当前处于非运行态的无主散人记录 |
+| `"merge"` | `target` | 将成员隔离 `worktree` 的文件变更合回主工作区并清理临时工作树 |
 
-## 生命周期细节
+### CLI 端口代理门禁（`futureaide_cli_proxy`）
+- 支持对 `"codex-cli"`、`"claude-cli"`、`"agy-cli"` 或 `"all"` 查看（`status`）或绑定（`bind`）代理规格：端口号（如 `17913`）、完整代理 URL（`http://` / `socks5://`）、`"faswitch"`（自动跟随 FAswitch 激活档案并校验 `profile_id` 一致性）或 `"direct"`（显式直连）。
+- 只要解析出代理地址，每次拉起无头 CLI 前都会执行本地 TCP 连通性探针，**探针不通或档案错位立即拒绝启动（Fail-Closed）**，绝不退回裸奔直连。
 
-**一次性：** 一项任务里可以多次提问、回答和报告，非 final 报告不会结束任务。成功的 final 报告确认送达且整树收尾后，插件关闭实例、清理私有记录并移出名单。DSH 和 Codex 目标清理受管会话数据，Claude CLI 保留原生历史。取消只更新可见状态，不自动通知或清理。已提交的报告继续交付，助手可以按名字删除。清理失败仍显示在列表里。
+### 本地只读状态看板（可选）
+`config.json` 中将 `teamBoard` 设为 `true` 并重启监工后，可在本地访问 `http://127.0.0.1:<监工端口>/board` 查看只读花名册状态页；默认关闭时不加载任何页面资源。
 
-**长期：** final 报告交付后回到空闲，下一项任务用原上下文。没有 final 时显示 `awaiting_report`，同名发送继续原任务。final 已提交但尚未交付时不接受追加消息。取消或失败后，没有待投报告的长期助手可以在同一会话开始新任务。主动删除会同时丢弃尚未交付的报告。
+---
 
-**失败：** 模型请求失败时，列表和查看结果里的 `error.source: "model"` 给出错误代码、可用的 HTTP 状态和简短提示。任务进入确定的失败终态时，插件给直接上级发一次失败通知。重试中不发，上级自己取消也不发。模型任务不会自动重试。新任务或后续成功会清除展示中的旧失败。
+## 6. `Transport closed` 恢复与维护接口
 
-**取消：** 取消请求优先送到所属助手，不用等普通监工释放操作锁。`accepted` 表示宿主已接受，用列表确认任务树停止。取消不会撤销已经发生的操作。自动清理已经开始时，取消返回未接受。
+### `Transport closed`
+当 Codex 客户端的 MCP 管道意外断开并报 `Transport closed` 时，可在资源管理器双击运行 [recover.cmd](recover.cmd)（或先运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.ps1 -Check` 只读检查），重启客户端连接后在原聊天调用 `futureaide_status({})` 与 `futureaide_list_agents({})` 即可无缝接回在途名单。
 
-## 监工和持久化
-
-一个共享监工进程推进各名字的任务。任务树静止、没有执行中或排队输入的等待助手显示 `monitor: sleeping`，发送或回答会唤醒它。监听器通常在宿主持久记录变化时唤醒，约每 30 秒补扫一次待投递的报告和问题。所有插件连接和监听器都关闭时，下次连接恢复检查。
-
-桌面目标的首次派发、忙时补充、取消和删除都是持久排队意图：受理后不重发，执行者或监听器中断后按原 `requestId` 恢复，已发出的不重放。
-
-任务回执、问题、答案和待回包结果都持久保存。连接恢复后按原任务继续，不新建助手顶替。发送情况不明时先核对原生证据，回包情况不明时核对原聊天，不盲目发送第二份。
-
-`delivery_pending` 表示工作已完成、结果等待交付，这时一次性会话尚未删除。已保存且具备交付条件的显式报告，可以在 DSH 暂时离线时继续交付。
-
-## 安装范围
-
-`install.ps1` 准备三样东西：Codex 插件、本机 DSH 主机桥接、Claude 用户级插件。
-
-安装器在 `.runtime/claude-marketplace` 生成只含清单、MCP 配置和技能的薄插件，运行入口用绝对路径指向克隆目录，再执行 `claude plugin marketplace add … --scope user` 和 `claude plugin install futureaide-control@futureaide --scope user`。注册是用户级的，Claude 在任何项目的会话都能用，不用为每个项目写 `.mcp.json`。
-
-- 找不到 `claude` 或注册失败不影响 Codex 安装，返回值里 `claude.registered` 是 `false` 并带原因。
-- 桌面端自带的 `claude.exe` 不在 PATH 时，用 `-ClaudeCli <path>` 指定。不想改 Claude 环境时用 `-SkipClaude`。
-- 自定义 DSH 数据目录用 `-DshHome 'E:\DSH-data'`，重装会保留已保存的选择。
-- 私有配置和状态在克隆目录的 `.runtime/` 里，这个目录的位置要保持不变。
-
-Claude 侧的桥接声明了 `tools.listChanged`：服务端的工具名或 schema 变化后，会向已打开的会话发 `tools/list_changed`，比对失败只记日志，不影响工具调用。
-
-## 升级
-
-从 0.4 升级到 0.5 前，先让运行中的任务完成。需要保留在途任务升级时，要按原任务身份切换后台 `scoped-worker`。只重新加载 MCP 不会替换已经启动的监工进程，也不要重新派发任务来代替迁移。
-
-已加载的旧 MCP 模块在连接重新加载前仍走旧路径。
-
-## 配置
-
-宿主目标由 `target` 决定：`dsh`（默认）、`codex-desktop`、`claude-cli`。
-
-DSH 路径未指定实例时只读 DSH 的注册记录，默认数据目录是 `DSH_HOME` 或 `~/.dsh`。旧 FutureAide 应用的 shell、端口、启动日志和环境变量覆盖一律不用。手工维护配置里的 `target` 只能是 `dsh`，已有 `auto` 或 `futureaide` 配置会明确报错，安装器会生成固定的 DSH 配置。
-
-维护 CLI 默认用安装目录的 `.runtime/config.json`，`--config` 和配置环境变量可以显式选择其他配置。桌面桥接已绑定不同凭据或托管状态目录时，安装会报告冲突并保留原绑定，确定要迁移时才用 `desktop-host-install --rebind` 或 `connect-desktop.ps1 -Rebind`。
-
-## `Transport closed`
-
-每个聊天都有自己的调用连接和名单。一个聊天能用，不代表其他聊天的连接正常。工具直接返回 `Transport closed`，尤其 Codex 内置工具也失败时，要恢复 Codex 持有的连接。重新派发任务或只重启 DSH 不能代替这一步。
-
-[recover.cmd](recover.cmd) 会完整退出 Codex 及其后台进程再重新打开，保留原启动路径和参数，不删聊天、名单或项目文件，也不重启 DSH。它会中断正在执行的聊天，要在合适的时候用，不要在 Codex 自己的终端或工具里运行。
-
-只检查目标进程，不重启：
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\recover-codex.ps1 -Check
-```
-
-重新打开后，在每个受影响的聊天调用 `futureaide_status({})` 和 `futureaide_list_agents({})`，核对原名单再继续。
-
-运行进程清理工具时要保留存活 Codex 进程树内的工具。MCP 没有窗口、等待请求时不活动，都不表示已经没用。
-
-安装配置下，新启动的 MCP 进程会在 `.runtime/diagnostics/` 记录精简日志，包含进程、工具名和聊天身份，不含任务正文、结果或凭据。
-
-## 维护接口
-
-原生会话清理支持上述 DSH 版本的 JSONL 会话、项目索引和派生缓存，不支持的存储后端会返回清理失败。整树清理支持本机原生 one-shot 和 continuable 下属，外部托管的下属会明确报告不支持自动清理。
-
-显式 ID 的 CLI 仍可用于 DSH 维护，查看 `node src/cli.mjs --help`。需要这套 MCP 管理面时，在维护环境设置 `FUTUREAIDE_LEGACY_TOOLS=1`，它和默认名字工具面二选一。这里的 legacy 指维护接口，不表示仍支持旧 FutureAide 宿主。`src/cli.mjs list-agents` 也属于这套显式 ID 维护接口：它只按 workspace 走旧 DSH 会话 API，不接受 name/state 过滤，不是 MCP/stdio/Claude 的 `futureaide_list_agents`（后者走受管名单并提供轻量 name/state 过滤）。详见[旧版 CLI 与显式接口](skills/futureaide-control/references/legacy-workflows.md)。DSH 版本用的 slash 和 dot HTTP API 适配都保留，status 里的 `apiDialect: legacy` 只表示 slash 协议。
+### 维护接口
+`src/cli.mjs` 仍提供团队治理、黑板读写、反馈收件箱巡检（`feedback-pending`）与自动清理命令；早期显式会话 ID 维护接口默认隐藏，仅在维护环境显式设置 `FUTUREAIDE_LEGACY_TOOLS=1` 时启用，详见[旧版 CLI 与显式接口](skills/futureaide-control/references/legacy-workflows.md)。

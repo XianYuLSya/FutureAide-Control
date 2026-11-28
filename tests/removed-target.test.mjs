@@ -33,7 +33,7 @@ function dshFixture(calls) {
     async hostStatus() {
       calls.push('hostStatus');
       return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus',
-        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPromptV2', 'managedPromptReceipt'] };
+        'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] };
     },
     async managedCreate() { calls.push('managedCreate'); return { sessionId: 'never', modelRequestsStarted: 0 }; },
     async managedBeginTask() { calls.push('managedBeginTask'); return { treeProtocol: 1, reportProtocol: 1 }; },
@@ -54,7 +54,7 @@ async function fixture(records = [legacyRecord()]) {
     store,
     clientFactory: () => api,
     controlFactory: () => ({ async send() { calls.push('send'); return { accepted: true, afterSeq: 1 }; },
-      async wait() { return { state: 'running' }; }, async models() { return { default: { provider: 'fixture', model: 'dsh-model' }, groups: [{ id: 'fixture', models: [{ id: 'dsh-model', reasoningEfforts: ['max'] }] }] }; },
+      async wait() { return { state: 'running' }; }, async models() { return { default: {}, groups: [] }; },
       async selectModel() { return { accepted: true }; } }),
     callCodex: async (threadId, tool) => (tool === 'read_thread'
       ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } } : { accepted: true }),
@@ -68,7 +68,7 @@ async function fixture(records = [legacyRecord()]) {
 }
 
 test('the removed target is not one of the offered targets', () => {
-  assert.deepEqual([...TARGETS], ['dsh', 'codex-desktop', 'claude-cli']);
+  assert.deepEqual([...TARGETS], ['dsh', 'codex-desktop', 'codex-cli', 'claude-cli', 'agy-cli']);
   assert.deepEqual([...REMOVED_TARGETS], ['claude-desktop']);
   assert.throws(() => normalizeTarget('claude-desktop'), error => error.code === 'invalid-target');
   // Reading a stored record is not creation: the legacy value survives the read.
@@ -80,7 +80,7 @@ test('a closed record for the removed target stays listed with its own bytes', a
   const f = await fixture();
   try {
     const before = f.body(LEGACY_ID);
-    const listed = await f.service.list(extra(A), { state: 'cleanup_failed' });
+    const listed = await f.service.list(extra(A));
     const entry = listed.items.find(item => item.name === LEGACY);
     assert.equal(entry.target, 'claude-desktop', 'the stored target is reported as stored');
     assert.equal(entry.state, 'cleanup_failed');
@@ -97,7 +97,7 @@ test('status and wait answer normally while that record exists', async () => {
     assert.equal(status.ready, true, 'the installation itself is still ready');
     assert.equal(status.contextVerified, true);
     assert.equal(status.agents, 1);
-    assert.deepEqual(Object.keys(status.backends).sort(), ['claude-cli', 'codex-desktop', 'dsh']);
+    assert.deepEqual(Object.keys(status.backends).sort(), ['agy-cli', 'claude-cli', 'codex-cli', 'codex-desktop', 'dsh']);
 
     const waited = await f.service.wait({ names: [LEGACY], timeoutSeconds: 0 }, extra(A));
     assert.equal(waited.items.length, 1);
@@ -123,12 +123,9 @@ test('another assistant in the same roster is unaffected', async () => {
       lifetime: 'persistent', target: 'dsh', workspace, created: true, state: 'idle',
       createdAt: '2026-11-04T00:00:00.000Z', updatedAt: '2026-11-04T00:00:00.000Z', history: [] }]);
   try {
-    const active = await f.service.list(extra(A));
-    assert.deepEqual(active.items.map(item => [item.name, item.target]), [['画图助手', 'dsh']],
-      'the inactive legacy name is not in the default list');
-    const listed = await f.service.list(extra(A), { name: '正式双向验收' });
-    assert.deepEqual(listed.items.map(item => [item.name, item.target]), [['正式双向验收', 'claude-desktop']],
-      'the inactive name is still reachable by name');
+    const listed = await f.service.list(extra(A));
+    assert.deepEqual(listed.items.map(item => [item.name, item.target]).sort(),
+      [['正式双向验收', 'claude-desktop'], ['画图助手', 'dsh']].sort());
     const receipt = await f.service.send({ name: '画图助手', message: '继续' }, extra(A));
     assert.notEqual(receipt.error?.code, 'backend-not-ready', 'its failure, if any, is its own and not the removed target');
     assert.equal(f.store.get('agent-' + 'a'.repeat(32)).target, 'dsh');

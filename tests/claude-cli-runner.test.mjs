@@ -18,7 +18,6 @@ import {
   CLAUDE_TURN_FILES, allowedCallbackTools, applyClaudeLine, cancelClaudeTurn, claudeSystemPrompt,
   claudeTurnArguments, claudeTurnOutcome, createClaudeTurnState, mcpServerFromConfig,
   permissionSupportFromHelp, probeClaudeCli, readClaudeTurn, startClaudeTurn, WORKER_HEARTBEAT_MS,
-  discoverClaudeModels, claudeCatalog,
 } from '../src/claude-cli-runner.mjs';
 
 const projectRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -28,92 +27,6 @@ const scratchRoot = path.join(projectRoot, 'clean', 'claude-cli-runner-tests',
 const SESSION = '11111111-2222-4333-8444-555555555555';
 const MCP_CONFIG = { mcpServers: { futureaide: { command: process.execPath, args: ['src/mcp-server.mjs'] } } };
 const fixtureCli = { command: process.execPath, prefixArgs: [fixture] };
-
-const protocolFixture = `
-import readline from 'node:readline';
-import { appendFileSync } from 'node:fs';
-const args = process.argv.slice(2), value = flag => args[args.indexOf(flag)+1];
-const model = args.includes('--model') ? value('--model') : 'claude-test';
-const effort = args.includes('--effort') ? value('--effort') : 'high';
-const models = [{value:'default',resolvedModel:'claude-test',supportedEffortLevels:['high','max']}];
-for await (const line of readline.createInterface({input:process.stdin})) {
- const event=JSON.parse(line);
- if(event.type==='control_request') {
-  const subtype=event.request.subtype;
-  const response=subtype==='list_models'?{models}:subtype==='get_settings'?{applied:{model,effort}}:{};
-  console.log(JSON.stringify({type:'control_response',response:{subtype:'success',request_id:event.request_id,response}}));
- } else if(event.type==='user') {
-  console.log(JSON.stringify(event));
-  appendFileSync('business.log',JSON.stringify({session:event.session_id,resume:args.includes('--resume'),text:event.message.content})+'\\n');
-  console.log(JSON.stringify({type:'system',subtype:'init',session_id:event.session_id,model,permissionMode:'auto',mcp_servers:[]}));
-  console.log(JSON.stringify({type:'result',subtype:'success',is_error:false,result:'done',session_id:event.session_id}));
- }
-}
-`;
-
-test('unadvertised effort capabilities remain unknown', () => {
-  const catalog = claudeCatalog({ models: [{ value: 'default', resolvedModel: 'm' }] }, { applied: { model: 'm' } });
-  assert.equal(catalog.groups[0].models[0].reasoning.efforts, undefined);
-  const unsupported = claudeCatalog({ models: [{ resolvedModel: 'm', supportsEffort: false }] }, { applied: { model: 'm' } });
-  assert.deepEqual(unsupported.groups[0].models[0].reasoning.efforts, []);
-});
-
-test('staged protocol reads capabilities and applied before one input for new and resumed sessions', async () => {
-  const workspace = await scratch('protocol');
-  const script = path.join(workspace, 'protocol.mjs');
-  await writeFile(script, protocolFixture);
-  const cli = { command: process.execPath, prefixArgs: [script] };
-  const catalog = await discoverClaudeModels({ cli, workspace });
-  assert.equal(catalog.default.model, 'claude-test');
-  await assert.rejects(readFile(path.join(workspace, 'business.log')), { code: 'ENOENT' });
-  for (const resume of [false, true]) {
-    const directory = path.join(workspace, resume ? 'resume' : 'new');
-    await startClaudeTurn({ directory, workspace, cli, sessionId: SESSION, resume, message: 'one task',
-      model: 'claude-test', effort: 'max', stagedControl: true });
-    const result = await waitForTurn(directory);
-    assert.equal(result.state, 'ended');
-    assert.equal(result.actualEffort, 'max');
-    assert.equal(result.businessAccepted, true);
-    assert.deepEqual(result.capabilities.supportedEffortLevels, ['high', 'max']);
-    assert.equal(result.applied.model, 'claude-test');
-  }
-  const inputs = (await readFile(path.join(workspace, 'business.log'), 'utf8')).trim().split('\n').map(JSON.parse);
-  assert.deepEqual(inputs.map(item => item.resume), [false, true]);
-  assert.deepEqual(inputs.map(item => item.text), ['one task', 'one task']);
-});
-
-for (const [scenario, settings] of [
-  ['different model', '{model:"other",effort}'],
-  ['unconfirmed effort', '{model}'],
-  ['unknown applied effort', '{model,effort:"unlisted"}'],
-]) test('staged protocol refuses ' + scenario + ' before the business input', async () => {
-  const workspace = await scratch('protocol-refusal');
-  const script = path.join(workspace, 'protocol.mjs');
-  await writeFile(script, protocolFixture.replace('applied:{model,effort}', 'applied:' + settings));
-  const cli = { command: process.execPath, prefixArgs: [script] };
-  const directory = path.join(workspace, 'turn');
-  await startClaudeTurn({ directory, workspace, cli, sessionId: SESSION, message: 'must not arrive',
-    model: 'claude-test', effort: 'max', stagedControl: true });
-  const result = await waitForTurn(directory);
-  assert.equal(result.state, 'failed');
-  assert.equal(result.error.code, 'claude-capabilities-unconfirmed');
-  assert.equal(result.error.notSent, true);
-  await assert.rejects(readFile(path.join(workspace, 'business.log')), { code: 'ENOENT' });
-});
-
-test('staged protocol records a policy-adjusted applied effort', async () => {
-  const workspace = await scratch('protocol-cap');
-  const script = path.join(workspace, 'protocol.mjs');
-  await writeFile(script, protocolFixture.replace("const effort = args.includes('--effort') ? value('--effort') : 'high';", "const effort = 'high';"));
-  const directory = path.join(workspace, 'turn');
-  await startClaudeTurn({ directory, workspace, cli: { command: process.execPath, prefixArgs: [script] },
-    sessionId: SESSION, message: 'one task', model: 'claude-test', effort: 'max', stagedControl: true });
-  const result = await waitForTurn(directory);
-  assert.equal(result.state, 'ended');
-  assert.equal(result.actualEffort, 'high');
-  assert.equal(result.effortAdjustment.requested, 'max');
-  assert.equal(result.businessAccepted, true);
-});
 
 let scratchCount = 0;
 async function scratch(name) {
@@ -296,7 +209,7 @@ test('claudeTurnArguments builds the print-mode argv and widens nothing', () => 
   assert.equal(args.includes('--model'), false);
   assert.equal(args.includes('--effort'), false);
   // Exactly the two callback tools are pre-allowed, and no bypass flag is anywhere.
-  assert.equal(args[args.indexOf('--allowedTools') + 1], 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent,mcp__futureaide__feedback');
+  assert.equal(args[args.indexOf('--allowedTools') + 1], 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent');
   for (const forbidden of ['--dangerously-skip-permissions', '--allow-dangerously-skip-permissions', '--bare']) {
     assert.equal(args.includes(forbidden), false, forbidden + ' must never be passed');
   }
@@ -316,7 +229,7 @@ test('an MCP config must declare exactly one server, and only its callbacks are 
   assert.throws(() => mcpServerFromConfig({ mcpServers: { a: {}, b: {} } }), error => error.code === 'invalid-mcp-config');
   assert.throws(() => mcpServerFromConfig({}), error => error.code === 'invalid-mcp-config');
   assert.deepEqual(allowedCallbackTools('futureaide'),
-    ['mcp__futureaide__ask_parent', 'mcp__futureaide__report_parent', 'mcp__futureaide__feedback']);
+    ['mcp__futureaide__ask_parent', 'mcp__futureaide__report_parent']);
 });
 
 test('the system prompt names both parent callbacks and the final report flag', () => {
@@ -336,28 +249,6 @@ function stateOf() {
   return createClaudeTurnState({ requestId: 'r1', sessionId: SESSION, workspace: 'D:\\w',
     message: 'task', mcpRequired: 'futureaide' });
 }
-
-test('init effort is observed only when the CLI reports a recognized value', () => {
-  const state = stateOf();
-  applyClaudeLine(state, JSON.stringify({ type: 'system', subtype: 'init', model: 'm', effort: 'high' }));
-  assert.equal(state.actualEffort, 'high');
-  const unknown = stateOf();
-  applyClaudeLine(unknown, JSON.stringify({ type: 'system', subtype: 'init', model: 'm' }));
-  assert.equal(unknown.actualEffort, undefined);
-});
-
-test('an uncorrelated init or user echo never proves a business input was accepted', () => {
-  const state = stateOf();
-  state.businessSubmitted = true;
-  state.inputUuid = '11111111-1111-4111-8111-111111111111';
-  applyClaudeLine(state, JSON.stringify({ type: 'system', subtype: 'init', session_id: SESSION, model: 'm' }));
-  applyClaudeLine(state, JSON.stringify({ type: 'user', session_id: SESSION,
-    uuid: '22222222-2222-4222-8222-222222222222', message: { role: 'user', content: 'other' } }));
-  assert.notEqual(state.businessAccepted, true);
-  applyClaudeLine(state, JSON.stringify({ type: 'user', session_id: SESSION,
-    uuid: state.inputUuid, message: { role: 'user', content: 'ours' } }));
-  assert.equal(state.businessAccepted, true);
-});
 
 test('normalization keeps the real model, the MCP status and the tool trail', () => {
   const state = stateOf();
@@ -603,7 +494,7 @@ test('the CLI receives exactly the documented argv, prompt and MCP config', { ti
   assert.equal(receipt.sessionId, SESSION);
   assert.equal(receipt.permissionMode, 'auto');
   assert.equal(receipt.permissionPrompts, 'none');
-  assert.equal(receipt.allowedTools, 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent,mcp__futureaide__feedback');
+  assert.equal(receipt.allowedTools, 'mcp__futureaide__ask_parent,mcp__futureaide__report_parent');
   assert.deepEqual(receipt.mcpServerNames, ['futureaide']);
   assert.equal(receipt.prompt, 'Do the task.');
   assert.equal(receipt.model, 'claude-fixture-default', 'no --model was passed, so the CLI default is reported');

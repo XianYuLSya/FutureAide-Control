@@ -444,7 +444,7 @@ export function createRosterCleanup(config, { dsh, desktop } = {}) {
       }
       if (!await context.revalidate() || !verifyRosterTicket(filename,id).valid) throw new Error('cleanup-authorization-or-tree-changed');
       completeRosterTicket(filename,id);
-      return withBytes({removed:true,ticketId:id,nativeSessionRetained:plans.every(plan => plan.record.target === 'claude-cli')});
+      return withBytes({removed:true,ticketId:id,nativeSessionRetained:plans.every(plan => plan.record.target === 'claude-cli' || plan.record.target === 'codex-cli')});
     } catch (error) { return withBytes({removed:false,reason:error.message,ticketId:id,steps:rosterSteps(filename,id)}); }
   }
   async function remove(item, context = {}) {

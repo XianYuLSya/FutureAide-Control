@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, readdir } from 'node:fs/promises';
 import { watch } from 'node:fs';
 import path from 'node:path';
@@ -18,7 +19,11 @@ const { values, positionals } = parseArgs({
     'max-messages': { type: 'string' }, 'through-seq': { type: 'string' }, view: { type: 'string' },
     message: { type: 'string' }, 'message-file': { type: 'string' },
     'request-id': { type: 'string' }, mode: { type: 'string' }, background: { type: 'boolean' },
-    'timeout-seconds': { type: 'string' }, 'poll-interval-ms': { type: 'string' }, 'after-seq': { type: 'string' },
+    'timeout-seconds': { type: 'string' }, timeout: { type: 'string' }, 'poll-interval-ms': { type: 'string' }, 'after-seq': { type: 'string' },
+    conv: { type: 'string' }, conversation: { type: 'string' },
+    keys: { type: 'string' }, names: { type: 'string' }, 'task-keys': { type: 'string' },
+    raw: { type: 'boolean' },
+    barrier: { type: 'string' }, after: { type: 'string' }, target: { type: 'string' }, proxy: { type: 'string' },
     event: { type: 'string' }, summary: { type: 'string' }, evidence: { type: 'string' },
     'agent-preset': { type: 'string' }, provider: { type: 'string' }, model: { type: 'string' },
     'reasoning-effort': { type: 'string' }, 'tool-name': { type: 'string' }, 'no-activate': { type: 'boolean' },
@@ -34,6 +39,9 @@ const { values, positionals } = parseArgs({
     output: {type:'string'}, manifest: {type:'string'}, decisions: {type:'string'}, approval: {type:'string'}, ticket:{type:'string'}, 'original-id':{type:'string'},
     scopes: {type:'string'}, key: {type:'string'}, name: {type:'string'}, owner: {type:'string'}, from: {type:'string'},
     to: {type:'string'}, 'worktree-review': {type:'string'},
+    parent: { type: 'string' }, 'reparent-to': { type: 'string' },
+    'kill-tree': { type: 'boolean' }, 'keep-children': { type: 'string' },
+    author: { type: 'string' },
   },
 });
 
@@ -87,8 +95,13 @@ const usage = `futureaide-control <connect|status|sessions|read|send|wait|watch|
   sessions --query TEXT --limit 20
   read --max-messages 8 [--through-seq N] [--view messages|events]
   send --message-file PATH --request-id UNIQUE-ID [--mode queue|steer]
+  wait --conv CONV-ID [--keys k1,k2] [--names a,b] [--barrier any|all] [--timeout 3600]
   wait --request-id SEND-REQUEST-ID [--timeout-seconds 45] [--poll-interval-ms 1500] [--max-messages 8]
                             Block until that dispatched turn ends and print its reply; re-run while state is running
+  proxy status [codex-cli|claude-cli|agy-cli|all]
+  proxy bind <codex-cli|claude-cli|agy-cli|all> <port|url|faswitch|direct>
+  team <adopt|kick|merge|reparent|resume|strays|sweep> [target] [--conv ID|--owner OWNER-ID] [--parent NAME] [--kill-tree] [--message TEXT]
+  board <post|read> [message] [--conv ID|--owner OWNER-ID] [--author NAME] [--limit 50] [--after-seq 0]
   watch --request-id SEND-REQUEST-ID [--timeout-seconds 900] [--poll-interval-ms 5000]
                             Blocking watch with a saved report; automatic chat wakeup depends on the client
   cancel --request-id UNIQUE-ID
@@ -106,9 +119,14 @@ if (values.help || !positionals.length) {
 } else {
   try {
     const command = positionals[0];
+    const isScopedWait = command === 'wait'
+      && Boolean(
+        values.conv || values.conversation || values.keys || values['task-keys'] || values.names || values.barrier
+        || (!values['request-id'] && !values['session-id'] && process.env.ANTIGRAVITY_CONVERSATION_ID),
+      );
     const feedback = command.startsWith('feedback-') ? await import('./feedback-inbox.mjs') : null;
-    values.config = await maintenanceConfigPath(values.config, path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
-    const control = feedback || ['profiles', 'profile-create', 'cleanup'].includes(command)
+    values.config = await maintenanceConfigPath(values.config || process.env.FUTUREAIDE_CONFIG, path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
+    const control = feedback || isScopedWait || ['profiles', 'profile-create', 'cleanup', 'proxy', 'team', 'board'].includes(command)
       ? undefined : createControl(await loadConfig(values.config, values.profile));
     const sessionId = values['session-id'];
     const number = name => {
@@ -249,8 +267,309 @@ if (values.help || !positionals.length) {
         result = await control.send({ sessionId, message, requestId: values['request-id'], mode: values.mode, background: values.background === true });
         break;
       }
-      case 'wait': result = await control.wait({ sessionId, requestId: values['request-id'], afterSeq: number('after-seq'),
-        timeoutSeconds: number('timeout-seconds'), pollIntervalMs: number('poll-interval-ms'), maxMessages: number('max-messages') }); break;
+      case 'wait': {
+        if (isScopedWait) {
+          const [{ createScopedAgents }, { TRUSTED_CALLER, ownerIdFor }] = await Promise.all([
+            import('./scoped-agents.mjs'),
+            import('./calling-context.mjs'),
+          ]);
+          const config = await loadConfig(values.config, values.profile);
+          const scoped = createScopedAgents(config);
+          const keepAlive = setInterval(() => {}, 30000);
+          try {
+            const convId = (values.conv || values.conversation || process.env.ANTIGRAVITY_CONVERSATION_ID || '').trim();
+            if (!convId) throw new Error('wait needs --conv <convId> (or --conversation / ANTIGRAVITY_CONVERSATION_ID).');
+            const names = values.names ? values.names.split(',').map(s => s.trim()).filter(Boolean) : undefined;
+            const rawKeys = values.keys ?? values['task-keys'];
+            const taskKeys = rawKeys ? rawKeys.split(',').map(s => s.trim()).filter(Boolean) : undefined;
+            const multiTarget = (taskKeys?.length ?? 0) > 1 || (names?.length ?? 0) > 1;
+            const effectiveBarrier = values.barrier ?? (multiTarget ? 'all' : 'any');
+            const timeoutSec = values.timeout !== undefined ? number('timeout') : (number('timeout-seconds') ?? 3600);
+            const callerExtra = convId.startsWith('owner-')
+              ? {
+                [TRUSTED_CALLER]: {
+                  source: 'managed-cli',
+                  ownerId: convId,
+                  workspace: values.workspace || config.workspace,
+                },
+              }
+              : (/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(convId) && scoped.store.owner(ownerIdFor(convId)))
+                ? { _meta: { threadId: convId } }
+                : {
+                  [TRUSTED_CALLER]: {
+                    source: 'antigravity',
+                    conversationId: convId,
+                    workspace: values.workspace || config.workspace,
+                  },
+                };
+            const rawWait = await scoped.wait({
+              ...(names?.length ? { names } : {}),
+              ...(taskKeys?.length ? { taskKeys } : {}),
+              ...(values.after ? { after: values.after } : {}),
+              barrier: effectiveBarrier,
+              timeoutSeconds: timeoutSec,
+              allowExtendedTimeout: true,
+            }, callerExtra);
+            await scoped.flushSettlements();
+            if (values.raw) {
+              result = rawWait;
+            } else {
+              const events = Array.isArray(rawWait.events) ? rawWait.events : [];
+              const questions = [];
+              const results = [];
+              const seenResultKeys = new Set();
+              for (const evt of events) {
+                if (!evt) continue;
+                if (evt.type === 'question') {
+                  questions.push({
+                    ...(evt.name ? { name: evt.name } : {}),
+                    ...(evt.role ? { role: evt.role } : {}),
+                    ...(evt.taskKey ? { taskKey: evt.taskKey } : {}),
+                    message: evt.message ?? '',
+                  });
+                } else if (evt.type === 'final' || evt.type === 'delivered' || evt.type === 'report') {
+                  results.push({
+                    ...(evt.name ? { name: evt.name } : {}),
+                    ...(evt.role ? { role: evt.role } : {}),
+                    ...(evt.taskKey ? { taskKey: evt.taskKey } : {}),
+                    type: evt.type,
+                    final: evt.final === true,
+                    message: evt.message ?? '',
+                  });
+                  if (evt.taskKey) seenResultKeys.add(evt.taskKey);
+                  if (evt.name) seenResultKeys.add(`name:${evt.name}`);
+                } else if (evt.type === 'failed' || evt.type === 'cancelled') {
+                  const dup = (evt.taskKey && seenResultKeys.has(evt.taskKey))
+                    || (evt.name && seenResultKeys.has(`name:${evt.name}`));
+                  if (!dup) {
+                    results.push({
+                      ...(evt.name ? { name: evt.name } : {}),
+                      ...(evt.taskKey ? { taskKey: evt.taskKey } : {}),
+                      type: evt.type,
+                      final: true,
+                      ...(evt.reason ? { error: evt.reason } : {}),
+                    });
+                  }
+                }
+              }
+              if (!questions.length) {
+                for (const item of rawWait.items ?? []) {
+                  for (const q of item.questions ?? []) {
+                    if (q?.message) {
+                      questions.push({
+                        name: item.name,
+                        ...(item.role ? { role: item.role } : {}),
+                        message: q.message,
+                      });
+                    }
+                  }
+                }
+              }
+              if (!results.length && !questions.length) {
+                for (const item of rawWait.items ?? []) {
+                  results.push({
+                    name: item.name,
+                    ...(item.role ? { role: item.role } : {}),
+                    state: item.state,
+                    ...(item.state === 'running' && item.activity ? { activity: item.activity } : {}),
+                    ...(item.stalled ? { stalled: true } : {}),
+                    ...(item.error ? { error: item.error } : {}),
+                  });
+                }
+              }
+              const timedOut = rawWait.timedOut === true;
+              const notListed = Array.isArray(rawWait.notListed) && rawWait.notListed.length ? rawWait.notListed : undefined;
+              const anyStillRunning = (rawWait.items ?? []).some(item => item.state === 'running')
+                && !results.some(r => r.final === true) && !events.length;
+              const allResultsFinal = results.length > 0 && results.every(r => r.final === true);
+              const done = !timedOut && questions.length === 0 && !notListed && !anyStillRunning
+                && (effectiveBarrier === 'all' ? rawWait.reason === 'event' || allResultsFinal : allResultsFinal);
+              const legacyVerboseFlags = Boolean((values.conversation || values['task-keys']) && !values.conv && !values.keys);
+              result = {
+                done,
+                results,
+                ...(questions.length ? { questions } : {}),
+                ...(notListed ? { notListed } : {}),
+                timedOut,
+                ...(legacyVerboseFlags ? {
+                  reason: rawWait.reason,
+                  events,
+                  ...(rawWait.nextCursor ? { nextCursor: rawWait.nextCursor } : {}),
+                } : {}),
+              };
+            }
+          } finally {
+            clearInterval(keepAlive);
+            scoped.close();
+          }
+        } else {
+          result = await control.wait({ sessionId, requestId: values['request-id'], afterSeq: number('after-seq'),
+            timeoutSeconds: number('timeout-seconds'), pollIntervalMs: number('poll-interval-ms'), maxMessages: number('max-messages') });
+        }
+        break;
+      }
+      case 'proxy': {
+        const { createScopedAgents } = await import('./scoped-agents.mjs');
+        const config = await loadConfig(values.config, values.profile);
+        const scoped = createScopedAgents(config);
+        try {
+          const sub = positionals[1] || 'status';
+          if (sub === 'status') {
+            const target = values.target || positionals[2] || 'all';
+            result = await scoped.manageCliProxy({ action: 'status', target });
+          } else if (sub === 'bind') {
+            const target = values.target || positionals[2];
+            const proxyVal = values.proxy ?? positionals[3];
+            if (!target || proxyVal === undefined) {
+              throw new Error('Usage: proxy bind <codex-cli|claude-cli|agy-cli|all> <port|url|faswitch|direct>');
+            }
+            result = await scoped.manageCliProxy({ action: 'bind', target, proxy: proxyVal });
+          } else {
+            throw new Error('Unknown proxy action. Use: proxy status | proxy bind <target> <value>');
+          }
+        } finally {
+          scoped.close();
+        }
+        break;
+      }
+      case 'team':
+      case 'board': {
+        const [{ createScopedAgents }, { TRUSTED_CALLER, ownerIdFor }] = await Promise.all([
+          import('./scoped-agents.mjs'),
+          import('./calling-context.mjs'),
+        ]);
+        const config = await loadConfig(values.config, values.profile);
+        const scoped = createScopedAgents(config);
+        const keepAlive = setInterval(() => {}, 30000);
+        try {
+          const ws = path.resolve(values.workspace || config.workspace || process.cwd());
+          const normWs = process.platform === 'win32' ? ws.toLowerCase() : ws;
+          const sameWs = candidate => {
+            if (typeof candidate !== 'string' || !candidate) return false;
+            const resolved = path.resolve(candidate);
+            return (process.platform === 'win32' ? resolved.toLowerCase() : resolved) === normWs;
+          };
+          const extraFromOwnerId = targetOwnerId => {
+            const existingOwner = scoped.store.owner(targetOwnerId);
+            if (existingOwner?.source === 'antigravity' && existingOwner.conversationId) {
+              return {
+                [TRUSTED_CALLER]: {
+                  source: 'antigravity',
+                  conversationId: existingOwner.conversationId,
+                  workspace: existingOwner.workspace || ws,
+                },
+              };
+            }
+            if (existingOwner?.source === 'codex-desktop' && existingOwner.threadId) {
+              return { _meta: { threadId: existingOwner.threadId } };
+            }
+            return {
+              [TRUSTED_CALLER]: {
+                source: 'managed-cli',
+                ownerId: targetOwnerId,
+                workspace: existingOwner?.workspace || ws,
+              },
+            };
+          };
+          const resolveCanvasCallerExtra = () => {
+            const explicitOwner = (values.owner || '').trim();
+            if (explicitOwner) {
+              return explicitOwner.startsWith('owner-')
+                ? extraFromOwnerId(explicitOwner)
+                : { [TRUSTED_CALLER]: { source: 'antigravity', conversationId: explicitOwner, workspace: ws } };
+            }
+            const explicitConv = (values.conv || values.conversation || process.env.ANTIGRAVITY_CONVERSATION_ID || '').trim();
+            if (explicitConv) {
+              if (explicitConv.startsWith('owner-')) return extraFromOwnerId(explicitConv);
+              if (/^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i.test(explicitConv)
+                  && scoped.store.owner(ownerIdFor(explicitConv))) {
+                return { _meta: { threadId: explicitConv } };
+              }
+              return { [TRUSTED_CALLER]: { source: 'antigravity', conversationId: explicitConv, workspace: ws } };
+            }
+            // Auto-detect latest active owner in this workspace so Canvas UI buttons work out-of-the-box
+            const openRecords = scoped.store.list().filter(r => r && !r.closed && sameWs(r.rootWorkspace ?? r.workspace ?? ''));
+            if (openRecords.length > 0) {
+              const rank = r => (['running', 'awaiting_input', 'awaiting_report', 'idle'].includes(r.state) ? 1 : 0);
+              openRecords.sort((a, b) => rank(b) - rank(a)
+                || (Date.parse(b.updatedAt ?? b.createdAt ?? '') || 0) - (Date.parse(a.updatedAt ?? a.createdAt ?? '') || 0));
+              let top = openRecords[0];
+              const seen = new Set();
+              while (top?.parentAgentId && !seen.has(top.agentId)) {
+                seen.add(top.agentId);
+                const p = scoped.store.get(top.parentAgentId);
+                if (!p) break;
+                top = p;
+              }
+              if (top?.ownerId) return extraFromOwnerId(top.ownerId);
+            }
+            const wsOwners = scoped.store.listOwners()
+              .filter(o => o?.ownerId && sameWs(o.workspace ?? ''))
+              .sort((a, b) => (Date.parse(b.createdAt ?? '') || 0) - (Date.parse(a.createdAt ?? '') || 0));
+            if (wsOwners[0]?.ownerId) return extraFromOwnerId(wsOwners[0].ownerId);
+            const canvasConvId = 'canvas-' + createHash('sha256').update(normWs).digest('hex').slice(0, 12);
+            return {
+              [TRUSTED_CALLER]: {
+                source: 'antigravity',
+                conversationId: canvasConvId,
+                workspace: ws,
+              },
+            };
+          };
+
+          const callerExtra = resolveCanvasCallerExtra();
+          if (command === 'team') {
+            const subAction = positionals[1];
+            if (!subAction) {
+              throw new Error('Usage: team <adopt|kick|merge|reparent|resume|strays|sweep> [target] [--parent <p>] [--kill-tree] [--message <msg>]');
+            }
+            const positionalTarget = positionals[2];
+            const effectiveTarget = values.target ?? values.name ?? positionalTarget;
+            const rawParent = values.parent ?? values['reparent-to'];
+            const parsedParent = rawParent === undefined
+              ? undefined
+              : (['null', 'none', 'root'].includes(rawParent.trim().toLowerCase()) ? null : rawParent.trim());
+            const keepChildren = values['kill-tree'] === true
+              ? false
+              : (values['keep-children'] !== undefined ? values['keep-children'] !== 'false' : undefined);
+            const msg = await messageText();
+            if (subAction === 'answer') {
+              if (!effectiveTarget || !msg) throw new Error('team answer requires --target <name> and --message <text>.');
+              result = { ok: true, action: 'answer', ...(await scoped.answer({ name: effectiveTarget, message: msg }, callerExtra)) };
+            } else {
+              result = await scoped.manageTeam({
+                action: subAction,
+                ...(effectiveTarget !== undefined ? { target: effectiveTarget } : {}),
+                ...(parsedParent !== undefined ? { parent: parsedParent } : {}),
+                ...(keepChildren !== undefined ? { keepChildren } : {}),
+                ...(msg !== undefined ? { message: msg } : {}),
+              }, callerExtra);
+            }
+          } else {
+            const subAction = (positionals[1] || 'read').toLowerCase();
+            if (subAction === 'post') {
+              const msg = (await messageText()) ?? positionals.slice(2).join(' ').trim();
+              if (!msg) throw new Error('board post requires a message (via positional argument or --message).');
+              result = await scoped.postBoard({
+                message: msg,
+                ...(values.author ? { author: values.author } : {}),
+              }, callerExtra);
+            } else if (subAction === 'read') {
+              result = await scoped.readBoard({
+                ...(values.limit !== undefined ? { limit: number('limit') } : {}),
+                ...(values['after-seq'] !== undefined ? { afterSeq: number('after-seq') } : {}),
+              }, callerExtra);
+            } else {
+              throw new Error('Unknown board action. Use: board post <message> | board read');
+            }
+          }
+          await scoped.flushSettlements();
+        } finally {
+          clearInterval(keepAlive);
+          scoped.close();
+        }
+        break;
+      }
       case 'watch': result = await control.watch({ sessionId, requestId: values['request-id'], afterSeq: number('after-seq'),
         timeoutSeconds: number('timeout-seconds'), pollIntervalMs: number('poll-interval-ms'), maxMessages: number('max-messages') }); break;
       case 'cancel': result = await control.cancel({ sessionId, requestId: values['request-id'] }); break;

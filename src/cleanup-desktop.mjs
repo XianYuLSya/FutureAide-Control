@@ -3,6 +3,7 @@ import path from 'node:path';
 import { lstat } from 'node:fs/promises';
 import { requestCodexNative } from './codex-ipc.mjs';
 import { readClaudeTurn } from './claude-cli-runner.mjs';
+import { readCodexTurn } from './codex-cli-runner.mjs';
 import { codexDomainForThread, sameCodexDomain } from './codex-domain.mjs';
 import { deletionReceipt, rememberDeleted } from './cleanup-native-receipts.mjs';
 
@@ -17,6 +18,7 @@ const validId = value => typeof value === 'string' && /^[a-zA-Z0-9_-][a-zA-Z0-9_
 export function createDesktopCleanup(config = {}) {
   const request = config.nativeRequest ?? requestCodexNative;
   const readTurn = config.readClaudeTurn ?? readClaudeTurn;
+  const readCodexCliTurn = config.readCodexTurn ?? readCodexTurn;
   const domainForThread = config.domainForThread ?? codexDomainForThread;
   const isAlive = config.isProcessAlive ?? (pid => {
     try { process.kill(pid, 0); return true; } catch (error) { return error.code !== 'ESRCH'; }
@@ -98,9 +100,30 @@ export function createDesktopCleanup(config = {}) {
       return {running:false,treeIds:[record.sessionId],activityVersion:digest(results),lastActivityAt,historyPresent:results.length>0};
     } catch (error) { return unknown(`claude-observation-unverified:${error.code ?? error.message ?? 'error'}`); }
   }
+  async function codexCli(record, state) {
+    if (!validId(record.sessionId) || !config.stateDirectory || !validId(record.ownerId) || !validId(record.agentId)) return unknown('codex-cli-identity-unverified');
+    if (!state || typeof state.requests !== 'object' || state.active) return state?.active
+      ? {running:true,treeIds:[record.sessionId],activityVersion:'',reason:'codex-cli-worker-active-or-unverified'} : unknown('codex-cli-state-unverified');
+    const results = [];
+    try {
+      for (const [id, entry] of Object.entries(state.requests)) {
+        if (!validId(id) || !['accepted','rejected'].includes(entry?.status)) return unknown('codex-cli-dispatch-unconfirmed');
+        if (entry.status === 'rejected') continue;
+        const dir = path.join(config.stateDirectory,'scoped',record.ownerId,record.agentId,'codex-cli','turns',id);
+        const turn = await readCodexCliTurn(dir);
+        if (!['ended','failed','cancelled'].includes(turn?.state) || !turn.endedAt) return unknown('codex-cli-worker-exit-unverified');
+        if ([turn.workerPid,turn.codexPid].some(pid => Number.isSafeInteger(pid) && pid > 0 && isAlive(pid))) return {running:true,treeIds:[record.sessionId],activityVersion:'',reason:'codex-cli-process-still-alive'};
+        results.push({id,state:turn.state,startedAt:turn.startedAt,endedAt:turn.endedAt,request:entry});
+      }
+      const dates=results.map(value=>Date.parse(value.endedAt));
+      const lastActivityAt=dates.length && dates.every(Number.isFinite) ? new Date(Math.max(...dates)).toISOString() : null;
+      return {running:false,treeIds:[record.sessionId],activityVersion:digest(results),lastActivityAt,historyPresent:results.length>0};
+    } catch (error) { return unknown(`codex-cli-observation-unverified:${error.code ?? error.message ?? 'error'}`); }
+  }
   async function inspect(record, state) {
     if (record?.target === 'codex-desktop') return codex(record,state);
     if (record?.target === 'claude-cli') return claude(record,state);
+    if (record?.target === 'codex-cli') return codexCli(record,state);
     return unknown('unsupported-target');
   }
   async function remove(record,state,expected,context = {}) {

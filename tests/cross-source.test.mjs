@@ -11,6 +11,7 @@ import { CLAUDE_RECEIPT_PARSER, claudeBindingStale, claudeNoticeReceipt, claudeN
   createScopedAgents } from '../src/scoped-agents.mjs';
 import { RosterStore, submissionNoticeId } from '../src/roster-store.mjs';
 import { createCodexBackend } from '../src/codex-backend.mjs';
+import { createCodexHost } from '../src/codex-host.mjs';
 import { ownerIdFor, ownerIdForSource, TRUSTED_CALLER } from '../src/calling-context.mjs';
 import { claudeTrustedCaller, registerScopedTools, scopedManagement } from '../src/mcp-server.mjs';
 import { bindClaude, discoverClaude } from '../src/claude-inbox.mjs';
@@ -21,7 +22,7 @@ const OTHER = '22222222-2222-4222-8222-222222222222';
 const extra = threadId => ({ _meta: { threadId } });
 
 async function fixture({ adapters = {}, onPollComplete, captureFiles, claudeInbox, config = {},
-  notifyDesktop, persist = false,
+  notifyDesktop, persist = false, codexProbeRegistration,
   clientFactory = () => { throw new Error('no DSH host is needed for these cases'); }, startSharedMonitor = () => true } = {}) {
   const base = path.join(workspace, '.runtime', 'tests');
   await mkdir(base, { recursive: true });
@@ -38,6 +39,7 @@ async function fixture({ adapters = {}, onPollComplete, captureFiles, claudeInbo
         ? { thread: { id: threadId, kind: 'codex', hostId: 'local', cwd: workspace } }
         : { accepted: true }),
       backendAdapters: adapters,
+      codexProbeRegistration,
       ...(onPollComplete ? { onPollComplete } : {}),
       ...(captureFiles ? { captureFiles } : {}),
       ...(claudeInbox ? { claudeInbox } : {}),
@@ -103,7 +105,7 @@ test('a Claude notice is settled by its native delivery record, never by trailin
   assert.equal(claudeBindingStale(new Error('claude-message-empty')), false, 'a message error is not a stale binding');
 });
 
-test('the shared registration mounts the management tools with a trusted caller', async () => {
+test('the shared registration mounts the eleven management tools with a trusted caller', async () => {
   const registered = [];
   const server = { registerTool: (tool, config, handler) => registered.push({ tool, config, handler }) };
   const seen = [];
@@ -111,7 +113,7 @@ test('the shared registration mounts the management tools with a trusted caller'
   registerScopedTools(server, { service,
     extraFor: async () => ({ [TRUSTED_CALLER]: { source: 'claude-desktop', nativeSessionId: 'native-1', workspace } }) });
   const names = registered.map(item => item.tool);
-  assert.deepEqual(names, ['futureaide_feedback', 'futureaide_status', 'futureaide_run_agent', 'futureaide_create_agent', 'futureaide_send_agent', 'futureaide_answer_agent',
+  assert.deepEqual(names, ['futureaide_status', 'futureaide_run_agent', 'futureaide_create_agent', 'futureaide_send_agent', 'futureaide_answer_agent',
     'futureaide_list_agents', 'futureaide_wait_agents', 'futureaide_agent_changes', 'futureaide_inspect_agent',
     'futureaide_cancel_agent', 'futureaide_delete_agent']);
   assert.equal(names.includes('ask_parent'), false, 'the report surface keeps its own ask/report tools');
@@ -127,7 +129,7 @@ test('the management hook builds the trusted context from the connection', async
   const received = [];
   scopedManagement({ service: { status: async extra => { received.push(extra); return { ready: true }; } } })
     ({ server, caller: async () => ({ sessionId: 'native-9', cwd: workspace, pid: 42 }), trusted: async () => undefined });
-  assert.equal(registered.length, 12);
+  assert.equal(registered.length, 11);
   const status = registered.find(item => item.tool === 'futureaide_status');
   await status.handler({}, {});
   assert.equal(received[0][TRUSTED_CALLER].nativeSessionId, 'native-9');
@@ -205,7 +207,7 @@ function fakeBackend({ nodes = [], changes = [], historyText = id => 'history:' 
     receipt: async () => undefined,
     turn: async () => ({ state: 'ended' }),
     models: async () => ({ default: MODEL, routableProviders: [MODEL.provider],
-      groups: [{ id: MODEL.provider, models: [{ id: MODEL.model, reasoningEfforts: ['high', 'max'] }] }] }),
+      groups: [{ id: MODEL.provider, models: [{ id: MODEL.model }] }] }),
     model: async () => MODEL,
     selectModel: async () => ({ accepted: true }),
     cancel: async () => ({ cancelRequested: true }),
@@ -232,6 +234,113 @@ const completedInput = (name, reports = []) => ({ taskId: `task-${name}`, messag
   dispatches: [{ requestId: `request-${name}`, state: 'completed', accepted: true }] });
 const finalReport = name => ({ id: `final-${name}`, taskId: `task-${name}`, message: `${name} done`, final: true,
   delivery: { id: `notice-${name}`, state: 'pending' } });
+
+const desktopResponseTimeout = () => Object.assign(new Error('Native Desktop response timed out.'),
+  { code: 'codex-native-rpc-response-timeout' });
+
+test('status makes one fresh Codex read after a timeout and reports persistent failure', async () => {
+  for (const failedMethod of ['thread/list', 'model/list']) {
+    for (const persistent of [false, true]) {
+      const calls = [];
+      const host = createCodexHost({ nativeRequest: async method => {
+        calls.push(method);
+        if (method === failedMethod && (persistent || calls.filter(item => item === method).length === 1)) throw desktopResponseTimeout();
+        if (method === 'thread/list') return { data: [] };
+        if (method === 'config/read') return { provider: 'openai', model: 'test-model', reasoningEffort: 'low' };
+        if (method === 'model/list') return { data: [{ id: 'test-model', model: 'test-model', isDefault: true,
+          defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low' }] }] };
+        throw new Error(`unexpected ${method}`);
+      } });
+      const base = fakeBackend();
+      const f = await fixture({ adapters: { 'claude-cli': base, 'codex-desktop': record => ({ ...base(record),
+        probe: async options => ({ ...await host.probe(options), treeProtocol: 1, reportProtocol: 1 }),
+        models: () => host.models({ workspace }),
+      }) }, codexProbeRegistration: async () => ({ registered: true, tools: ['ask_parent', 'report_parent'] }) });
+      try {
+        const result = (await f.service.status(extra(THREAD))).backends['codex-desktop'];
+        assert.equal(calls.filter(method => method === failedMethod).length, 2);
+        assert.equal(calls.filter(method => method === 'thread/list').length, failedMethod === 'thread/list' ? 2 : 1);
+        if (persistent) {
+          assert.deepEqual(result.models, []);
+          assert.equal((result.reason ?? result.modelError)?.code, desktopResponseTimeout().code);
+        } else {
+          assert.equal(result.ready, true);
+          assert.deepEqual(result.models, ['test-model']);
+        }
+      } finally { f.service.close(); }
+    }
+  }
+});
+
+test('status skips a Codex recheck without reply time or on a non-timeout rejection', async t => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const denied = Object.assign(new Error('Permission rejected.'), { code: 'codex-native-rpc-rejected' });
+  for (const { error, elapsed } of [{ error: desktopResponseTimeout(), elapsed: 40_000 }, { error: denied, elapsed: 0 }]) {
+    let probes = 0;
+    const base = fakeBackend();
+    const f = await fixture({ adapters: { 'claude-cli': base, 'codex-desktop': record => ({ ...base(record),
+      probe: async () => { probes++; t.mock.timers.tick(elapsed); throw error; },
+    }) } });
+    try {
+      const result = (await f.service.status(extra(THREAD))).backends['codex-desktop'];
+      assert.equal(probes, 1);
+      assert.equal(result.ready, false);
+      assert.equal(result.reason.code, error.code);
+    } finally { f.service.close(); }
+  }
+});
+
+test('automatic Codex cleanup defers only proven pre-delete timeouts and stops after two retries', async () => {
+  for (const phase of ['probe', 'preflight', 'persistent', 'unknown-write']) {
+    const base = fakeBackend();
+    let probes = 0, destroys = 0;
+    const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
+      probe: async () => {
+        probes++;
+        if (phase === 'persistent' || (phase === 'probe' && probes === 1)) {
+          throw Object.assign(new Error('Desktop renderer discovery timed out.'),
+            { code: 'codex-native-rpc-unavailable', discoveryReason: 'timeout' });
+        }
+        return base(record).probe();
+      },
+      destroy: async () => {
+        destroys++;
+        if (phase === 'preflight' && destroys === 1) throw Object.assign(desktopResponseTimeout(), { cleanupNotSent: true });
+        if (phase === 'unknown-write') throw desktopResponseTimeout();
+        return { destroyed: true };
+      },
+    }) } });
+    try {
+      const id = `codex-clean-${phase}`;
+      f.store.insert(taskRecord({ agentId: id, ownerId: ownerIdFor(THREAD), sessionId: `session-${id}`, name: id,
+        state: 'cleaning', closed: true, autoCleanupClosed: true, lifetime: 'once', nativeDestroyed: false }));
+      const first = await f.service.poll(id);
+      if (phase === 'unknown-write') {
+        assert.equal(first.state, 'cleanup_failed');
+        await f.service.poll(id);
+        assert.equal(destroys, 1, 'the uncertain write is never replayed by polling');
+        continue;
+      }
+      assert.equal(first.queued, true);
+      assert.equal(f.store.get(id).nextAttemptAt > Date.now(), true);
+      const whenDue = async () => {
+        const row = f.store.get(id);
+        row.nextAttemptAt = 0; f.store.save(row);
+        return f.service.poll(id);
+      };
+      const second = await whenDue();
+      if (phase === 'persistent') {
+        assert.equal(second.queued, true);
+        assert.equal((await whenDue()).state, 'cleanup_failed');
+        assert.equal(probes, 3);
+        assert.equal(destroys, 0);
+      } else {
+        assert.equal(second.deleted, true);
+        assert.equal(f.store.get(id), undefined);
+      }
+    } finally { f.service.close(); }
+  }
+});
 
 test('a same-named descendant never enters this chat’s namespace or list', async () => {
   const owner = ownerIdFor(THREAD);
@@ -535,8 +644,6 @@ test('Codex poll consumes submissions atomically while ask remains answerable th
   const adapter = (record, deps) => createCodexBackend(record, { ...deps, host: {
     probe: async () => ({ identity: { application: 'codex-desktop' }, missing: [] }),
     readDefaultModel: async () => ({ provider: 'openai', model: 'test' }),
-    models: async () => ({ default: { provider: 'openai', model: 'test' },
-      groups: [{ id: 'openai', models: [{ id: 'test', reasoningEfforts: ['max'] }] }] }),
   } });
   const f = await fixture({ adapters: { 'codex-desktop': adapter } });
   try {
@@ -607,9 +714,9 @@ test('Desktop first input and immediate supplement queue promptly and each dispa
     assert.equal((await f.service.send({ name: 'queue', message: 'first' }, extra(THREAD))).queued, true);
     assert.equal((await f.service.send({ name: 'queue', message: 'supplement' }, extra(THREAD))).queued, true);
     assert.equal(sent.length, 0);
-    const beforePoll = instances; // Queuing resolves the model catalog without dispatching.
+    assert.equal(instances, 0, 'queuing never probes the host or creates an adapter');
     await f.service.poll('queue');
-    assert.equal(instances, beforePoll + 1, 'a poll uses one backend instance');
+    assert.equal(instances, 1, 'a poll uses one backend instance');
     await f.service.poll('queue');
     await f.service.poll('queue');
     assert.deepEqual(sent.map(input => [input.message, input.kind]), [['first', 'task'], ['supplement', 'supplement']]);
@@ -682,8 +789,7 @@ test('a 123-name retained roster serves HTTP during a scan without loading idle 
 });
 
 test('pre-delivery failures back off visibly, while ambiguous delivery is never sent again', async () => {
-  // Fail once at collection and again when the same dispatch prepares its pending selection.
-  let beginFailures = 1, modelFailures = 2, begins = 0, models = 0, sends = 0;
+  let beginFailures = 1, modelFailures = 1, begins = 0, models = 0, sends = 0;
   const base = fakeBackend();
   const f = await fixture({ adapters: { 'codex-desktop': record => ({ ...base(record),
     beginTask: async () => { begins++; if (beginFailures-- > 0) throw Object.assign(new Error('host busy before begin'), { code: 'agent-busy' }); return { treeProtocol: 1, reportProtocol: 1 }; },
@@ -700,7 +806,7 @@ test('pre-delivery failures back off visibly, while ambiguous delivery is never 
     assert.ok(f.store.get('retry').nextAttemptAt > Date.now());
     let r = f.store.get('retry'); r.nextAttemptAt = 0; f.store.save(r);
     await f.service.poll('retry'); await f.service.poll('retry');
-    assert.equal(models, 2);
+    assert.equal(models, 1);
     r = f.store.get('retry');
     assert.equal(r.task.dispatches[0].state, 'retrying');
     const waiting = await f.service.wait({ names: ['retry'], timeoutSeconds: 1 }, extra(THREAD));
@@ -786,7 +892,7 @@ test('queued Desktop cleanup survives an old poll save and native failure is vis
     await f.service.monitorScan();
     await f.service.poll('delete');
     assert.equal(f.store.get('delete').state, 'cleanup_failed');
-    assert.match((await f.service.list(extra(THREAD), { name: 'delete' })).items[0].error.message, /native deletion refused/);
+    assert.match((await f.service.list(extra(THREAD))).items[0].error.message, /native deletion refused/);
     await f.service.delete({ name: 'delete' }, extra(THREAD));
     assert.equal((await f.service.poll('delete')).deleted, true);
     assert.equal(destroys, 2);
@@ -840,7 +946,7 @@ test('a returned stop refusal remains visible through observation until native c
     await f.service.cancel({ name: 'refusal' }, extra(THREAD));
     await f.service.poll('refusal');
     assert.equal(f.store.get('refusal').error, undefined, 'observe completed normally');
-    const listed = (await f.service.list(extra(THREAD), { name: 'refusal' })).items[0];
+    const listed = (await f.service.list(extra(THREAD))).items[0];
     assert.equal(listed.error.code, 'native-cancel-unconfirmed');
     assert.equal(listed.error.detail.rounds[0].rows[0].error.code, 'task-stop-click-unavailable');
     assert.equal(JSON.stringify(listed).includes('private-id'), false);
@@ -851,12 +957,12 @@ test('a returned stop refusal remains visible through observation until native c
     assert.equal(cancels, 1, 'normal-return refusals also back off');
     let r = f.store.get('refusal'); r.nextAttemptAt = 0; f.store.save(r);
     await f.service.poll('refusal');
-    assert.equal((await f.service.list(extra(THREAD), { name: 'refusal' })).items[0].error.code, 'native-cancel-partial');
+    assert.equal((await f.service.list(extra(THREAD))).items[0].error.code, 'native-cancel-partial');
     assert.equal(f.store.get('refusal').task.cancelPending, true);
     r = f.store.get('refusal'); r.nextAttemptAt = 0; f.store.save(r);
     await f.service.poll('refusal');
     assert.equal(f.store.get('refusal').state, 'cancelled');
-    assert.equal((await f.service.list(extra(THREAD), { name: 'refusal' })).items[0].error, undefined);
+    assert.equal((await f.service.list(extra(THREAD))).items[0].error, undefined);
   } finally { f.service.close(); }
 });
 

@@ -1,10 +1,10 @@
 {
   "name": "futureaide-control",
-  "version": "0.5.21",
+  "version": "2.3.0",
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Named subagents for Codex and Claude Desktop: assign work to DSH, Codex Desktop or the Claude CLI by name, with direct questions, explicit reports, file attribution and managed lifetimes.",
+  "description": "Cross-client headless subagent controller for Antigravity, Codex, and Claude: dispatch codex-cli, claude-cli, and agy-cli fleets by role or name with <50ms callbacks, isolated git worktrees, team board @mentions, proxy locks, and live token billing.",
   "homepage": "https://github.com/XianYuLSya/FutureAide-Control#readme",
   "repository": {
     "type": "git",
@@ -14,13 +14,16 @@
     "url": "https://github.com/XianYuLSya/FutureAide-Control/issues"
   },
   "keywords": [
+    "antigravity",
     "codex",
-    "codex-plugin",
-    "dsh",
-    "deepseek-harness",
+    "claude",
+    "codex-cli",
+    "claude-cli",
+    "agy-cli",
     "futureaide",
     "mcp",
     "subagents",
+    "worktree",
     "windows"
   ],
   "engines": {

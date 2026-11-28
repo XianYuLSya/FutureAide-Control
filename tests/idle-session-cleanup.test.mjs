@@ -297,8 +297,7 @@ test('a released thread resumes for the next task with the same selection', asyn
     assert.equal(f.codex.loaded(lead.threadId), true);
     const starts = f.codex.inputs('turn/start');
     assert.equal(starts.length, 2, 'the second task starts its own turn on the same thread');
-    assert.deepEqual([starts[1].params.model, starts[1].params.effort], ['gpt-6-luna', 'low'],
-      'the same name keeps its explicit model and effort after a cold resume');
+    assert.deepEqual([starts[1].params.model, starts[1].params.effort], ['gpt-6-luna', 'low'], 'the frozen model is unchanged');
     assert.deepEqual(f.record('lead').modelPin, pinned);
     assert.equal(f.releases.length, 1, 'the new round has not finished, so nothing is released again');
   } finally { f.service.close(); }

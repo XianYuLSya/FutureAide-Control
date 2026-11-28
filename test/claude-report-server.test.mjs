@@ -12,8 +12,8 @@ import { createClaudeReportServer, INSTRUCTIONS, startHttpService,
 
 const sessionId = '6808231c-116c-4fc7-b9b0-4d790e763b0b';
 const trustedShape = { source: 'claude-desktop', nativeSessionId: sessionId,
-  workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, via: 'pid' };
-const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\xiayuls_workflow', via: 'pid' };
+  workspace: 'D:\\Work\\demo-workspace', pid: 50124, via: 'pid' };
+const caller = { pid: 50124, sessionId, cwd: 'D:\\Work\\demo-workspace', via: 'pid' };
 
 async function inMemory(resolveCaller = async () => caller, management) {
   const server = createClaudeReportServer({ resolveCaller, management });
@@ -64,7 +64,7 @@ test('the trusted caller carries only what the connection proved', () => {
     procStart: '134381970992798945', pidDomain: 'win32:h', socketPath: '\\\\.\\pipe\\p',
     recordFile: 'D:\\s\\50124.json', directory: 'D:\\s', image: 'claude.exe', peerToken: 'secret' });
   assert.deepEqual(full, { source: 'claude-desktop', nativeSessionId: sessionId,
-    workspace: 'D:\\Work\\xiayuls_workflow', pid: 50124, procStart: '134381970992798945',
+    workspace: 'D:\\Work\\demo-workspace', pid: 50124, procStart: '134381970992798945',
     pidDomain: 'win32:h', socketPath: '\\\\.\\pipe\\p', recordFile: 'D:\\s\\50124.json',
     directory: 'D:\\s', hostSessionId: 'local_1', label: '测试会话', via: 'pid' });
   assert.ok(!('peerToken' in full) && !('image' in full));

@@ -1,15 +1,15 @@
 {
   "name": "futureaide-control",
-  "version": "0.5.21",
-  "description": "Named subagents for Codex and Claude Desktop: assign work to DSH, Codex Desktop or the Claude CLI by name, with direct questions, explicit reports, file attribution and managed lifetimes.",
+  "version": "2.3.0",
+  "description": "Cross-client headless subagent controller for Antigravity, Codex, and Claude: dispatch codex-cli, claude-cli, and agy-cli fleets by role or name with <50ms callbacks, isolated git worktrees, team board @mentions, proxy locks, and live token billing.",
   "author": {
     "name": "FutureAide"
   },
   "skills": "./skills/",
   "interface": {
-    "displayName": "FutureAide Control · DSH Control",
-    "shortDescription": "按名字安排 DSH 团队，多层委派、主动汇报和整树监工。",
-    "longDescription": "为每个 Codex 聊天建立独立的 DSH 子代理名单，自动使用当前项目路径。按名字派活与答疑，DSH 助手可继续安排多层下属；查看整棵树的任务、文件归属和对话，仅DSH主动提交的汇报、提问和最终交付回到原聊天，普通轮次结束保持安静。一次性任务交付后清理本机受管树，长期代理保留上下文供复用。适用于 Windows Codex Desktop 与 DSH Desktop，需 Node.js 24.14 或更高版本。QQ 交流群：259109974。",
+    "displayName": "FutureAide Control",
+    "shortDescription": "Antigravity / Codex / Claude 跨端调度 codex-cli、claude-cli、agy-cli 无头子代理军团。",
+    "longDescription": "在 Antigravity、Codex 或 Claude 主对话中按角色或名字调度 codex-cli、claude-cli、agy-cli 三极无头军团。自动读取团队配置排号（后端1、后端2），支持最多 20 路并发与 Git worktree 独立分支、一键合入拆树、<50ms 极薄回调桥与 futureaide-wait 零轮询唤醒、Win32 Job Object 零孤儿进程笼、团队会议室 @ 跨级直问、整队接班收编与 FAswitch 切号续跑、CLI 代理防跑偏硬锁及实时 Token 账单。适用于 Windows，需 Node.js 24.14+。QQ 交流群：259109974。",
     "developerName": "FutureAide",
     "category": "Productivity",
     "capabilities": [
@@ -17,9 +17,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "创建一次性画图助手，为当前项目生成中文架构图",
-      "安排一个 DSH 团队长，自行分配下属并汇总当前项目的架构和模块说明",
-      "查看当前聊天的 DSH 团队、下属任务和文件修改"
+      "派两名后端工程师在独立 worktree 并行实现接口与单测，做完合入分支",
+      "派一名团队长统筹前后端子代理推进当前需求，并在会议室黑板对表",
+      "查看当前团队上下级状态、代理端口锁与实时 Token 消耗"
     ]
   },
   "mcpServers": "./.mcp.json"

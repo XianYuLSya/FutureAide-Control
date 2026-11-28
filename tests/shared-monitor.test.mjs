@@ -2,13 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
 import path, { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { RosterStore } from '../src/roster-store.mjs';
 import { processStartTime } from '../src/claude-caller-identity.mjs';
 import { idleSignal } from '../src/idle-monitor.mjs';
+import { startReportService } from '../src/claude-report-server.mjs';
+import { readReportStatus } from '../src/report-endpoint.mjs';
 import { createDirectoryWatchers, ensureSharedMonitor, monitorAlive, monitorDirectories, monitorProcess, monitorSpawn,
   monitorState, monitorWaitMs, processAlive, recordMonitorPid, renewMonitorPid, MONITOR_PROCESS_LEASE } from '../src/shared-monitor.mjs';
 
@@ -556,6 +558,51 @@ async function workerFixture(settings) {
   const configFile = path.join(root, 'config.json');
   await writeFile(configFile, JSON.stringify({ workspace: root, reportPort: 0, ...settings }), 'utf8');
   return { root, configFile, store: new RosterStore(path.join(root, 'state', 'roster.sqlite')) };
+}
+
+for (const foreign of [false, true]) {
+  test(`the worker takes its own report port after ${foreign ? 'an unrelated listener' : 'its predecessor'} leaves`, async () => {
+    const { root, configFile, store } = await workerFixture({ target: 'dsh' });
+    const former = await startReportService({ store: foreign ? { identity: () => 'other-roster' } : store, port: 0 });
+    const { port } = former;
+    const expectedRoster = store.identity();
+    let healthChecks = 0;
+    former.server.on('request', request => { if (request.url === '/healthz') healthChecks++; });
+    let worker;
+    try {
+      await writeFile(configFile, JSON.stringify({ workspace: root, target: 'dsh', reportPort: port }), 'utf8');
+      const before = await readReportStatus({ port });
+      const baseline = healthChecks;
+      worker = await startWorker(store, configFile);
+      const checkedBy = Date.now() + 3000;
+      while (healthChecks === baseline && Date.now() < checkedBy) await tick(50);
+      assert.ok(healthChecks > baseline, 'the worker checked the port while it was occupied');
+      const occupied = await readReportStatus({ port });
+      assert.equal(occupied.health?.startedAt, before.health?.startedAt, 'the existing listener keeps serving');
+
+      await former.close();
+      const deadline = Date.now() + 9000;
+      let resumed;
+      do {
+        resumed = await readReportStatus({ port, expectedRoster });
+        if (resumed.ready) break;
+        await tick(100);
+      } while (Date.now() < deadline);
+      assert.equal(resumed.ready, true, 'the same worker binds the port after it becomes free');
+      assert.notEqual(resumed.health?.startedAt, before.health?.startedAt);
+      assert.equal(store.leaseHeld('idle-monitor:ready', LEASE), true);
+
+      const exited = once(worker, 'exit', { signal: AbortSignal.timeout(9000) });
+      store.releaseLease('idle-monitor:ready', LEASE);
+      const [code] = await exited;
+      assert.equal(code, 0, 'the worker drains and exits normally');
+      assert.equal((await readReportStatus({ port, expectedRoster })).ready, false, 'the worker closed its own port');
+    } finally {
+      if (worker?.exitCode === null) worker.kill();
+      if (former.server.listening) await former.close();
+      store.close();
+    }
+  });
 }
 
 // A sleeping name is woken from the listener's own process, and that path asks

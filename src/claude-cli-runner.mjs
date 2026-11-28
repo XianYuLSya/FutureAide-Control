@@ -51,6 +51,8 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { createInterface } from 'node:readline';
+import { buildCliProxyEnv, checkProxyReachable, resolveCliRoute } from './cli-proxy.mjs';
+import { killProcessCage } from './process-cage.mjs';
 import { replaceStateFile } from './replace-state-file.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -65,12 +67,15 @@ async function defaultFindClaudeCli(options) {
 
 /** Effort levels `--effort` accepts; anything else is refused before a process starts. */
 export const CLAUDE_EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max']);
+export const DEFAULT_TURN_TIMEOUT_MS = 25 * 60 * 1000;
 /** The MCP server whose two callback tools are the only ones pre-allowed. */
 export const DEFAULT_MCP_SERVER_NAME = 'futureaide';
 /** Callback tools pre-allowed non-interactively; nothing else is widened. */
 export const REQUIRED_MCP_TOOLS = Object.freeze(['ask_parent', 'report_parent']);
 /** Stored message text is bounded the same way the shared history view bounds it. */
 export const MAX_MESSAGE_TEXT = 8000;
+/** Concise live action label shown in observe() activity. */
+export const MAX_LAST_STEP_CHARS = 50;
 /** Oldest normalized messages are dropped beyond this, so a long turn cannot bloat state.json. */
 export const MAX_STORED_MESSAGES = 400;
 /** A live worker rewrites its heartbeat this often; a reader uses it to spot a killed worker. */
@@ -143,12 +148,69 @@ function recordedWorkerPid(turn, state) {
 }
 
 function cliCommand(cli) {
-  if (typeof cli === 'string' && cli.trim()) return { command: cli.trim(), prefixArgs: [] };
+  if (typeof cli === 'string' && cli.trim()) {
+    const trimmed = cli.trim();
+    if (/\.(mjs|cjs|js)$/i.test(trimmed)) return { command: process.execPath, prefixArgs: [trimmed] };
+    return { command: trimmed, prefixArgs: [] };
+  }
   if (cli && typeof cli === 'object' && typeof cli.command === 'string' && cli.command.trim()) {
     const prefixArgs = Array.isArray(cli.prefixArgs) ? cli.prefixArgs.map(String) : [];
     return { command: cli.command.trim(), prefixArgs };
   }
   throw fail('invalid-cli', 'A Claude CLI path (or a {command, prefixArgs} stand-in) is required. Use probeClaudeCli() to resolve it.');
+}
+
+export function resolveTurnTimeoutMs({ timeoutMs, timeoutMinutes, config } = {}) {
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) return Math.max(1, Math.round(timeoutMs));
+  if (Number.isFinite(timeoutMinutes) && timeoutMinutes > 0) return Math.max(1, Math.round(timeoutMinutes * 60 * 1000));
+  if (Number.isFinite(config?.turnTimeoutMs) && config.turnTimeoutMs > 0) {
+    return Math.max(1, Math.round(config.turnTimeoutMs));
+  }
+  if (Number.isFinite(config?.turnTimeoutMinutes) && config.turnTimeoutMinutes > 0) {
+    return Math.max(1, Math.round(config.turnTimeoutMinutes * 60 * 1000));
+  }
+  return DEFAULT_TURN_TIMEOUT_MS;
+}
+
+function toNonNegInt(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) && num >= 0 ? Math.round(num) : fallback;
+}
+
+export function normalizeClaudeUsage(raw, prev = null, { startedAt, durationMs, durationSec: explicitDurationSec, nowMs = Date.now() } = {}) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const inputTokens = toNonNegInt(
+    src.input_tokens ?? src.inputTokens ?? src.prompt_tokens,
+    prev?.inputTokens ?? 0,
+  );
+  const outputTokens = toNonNegInt(
+    src.output_tokens ?? src.outputTokens ?? src.completion_tokens,
+    prev?.outputTokens ?? 0,
+  );
+  const cachedTokens = toNonNegInt(
+    src.cache_read_input_tokens ?? src.cache_read_tokens ?? src.cached_input_tokens ?? src.cachedTokens,
+    prev?.cachedTokens ?? 0,
+  );
+  const cacheCreation = toNonNegInt(src.cache_creation_input_tokens ?? src.cache_write_tokens, 0);
+  const rawTotal = src.total_tokens ?? src.totalTokens;
+  const totalTokens = Number.isFinite(Number(rawTotal)) && Number(rawTotal) >= 0
+    ? Math.round(Number(rawTotal))
+    : inputTokens + outputTokens + cachedTokens + cacheCreation;
+
+  let durationSec = prev?.durationSec ?? 0;
+  const rawSec = explicitDurationSec ?? src.duration_seconds ?? src.durationSec;
+  const rawMs = durationMs ?? src.duration_ms ?? src.durationMs;
+  if (Number.isFinite(Number(rawSec)) && Number(rawSec) >= 0) {
+    durationSec = Math.round(Number(rawSec) * 100) / 100;
+  } else if (Number.isFinite(Number(rawMs)) && Number(rawMs) >= 0) {
+    durationSec = Math.round((Number(rawMs) / 1000) * 100) / 100;
+  } else if (typeof startedAt === 'string' && startedAt) {
+    const parsedStart = Date.parse(startedAt);
+    if (Number.isFinite(parsedStart)) {
+      durationSec = Math.max(0, Math.round(((nowMs - parsedStart) / 1000) * 100) / 100);
+    }
+  }
+  return { inputTokens, outputTokens, cachedTokens, totalTokens, durationSec };
 }
 
 /** `mcp__<server>__<tool>`: the name the CLI exposes for one MCP tool. */
@@ -282,9 +344,11 @@ export function permissionSupportFromHelp(help) {
   return { modeFlag, promptsFlag, modes, auto: modeFlag && modes.includes('auto') };
 }
 
-async function runCli(cli, args, { exec = execFileAsync } = {}) {
+async function runCli(cli, args, { exec = execFileAsync, env } = {}) {
+  const spec = cliCommand(cli);
   try {
-    const { stdout, stderr } = await exec(cli, args, { encoding: 'utf8', windowsHide: true,
+    const { stdout, stderr } = await exec(spec.command, [...spec.prefixArgs, ...args], { encoding: 'utf8', windowsHide: true,
+      ...(env ? { env } : {}),
       maxBuffer: 8 * 1024 * 1024, timeout: PROBE_TIMEOUT_MS });
     return { code: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') };
   } catch (error) {
@@ -345,12 +409,36 @@ export function authMethodKind(method) {
  * @param {object} [options] Test seams and an explicit CLI path.
  * @returns {Promise<{cli: string, auth: object, permissions: object}>}
  */
-export async function probeClaudeCli({ explicit, env = process.env, findCli = defaultFindClaudeCli, exec } = {}) {
-  const cli = await findCli({ explicit, env });
+export async function probeClaudeCli({
+  explicit,
+  config,
+  env = process.env,
+  findCli = defaultFindClaudeCli,
+  resolveRoute,
+  exec,
+} = {}) {
+  const shouldResolveRoute = Boolean(
+    resolveRoute
+    || config !== undefined
+    || env?.FUTUREAIDE_CLAUDE_CLI_PROXY
+    || env?.FUTUREAIDE_CLAUDE_CLI_PROXY_PORT
+    || env?.FUTUREAIDE_CLI_PROXY
+    || (findCli === defaultFindClaudeCli && exec === undefined),
+  );
+  const route = shouldResolveRoute
+    ? await (resolveRoute ?? resolveCliRoute)({ target: 'claude-cli', client: 'claude', config: config ?? {}, env })
+    : { ok: true, source: 'inherit', mode: 'inherit', proxyUrl: null, port: null };
+  if (!route.ok) {
+    throw fail(route.code || 'proxy-unavailable',
+      route.error || 'Claude CLI proxy route is unavailable. Nothing was started.',
+      { route });
+  }
+  const childEnv = route.mode === 'proxy' || route.mode === 'direct' ? buildCliProxyEnv(env, route) : env;
+  const cli = await findCli({ explicit, env: childEnv });
   if (!cli) {
     throw fail('claude-cli-not-found', 'The Claude Code CLI was not found: put claude on PATH, install Claude Code, or pass an explicit path. Nothing was started.');
   }
-  const auth = await runCli(cli, ['auth', 'status'], { exec });
+  const auth = await runCli(cli, ['auth', 'status'], { exec, ...(childEnv !== process.env ? { env: childEnv } : {}) });
   const status = readJsonAnswer(auth.stdout);
   if (!status) {
     throw fail('claude-cli-probe-failed', '`claude auth status` did not return JSON, so this CLI cannot be used. Nothing was started.');
@@ -366,7 +454,7 @@ export async function probeClaudeCli({ explicit, env = process.env, findCli = de
       + 'but `claude auth status` reports authMethod ' + JSON.stringify(status.authMethod ?? null)
       + ', which is not that sign-in. Sign the CLI in with its own OAuth login and dispatch again. Nothing was started.');
   }
-  const help = await runCli(cli, ['--help'], { exec });
+  const help = await runCli(cli, ['--help'], { exec, ...(childEnv !== process.env ? { env: childEnv } : {}) });
   if (help.code !== 0 || !help.stdout.trim()) {
     throw fail('claude-cli-probe-failed', 'This Claude CLI did not print its help, so its permission flags cannot be verified. Nothing was started.'
       + (help.stderr.trim() ? ' It said: ' + help.stderr.trim().slice(0, 300) : ''));
@@ -390,6 +478,7 @@ export async function probeClaudeCli({ explicit, env = process.env, findCli = de
       subscriptionType: status.subscriptionType ?? null,
     },
     permissions: { mode: 'auto', prompts: 'none', modes: support.modes },
+    route,
   };
 }
 
@@ -403,11 +492,12 @@ export function createClaudeTurnState({ requestId, sessionId, workspace, message
   const state = {
     version: 1, requestId: requestId ?? null, sessionId: sessionId ?? null, cliSessionId: null,
     workspace: workspace ?? null, state: 'running', phase: 'starting',
-    startedAt: time, updatedAt: time, heartbeatAt: time, endedAt: null,
+    startedAt: time, updatedAt: time, heartbeatAt: time, lastEventAt: time, lastStep: null, endedAt: null,
     model: null, permissionMode: null, sessionStarted: false,
     messages: [], messagesDropped: 0,
     warnings: [], mcp: { required: mcpRequired ?? null, servers: [], errors: [] },
     denials: [], rawTail: [],
+    usage: null,
     resultSeen: false, resultSubtype: null, resultIsError: false, resultText: null,
     resultErrors: [], turns: null, durationMs: null, costUsd: null, stopReason: null,
     pid: null, exitCode: null, error: null,
@@ -421,6 +511,35 @@ export function createClaudeTurnState({ requestId, sessionId, workspace, message
 function bounded(text) {
   const value = String(text ?? '');
   return { text: value.slice(0, MAX_MESSAGE_TEXT), truncated: value.length > MAX_MESSAGE_TEXT };
+}
+
+function clipLastStep(value) {
+  const normalized = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return null;
+  return normalized.length > MAX_LAST_STEP_CHARS
+    ? normalized.slice(0, MAX_LAST_STEP_CHARS - 3) + '...'
+    : normalized;
+}
+
+function describeClaudeToolStep(rawName, input) {
+  const name = String(rawName ?? '').trim();
+  if (!name) return '调工具';
+  if (/^mcp__[^_]+__(.+)$/.test(name)) {
+    return clipLastStep(`mcp: ${name.replace(/^mcp__[^_]+__/, '')}`);
+  }
+  if (/^(?:bash|shell)$/i.test(name)) {
+    const cmd = typeof input?.command === 'string' ? input.command.replace(/\s+/g, ' ').trim() : '';
+    return clipLastStep(cmd ? `shell: ${cmd}` : 'shell');
+  }
+  if (/^(?:edit|multiedit|write|notebookedit)$/i.test(name)) {
+    const file = input?.file_path ?? input?.path ?? input?.notebook_path;
+    return clipLastStep(file ? `改文件 ${path.basename(String(file))}` : '改文件');
+  }
+  if (/^(?:read|glob|grep)$/i.test(name)) {
+    const target = input?.file_path ?? input?.pattern ?? input?.path;
+    return clipLastStep(target ? `读查: ${path.basename(String(target))}` : `tool: ${name}`);
+  }
+  return clipLastStep(`tool: ${name}`);
 }
 
 function pushClaudeMessage(state, message) {
@@ -458,6 +577,7 @@ function applySystemEvent(state, value) {
   if (value.subtype !== 'init') return;
   state.sessionStarted = true;
   if (state.phase === 'starting') state.phase = 'streaming';
+  state.lastStep ??= '会话已启动';
   if (typeof value.session_id === 'string' && value.session_id) state.cliSessionId = value.session_id;
   if (typeof value.claude_code_version === 'string') state.cliVersion = value.claude_code_version;
   if (typeof value.model === 'string' && value.model) state.model = value.model;
@@ -503,7 +623,19 @@ function applyAssistantEvent(state, value) {
   const content = Array.isArray(value.message?.content) ? value.message.content : [];
   const raw = content.filter(part => part?.type === 'text' && typeof part.text === 'string')
     .map(part => part.text).join('\n');
-  const tools = content.filter(part => part?.type === 'tool_use').slice(0, 24)
+  const rawToolUses = content.filter(part => part?.type === 'tool_use');
+  if (rawToolUses.length) {
+    const latestTool = rawToolUses.at(-1);
+    state.lastStep = describeClaudeToolStep(latestTool.name, latestTool.input);
+  } else if (raw.trim()) {
+    state.lastStep = '输出回复中';
+  } else if (content.some(part => part?.type === 'thinking')) {
+    state.lastStep = '思考推理中';
+  }
+  if (value.message?.usage && typeof value.message.usage === 'object') {
+    state.usage = normalizeClaudeUsage(value.message.usage, state.usage, { startedAt: state.startedAt });
+  }
+  const tools = rawToolUses.slice(0, 24)
     .map(part => ({ name: String(part.name ?? '').slice(0, 160), id: String(part.id ?? '').slice(0, 200) }));
   if (!raw && !tools.length) return;
   const text = bounded(raw);
@@ -554,10 +686,20 @@ function applyResultEvent(state, value) {
   state.resultSubtype = typeof value.subtype === 'string' ? value.subtype : null;
   state.resultIsError = value.is_error === true
     || (typeof value.subtype === 'string' && value.subtype !== 'success');
+  state.lastStep = state.resultIsError
+    ? clipLastStep(`错误: ${state.resultSubtype || '执行失败'}`)
+    : '回合已完成';
   if (typeof value.result === 'string') state.resultText = value.result.slice(0, MAX_MESSAGE_TEXT);
   if (Number.isSafeInteger(value.num_turns)) state.turns = value.num_turns;
   if (Number.isFinite(value.duration_ms)) state.durationMs = value.duration_ms;
   if (Number.isFinite(value.total_cost_usd)) state.costUsd = value.total_cost_usd;
+  if ((value.usage && typeof value.usage === 'object') || state.usage) {
+    state.usage = normalizeClaudeUsage(value.usage, state.usage, {
+      startedAt: state.startedAt,
+      durationMs: value.duration_ms,
+      durationSec: value.duration_seconds,
+    });
+  }
   if (typeof value.stop_reason === 'string') state.stopReason = value.stop_reason;
   if (Array.isArray(value.errors) && value.errors.length) {
     state.resultErrors = value.errors.slice(0, 4).map(entry => String(entry).slice(0, 400));
@@ -591,6 +733,7 @@ export function applyClaudeLine(state, line) {
     return { kind: 'raw' };
   }
   state.updatedAt = new Date().toISOString();
+  state.lastEventAt = state.updatedAt;
   if (value.type === 'system') { applySystemEvent(state, value); return { kind: 'system' }; }
   if (value.type === 'user' && state.businessSubmitted === true && state.inputUuid
       && value.uuid === state.inputUuid && value.session_id === state.sessionId) state.businessAccepted = true;
@@ -710,9 +853,9 @@ export function claudeTurnOutcome({ state, exitCode = null, cancelled = false, s
 // ---------------------------------------------------------------------------
 
 /** Spawn the detached, windowless worker that outlives this call. */
-function startDetachedWorker(directory) {
+function startDetachedWorker(directory, { env = process.env } = {}) {
   const worker = fileURLToPath(new URL('./claude-cli-worker.mjs', import.meta.url));
-  const child = spawn(process.execPath, [worker, '--turn', directory], { detached: true, stdio: 'ignore', windowsHide: true });
+  const child = spawn(process.execPath, [worker, '--turn', directory], { detached: true, stdio: 'ignore', windowsHide: true, env });
   child.unref();
   return { pid: child.pid };
 }
@@ -729,7 +872,11 @@ function startDetachedWorker(directory) {
  * @returns {Promise<object>} {accepted, duplicate, state, directory, requestId, sessionId, workerPid?, startedAt}
  */
 export async function startClaudeTurn(input = {}, deps = {}) {
-  const { directory, cli, workspace, sessionId, resume = false, message, model, effort, mcpConfig, name } = input;
+  const {
+    directory, cli, workspace, sessionId, resume = false, message, model, effort,
+    mcpConfig, name, callerEnv, reportConfig, route: explicitRoute, config,
+    timeoutMs, timeoutMinutes,
+  } = input;
   if (typeof directory !== 'string' || !directory.trim() || !path.isAbsolute(directory)) {
     throw fail('invalid-directory', 'directory must be an absolute per-request path; the caller owns one private directory per request.');
   }
@@ -746,6 +893,40 @@ export async function startClaudeTurn(input = {}, deps = {}) {
   const nameValue = name === undefined || name === null || name === '' ? undefined : String(name);
   const command = cliCommand(cli);
   const serverName = mcpConfig === undefined || mcpConfig === null ? undefined : mcpServerFromConfig(mcpConfig);
+
+  const baseEnv = deps.env ?? process.env;
+  let resolvedRoute;
+  if (explicitRoute && typeof explicitRoute === 'object') {
+    if (explicitRoute.ok === false) {
+      throw fail(explicitRoute.code || 'proxy-unavailable',
+        explicitRoute.error || 'Claude CLI proxy route is unavailable; nothing was dispatched.',
+        { terminal: true, notSent: true, route: explicitRoute });
+    }
+    if (explicitRoute.mode === 'proxy' && explicitRoute.proxyUrl) {
+      const check = await (deps.checkProxy ?? checkProxyReachable)(explicitRoute.proxyUrl);
+      if (!check.ok) {
+        throw fail('proxy-unavailable',
+          `Bound proxy ${explicitRoute.proxyUrl} is unreachable (${check.error || 'TCP probe failed'}); nothing was dispatched.`,
+          { terminal: true, notSent: true, route: { ...explicitRoute, ok: false, proxyReachable: false } });
+      }
+      resolvedRoute = { ...explicitRoute, ok: true, proxyReachable: true };
+    } else {
+      resolvedRoute = { ok: true, ...explicitRoute };
+    }
+  } else {
+    resolvedRoute = await (deps.resolveRoute ?? resolveCliRoute)({
+      target: 'claude-cli',
+      client: 'claude',
+      config: config ?? {},
+      env: baseEnv,
+      ...(deps.checkProxy ? { checkProxy: deps.checkProxy } : {}),
+    });
+    if (!resolvedRoute.ok) {
+      throw fail(resolvedRoute.code || 'proxy-unavailable',
+        resolvedRoute.error || 'Claude CLI proxy route is unavailable; nothing was dispatched.',
+        { terminal: true, notSent: true, route: resolvedRoute });
+    }
+  }
 
   const requestId = createHash('sha256').update(JSON.stringify([directory, workspace, sessionId, message])).digest('hex');
   const fingerprint = createHash('sha256').update(JSON.stringify({
@@ -785,10 +966,37 @@ export async function startClaudeTurn(input = {}, deps = {}) {
   }
 
   const mcpFile = serverName === undefined ? undefined : path.join(directory, CLAUDE_TURN_FILES.mcp);
+  const resolvedCallerEnv = callerEnv ?? mcpConfig?.callerEnv ?? reportConfig?.callerEnv ?? null;
+  const resolvedReportConfig = reportConfig ?? null;
   const state = createClaudeTurnState({ requestId, sessionId, workspace, message, mcpRequired: serverName });
   let turn;
   try {
-    if (mcpFile) await writeFile(mcpFile, JSON.stringify(mcpConfig, null, 2) + '\n', { encoding: 'utf8' });
+    if (mcpFile) {
+      let mcpDocument = mcpConfig;
+      if (mcpConfig && Object.hasOwn(mcpConfig, 'callerEnv')) {
+        const { callerEnv: _ignoredCallerEnv, ...restMcp } = mcpConfig;
+        mcpDocument = restMcp;
+      }
+      if (serverName && (resolvedCallerEnv || resolvedReportConfig?.env) && mcpDocument?.mcpServers?.[serverName]) {
+        const serverEntry = mcpDocument.mcpServers[serverName];
+        const extraServerEnv = {};
+        for (const src of [resolvedCallerEnv, resolvedReportConfig?.env, serverEntry.env]) {
+          if (src && typeof src === 'object' && !Array.isArray(src)) {
+            for (const [key, val] of Object.entries(src)) {
+              if (val !== undefined && val !== null) extraServerEnv[key] = String(val);
+            }
+          }
+        }
+        mcpDocument = {
+          ...mcpDocument,
+          mcpServers: {
+            ...mcpDocument.mcpServers,
+            [serverName]: { ...serverEntry, env: extraServerEnv },
+          },
+        };
+      }
+      await writeFile(mcpFile, JSON.stringify(mcpDocument, null, 2) + '\n', { encoding: 'utf8' });
+    }
     await writeFile(path.join(directory, CLAUDE_TURN_FILES.prompt), message, { encoding: 'utf8' });
     turn = {
       version: 1, requestId, sessionId, resume: resume === true, workspace, name: nameValue ?? null,
@@ -800,9 +1008,14 @@ export async function startClaudeTurn(input = {}, deps = {}) {
         name: nameValue,
       }),
       selectedModel: modelValue ?? null, selectedEffort: effortValue ?? null,
+      timeoutMs: resolveTurnTimeoutMs({ timeoutMs, timeoutMinutes, config }),
       stagedControl: input.stagedControl === true,
       inputUuid: input.stagedControl === true ? randomUUID() : null,
-      mcpServer: serverName ?? null, startedAt, workerPid: null,
+      mcpServer: serverName ?? null,
+      route: resolvedRoute ?? null,
+      ...(resolvedCallerEnv ? { callerEnv: resolvedCallerEnv } : {}),
+      ...(resolvedReportConfig ? { reportConfig: resolvedReportConfig } : {}),
+      startedAt, workerPid: null,
       files: { prompt: CLAUDE_TURN_FILES.prompt, mcp: mcpFile ? CLAUDE_TURN_FILES.mcp : null,
         stdout: CLAUDE_TURN_FILES.stdout, stderr: CLAUDE_TURN_FILES.stderr },
     };
@@ -834,9 +1047,10 @@ export async function startClaudeTurn(input = {}, deps = {}) {
     throw fail(blocked, state.error.message, { terminal: true, notSent: true });
   }
 
+  const workerEnv = buildCliProxyEnv(baseEnv, resolvedRoute);
   let worker;
   try {
-    worker = await (deps.spawnWorker ?? startDetachedWorker)(directory);
+    worker = await (deps.spawnWorker ?? startDetachedWorker)(directory, { env: workerEnv, route: resolvedRoute });
   } catch (error) {
     // The request is claimed but nothing runs it. Record that instead of leaving a turn that
     // looks busy until its heartbeat goes stale.
@@ -912,10 +1126,11 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
     if (!turn) throw fail('claude-turn-not-found', `No Claude turn is recorded in ${directory}.`);
     return {
       directory, state: alive ? 'running' : 'failed', requestId: turn.requestId ?? null,
-      sessionId: turn.sessionId ?? null, cliSessionId: null, model: null, messages: [], sessionStarted: false,
+      sessionId: turn.sessionId ?? null, cliSessionId: null, model: null, usage: null, messages: [], sessionStarted: false,
       ...(alive ? {} : { error: await workerLostError(directory,
         'The detached Claude worker is gone and never wrote a state file. Nothing can be recovered from this turn.') }),
-      workerPid: turn.workerPid ?? null, startedAt: turn.startedAt ?? null, endedAt: null,
+      workerPid: turn.workerPid ?? null, lastStep: null, lastEventAt: turn.startedAt ?? null,
+      startedAt: turn.startedAt ?? null, endedAt: null,
     };
   }
   const marker = await readJson(path.join(directory, CLAUDE_TURN_FILES.cancel));
@@ -978,6 +1193,7 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
     ...(state.businessAccepted === true && state.inputUuid ? { inputUuid: state.inputUuid } : {}),
     messages: state.messages ?? [],
     ...(error ? { error } : {}),
+    notSent: state.notSent === true || state.error?.notSent === true,
     sessionStarted: state.sessionStarted === true,
     warnings: [...(state.warnings ?? []), ...(orphaned ? [orphaned] : [])],
     mcp: state.mcp ?? { required: null, servers: [], errors: [] },
@@ -986,8 +1202,11 @@ export async function readClaudeTurn(directory, { isAlive = processAlive } = {})
     turns: state.turns ?? null,
     costUsd: state.costUsd ?? null,
     durationMs: state.durationMs ?? null,
+    usage: state.usage ?? null,
     resultText: state.resultText ?? null,
     phase: state.phase ?? null,
+    lastStep: state.lastStep ?? null,
+    lastEventAt: state.lastEventAt ?? state.updatedAt ?? state.startedAt ?? turn?.startedAt ?? null,
     startedAt: state.startedAt ?? null,
     endedAt: state.endedAt ?? null,
     exitCode: state.exitCode ?? null,
@@ -1070,10 +1289,11 @@ async function readCommandLines(pids) {
  * `--turn <directory>` and the CLI with this session's id, so a process that answers to neither
  * is some other program that inherited the number.
  */
-function ownsRequest(commandLine, { directory, sessionId }) {
+function ownsRequest(commandLine, { directory, sessionId, requestId }) {
   const text = String(commandLine ?? '').toLowerCase();
   if (!text) return false;
-  return [directory, sessionId]
+  const normalizedDir = directory ? path.resolve(directory).toLowerCase() : '';
+  return [normalizedDir, directory, sessionId, requestId]
     .filter(marker => typeof marker === 'string' && marker.length > 8)
     .some(marker => text.includes(marker.toLowerCase()));
 }
@@ -1099,46 +1319,81 @@ async function markCancelled(directory, state) {
  * @returns {Promise<{cancelled: boolean, stopped: boolean, state: string, pids: object, remaining: number[], note?: string}>}
  */
 export async function cancelClaudeTurn(directory, { isAlive = processAlive, killTree = stopClaudeTree,
+  killCage = killTree === stopClaudeTree ? killProcessCage : async () => ({ ok: true, killed: [] }),
   commandLines = readCommandLines } = {}) {
   const turn = await readJson(path.join(directory, CLAUDE_TURN_FILES.turn));
   const state = await readTurnState(directory, turn, { checkTerminal: true });
   const pids = { worker: recordedWorkerPid(turn, state),
     claude: Number.isSafeInteger(state?.pid) && state.pid > 0 ? state.pid : null };
   if (!state && !turn) {
-    return { cancelled: false, stopped: true, state: null, pids, remaining: [],
+    return { ok: true, cancelled: false, stopped: true, state: null, pids, remaining: [],
       note: 'No Claude turn is recorded in this directory, so there is nothing to stop.' };
   }
   const recorded = [...new Set([pids.worker, pids.claude].filter(pid => Number.isSafeInteger(pid) && pid > 0))];
   const alive = () => recorded.filter(pid => isAlive(pid));
   const requestedAt = new Date().toISOString();
   const requestId = state?.requestId ?? turn?.requestId ?? null;
+  const sessionId = state?.sessionId ?? turn?.sessionId ?? null;
+  const markers = { directory, sessionId, requestId };
 
   if (TERMINAL_STATES.includes(state?.state)) {
     const surviving = alive();
     if (surviving.length) {
-      return { cancelled: false, stopped: false, state: state.state, pids, remaining: surviving,
-        note: 'This turn already reached a terminal state; its recorded processes are alive but are never killed by pid again. Retry with a fresh request.' };
+      const lines = await commandLines(surviving);
+      const ours = [];
+      const reused = [];
+      for (const pid of surviving) {
+        const identity = lines?.get?.(pid) ?? { text: null, ok: false };
+        if (!identity.ok || !identity.text) continue;
+        if (ownsRequest(identity.text, markers)) ours.push(pid);
+        else reused.push(pid);
+      }
+      if (ours.length) {
+        for (const pid of ours) await killTree(pid);
+        await killCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
+        const deadline = Date.now() + CANCEL_CONFIRM_MS;
+        let stillOurs = ours.filter(pid => isAlive(pid));
+        while (stillOurs.length && Date.now() < deadline) {
+          await delay(100);
+          stillOurs = ours.filter(pid => isAlive(pid));
+        }
+        if (stillOurs.length) {
+          return { ok: false, cancelled: false, stopped: false, state: state.state, pids, remaining: stillOurs,
+            note: 'Still running and not confirmed stopped: ' + stillOurs.join(', ') + '.' };
+        }
+        return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [] };
+      }
+      const swept = await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+      const stillSurviving = surviving.filter(pid => isAlive(pid) && !reused.includes(pid));
+      if (stillSurviving.length) {
+        return { ok: false, cancelled: false, stopped: false, state: state.state, pids, remaining: stillSurviving,
+          note: 'This turn already reached a terminal state; its recorded processes are alive but are never killed by pid again. Retry with a fresh request.' };
+      }
+      return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [],
+        ...(state.state === 'cancelled' || swept.killed?.length ? {} : { note: 'This turn already ended; nothing was killed.' }) };
     }
-    return { cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [],
-      ...(state.state === 'cancelled' ? {} : { note: 'This turn already ended; nothing was killed.' }) };
+    const swept = await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    return { ok: true, cancelled: state.state === 'cancelled', stopped: true, state: state.state, pids, remaining: [],
+      ...(state.state === 'cancelled' || swept.killed?.length ? {} : { note: 'This turn already ended; nothing was killed.' }) };
   }
 
   if (!recorded.length) {
     // The claim exists but the worker never recorded a pid: it may be starting right now.
-    return { cancelled: false, stopped: false, state: 'running', pids, remaining: [],
+    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
+    return { ok: false, cancelled: false, stopped: false, state: 'running', pids, remaining: [],
       note: 'The worker has not recorded any process yet, so nothing can be confirmed stopped. Retry cancel shortly.' };
   }
 
   await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel, { requestId, requestedAt, stopped: null, pids });
   const targets = alive();
   if (!targets.length) {
-    // Every recorded process is already gone: the tree is stopped, whether or not the
-    // worker got to write its own final state.
+    // Every recorded process is already gone: sweep any broken-chain orphans, then record stopped.
+    await killCage({ pids: [], turnDir: directory, runId: requestId, sessionId });
     const latest = await readTurnState(directory, turn, { checkTerminal: true });
     const current = TERMINAL_STATES.includes(latest?.state) ? latest.state : 'cancelled';
     if (!TERMINAL_STATES.includes(latest?.state)) await markCancelled(directory, latest ?? state);
     await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel, { requestId, requestedAt, stopped: true, remaining: [], pids });
-    return { cancelled: current === 'cancelled', stopped: true, state: current, pids, remaining: [] };
+    return { ok: true, cancelled: current === 'cancelled', stopped: true, state: current, pids, remaining: [] };
   }
 
   // Every recorded pid is judged on its own, and only a pid that still names this request is
@@ -1146,7 +1401,6 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
   // and counts as "the original process has left"; a pid whose identity cannot be read yet
   // proves nothing and is neither killed nor counted as stopped.
   const lines = await commandLines(targets);
-  const markers = { directory, sessionId: state?.sessionId ?? turn?.sessionId ?? null };
   const ours = [];
   const reused = [];
   const unknown = [];
@@ -1162,11 +1416,12 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
     // stopped: the turn stays open instead of reporting a stop that never happened.
     await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel,
       { requestId, requestedAt, stopped: false, remaining: targets, pids, unknown });
-    return { cancelled: false, stopped: false, state: 'running', pids, remaining: targets,
+    return { ok: false, cancelled: false, stopped: false, state: 'running', pids, remaining: targets,
       note: 'The identity of the recorded processes (' + targets.join(', ') + ') could not be read, so nothing was killed and nothing is confirmed stopped. The turn stays running.' };
   }
 
   for (const pid of ours) await killTree(pid);
+  await killCage({ pids: ours, turnDir: directory, runId: requestId, sessionId });
   // A reused pid is another program and never blocks a stop; anything else still running does.
   const blocking = () => recorded.filter(pid => isAlive(pid) && !reused.includes(pid));
   const deadline = Date.now() + CANCEL_CONFIRM_MS;
@@ -1180,7 +1435,7 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
     // attempt failed so a retry is the obvious next step.
     await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel, { requestId, requestedAt, stopped: false,
       remaining, pids, ...(reused.length ? { reused } : {}), ...(unknown.length ? { unknown } : {}) });
-    return { cancelled: false, stopped: false, state: 'running', pids, remaining,
+    return { ok: false, cancelled: false, stopped: false, state: 'running', pids, remaining,
       note: 'Still running and not confirmed stopped: ' + remaining.join(', ')
         + (unknown.some(pid => remaining.includes(pid)) ? ' (its identity could not be read yet, so it was not killed)' : '')
         + '. The turn stays running and cancel can be retried.' };
@@ -1192,9 +1447,9 @@ export async function cancelClaudeTurn(directory, { isAlive = processAlive, kill
     : {};
   if (TERMINAL_STATES.includes(latest?.state)) {
     await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel, { requestId, requestedAt, stopped: true, remaining: [], pids });
-    return { cancelled: latest.state === 'cancelled', stopped: true, state: latest.state, pids, remaining: [], ...reusedNote };
+    return { ok: true, cancelled: latest.state === 'cancelled', stopped: true, state: latest.state, pids, remaining: [], ...reusedNote };
   }
   await writeJsonFile(directory, CLAUDE_TURN_FILES.cancel, { requestId, requestedAt, stopped: true, remaining: [], pids });
   await markCancelled(directory, latest ?? state);
-  return { cancelled: true, stopped: true, state: 'cancelled', pids, remaining: [], ...reusedNote };
+  return { ok: true, cancelled: true, stopped: true, state: 'cancelled', pids, remaining: [], ...reusedNote };
 }

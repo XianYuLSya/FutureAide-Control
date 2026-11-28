@@ -610,7 +610,8 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
   appPages = appPagesOnEndpoint, targetHandshakeMs = 500, extraProbeTimeoutMs = 1500,
   idleMs = 30000, timeoutMs = 15000, measure = writeCodexMeasurement, onRecovery, probeTimeoutMs = 1000 } = {}) {
   let connection, timer, sequence = 0, generation = 0, active = 0, failedUntil = 0, failure;
-  let faultSequence = 0, recoverySequence = 0, recoveredFaultSequence = 0, fault, probing = false, probeTimer, discoveryInFlight;
+  let faultSequence = 0, recoverySequence = 0, recoveredFaultSequence = 0, fault, discoveryInFlight;
+  let probing = false, probeRequested = false, probeTimer;
   const listeners = new Set(onRecovery ? [onRecovery] : []);
   const subscribeRecovery = listener => { listeners.add(listener); return () => listeners.delete(listener); };
   const emit = measure ? (event, data) => {
@@ -633,6 +634,11 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     emit?.('close_requested', { generation: target?.generation, reason, inFlight: target?.pending?.size ?? 0 });
     if (connection === target) {
       if (target && reason !== 'explicit' && reason !== 'idle') recordFault(target);
+      if (reason === 'explicit') {
+        clearTimeout(probeTimer);
+        probeTimer = undefined;
+        probeRequested = false;
+      }
       clearTimeout(timer);
       connection = undefined;
     }
@@ -640,7 +646,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     target?.socket?.close();
   }
   function closeWhenIdle(target) {
-    if (active || !target || connection !== target || target.verification) return;
+    if (active || probing || !target || connection !== target) return;
     clearTimeout(timer);
     timer = setTimeout(() => close(target, 'idle'), idleMs);
     timer.unref?.();
@@ -667,7 +673,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     }
     catch (error) { failedUntil = Date.now() + 5000; failure = error; throw error; }
   }
-  async function connect(target, recovery = false, forceDiscovery = recovery) {
+  async function connect(target, forceDiscovery = false) {
     // The one renderer discovery per connection; the release window check reads this same
     // `found`, so the page list and the socket can never come from different endpoints.
     emit?.('discovery_start', { generation: target.generation });
@@ -728,7 +734,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       target.pending.clear();
     });
     await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { target.closeReason ??= 'connect-timeout'; emit?.('close_requested', { generation: target.generation, reason: 'connect-timeout', inFlight: target.pending.size }); socket.close(); reject(fail('codex-native-rpc-timeout', 'Native Desktop connection timed out.')); }, recovery ? probeTimeoutMs : timeoutMs);
+      const timer = setTimeout(() => { target.closeReason ??= 'connect-timeout'; emit?.('close_requested', { generation: target.generation, reason: 'connect-timeout', inFlight: target.pending.size }); socket.close(); reject(fail('codex-native-rpc-timeout', 'Native Desktop connection timed out.')); }, timeoutMs);
       socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
       socket.addEventListener('error', () => { emit?.('socket_error', { generation: target.generation, ...endpointInfo(target.found) }); clearTimeout(timer); reject(fail('codex-native-rpc-unavailable', 'Native Desktop connection failed.')); }, { once: true });
     });
@@ -906,7 +912,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     }
   }
   function scheduleProbe(delay = 0) {
-    if (probing || probeTimer || !fault) return;
+    if (probing || probeTimer || !fault || (!active && !probeRequested)) return;
     probeTimer = setTimeout(() => { probeTimer = undefined; void probe(); }, delay);
     probeTimer.unref?.();
   }
@@ -914,19 +920,19 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     if (!fault) fault = { id: ++faultSequence, origin: source?.generation, attempts: 0 };
     if (source) source.faultId = fault.id;
   }
-  function ensureProbe(source = connection) {
-    recordFault(source);
+  function ensureProbe() {
+    // The monitor requests a probe on sweeps with persisted transport work.
+    probeRequested = true;
+    recordFault(connection);
     scheduleProbe();
   }
   function createConnection() {
-    const target = { generation: ++generation };
+    const target = { generation: ++generation, users: 0 };
     connection = target;
     if (fault) {
-      // During recovery, only the probe can open and validate a replacement.
-      // Requests arriving during backoff join the same candidate as the next probe.
+      // A replacement can serve reads while the probe is still verifying it for writes.
       target.faultId = fault.id;
       target.verification = Promise.withResolvers();
-      scheduleProbe();
     } else {
       target.ready = connect(target);
     }
@@ -941,8 +947,10 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     } finally { clearTimeout(deadline); }
   }
   async function probe() {
-    if (probing || !fault) return;
+    if (probing || !fault || (!active && !probeRequested)) return;
     probing = true;
+    probeRequested = false;
+    clearTimeout(timer);
     const cycle = fault;
     const target = connection ?? createConnection();
     try {
@@ -965,19 +973,21 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       if (!value || value.__futureaideRpcError || !Array.isArray(value.data)) throw fail('codex-native-rpc-invalid-response', 'Recovery probe did not return thread metadata.');
       if (connection !== target || fault !== cycle) return;
       fault = undefined;
+      probeRequested = false;
       recoveredFaultSequence = cycle.id;
       target.verification?.resolve(true);
       target.verification = undefined;
       const event = { generation: target.generation, recoverySequence: ++recoverySequence, faultSequence: cycle.id,
         mode: cycle.origin === target.generation ? 'same' : 'new' };
       for (const listener of listeners) { try { Promise.resolve(listener(event)).catch(() => {}); } catch { /* notification only */ } }
-      closeWhenIdle(target);
     } catch {
-      if (connection === target) close(target, 'recovery-probe-failed');
+      // This probe has a shorter deadline than the requests using the socket.
+      if (connection === target && !target.users) close(target, 'recovery-probe-failed');
       cycle.attempts++;
     } finally {
       probing = false;
       if (fault === cycle) scheduleProbe([500, 1000, 2000][Math.min(cycle.attempts - 1, 2)] ?? 500);
+      closeWhenIdle(connection);
     }
   }
   async function request(method, params, options = {}, refreshAllowed = true) {
@@ -997,7 +1007,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
     const expression = release ? null : userInputRead ? userInputReadExpression(params)
       : userInputReply ? userInputReplyExpression(params) : nativeRpcExpression(method, params, timeoutMs, requestId);
     clearTimeout(timer); active++;
-    let target, awaitingConnection = false;
+    let target, awaitingConnection = false, usingConnection = false;
     let attemptRecovery = recoverySequence;
     let attemptFault = fault?.id ?? faultSequence + 1;
     const staleRead = () => target?.generation !== generation || attemptRecovery !== recoverySequence;
@@ -1020,6 +1030,7 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         if (!before.go) return { status: 'notSent', reason: before.reason };
       }
       target = connection ?? createConnection();
+      scheduleProbe();
       awaitingConnection = true;
       if (target.verification && !read) {
         const verified = await waitForVerification(target);
@@ -1035,14 +1046,13 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         // This is the first send for this attempt, after the recovery that admitted it.
         attemptRecovery = recoverySequence;
         attemptFault = fault?.id ?? faultSequence + 1;
-      } else if (target.verification) {
-        // Read-only status must not wait behind the write-admission probe. It opens
-        // the same candidate with the normal request deadline; a failing probe still
-        // fences every write until it is verified. Discovery is forced past a cached
-        // failed probe call, which belongs to the write-admission path, not to this read.
-        target.ready ??= connect(target, false, true);
-        await target.ready;
-      } else await target.ready;
+      }
+      usingConnection = true;
+      target.users++;
+      // Read-only status can open the same candidate with the normal request deadline.
+      // Bypass cached discovery failures when trying that candidate.
+      target.ready ??= connect(target, true);
+      await target.ready;
       awaitingConnection = false;
       if (GATED_WRITE_METHODS.has(method) && typeof options?.blockReason === 'function') {
         const refused = options.blockReason();
@@ -1159,7 +1169,10 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
       const stale = (target && target.generation !== generation) || attemptRecovery < recoverySequence;
       const connectionAdmission = !read && awaitingConnection;
       if (!stale && (connectionAdmission || (read && ['codex-native-rpc-response-timeout', 'codex-native-rpc-unavailable',
-        'codex-native-rpc-timeout', 'codex-native-rpc-closed'].includes(error?.code)))) ensureProbe(target);
+        'codex-native-rpc-timeout', 'codex-native-rpc-closed'].includes(error?.code)))) {
+        recordFault(target);
+        scheduleProbe();
+      }
       if ((read || connectionAdmission) && target && error && typeof error === 'object') {
         // A shared failed discovery can reject multiple callers with the same Error.
         // Stamp each caller's own attempt without modifying that shared exception.
@@ -1178,7 +1191,11 @@ export function createCodexNativeRpc({ discover = discoverCodexRenderer, WebSock
         'codex-native-rpc-invalid-response'].includes(error.code)) { if (!stale && target) close(target, error?.code ?? 'transport-error'); }
       throw error;
     }
-    finally { active--; closeWhenIdle(connection); }
+    finally {
+      if (usingConnection) target.users--;
+      active--;
+      closeWhenIdle(connection);
+    }
   }
   return { close, subscribeRecovery, ensureProbe, request,
     get recoveredFaultSequence() { return recoveredFaultSequence; } };
@@ -1718,11 +1735,12 @@ export async function sendCodexTextNative(threadId, text, {
   }
   refuse();
   if (method === 'turn/steer') {
-    const steer = { threadId, expectedTurnId: active.id, clientUserMessageId: randomUUID(), input };
+    const clientUserMessageId = randomUUID();
+    const steer = { threadId, expectedTurnId: active.id, clientUserMessageId, input };
     try {
       const result = await request('turn/steer', steer, fence);
       return { ...(result ?? {}), method: 'turn/steer', delivery: 'current-turn',
-        turnId: result?.turnId ?? active.id };
+        clientUserMessageId, turnId: result?.turnId ?? active.id };
     } catch (error) {
       // A native rejection of expectedTurnId proves the steer was not written. Re-read
       // the root thread itself; the pre-steer metadata may be stale in either direction.
@@ -1748,11 +1766,12 @@ export async function sendCodexTextNative(threadId, text, {
     }
   }
   try {
-    const started = await request('turn/start', { threadId, clientUserMessageId: randomUUID(), input,
+    const clientUserMessageId = randomUUID();
+    const started = await request('turn/start', { threadId, clientUserMessageId, input,
       ...(wantedSelection?.model === undefined ? {} : { model: wantedSelection.model }),
       ...(wantedSelection?.reasoningEffort === undefined ? {} : { effort: wantedSelection.reasoningEffort }) }, fence);
     return { ...(started ?? {}), method: 'turn/start', delivery: 'new-turn', priorTurnId,
-      turnId: started?.turn?.id };
+      clientUserMessageId, turnId: started?.turn?.id };
   } catch (error) {
     // Another turn can start between our idle read and this write. The native
     // rejection proves nothing was written; re-read the root and wait behind that

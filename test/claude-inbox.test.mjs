@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile, appendFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { readClaudeEvents } from '../src/claude-inbox.mjs';
+import { CLAUDE_RECEIPT_PARSER, findClaudeReceipt } from '../src/scoped-agents.mjs';
 
 const sessionId = '3725418e-ac07-45d6-877b-2ab22ef89017';
 const requestId = '275da961-d841-4f01-a532-5300fdd4fbcd';
@@ -62,6 +63,41 @@ test('idle inbox delivery retains the user-frame UUID, unlike a tool result', as
       content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'Done.' }] } }));
   const result = await readClaudeEvents(binding);
   assert.deepEqual(result.deliveries.map(({ requestId: id, stage }) => [id, stage]), [[requestId, 'inserted']]);
+});
+
+test('a desktop peer insertion with a replaced UUID confirms only its exact original body', async () => {
+  const noticeId = 'notice-rewritten-user';
+  const original = 'Report body\n\n<!-- futureaide-control:notice-rewritten-user -->';
+  const originBody = `[FutureAide request ${noticeId}]\n${original}`;
+  const makeContent = body => `Desktop notice\n<cross-session-message from-name="FutureAide Control">\n${body}\n</cross-session-message>\nDesktop suffix`;
+  const event = { type: 'user', uuid: 'a-different-desktop-uuid', isMeta: true,
+    entrypoint: 'claude-desktop', promptSource: 'system', turnOrigin: 'peer',
+    origin: { kind: 'peer', from: 'FutureAide Control', name: 'FutureAide Control', body: originBody },
+    message: { role: 'user', content: makeContent(originBody) } };
+  const invalid = await fixture(
+    line({ ...event, sessionId: 'another-session' })
+    + line({ ...event, isSidechain: true })
+    + line({ ...event, type: 'assistant' })
+    + line({ ...event, isMeta: false, promptSource: 'user', turnOrigin: 'user', origin: undefined })
+    + line({ ...event, origin: { ...event.origin, name: 'Another peer' } })
+    + line({ ...event, message: { role: 'user', content: makeContent(originBody.replace('Report body', 'Another body')) } })
+    + line({ ...event, message: { role: 'user', content: originBody } }));
+  const parsed = await readClaudeEvents(invalid);
+  assert.equal(parsed.deliveries.some(receipt => receipt.requestId === noticeId), false);
+
+  const binding = await fixture(line(event));
+  const hash = body => createHash('sha256').update(body).digest('hex');
+  const find = body => findClaudeReceipt(binding, { id: noticeId, receiptParser: CLAUDE_RECEIPT_PARSER, cursor: 0 }, readClaudeEvents,
+    body === undefined ? undefined : hash(body));
+  assert.equal(await find(), undefined);
+  assert.equal(await find('Another original body'), undefined);
+  const receipt = await find(original);
+  assert.equal(receipt?.requestId, noticeId);
+  assert.equal(receipt?.stage, 'inserted');
+
+  const older = { id: noticeId, receiptParser: 2, cursor: Buffer.byteLength(line(event)) };
+  assert.equal((await findClaudeReceipt(binding, older, readClaudeEvents, hash(original)))?.requestId, noticeId);
+  assert.equal(older.receiptParser, CLAUDE_RECEIPT_PARSER);
 });
 
 test('enqueue acknowledges only the exact transport envelope, before busy insertion', async () => {

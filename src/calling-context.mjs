@@ -27,24 +27,76 @@ export function ownerIdFor(threadId) {
 }
 
 /**
- * Owner ids are namespaced by source, so the same name in a Codex chat and in a
- * Claude session are different owners and can never collide in the roster.
- * @param {'codex-desktop'|'claude-desktop'} source Calling application.
- * @param {string} key Thread id or verified native session id.
+ * Owner ids are namespaced by source, so the same name in a Codex chat, a
+ * Claude session, and an Antigravity conversation are different owners and can
+ * never collide in the roster.
+ * @param {'codex-desktop'|'claude-desktop'|'antigravity'} source Calling application.
+ * @param {string} key Thread id, verified native session id, or Antigravity conversation id.
  */
 export function ownerIdForSource(source, key) {
   if (source === 'codex-desktop') return ownerIdFor(key);
   if (typeof key !== 'string' || !key) throw new Error('A verified native session id is required.');
+  if (source === 'managed-cli') {
+    const trimmed = key.trim();
+    if (trimmed.startsWith('owner-')) return trimmed;
+    return 'owner-' + createHash('sha256').update(`managed-cli:local:${trimmed.toLowerCase()}`).digest('hex').slice(0, 32);
+  }
+  if (source === 'antigravity') {
+    return 'owner-' + createHash('sha256').update(`antigravity:local:${key.toLowerCase()}`).digest('hex').slice(0, 32);
+  }
   return 'owner-' + createHash('sha256').update(`claude:desktop:${key.toLowerCase()}`).digest('hex').slice(0, 32);
 }
 
 export function trustedCaller(extra) {
-  const value = extra?.[TRUSTED_CALLER];
+  const raw = extra?.[TRUSTED_CALLER];
+  const directManaged = !raw && extra && typeof extra === 'object'
+    && (typeof extra.parentAgentId === 'string' && extra.parentAgentId.trim())
+    ? {
+        source: 'managed-cli',
+        parentAgentId: extra.parentAgentId,
+        ownerId: extra.ownerId,
+        workspace: extra.workspace,
+        label: extra.label,
+      }
+    : undefined;
+  const value = raw ?? directManaged;
   if (!value) return undefined;
-  if (typeof value !== 'object' || typeof value.nativeSessionId !== 'string' || !value.nativeSessionId) {
+  if (typeof value !== 'object') {
     throw Object.assign(new Error('The trusted caller record is incomplete.'), { code: 'calling-context-unavailable' });
   }
-  return { source: value.source ?? 'claude-desktop', nativeSessionId: value.nativeSessionId,
+  const source = value.source ?? 'claude-desktop';
+  if (source === 'managed-cli') {
+    const parentAgentId = typeof (value.parentAgentId ?? value.callerAgentId ?? extra?.parentAgentId) === 'string'
+      ? (value.parentAgentId ?? value.callerAgentId ?? extra?.parentAgentId).trim()
+      : '';
+    const ownerId = typeof (value.ownerId ?? extra?.ownerId) === 'string'
+      ? (value.ownerId ?? extra?.ownerId).trim()
+      : '';
+    if (!parentAgentId && !ownerId) {
+      throw Object.assign(new Error('The trusted managed-cli caller record is incomplete.'), { code: 'calling-context-unavailable' });
+    }
+    return {
+      source: 'managed-cli',
+      ...(parentAgentId ? { parentAgentId, callerAgentId: parentAgentId } : {}),
+      ...(ownerId ? { ownerId } : {}),
+      nativeSessionId: parentAgentId || ownerId,
+      workspace: value.workspace ?? extra?.workspace,
+      label: value.label,
+    };
+  }
+  if (source === 'antigravity') {
+    const conversationId = value.conversationId ?? value.nativeSessionId;
+    if (typeof conversationId !== 'string' || !conversationId.trim()) {
+      throw Object.assign(new Error('The trusted Antigravity caller record is incomplete.'), { code: 'calling-context-unavailable' });
+    }
+    const normalizedId = conversationId.trim();
+    return { source: 'antigravity', conversationId: normalizedId, nativeSessionId: normalizedId,
+      workspace: value.workspace, label: value.label };
+  }
+  if (typeof value.nativeSessionId !== 'string' || !value.nativeSessionId) {
+    throw Object.assign(new Error('The trusted caller record is incomplete.'), { code: 'calling-context-unavailable' });
+  }
+  return { source, nativeSessionId: value.nativeSessionId,
     workspace: value.workspace, label: value.label };
 }
 
@@ -88,18 +140,73 @@ async function resolveClaudeOwner(caller, { knownOwner, verifyClaude, bindOwner 
     pid: verified.pid, workspace, ...(binding ? { binding } : {}), createdAt: new Date().toISOString() };
 }
 
+async function resolveAntigravityOwner(caller, { knownOwner, defaultWorkspace } = {}) {
+  const conversationId = (caller.conversationId ?? caller.nativeSessionId).trim();
+  const ownerId = ownerIdForSource('antigravity', conversationId);
+  if (knownOwner) {
+    const knownId = String(knownOwner.conversationId ?? knownOwner.nativeSessionId ?? '').trim();
+    if (knownOwner.ownerId !== ownerId || knownId.toLowerCase() !== conversationId.toLowerCase()) {
+      throw new Error('Saved Antigravity conversation ownership does not match the caller.');
+    }
+    return knownOwner;
+  }
+  const candidateWorkspace = caller.workspace ?? defaultWorkspace;
+  let workspace;
+  if (typeof candidateWorkspace === 'string' && path.isAbsolute(candidateWorkspace)) {
+    try { workspace = await realpath(candidateWorkspace); }
+    catch { workspace = path.resolve(candidateWorkspace); }
+  }
+  return {
+    ownerId,
+    source: 'antigravity',
+    conversationId,
+    ...(workspace ? { workspace } : {}),
+    createdAt: new Date().toISOString(),
+  };
+}
+
+async function resolveManagedCliOwner(caller, { knownOwner, defaultWorkspace } = {}) {
+  const callerAgentId = caller.parentAgentId ?? caller.callerAgentId;
+  if (knownOwner) {
+    return {
+      ...knownOwner,
+      ...(callerAgentId ? { callerAgentId, parentAgentId: callerAgentId } : {}),
+    };
+  }
+  const ownerId = caller.ownerId || ownerIdForSource('managed-cli', callerAgentId);
+  const candidateWorkspace = caller.workspace ?? defaultWorkspace;
+  let workspace;
+  if (typeof candidateWorkspace === 'string' && path.isAbsolute(candidateWorkspace)) {
+    try { workspace = await realpath(candidateWorkspace); }
+    catch { workspace = path.resolve(candidateWorkspace); }
+  }
+  return {
+    ownerId,
+    source: 'managed-cli',
+    ...(callerAgentId ? { callerAgentId, parentAgentId: callerAgentId } : {}),
+    ...(workspace ? { workspace } : {}),
+    createdAt: new Date().toISOString(),
+  };
+}
+
 /**
  * The host supplies identity; only the native desktop supplies the initial cwd.
- * A verified Claude caller takes precedence over the Codex metadata path, and the
- * two owners are namespaced apart. A Codex caller is read over the native RPC
- * first; a desktop without a debug port falls back to its app-tools bridge, which
- * is the normal path for an ordinary Codex chat.
+ * A verified Claude or Antigravity caller takes precedence over the Codex metadata
+ * path, and the owners are namespaced apart. A Codex caller is read over the native
+ * RPC first; a desktop without a debug port falls back to its app-tools bridge,
+ * which is the normal path for an ordinary Codex chat.
  */
 export async function resolveCallingContext(extra, {
-  knownOwner, callCodex = callCodexOwner, nativeRequest, codexInvoke, verifyClaude, bindOwner,
+  knownOwner, callCodex = callCodexOwner, nativeRequest, codexInvoke, verifyClaude, bindOwner, defaultWorkspace,
 } = {}) {
   const caller = trustedCaller(extra);
   if (caller) {
+    if (caller.source === 'managed-cli') {
+      return resolveManagedCliOwner(caller, { knownOwner, defaultWorkspace });
+    }
+    if (caller.source === 'antigravity') {
+      return resolveAntigravityOwner(caller, { knownOwner, defaultWorkspace });
+    }
     if (typeof verifyClaude !== 'function') {
       throw Object.assign(new Error('This plugin build cannot verify Claude session callers.'),
         { code: 'calling-context-unavailable' });
@@ -123,5 +230,5 @@ export async function resolveCallingContext(extra, {
   }
   // Only native RPC metadata carries the provenance needed for this domain.
   const codexDomain = lookup?.via === 'native-rpc' ? await codexDomainForThread(thread) : undefined;
-  return { ownerId, source: 'codex-desktop', threadId, workspace: await realpath(thread.cwd), ...(codexDomain ? {codexDomain} : {}), createdAt: new Date().toISOString() };
+  return { ownerId, source: 'codex-desktop', threadId, workspace: await realpath(thread.cwd), ...(codexDomain ? { codexDomain } : {}), createdAt: new Date().toISOString() };
 }

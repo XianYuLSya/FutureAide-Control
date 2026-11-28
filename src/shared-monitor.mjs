@@ -363,8 +363,26 @@ export async function monitorAlive(store, now = Date.now(), options = {}) {
   return (await monitorState(store, now, options)).alive;
 }
 
+/**
+ * Return a shallow copy of baseEnv with all proxy variables stripped (case-insensitively)
+ * and loopback NO_PROXY set so the shared monitor never inherits external proxy settings.
+ */
+export function cleanProxyEnv(baseEnv = process.env) {
+  const env = { ...(baseEnv ?? {}) };
+  for (const key of Object.keys(env)) {
+    if (/^(?:http|https|all|no)_proxy$/i.test(key)) delete env[key];
+  }
+  env.NO_PROXY = '127.0.0.1,localhost,::1';
+  return env;
+}
+
 /** Spawn the single detached monitor. A PID alone never confirms a successful spawn. */
-export function monitorSpawn(configFile, lease, spawnProcess = spawn, config) {
+export function monitorSpawn(configFile, lease, spawnOrOptions = spawn, configOrOptions) {
+  const isFn = typeof spawnOrOptions === 'function';
+  const spawnProcess = isFn ? spawnOrOptions : (spawnOrOptions?.spawnProcess ?? spawn);
+  const extra = isFn ? configOrOptions : spawnOrOptions;
+  const config = extra?.config ?? extra;
+  const env = extra?.env || process.env;
   if (!configFile) throw new Error('The installed plugin has no private configuration path for recovery.');
   if (!/^monitor-[0-9a-f-]{36}$/.test(lease ?? '')) throw new Error('Invalid shared monitor lease.');
   const script = fileURLToPath(new URL('./scoped-worker.mjs', import.meta.url));
@@ -373,6 +391,7 @@ export function monitorSpawn(configFile, lease, spawnProcess = spawn, config) {
   if (config?.stateDirectory && config?.dshDataRoot) args.push('--state', path.resolve(config.stateDirectory), '--root', path.resolve(config.dshDataRoot));
   const child = spawnProcess(process.execPath, args, {
     detached: true, stdio: 'ignore', windowsHide: true,
+    env: cleanProxyEnv(env),
   });
   return new Promise((resolve, reject) => {
     // Spawn failures arrive asynchronously; a surrounding try/catch cannot catch
@@ -409,7 +428,7 @@ export function monitorSpawn(configFile, lease, spawnProcess = spawn, config) {
  * an attempt, as it always did.
  */
 export async function ensureSharedMonitor(config, store, { spawnProcess = spawn, isProcessAlive = processAlive, startTime = processStartTime,
-  idleSessionCleanup = lifecycleEnabled(config) } = {}) {
+  idleSessionCleanup = lifecycleEnabled(config), env } = {}) {
   if (!config.configFile) return false;
   const state = await monitorState(store, Date.now(), { isProcessAlive, startTime, idleSessionCleanup });
   if (state.alive) return true;
@@ -440,7 +459,7 @@ export async function ensureSharedMonitor(config, store, { spawnProcess = spawn,
     if (owner && owner.holder === state.holder && unknownIdentity) return false;
     return true;
   }
-  try { await monitorSpawn(config.configFile, holder, spawnProcess, config); }
+  try { await monitorSpawn(config.configFile, holder, spawnProcess, env ? { config, env } : config); }
   catch (error) { store.releaseLease(MONITOR_LEASE, holder); throw error; }
   return true;
 }

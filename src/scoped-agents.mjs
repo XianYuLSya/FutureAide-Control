@@ -1,31 +1,42 @@
 
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { withCodexInstrumentation, getCodexInstrumentation, codexInstrumentationEnabled } from './codex-instrumentation.mjs';
 import { setImmediate as yieldToIO } from 'node:timers/promises';
-import { lstat, mkdir, open, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, open, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { watch } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+import { updateCliRoutes } from './config.mjs';
+import { buildCliProxyEnv, defaultFaswitchRoot, normalizeProxySpec, resolveCliRoute } from './cli-proxy.mjs';
+import { activeTaskUse } from './cleanup-worktree.mjs';
+import { killProcessCage } from './process-cage.mjs';
+import { activeReportPort } from './report-endpoint.mjs';
 import { createControl, endedState, modelTurnError } from './control.mjs';
 import { feedbackRecordError, submitFeedback } from './feedback-client.mjs';
 import { FutureAideClient } from './futureaide-api.mjs';
 import { resolveModel } from './agents.mjs';
 import { actualModelName, resolveDispatchSelection, sameModelSelection } from './model-selection.mjs';
+import { resolveRoleDefaults } from './team-config-defaults.mjs';
 import { callCodexOwner, readCodexOwnerTurns, readCodexOwnerItems } from './codex-notify.mjs';
 import { callingThread, ownerIdFor, ownerIdForSource, resolveCallingContext, threadFromResult, trustedCaller } from './calling-context.mjs';
-import { bindClaude, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
+import { bindClaude, claudeInboxBodyHash, currentRecord, discoverClaude, readClaudeEvents, sendClaude } from './claude-inbox.mjs';
 import { resolveNativeSession } from './claude-sessions.mjs';
 import { captureNativeQuestionHistory, isCancelledRound, RosterStore, submissionNoticeId, submissionRef } from './roster-store.mjs';
 import { canReleaseThreads, canSleep, hasPendingDelivery, RELEASE_RECHECK_MS, releaseDue,
   releaseRetryDelay } from './idle-monitor-eligibility.mjs';
 import { idleSignal } from './idle-monitor.mjs';
 import { ensureSharedMonitor, monitorAlive } from './shared-monitor.mjs';
-import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, normalizeTarget, readStatusModels, REMOVED_TARGETS, removedTarget, resolveBackend,
+import { diagnoseTarget, DSH_HOST_METHODS, hostLabel, isCodexTransientTimeout, normalizeTarget, readStatusModels, REMOVED_TARGETS, removedTarget, resolveBackend,
   TARGET_LABELS, targetOf } from './agent-backend.mjs';
 import { captureWorkspace, diffWorkspace } from './workspace-diff.mjs';
 import { FINAL_REPORT_REMINDER, presentedNativeQuestion } from './report-contract.mjs';
+import { finalReportReady, finalReportDeadline, treeReleaseDue, treeReleaseRecord, treeReleaseText,
+  reportBodyPage, reportBodyReference, REPORT_BODY_PAGE_CHARS } from './report-delivery.mjs';
 import { absentClaudeReportReminder, claudeCallbackReminderMs, createDesktopToastNotifier } from './claude-report-reminder.mjs';
 
+const execFileAsync = promisify(execFile);
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const uid = prefix => `${prefix}-${randomUUID().replaceAll('-', '')}`;
 const now = () => new Date().toISOString();
@@ -34,6 +45,41 @@ const ACTIVE = new Set(['creating', 'running', 'awaiting_input', 'awaiting_repor
 // including an idle persistent name and a cleaning/cleanup-claimed one — stays in
 // the default list. An unknown state is kept too: hiding it would be a guess.
 const INACTIVE_STATES = new Set(['completed', 'failed', 'cancelled', 'cleanup_failed']);
+const STALE_IDLE_MS = 5 * 60 * 1000;
+const MENTION_PATTERN = /@([\p{L}\p{N}._-]+(?:\/[\p{L}\p{N}._-]+)?)/gu;
+const isPullOwner = owner => owner?.source === 'antigravity' || owner?.source === 'managed-cli';
+
+function normalizeRole(role) {
+  if (role === undefined || role === null || role === '') return undefined;
+  if (typeof role !== 'string' || !role.trim() || role.trim().length > 40 || /[\x00-\x1f/]/.test(role)) {
+    throw Object.assign(new Error('role must be a non-empty string of at most 40 characters without slashes or control characters.'), { code: 'invalid-role' });
+  }
+  return role.trim();
+}
+
+function inferRoleFromName(name) {
+  if (typeof name !== 'string' || !name.trim()) return undefined;
+  const match = /^(.+?)-?\d+$/u.exec(name.trim());
+  const prefix = match?.[1]?.trim();
+  return prefix ? prefix : undefined;
+}
+
+export function extractBoardMentions(text, explicitMentions) {
+  const found = new Set();
+  if (typeof text === 'string') {
+    for (const match of text.matchAll(MENTION_PATTERN)) {
+      if (match[1]) found.add(match[1]);
+    }
+  }
+  if (Array.isArray(explicitMentions)) {
+    for (const item of explicitMentions) {
+      if (typeof item === 'string' && item.trim()) {
+        found.add(item.trim().replace(/^@/, ''));
+      }
+    }
+  }
+  return [...found];
+}
 const METHODS = DSH_HOST_METHODS;
 const TREE_PROTOCOL = 1;
 const REPORT_PROTOCOL = 1;
@@ -41,12 +87,18 @@ const UNCONFIRMED_AFTER_MS = 30 * 60 * 1000;
 const EXPIRE_UNSENT_AFTER_MS = 6 * 60 * 60 * 1000;
 const dispatchExpired = created => Date.now() - Date.parse(created ?? '') >= EXPIRE_UNSENT_AFTER_MS;
 const CONFIRM_ABSENCE_AFTER_MS = 2 * 60 * 1000;
+// Leave time to assemble the answer before the Codex MCP host's 60-second limit.
+const STATUS_RETRY_DEADLINE_MS = 55_000;
+const CODEX_READ_REPLY_BUDGET_MS = 16_000;
+const CODEX_CLEANUP_READ_RETRIES = 2;
 const terminalNotice = notice => ['delivered', 'blocked'].includes(notice?.state);
 const awaitingNoticeReceipt = notice => ['sending', 'unknown'].includes(notice?.state);
 /** A task report actually reached the caller through the cross-session path. */
 const hasDeliveredReport = record => (record?.task?.reports ?? [])
   .some(report => !report.failure && report.delivery?.state === 'delivered');
 const fromSubmission = id => typeof id === 'string' && id.startsWith('submission:');
+const bareReportId = id => fromSubmission(id) ? id.slice('submission:'.length) : id;
+const sameReportId = (left, right) => Boolean(left && right && bareReportId(left) === bareReportId(right));
 const MISSING_THREAD_CODE = 'codex-thread-not-found';
 const MISSING_CODEX_TREE = '任务树无法确认：线程不在当前 Codex 档案';
 const NATIVE_ANSWER_REFUSALS = new Set(['native-answer-invalid', 'native-question-not-pending', 'native-answer-unconfirmed']);
@@ -76,18 +128,44 @@ export function terminalRound(record) {
   return undefined;
 }
 
+/** A DSH-managed report keeps its native persistent UUID as the only identity. */
+function nativeReportOnly(record) {
+  return targetOf(record) === 'dsh';
+}
+
+/** Local-only identity of the process that read a receipt; never a chat address. */
+function receiptProcessIdentity() {
+  const leaseIndex = process.argv.indexOf('--lease');
+  const monitorId = leaseIndex >= 0 && typeof process.argv[leaseIndex + 1] === 'string'
+    ? process.argv[leaseIndex + 1] : undefined;
+  const role = process.argv[1]?.endsWith('scoped-worker.mjs') ? 'monitor' : 'mcp';
+  return { pid: process.pid, role, monitorPid: process.pid, monitorRole: role,
+    ...(monitorId ? { monitorId } : {}) };
+}
+
+/** A final may still settle early even when its notice's own retry is backing off. */
+function hasWaitingTreeFinal(value) {
+  const reports = value?.reports ?? value?.task?.reports ?? [];
+  return reports.some(report => report?.final === true
+    && report.delivery?.waitingForTree === true
+    && !['delivered', 'blocked'].includes(report.delivery?.state));
+}
+
 
 /** Adopt evidence from old task bodies before any attempt with the canonical ID. */
 function submissionNotice(item, projection) {
   const id = submissionNoticeId(item.id);
-  const sources = [item.delivery, projection].filter(Boolean);
+  // The task's own report projection is the authoritative mirror while it exists;
+  // the submission row is the durable copy. Prefer the projection so a repair or a
+  // test that changes the task delivery state is not masked by a stale mirror.
+  const sources = [projection, item.delivery].filter(Boolean);
   const terminal = sources.find(notice => notice.state === 'delivered')
     ?? sources.find(notice => notice.state === 'blocked');
   const ambiguous = sources.filter(entry => awaitingNoticeReceipt(entry)
     && !(entry.state === 'unknown' && entry.error?.message === 'claude-request-id-invalid'
       && claudeNoticeRequestId(entry.id) !== entry.id));
   const saved = terminal ?? ambiguous[0] ?? sources.find(entry => !awaitingNoticeReceipt(entry));
-  const notice = { state: 'pending', ...saved, id, createdAt: item.created };
+  const notice = { state: 'pending', ...saved, id, createdAt: projection?.createdAt ?? item.created };
   if (!terminal && ambiguous.length) {
     const aliases = new Set(ambiguous.flatMap(entry => [entry.id, ...(entry.readbackIds ?? [])])
       .filter(value => typeof value === 'string' && value));
@@ -116,6 +194,63 @@ const treeProtocolError = (host = 'DSH') => Object.assign(new Error(`The ${host}
 const safeError = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 1200),
   ...(error?.discoveryReason ? { discoveryReason: error.discoveryReason } : {}) });
 const readOnlyTarget = record => REMOVED_TARGETS.includes(record?.target);
+const isHeadlessCli = target => target === 'claude-cli' || target === 'codex-cli' || target === 'agy-cli';
+
+function sumTwoUsages(a, b) {
+  const valid = [a, b].filter(item => item && typeof item === 'object');
+  if (!valid.length) return undefined;
+  return {
+    inputTokens: Math.round(valid.reduce((s, u) => s + (Number(u.inputTokens) || 0), 0)),
+    outputTokens: Math.round(valid.reduce((s, u) => s + (Number(u.outputTokens) || 0), 0)),
+    cachedTokens: Math.round(valid.reduce((s, u) => s + (Number(u.cachedTokens) || 0), 0)),
+    totalTokens: Math.round(valid.reduce((s, u) => s + (Number(u.totalTokens) || 0), 0)),
+    durationSec: Math.round(valid.reduce((s, u) => s + (Number(u.durationSec) || 0), 0) * 100) / 100,
+  };
+}
+
+function normalizeTurnTimeoutOptions({ timeoutMs, timeoutMinutes } = {}) {
+  let resolvedMs;
+  let resolvedMinutes;
+  if (timeoutMs !== undefined && timeoutMs !== null) {
+    const n = Number(timeoutMs);
+    if (!Number.isFinite(n) || n <= 0) {
+      throw Object.assign(new Error('timeoutMs must be a positive number.'), { code: 'invalid-timeout' });
+    }
+    resolvedMs = Math.max(1, Math.round(n));
+  }
+  if (timeoutMinutes !== undefined && timeoutMinutes !== null) {
+    const m = Number(timeoutMinutes);
+    if (!Number.isFinite(m) || m <= 0) {
+      throw Object.assign(new Error('timeoutMinutes must be a positive number.'), { code: 'invalid-timeout' });
+    }
+    resolvedMinutes = m;
+  }
+  return { timeoutMs: resolvedMs, timeoutMinutes: resolvedMinutes };
+}
+
+function effectiveTrustedCaller(extra) {
+  const caller = trustedCaller(extra);
+  if (caller?.source === 'antigravity'
+      && typeof caller.conversationId === 'string'
+      && caller.conversationId.startsWith('managed-cli:')) {
+    const rest = caller.conversationId.slice('managed-cli:'.length);
+    const colonIdx = rest.indexOf(':');
+    const parentAgentId = (colonIdx >= 0 ? rest.slice(0, colonIdx) : rest).trim();
+    const ownerId = (colonIdx >= 0 ? rest.slice(colonIdx + 1) : '').trim() || undefined;
+    if (parentAgentId) {
+      return {
+        source: 'managed-cli',
+        parentAgentId,
+        callerAgentId: parentAgentId,
+        ...(ownerId ? { ownerId } : {}),
+        nativeSessionId: parentAgentId,
+        workspace: caller.workspace,
+      };
+    }
+  }
+  return caller;
+}
+
 function requireWritableTarget(record) {
   if (readOnlyTarget(record)) throw removedTarget(record.target);
   return record;
@@ -132,9 +267,12 @@ function textMessage(message) {
   return message;
 }
 function stableHost(identity, target) {
+  if (identity?.profileId) {
+    return { application: identity.application ?? null, profileId: String(identity.profileId) };
+  }
   // Codex home changes wholesale when FAswitch switches profiles, and the thread
   // read is the real ownership test. Compare only the application there.
-  if (target === 'codex-desktop' || target === 'claude-cli') return { application: identity.application ?? null };
+  if (target === 'codex-desktop' || isHeadlessCli(target)) return { application: identity.application ?? null };
   return { application: identity.application ?? null, dataRoot: path.resolve(identity.dataRoot ?? '') };
 }
 // The compact view keeps the one label that stops a snapshot guess reading as a confirmed write.
@@ -172,6 +310,51 @@ function ownedTree(record, view) {
 
 function treeSettled(record, view) {
   return !record.task?.cancelPending && view.tree?.settled === true && view.tree.running === false && ownedTree(record, view).complete;
+}
+
+/**
+ * Record the bounded release exactly once. It deliberately does not set
+ * treeSettledConfirmed: the real tree proof and the delivery release are two
+ * different facts, and cleanup still reads only the real one.
+ */
+function markTreeReleased(record, report, view, reason) {
+  if (!report || report.treeSettledConfirmed || report.treeReleased) return report?.treeRelease;
+  const tree = ownedTree(record, view ?? {});
+  // A stale or read-failed observation may supply the last node names, but the
+  // release itself is marked unreadable; it never claims a current tree proof.
+  const readable = Boolean(view?.tree) && view?.stale !== true && !view?.observationError && !view?.tree?.observationError;
+  const release = treeReleaseRecord({
+    nodes: tree.nodes,
+    settled: view?.tree?.settled === true,
+    running: view?.tree?.running === true,
+    complete: tree.complete,
+    readable,
+    reason: reason ?? view?.tree?.observationError ?? view?.observationError,
+    deadlineAt: finalReportDeadline(report, record.task),
+  });
+  report.treeReleased = true;
+  report.treeRelease = release;
+  if (report.delivery) Object.assign(report.delivery, { treeRelease: release,
+    treeReleaseAt: release.deadlineAt });
+  if (report.delivery) {
+    // The release is the delivery moment; the earlier tree wait must not leave a
+    // future retry stamp that makes deliver() skip this released final.
+    delete report.delivery.waitingForTree;
+    delete report.delivery.nextAttemptAt;
+  }
+  return release;
+}
+
+/** Release every final that has reached its own persisted deadline. */
+function releaseDueFinals(record, view, reason) {
+  let changed = false;
+  for (const report of record.task?.reports ?? []) {
+    if (!report.final || report.treeSettledConfirmed || report.treeReleased) continue;
+    if (!treeReleaseDue(report, record.task)) continue;
+    markTreeReleased(record, report, view, reason);
+    changed = true;
+  }
+  return changed;
 }
 
 function rootSummary(view) {
@@ -226,7 +409,8 @@ function publicTree(record, view) {
     ...(observationError ? { observationError: safeError(observationError) } : {}),
     nodes: nodes.map(({ node, agentPath, depth }) => ({ name: agentPath.at(-1),
       parentName: depth ? agentPath.at(-2) : null, agentPath, depth, status: node.status,
-      activity: node.activity, changes: (node.changes ?? []).slice(0, 12).map(change => fileSummary({ ...change, agentPath })),
+      activity: node.activity, ...(node.stalled === true ? { stalled: true } : {}),
+      changes: (node.changes ?? []).slice(0, 12).map(change => fileSummary({ ...change, agentPath })),
       coverage: node.coverage ?? 'Not observed' })) };
 }
 
@@ -265,7 +449,9 @@ function publicResult(record, { fullResult = false } = {}) {
   const publicError = error?.code === 'codex-report-not-ready'
     && hasDeliveredReport(record) && !blockedInputPreflight ? undefined : error;
   return {
-    name: record.name, lifetime: record.lifetime, target: targetOf(record), state: record.state,
+    name: record.name, ...(record.role ? { role: record.role } : {}),
+    ...(record.workspaceMode && record.workspaceMode !== 'inherit' ? { workspaceMode: record.workspaceMode } : {}),
+    lifetime: record.lifetime, target: targetOf(record), state: record.state,
     requestedEffort: visibleSelection?.requestedEffort ?? null,
     effortSource: visibleSelection?.effortSource ?? null,
     selectedEffort: visibleSelection?.selectedEffort ?? null,
@@ -279,15 +465,18 @@ function publicResult(record, { fullResult = false } = {}) {
     // unpinned Codex name starts null and becomes known from the live observation
     // before record.model catches up.
     actualModel: activeDispatch && Object.hasOwn(activeDispatch, 'actualModel') ? actualModelName(activeDispatch.actualModel)
-      : record.modelPin && targetOf(record) !== 'claude-cli'
+      : record.modelPin && !isHeadlessCli(targetOf(record))
         ? actualModelName(record.model) ?? actualModelName(record.observation?.currentModel)
         : actualModelName(record.observation?.currentModel) ?? actualModelName(record.model),
     task: task ? { text: compactText(task.message, 240), state: task.state, startedAt: task.startedAt,
       ...(task.finishedAt ? { finishedAt: task.finishedAt } : {}),
+      ...(task.usage ? { usage: task.usage } : {}),
       ...(task.result ? { result: { state: task.result.state,
         ...(fullResult ? { reply: task.result.reply } : { summary: compactText(task.result.reply, 800) }),
         files: (task.result.changes ?? []).slice(0, 12).map(fileSummary), coverage: task.result.coverage } } : {}) } : null,
+    ...(record.usage || task?.usage ? { usage: record.usage ?? task.usage } : {}),
     activity: view.activity ?? (record.state === 'idle' ? 'Waiting for a task' : record.state),
+    ...(record.state === 'running' && view.stalled === true ? { stalled: true } : {}),
     // unconfirmed is counted over the whole list, not the 12 paths this answer can
     // afford: a compact view must not under-report how much is unattributed.
     changes: { count: changes.length, unconfirmed: changes.filter(change => change.attribution === 'unconfirmed').length,
@@ -310,6 +499,47 @@ function publicResult(record, { fullResult = false } = {}) {
     ...(record.callbackBlocked ? { callbackError: { code: 'native-callback-unavailable', message: 'The desktop does not permit background reports to this native multi-agent v2 sub-agent.' } } : {}),
     ...(publicError ? { error: publicError } : {}),
   };
+}
+
+/**
+ * A wait/list snapshot that never repeats a report body. The body is reachable
+ * through the explicit futureaide_read_report page entry named here; delivery
+ * status and the same submission identity remain visible.
+ */
+function waitItem(record, taskKey, bodyText) {
+  const item = publicResult(record);
+  if (item.task?.result) {
+    delete item.task.result.reply;
+    delete item.task.result.summary;
+  }
+  const reports = (record.task?.reports ?? []).filter(report => !report.failure);
+  const latest = reports.at(-1);
+  if (item.reports?.latest) delete item.reports.latest.summary;
+  if (!latest) return item;
+  const submissionId = typeof latest.id === 'string'
+    ? (latest.id.startsWith('submission:') ? latest.id.slice('submission:'.length) : latest.id) : undefined;
+  // An old receipt with no recoverable body gets no invented read entry. A stored
+  // body (current or historical) gets the exact-page reference.
+  const body = submissionId && taskKey && typeof bodyText === 'string'
+    ? reportBodyReference({ taskKey, submissionId, body: bodyText }) : undefined;
+  item.reports = {
+    ...(item.reports ?? {}),
+    latest: { ...(item.reports?.latest ?? {}), final: latest.final === true,
+      delivery: latest.delivery?.state ?? 'pending',
+      ...(latest.delivery?.error ? { error: latest.delivery.error } : {}),
+      ...(latest.delivery?.treeRelease ? { tree: latest.delivery.treeRelease } : {}),
+      ...(body ? { body } : {}) },
+  };
+  return item;
+}
+
+function storedBodyText(store, record, taskKey) {
+  const latest = [...(record.task?.reports ?? [])].filter(report => !report.failure).at(-1);
+  const id = typeof latest?.id === 'string'
+    ? (latest.id.startsWith('submission:') ? latest.id.slice('submission:'.length) : latest.id) : undefined;
+  if (!taskKey || !id) return undefined;
+  const stored = store.storedReportBody(record.ownerId, taskKey, id);
+  return stored && !stored.error && typeof stored.body === 'string' ? stored.body : undefined;
 }
 
 /**
@@ -521,9 +751,10 @@ function taskInputs(store, record) {
  * @param {Array<{requestId: string, stage: string, seq?: number}>} deliveries
  * @param {string} requestId
  */
-export function claudeNoticeReceipt(deliveries, requestId) {
+export function claudeNoticeReceipt(deliveries, requestId, expectedBodyHash) {
   if (!Array.isArray(deliveries) || typeof requestId !== 'string') return undefined;
-  return deliveries.find(item => item?.requestId === requestId && ['accepted', 'inserted'].includes(item.stage));
+  return deliveries.find(item => item?.requestId === requestId && ['accepted', 'inserted'].includes(item.stage)
+    && (item.bodyHash === undefined || item.bodyHash === expectedBodyHash));
 }
 
 const CLAUDE_STALE_BINDING = ['claude-session-changed', 'claude-process-replaced', 'claude-inbox-key-mismatch',
@@ -536,10 +767,9 @@ export const claudeBindingStale = error =>
 const CLAUDE_PAGE_BYTES = 1 << 20;
 const CLAUDE_MAX_PAGE_BYTES = 16 << 20;
 const CLAUDE_PAGES_PER_POLL = 8;
-// Version 2 finds the request marker inside Claude Desktop's absorbed
-// queued_command/remove records. A notice written by an older reader has a cursor
-// that may already have passed its receipt, so that cursor is discarded once.
-export const CLAUDE_RECEIPT_PARSER = 2;
+// The native peer user insertion can carry a new UUID. Older cursors have
+// already walked past those receipts, so they are discarded once.
+export const CLAUDE_RECEIPT_PARSER = 3;
 
 /**
  * Complete-line byte cursor at the current end of a transcript: where a new notice
@@ -583,7 +813,7 @@ export const claudeNoticeRequestId = id => /^[a-zA-Z0-9-]{1,100}$/.test(id)
 const claudeNeverWritten = notice => notice.error?.code === 'ENOENT'
   || (claudeNoticeRequestId(notice.id) !== notice.id && notice.error?.message === 'claude-request-id-invalid');
 
-export async function findClaudeReceipt(binding, notice, readEvents = readClaudeEvents) {
+export async function findClaudeReceipt(binding, notice, readEvents = readClaudeEvents, expectedBodyHash) {
   const requestIds = [notice.id, ...(notice.readbackIds ?? [])].map(claudeNoticeRequestId);
   let cursor;
   if (notice.receiptParser !== CLAUDE_RECEIPT_PARSER) {
@@ -625,7 +855,7 @@ export async function findClaudeReceipt(binding, notice, readEvents = readClaude
         throw retryError;
       }
     }
-    const matched = requestIds.map(id => claudeNoticeReceipt(read.deliveries, id)).find(Boolean);
+    const matched = requestIds.map(id => claudeNoticeReceipt(read.deliveries, id, expectedBodyHash)).find(Boolean);
     const next = Number.isSafeInteger(read.offset) ? read.offset : cursor;
     notice.cursor = next;
     if (matched) return matched;
@@ -698,7 +928,7 @@ function sameObservation(left, right) {
  */
 export function owesFastPoll(record, at = Date.now()) {
   if (!record || record.closed || record.sleep) return false;
-  const dueSoon = notice => Boolean(notice) && !['delivered', 'blocked'].includes(notice.state ?? 'pending')
+  const dueSoon = notice => Boolean(notice) && !['delivered', 'blocked', 'pull_ready'].includes(notice.state ?? 'pending')
     && (!notice.nextAttemptAt || notice.nextAttemptAt <= at + FAST_POLL_DUE_MS);
   if ((record.task?.reports ?? []).some(report => dueSoon(report.delivery))) return true;
   if (Object.values(record.task?.questionNotices ?? {}).some(dueSoon)) return true;
@@ -735,8 +965,175 @@ export function createScopedAgents(config, {
   // A report that keeps finding its Claude session gone is handed to the Windows
   // notification area. A drill replaces this seam; nothing is ever shown in a test.
   notifyDesktop = undefined,
+  checkCliProxy = undefined,
+  spawnFaswitch = undefined,
+  findFaswitchExe = undefined,
+  faswitchWakeTimeoutMs = 5000,
+  teamConfigPath = config?.teamConfigPath,
 } = {}) {
   const notify = notifyDesktop ?? createDesktopToastNotifier();
+  const settlementInflight = new Map();
+  const worktreeLocks = new Map();
+  let lastFaswitchWakeAt = 0;
+
+  async function withWorktreeLock(repoPath, fn) {
+    const key = pathKey(repoPath);
+    const prior = worktreeLocks.get(key) ?? Promise.resolve();
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const chain = prior.then(() => gate, () => gate);
+    worktreeLocks.set(key, chain);
+    await prior.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (worktreeLocks.get(key) === chain) worktreeLocks.delete(key);
+    }
+  }
+
+  function applyCallerDefaults({ role, target, model, effort, lifetime } = {}) {
+    const explicitRole = normalizeRole(role);
+    const dshDisabled = Array.isArray(config?.disabledTargets) && config.disabledTargets.includes('dsh');
+    if (!explicitRole && !dshDisabled) {
+      return {
+        explicitRole,
+        target,
+        model,
+        effort,
+        lifetime,
+        autoFilledModel: false,
+        autoFilledEffort: false,
+      };
+    }
+    const defaults = resolveRoleDefaults(explicitRole, { teamConfigPath });
+    const effectiveTarget = target !== undefined ? target : defaults.target;
+    const normalizedTarget = normalizeTarget(effectiveTarget);
+    const sameDefaultTarget = normalizedTarget === defaults.target;
+    const autoFilledModel = model === undefined && sameDefaultTarget && Boolean(defaults.model);
+    const autoFilledEffort = effort === undefined && sameDefaultTarget && Boolean(defaults.effort);
+    return {
+      explicitRole,
+      target: effectiveTarget,
+      model: autoFilledModel ? defaults.model : model,
+      effort: autoFilledEffort ? defaults.effort : effort,
+      lifetime: lifetime !== undefined ? lifetime : defaults.lifetime,
+      autoFilledModel,
+      autoFilledEffort,
+    };
+  }
+
+  function buildWakeCmd(owner, taskKeys, { batch = false } = {}) {
+    const validKeys = (Array.isArray(taskKeys) ? taskKeys : [taskKeys])
+      .filter(key => typeof key === 'string' && key.trim());
+    if (!validKeys.length) return undefined;
+    const conv = owner?.source === 'antigravity'
+      ? owner.conversationId
+      : (owner?.source === 'codex-desktop' ? owner.threadId : (owner?.ownerId ?? owner?.nativeSessionId));
+    const convArg = conv ? ` --conv "${conv}"` : '';
+    const barrierArg = batch || validKeys.length > 1 ? ' --barrier all' : '';
+    return `futureaide-wait${convArg} --keys "${validKeys.join(',')}"${barrierArg}`;
+  }
+
+  async function defaultFindFaswitchExe(effectiveConfig) {
+    const candidates = [
+      effectiveConfig?.faswitchExecutable,
+      'C:\\Program Files\\FAswitch\\FAswitch.exe',
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'FAswitch', 'FAswitch.exe') : undefined,
+      (() => { const root = defaultFaswitchRoot(); return root ? path.join(root, 'FAswitch.exe') : undefined; })(),
+      effectiveConfig?.faswitchHome ? path.join(effectiveConfig.faswitchHome, 'FAswitch.exe') : undefined,
+    ].filter(item => typeof item === 'string' && item.trim());
+    for (const candidate of candidates) {
+      try {
+        const meta = await lstat(candidate);
+        if (meta.isFile()) return candidate;
+      } catch {}
+    }
+    return null;
+  }
+
+  async function tryAutoWakeFaswitch(effectiveConfig) {
+    if (effectiveConfig?.autoWakeFaswitch !== true) return false;
+    const nowMs = Date.now();
+    if (nowMs - lastFaswitchWakeAt < 3000) return true;
+    const finder = findFaswitchExe ?? defaultFindFaswitchExe;
+    const exe = await finder(effectiveConfig);
+    if (!exe) return false;
+    lastFaswitchWakeAt = nowMs;
+    if (typeof spawnFaswitch === 'function') {
+      await spawnFaswitch(exe, ['--autostart']);
+      return true;
+    }
+    try {
+      const child = spawn(exe, ['--autostart'], { detached: true, stdio: 'ignore', windowsHide: true });
+      child.unref();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function resolveManagedCliRoute(target, effectiveConfig = config, extraOpts = {}) {
+    const check = extraOpts.checkProxy ?? checkCliProxy;
+    const probeOnce = () => resolveCliRoute({
+      ...extraOpts,
+      target,
+      config: effectiveConfig,
+      requireProxy: effectiveConfig?.requireProxy === true || extraOpts.requireProxy === true,
+      ...(check ? { checkProxy: check } : {}),
+    });
+    let route = await probeOnce();
+    if (!route.ok && effectiveConfig?.autoWakeFaswitch === true
+        && ['proxy-unavailable', 'faswitch-proxy-inactive'].includes(route.code)) {
+      const woken = await tryAutoWakeFaswitch(effectiveConfig);
+      if (woken) {
+        const deadline = Date.now() + faswitchWakeTimeoutMs;
+        while (Date.now() < deadline) {
+          await wait(200);
+          route = await probeOnce();
+          if (route.ok) break;
+        }
+      }
+    }
+    return route;
+  }
+
+  function cliConfigForRecord(current) {
+    if (!current || current.proxyOverride === undefined) return config;
+    return {
+      ...config,
+      cliRoutes: {
+        ...(config.cliRoutes ?? {}),
+        [targetOf(current)]: current.proxyOverride,
+      },
+    };
+  }
+
+  function hasExplicitClaudeProxyPolicy(current) {
+    return Boolean(
+      current?.proxyOverride !== undefined
+      || config?.requireProxy === true
+      || config?.cliRoutes?.['claude-cli'] !== undefined
+      || config?.claudeCliProxy !== undefined
+      || config?.claudeCliProxyPort !== undefined
+      || process.env.FUTUREAIDE_CLAUDE_CLI_PROXY
+      || process.env.FUTUREAIDE_CLAUDE_CLI_PROXY_PORT
+      || process.env.FUTUREAIDE_CLI_PROXY,
+    );
+  }
+
+  async function verifyClaudeCliProxyIfConfigured(current) {
+    if (targetOf(current) !== 'claude-cli' || !hasExplicitClaudeProxyPolicy(current)) return undefined;
+    const route = await resolveManagedCliRoute('claude-cli', cliConfigForRecord(current));
+    if (!route.ok) {
+      throw Object.assign(new Error(route.error ?? 'Claude CLI proxy is unreachable; refusing direct fallback.'), {
+        code: route.code ?? 'proxy-unavailable',
+        terminal: true,
+        notSent: true,
+      });
+    }
+    return route;
+  }
   const waitListeners = new Set();
   let waitWatcher, waitTimer, waitVersion, waitChanges, waitsClosed = false;
   const wakeWaiters = () => { for (const wake of [...waitListeners]) wake(); };
@@ -795,6 +1192,9 @@ export function createScopedAgents(config, {
   // per task: reading the baseline and shutting down both wait for it here.
   const baselineWrites = new Map();
   const nextPollAt = new Map();
+  // Distinguishes one poll pass from the next for receipt read-back. It starts at
+  // the wall clock so a persisted marker from a previous process can never match.
+  let pollGeneration = Date.now();
   // Names that owe something a five-second cadence would slow down.
   const fastPoll = new Set();
   // Names whose own poll has just found new work: one immediate re-poll, so a final is
@@ -824,6 +1224,9 @@ export function createScopedAgents(config, {
     if (!baseline) return;
     try {
       const capture = await baseline.pending;
+      if (waitsClosed) return;
+      const live = store.get(record.agentId);
+      if (!live || live.closed) return;
       const file = workspaceBaselineFile(record);
       await mkdir(path.dirname(file), { recursive: true });
       await writeFile(file, JSON.stringify({ taskId: baseline.taskId, workspace: record.workspace,
@@ -885,6 +1288,25 @@ export function createScopedAgents(config, {
   const adapterDeps = record => {
     const load = () => store.get(record.agentId) ?? record;
     const target = targetOf(record);
+    const buildCallerEnv = (current = load(), requestId = undefined) => {
+      const base = {
+        FUTUREAIDE_MANAGED_CLI: '1',
+        FUTUREAIDE_PARENT_AGENT_ID: current.agentId ?? record.agentId,
+        ...(current.task?.taskId ? { FUTUREAIDE_PARENT_TASK_ID: current.task.taskId } : {}),
+        ...(requestId ? { FUTUREAIDE_PARENT_REQUEST_ID: requestId } : {}),
+        FUTUREAIDE_CALLER_OWNER_ID: current.ownerId ?? record.ownerId,
+        FUTUREAIDE_CALLER_WORKSPACE: current.rootWorkspace ?? current.workspace ?? record.workspace ?? '',
+        FUTUREAIDE_ROSTER_PATH: store.location,
+        FUTUREAIDE_REPORT_PORT: String(activeReportPort(config)),
+        ...(config.configFile ? { FUTUREAIDE_CONFIG: config.configFile } : {}),
+        ...(config.antigravityCallerTokenFile ? { FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE: config.antigravityCallerTokenFile } : {}),
+      };
+      if (current._resolvedProxyRoute && (current._resolvedProxyRoute.mode === 'proxy' || current._resolvedProxyRoute.mode === 'direct')) {
+        return buildCliProxyEnv(base, current._resolvedProxyRoute);
+      }
+      return base;
+    };
+    const bridgeScript = fileURLToPath(new URL('./cli-callback-bridge.mjs', import.meta.url));
     return {
       load,
       requestDirectory: () => agentDirectory(load()),
@@ -904,12 +1326,66 @@ export function createScopedAgents(config, {
       withHostLock: (action, { key } = {}) => store.locked(`backend:${target}${key ? `:${key}` : ''}`, action),
       ensureCodexReports: () => beginCodexReports(record),
       readCodexReportState: () => readParentSubmissions(load()),
+      ...(isHeadlessCli(target) ? {
+        get callerEnv() { return buildCallerEnv(load()); },
+      } : {}),
       ...(target === 'claude-cli' ? {
+        get config() { return cliConfigForRecord(load()); },
+        resolveRoute: opts => resolveManagedCliRoute('claude-cli', cliConfigForRecord(load()), opts),
         readParentSubmissions: () => readParentSubmissions(load()),
-        claudeReportConfig: requestId => ({ mcpServers: { futureaide: { type: 'stdio', command: process.execPath,
-          args: [fileURLToPath(new URL('./mcp-server.mjs', import.meta.url)), '--claude-cli-reports',
-            store.location, record.agentId, load().task.taskId, requestId, config.configFile ?? '',
-            ...(config.idleSessionCleanup === false ? ['--no-idle-session-cleanup'] : [])] } } }),
+        claudeReportConfig: requestId => {
+          const current = load();
+          const envVars = buildCallerEnv(current, requestId);
+          return {
+            mcpServers: {
+              futureaide: {
+                type: 'stdio',
+                command: process.execPath,
+                args: [bridgeScript, '--claude-cli-reports',
+                  store.location, record.agentId, current.task.taskId, requestId, config.configFile ?? '',
+                  ...(config.idleSessionCleanup === false ? ['--no-idle-session-cleanup'] : [])],
+                env: envVars,
+              },
+            },
+            callerEnv: envVars,
+          };
+        },
+      } : {}),
+      ...(target === 'codex-cli' ? {
+        get config() { return cliConfigForRecord(load()); },
+        resolveRoute: opts => resolveManagedCliRoute('codex-cli', cliConfigForRecord(load()), opts),
+        readParentSubmissions: () => readParentSubmissions(load()),
+        codexCliReportConfig: requestId => {
+          const current = load();
+          const envVars = buildCallerEnv(current, requestId);
+          return {
+            serverName: 'futureaide_report',
+            command: process.execPath,
+            args: [bridgeScript, '--codex-cli-reports',
+              store.location, record.agentId, current.task.taskId, requestId, config.configFile ?? '',
+              ...(config.idleSessionCleanup === false ? ['--no-idle-session-cleanup'] : [])],
+            env: envVars,
+            callerEnv: envVars,
+          };
+        },
+      } : {}),
+      ...(target === 'agy-cli' ? {
+        get config() { return cliConfigForRecord(load()); },
+        resolveRoute: opts => resolveManagedCliRoute('agy-cli', cliConfigForRecord(load()), opts),
+        readParentSubmissions: () => readParentSubmissions(load()),
+        agyCliReportConfig: requestId => {
+          const current = load();
+          const envVars = buildCallerEnv(current, requestId);
+          return {
+            serverName: 'futureaide_report',
+            command: process.execPath,
+            args: [bridgeScript, '--agy-cli-reports',
+              store.location, record.agentId, current.task.taskId, requestId, config.configFile ?? '',
+              ...(config.idleSessionCleanup === false ? ['--no-idle-session-cleanup'] : [])],
+            env: envVars,
+            callerEnv: envVars,
+          };
+        },
       } : {}),
       // The Codex probe reads its protocol readiness only; this must never start a
       // session, so it is the same read-only evidence status uses.
@@ -933,11 +1409,11 @@ export function createScopedAgents(config, {
     if (target === 'dsh') {
       if (!clients.has(record.agentId)) clients.set(record.agentId, clientFactory(settings(record)));
       const client = clients.get(record.agentId);
-      return resolveBackend(record, { target, load, deps, dsh: { client, requestDirectory: deps.requestDirectory,
+      return resolveBackend(record, { target, load, deps, config, dsh: { client, requestDirectory: deps.requestDirectory,
         control: () => controlFactory(settings(load()), { client, managed: hostArgs(load()) }),
         hostArgs: () => hostArgs(load()) } });
     }
-    return resolveBackend(record, { target, load, deps, adapters: backendAdapters, ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
+    return resolveBackend(record, { target, load, deps, config, adapters: backendAdapters, ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
   }
   const forgetBackend = record => { clients.delete(record.agentId); operationBackends.delete(record); };
   // A target without a usable adapter is refused before the name is taken, and is
@@ -946,9 +1422,18 @@ export function createScopedAgents(config, {
   // here too, so a broken name is never left in the roster.
   async function ensureTargetBackend(record) {
     const target = targetOf(record);
-    if (target === 'dsh') return target;
+    if (target === 'dsh') {
+      if (Array.isArray(config?.disabledTargets) && config.disabledTargets.includes('dsh')) {
+        await resolveBackend(record, { target, load: () => record, config });
+      }
+      return target;
+    }
     const deps = adapterDeps(record);
-    const backend = await resolveBackend(record, { target, load: () => record, deps, adapters: backendAdapters,
+    if (target === 'claude-cli') {
+      const route = await verifyClaudeCliProxyIfConfigured(record);
+      if (route) record._resolvedProxyRoute = route;
+    }
+    const backend = await resolveBackend(record, { target, load: () => record, deps, config, adapters: backendAdapters,
       ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}) });
     const probe = await backend.probe();
     const required = backend.requiredMethods ?? probe.methods ?? [];
@@ -971,14 +1456,74 @@ export function createScopedAgents(config, {
     return target;
   }
 
+  function rootRecordOf(record) {
+    const seen = new Set();
+    let current = record;
+    while (current?.parentAgentId && !seen.has(current.agentId)) {
+      seen.add(current.agentId);
+      const parent = store.get(current.parentAgentId);
+      if (!parent) break;
+      current = parent;
+    }
+    return current;
+  }
+
+  function rootOwnerIdForRecord(record) {
+    const root = rootRecordOf(record);
+    return root?.ownerId ?? record?.ownerId;
+  }
+
   async function context(extra) {
-    // The owner comes from a verified caller (Codex chat metadata or a verified
-    // Claude native session); owner ids are namespaced by source, so the same name
-    // in two applications never collides.
-    const caller = trustedCaller(extra);
-    const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+    // The owner comes from a verified caller (Codex chat metadata, a verified
+    // Claude native session, an authenticated Antigravity caller, or a managed-cli
+    // team lead); owner ids are namespaced by source, so the same name in two
+    // applications never collides.
+    const caller = effectiveTrustedCaller(extra);
+    if (caller?.source === 'managed-cli') {
+      const parentRecord = caller.parentAgentId ? store.get(caller.parentAgentId) : undefined;
+      const effectiveCliOwnerId = caller.ownerId
+        || (parentRecord ? rootOwnerIdForRecord(parentRecord) : undefined)
+        || ownerIdForSource('managed-cli', caller.parentAgentId);
+      const known = store.owner(effectiveCliOwnerId);
+      const resolved = await resolveCallingContext({
+        ...extra,
+        [Symbol.for('futureaide.trustedCaller')]: { ...caller, ownerId: effectiveCliOwnerId },
+      }, {
+        knownOwner: known,
+        defaultWorkspace: parentRecord?.rootWorkspace ?? parentRecord?.workspace ?? config.workspace,
+      });
+      const { callerAgentId, parentAgentId: _parent, ...persistable } = resolved;
+      const saved = store.saveOwner(persistable);
+      return {
+        ...saved,
+        ...(callerAgentId ? { callerAgentId, parentAgentId: callerAgentId } : {}),
+      };
+    }
+    const callerKey = caller?.source === 'antigravity'
+      ? (caller.conversationId ?? caller.nativeSessionId)
+      : caller?.nativeSessionId;
+    const ownerId = caller ? ownerIdForSource(caller.source, callerKey) : ownerIdFor(callingThread(extra));
     return store.saveOwner(await resolveCallingContext(extra,
-      { knownOwner: store.owner(ownerId), callCodex: codexOwnerCall, nativeRequest, verifyClaude, bindOwner: bindClaude }));
+      { knownOwner: store.owner(ownerId), callCodex: codexOwnerCall, nativeRequest, verifyClaude, bindOwner: bindClaude,
+        defaultWorkspace: config.workspace }));
+  }
+
+  function resolveTeamRootOwnerId(owner, extra) {
+    if (owner?.callerAgentId) {
+      const parent = store.get(owner.callerAgentId);
+      if (parent) return rootOwnerIdForRecord(parent);
+    }
+    if (!effectiveTrustedCaller(extra)) {
+      try {
+        const bound = store.agentForCodexThread(callingThread(extra), { includeAutoClosed: true });
+        if (bound) {
+          const rec = store.get(bound.agentId);
+          if (rec) return rootOwnerIdForRecord(rec);
+          return bound.ownerId;
+        }
+      } catch {}
+    }
+    return owner.ownerId;
   }
   /**
    * Records this owner can see: its own, plus every managed descendant that a
@@ -987,14 +1532,62 @@ export function createScopedAgents(config, {
    */
   function visibleRecords(ownerId) {
     const own = store.list(ownerId);
-    return { own, all: [...own, ...store.descendantsOf(own.map(record => record.agentId))] };
+    const descendants = store.descendantsOf(own.map(record => record.agentId));
+    const seen = new Set();
+    const all = [];
+    for (const rec of [...own, ...descendants]) {
+      if (rec && !seen.has(rec.agentId)) {
+        seen.add(rec.agentId);
+        all.push(rec);
+      }
+    }
+    return { own, all };
   }
-  function named(owner, name) {
-    // Addressable names are this chat's own, exactly as in 0.5.7: a descendant's name
-    // belongs to the session that created it and never hijacks this chat's namespace.
-    const record = store.named(owner.ownerId, assertName(name));
-    if (!record) throw Object.assign(new Error(`No subagent named “${name}” exists in this chat.`), { code: 'agent-not-found' });
-    return record;
+  function named(owner, name, extra) {
+    const wanted = assertName(name);
+    if (!wanted.includes('/')) {
+      const direct = store.named(owner.ownerId, wanted);
+      if (direct) return direct;
+    }
+    const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+    const { all: teamAll } = visibleRecords(rootOwnerId);
+    if (owner.ownerId !== rootOwnerId) {
+      const seen = new Set(teamAll.map(r => r.agentId));
+      for (const ownRec of store.list(owner.ownerId)) {
+        if (!seen.has(ownRec.agentId)) {
+          seen.add(ownRec.agentId);
+          teamAll.push(ownRec);
+        }
+      }
+    }
+    if (wanted.startsWith('agent-')) {
+      const byId = teamAll.find(r => r.agentId === wanted);
+      if (byId) return byId;
+    }
+    const byPath = teamAll.filter(r => managedPath(r) === wanted);
+    if (byPath.length === 1) return byPath[0];
+    if (byPath.length > 1) {
+      const activeByPath = byPath.filter(r => !r.closed && !INACTIVE_STATES.has(r.state));
+      if (activeByPath.length === 1) return activeByPath[0];
+      const paths = (activeByPath.length > 1 ? activeByPath : byPath).map(r => managedPath(r));
+      throw Object.assign(
+        new Error(`“${wanted}” matches multiple team members: ${paths.join(', ')}. Pass the full team path to disambiguate.`),
+        { code: 'node-ambiguous', paths },
+      );
+    }
+    const byShort = teamAll.filter(r => r.name === wanted);
+    if (byShort.length === 1) return byShort[0];
+    if (byShort.length > 1) {
+      const activeMatches = byShort.filter(r => !r.closed && !INACTIVE_STATES.has(r.state));
+      if (activeMatches.length === 1) return activeMatches[0];
+      const candidates = activeMatches.length > 1 ? activeMatches : byShort;
+      const paths = candidates.map(r => managedPath(r));
+      throw Object.assign(
+        new Error(`“${wanted}” matches multiple team members: ${paths.join(', ')}. Pass a team path such as “${paths[0]}” to disambiguate.`),
+        { code: 'node-ambiguous', paths },
+      );
+    }
+    throw Object.assign(new Error(`No subagent named “${name}” exists in this chat.`), { code: 'agent-not-found' });
   }
 
   /** A Claude caller is checked against the native registry before it becomes an owner. */
@@ -1130,9 +1723,23 @@ export function createScopedAgents(config, {
     for (const item of pending) {
       if (item.kind === 'report') {
         record.task.reports ??= [];
-        if (!record.task.reports.some(report => report.id === submissionRef(item.id))) {
+        // A DSH native report already has a persistent report UUID. It is absorbed
+        // under that same identity, not duplicated as a second submission report.
+        const existing = record.task.reports.find(report => sameReportId(report.id, submissionRef(item.id))
+          || sameReportId(report.id, item.id) || report.sharedSubmission === item.id)
+          ?? record.task.reports.find(report => !fromSubmission(report.id) && (report.message === item.message
+            || (typeof report.message === 'string' && report.message.startsWith(item.message)))
+            && report.final === item.final && report.createdAt === item.created);
+        if (existing) {
+          existing.sharedSubmission = item.id;
+          if (existing.final !== item.final || (existing.message !== item.message
+              && !(typeof existing.message === 'string' && existing.message.startsWith(item.message)))) {
+            throw Object.assign(new Error('A persisted report identity changed.'), { code: 'report-identity-changed' });
+          }
+        } else {
           record.task.reports.push({ id: submissionRef(item.id), taskId: record.task.taskId,
-            message: item.message, final: item.final, createdAt: item.created, delivery: submissionNotice(item) });
+            message: item.message, final: item.final, createdAt: item.created, delivery: submissionNotice(item),
+            sharedSubmission: item.id });
         }
       } else if (!isCancelledRound(record) && !record.task.treeUnavailable) {
         record.observation ??= {};
@@ -1160,11 +1767,27 @@ export function createScopedAgents(config, {
     // Some old report projections carry a submission ID but no inbox row.
     // Rehydrate them once so their old receipt can be adopted by this sender.
     for (const report of task?.reports ?? []) {
-      if (!fromSubmission(report.id)) continue;
+      if (!fromSubmission(report.id)) {
+        // A terminal failure notice is an internal prompt, not a parent report.
+        if (report.failure) continue;
+        // Native DSH reports carry a persistent report UUID. Persist its body and,
+        // while it still owes delivery, fold it into the same submission state so
+        // the wait exit and the native notification share one identity.
+        store.saveReportBody({ ownerId: record.ownerId, agentId: record.agentId, taskId: task.taskId,
+          submissionId: report.id, body: report.message, created: report.createdAt ?? task.startedAt ?? '' });
+        if (!nativeReportOnly(record) && !terminalNotice(report.delivery) && !report.delivery?.attemptedAt
+            && (report.delivery?.state ?? 'pending') === 'pending') {
+          store.enqueueSubmission({ id: report.id, ownerId: record.ownerId, agentId: record.agentId,
+            taskId: task.taskId, kind: 'report', message: report.message, final: report.final,
+            created: report.createdAt ?? task.startedAt ?? '' });
+          report.sharedSubmission = report.id;
+        }
+        continue;
+      }
       const id = report.id.slice('submission:'.length);
       if (report.delivery?.id !== submissionNoticeId(id)) {
         store.enqueueSubmission({ id, ownerId: record.ownerId, agentId: record.agentId, taskId: task.taskId,
-          kind: 'report', message: report.message, final: report.final, created: report.createdAt ?? task.startedAt });
+          kind: 'report', message: report.message, final: report.final, created: report.createdAt ?? task.startedAt ?? '' });
       }
     }
     const rows = store.submissionWork(record.agentId, currentOnly ? task.taskId : undefined);
@@ -1177,17 +1800,21 @@ export function createScopedAgents(config, {
       }
       const round = current ? task : history.get(item.taskId);
       const ref = submissionRef(item.id);
-      let report = item.kind === 'report' ? round?.reports?.find(entry => entry.id === ref) : undefined;
+      let report = item.kind === 'report' ? round?.reports?.find(entry => entry.id === ref
+        || entry.id === item.id || entry.sharedSubmission === item.id) : undefined;
       const notice = submissionNotice(item, report?.delivery ?? round?.questionNotices?.[ref]);
+      let message;
+      if (report?.treeRelease) Object.assign(notice, { treeRelease: report.treeRelease, treeReleaseAt: report.treeRelease.deadlineAt, treeReleased: true });
       const persist = () => {
         const previousReport = report, previousReports = task?.reports;
         const previousDelivery = report?.delivery, previousQuestions = task?.questionNotices;
         if (current) {
           if (item.kind === 'report') {
             if (!report) {
-              report = { id: ref, taskId: item.taskId, message: item.message, final: item.final, createdAt: item.created };
+              report = { id: ref, taskId: item.taskId, message: message ?? item.message, final: item.final, createdAt: item.created };
               task.reports = [...(previousReports ?? []), report];
             }
+            report.message = message ?? item.message;
             report.delivery = { ...notice };
           } else task.questionNotices = { ...previousQuestions, [ref]: { ...notice } };
         }
@@ -1209,8 +1836,10 @@ export function createScopedAgents(config, {
       if (terminalNotice(notice)) { persist(); continue; }
       const name = `${hostLabel(record)}「${record.name}」`;
       let text;
+      message = item.kind === 'report'
+        ? exactReportText(record, round, report ?? { id: item.id }, item.message) : item.message;
       const missingTree = round?.treeUnavailable === 'codex-thread-not-found' && !report?.treeSettledConfirmed;
-      let ready = item.kind !== 'report' || !item.final || !current || report?.treeSettledConfirmed || missingTree;
+      let ready = item.kind !== 'report' || !item.final || !current || finalReportReady(report) || missingTree;
       if (item.kind === 'ask') {
         const answered = round?.answers?.some(answer => answer.questionIds?.includes(ref));
         const active = current && !answered && !round.treeUnavailable && !terminalRound(store.get(record.agentId) ?? record)
@@ -1219,23 +1848,28 @@ export function createScopedAgents(config, {
         text = active ? questionPrompt(record, item.message) : `${name}旧轮次提问：\n${item.message}`;
       } else {
         const label = current ? (item.final ? '交付' : '汇报') : (item.final ? '旧轮次最终汇报' : '旧轮次汇报');
-        text = `${name}${label}：\n${item.message}${item.final && missingTree ? '\n\n' + MISSING_CODEX_TREE : ''}`;
+        text = `${name}${label}：\n${message}${item.final && missingTree ? '\n\n' + MISSING_CODEX_TREE : ''}`;
+        if (report?.treeRelease) text += '\n\n' + treeReleaseText(report.treeRelease);
       }
       if ((notice.waitingForTree && ready) || (readOnDemand && awaitingNoticeReceipt(notice))) {
         delete notice.waitingForTree;
         delete notice.nextAttemptAt;
       }
       await deliver(record, notice, text, { persist, allowSend: ready, submission: true,
+        treeDeadline: item.kind === 'report' ? finalReportDeadline(report ?? { createdAt: item.created }, task) : undefined,
         // Only a real report is reminded to the user; an ask is answered, not read later.
-        ...(item.kind === 'report' ? { reportSummary: item.message } : {}) });
+        ...(item.kind === 'report' ? { reportSummary: message } : {}) });
     }
   }
   async function withName(extra, name, action, options) {
     const owner = await context(extra);
-    const record = named(owner, name);
+    const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+    const record = named(owner, name, extra);
     return store.locked(record.agentId, async () => {
       const fresh = store.get(record.agentId);
-      if (!fresh || fresh.ownerId !== owner.ownerId) throw new Error('This subagent instance has already been removed.');
+      if (!fresh || (fresh.ownerId !== owner.ownerId && rootOwnerIdForRecord(fresh) !== rootOwnerId)) {
+        throw new Error('This subagent instance has already been removed.');
+      }
       return action(fresh, owner);
     }, options);
   }
@@ -1342,6 +1976,7 @@ export function createScopedAgents(config, {
     if (!record || record.closed) return false;
     if (hasSubmission) return true;
     if (record.sleep) return false;
+    if (record.autoCleanupPending === true || record.task?.autoCleanupPending === true) return true;
     if (ACTIVE.has(record.state)) return true;
     // The scan projection already carries both of these, so a roster sweep no longer
     // runs one supplement query per name. A record loaded whole has neither field
@@ -1420,6 +2055,14 @@ export function createScopedAgents(config, {
    */
   async function observe(record, { checkingRestoredProfile = false } = {}) {
     const own = await observeOwn(record);
+    if (own.usage && record.task) {
+      record.task.usage = { ...own.usage };
+    }
+    if (own.usage || record.historicalUsage || own.agentUsage) {
+      record.usage = record.task?.usage
+        ? sumTwoUsages(record.historicalUsage, record.task.usage)
+        : (record.historicalUsage ?? (own.agentUsage ? { ...own.agentUsage } : undefined));
+    }
     const evidence = own.modelEvidence;
     if (evidence?.businessAccepted === true && evidence.requestId && evidence.actualEffort != null) {
       const dispatch = record.task?.dispatches?.find(item => item.requestId === evidence.requestId && item.accepted === true);
@@ -1761,16 +2404,47 @@ export function createScopedAgents(config, {
 
   async function resolveRequestedPin(record, input = {}, frozenConfig) {
     const backend = await backendFor(record);
-    const catalog = await backend.models();
+    const catalog = await backend.models(input.model !== undefined ? { requestedModel: input.model } : undefined);
     const current = input.model !== undefined && !dshDefaultOnly(record) ? undefined :
       targetOf(record) === 'dsh' && !record.modelPin ? catalog?.default :
       dshDefaultOnly(record) ? catalog?.default : (record.modelPin ? undefined : await backend.model());
     const request = selectionRequest(input);
     if (dshDefaultOnly(record)) delete request.model;
+    if (targetOf(record) === 'agy-cli' && typeof request.model === 'string' && typeof request.effort === 'string') {
+      const rawQuery = request.model.trim().toLowerCase();
+      const rawEff = request.effort.trim().toLowerCase();
+      if (rawQuery && rawEff && !/-(low|medium|high|xhigh|max)$/i.test(rawQuery)) {
+        const modelsList = (catalog?.groups ?? []).flatMap(group => group.models ?? []);
+        const exactTiered = modelsList.find(entry => {
+          const idLower = String(entry?.id ?? '').toLowerCase();
+          return idLower.includes(rawQuery) && idLower.endsWith(`-${rawEff}`);
+        });
+        if (exactTiered?.id) request.model = exactTiered.id;
+      }
+    }
     if (!hasModelRequest(request)) request.effort = pinnedCodexEffort(record);
-    const selection = resolveDispatchSelection(catalog, request, {
-      pinned: dshDefaultOnly(record) ? undefined : record.modelPin, current, config: frozenConfig ?? config.behavior ?? config,
-    });
+    let selection;
+    try {
+      selection = resolveDispatchSelection(catalog, request, {
+        pinned: dshDefaultOnly(record) ? undefined : record.modelPin, current, config: frozenConfig ?? config.behavior ?? config,
+      });
+    } catch (error) {
+      if (error?.code === 'model-catalog-unavailable' && !dshDefaultOnly(record) && input.model === undefined && record.modelPin?.model) {
+        const eff = request.effort ?? record.creationSelection?.selectedEffort ?? null;
+        return {
+          provider: record.modelPin.provider ?? (targetOf(record) === 'claude-cli' ? 'claude-cli' : targetOf(record) === 'agy-cli' ? 'antigravity' : 'openai'),
+          model: record.modelPin.model,
+          ...(eff ? { reasoningEffort: eff } : {}),
+          requestedEffort: eff,
+          effortSource: eff ? 'role-default' : null,
+          selectedEffort: eff,
+          explicitFields: { model: false, effort: input.effort !== undefined },
+          explicitInput: selectionRequest(input),
+          effortConfig: frozenConfig ?? { defaultEffort: (config.behavior ?? config).defaultEffort, modelDefaultEfforts: { ...((config.behavior ?? config).modelDefaultEfforts ?? {}) } },
+        };
+      }
+      throw error;
+    }
     return selection && { ...selection, explicitFields: {
       model: !dshDefaultOnly(record) && input.model !== undefined,
       effort: input.effort !== undefined,
@@ -1935,6 +2609,10 @@ export function createScopedAgents(config, {
     // The one structural gate every send path shares. A caller assigning new work writes a
     // new task first, so a finished round can never produce another turn by itself.
     if (terminalRound(record)) throw dispatchRefused();
+    if (targetOf(record) === 'claude-cli') {
+      const route = await verifyClaudeCliProxyIfConfigured(record);
+      if (route) record._resolvedProxyRoute = route;
+    }
     const baseline = Number.isSafeInteger(observed?.throughSeq)
       ? observed : await (await backendFor(record)).cursor();
     // Waiting for the cursor is asynchronous: the round is read again before the intent is
@@ -2091,18 +2769,22 @@ export function createScopedAgents(config, {
         row.task === record.task?.taskId && row.mode === 'queue' && row.status !== 'blocked');
       const allowStart = !(target === 'codex-desktop' && dispatch.kind === 'supplement'
         && dispatch.mode !== 'queue' && earlierQueue);
+      const effectiveTimeoutMs = dispatch.timeoutMs ?? record.task?.turnTimeoutMs ?? record.turnTimeoutMs;
+      const effectiveTimeoutMinutes = dispatch.timeoutMinutes ?? record.task?.turnTimeoutMinutes ?? record.turnTimeoutMinutes;
       const sent = await backend.deliver({ requestId: dispatch.requestId,
         message: dispatch.message, kind: dispatch.kind,
         writeBlockReason: reasonFor,
         allowStart,
         ...(startOnly ? { startOnly: true } : {}),
+        ...(effectiveTimeoutMs !== undefined ? { timeoutMs: effectiveTimeoutMs } : {}),
+        ...(effectiveTimeoutMinutes !== undefined ? { timeoutMinutes: effectiveTimeoutMinutes } : {}),
         mode: dispatch.mode === 'queue' ? 'queue' : 'steer',
         ...(dispatch.selectionExplicit === undefined ? {}
           : { selectionExplicit: dispatch.selectionExplicit === true }),
         ...(dispatch.model?.explicitFields ? { explicitFields: dispatch.model.explicitFields } : {}),
         ...(target === 'dsh' && dispatch.model ? { startModel: dispatch.model } : {}),
         ...(target === 'dsh' && method === 'steer' ? { expectedTurn: { throughSeq: dispatch.deliveryIntent.expectedThroughSeq } } : {}),
-        ...(modern || target === 'claude-cli' || target === 'dsh'
+        ...(modern || isHeadlessCli(target) || target === 'dsh'
           ? (dispatch.model ? { model: target === 'dsh' ? dispatch.deliveryModel ?? dispatch.model : dispatch.model } : {})
           : (explicit ? { model: dispatch.model, explicitModel: true } : { explicitModel: false })) });
       // A native receipt names the actual route. When it does not, a Codex write is
@@ -2127,7 +2809,7 @@ export function createScopedAgents(config, {
         ...(accepted && Object.hasOwn(sent, 'actualModel') ? { actualModel: sent.actualModel }
           : accepted && dispatch.deliveryModel?.model ? { actualModel: dispatch.deliveryModel.model } : {}),
         ...(accepted && sent.effortAdjustment ? { effortAdjustment: sent.effortAdjustment } : {}),
-        ...(accepted && sent.actualEffort != null ? { actualEffortSource: sent.actualEffortSource ?? (target === 'dsh' || target === 'claude-cli' ? 'host-readback' : 'native-turn-start') } : {}),
+        ...(accepted && sent.actualEffort != null ? { actualEffortSource: sent.actualEffortSource ?? (target === 'dsh' || isHeadlessCli(target) ? 'host-readback' : 'native-turn-start') } : {}),
         ...(sent.afterTurnId ?? (delivery === 'after-current' ? sent.turnId ?? root?.turnId : undefined)
           ? { afterTurnId: sent.afterTurnId ?? sent.turnId ?? root?.turnId } : {}),
         ...(sent.afterSeq !== undefined ? { afterSeq: sent.afterSeq } : {}),
@@ -2363,14 +3045,151 @@ export function createScopedAgents(config, {
   }
 
   /**
-   * A Codex owner's notification marker sits in the first user message, which a
-   * summary page already carries. Only when that is absent do we read the few
-   * turns started (or still running) after the attempt, one turn at a time.
-   * `complete` is false when the summary page was not the whole relevant window.
+   * A Codex receipt is one exact userMessage on the original thread. Tool output,
+   * model prose, summaries and a successful RPC response are not receipts: they can
+   * repeat our marker without proving the chat received it. The scan therefore
+   * inspects only userMessage items and never stringifies a whole page.
    */
-  async function findCodexNotice(owner, notice, hasMarker) {
-    const summary = await readCodexOwnerTurns(owner.threadId, { limit: 30, itemsView: 'summary' }, { nativeRequest });
-    if (hasMarker(summary)) return { delivered: true, complete: true };
+  function userMessageText(item) {
+    if (!item || typeof item !== 'object') return undefined;
+    if (item.type !== 'userMessage' && item.type !== 'user_message') return undefined;
+    const content = item.content ?? item.message?.content;
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) return content.map(part =>
+      typeof part === 'string' ? part : part?.type === 'text' && typeof part.text === 'string' ? part.text : '').join('');
+    if (typeof item.text === 'string') return item.text;
+    return undefined;
+  }
+  function exactCodexMessage(item, marker, expectedText, notice) {
+    const content = userMessageText(item);
+    if (content === undefined) return undefined;
+    const id = item.id ?? item.clientId ?? item.clientUserMessageId
+      ?? item.message?.id ?? item.message?.clientUserMessageId;
+    if (notice?.clientUserMessageId && id === notice.clientUserMessageId) return { itemId: id, exact: 'id' };
+    if (expectedText === undefined) return content.includes(marker) ? { itemId: id, exact: 'marker' } : undefined;
+    const envelope = `${expectedText}\n\n${marker}`;
+    // The written prompt is the only full-envelope authority. A marker quoted in a
+    // user message (for example a reviewer pasting the error) is not a receipt.
+    return content === envelope || content === `${envelope}\n`
+      ? { itemId: id, exact: 'envelope' } : undefined;
+  }
+  function codexReadViews(value) {
+    const views = [];
+    const visit = current => {
+      if (typeof current === 'string') {
+        if (!/^[\s]*[\[{]/.test(current)) return;
+        try { visit(JSON.parse(current)); } catch { /* ordinary text */ }
+        return;
+      }
+      if (!current || typeof current !== 'object' || views.includes(current)) return;
+      views.push(current);
+      if (current.structuredContent && typeof current.structuredContent === 'object') visit(current.structuredContent);
+      // app-tools wraps its thread page as content[0].text JSON. Only that direct
+      // wrapper is unwrapped; a tool/model item's own text is never inspected.
+      if (Array.isArray(current.content)) {
+        for (const part of current.content) if (typeof part?.text === 'string') visit(part.text);
+      }
+    };
+    visit(value);
+    return views;
+  }
+  function findUserMessageMarker(value, marker, expectedText, notice, seen = new Set()) {
+    if (!value || typeof value !== 'object' || seen.has(value)) return undefined;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const found = findUserMessageMarker(entry, marker, expectedText, notice, seen);
+        if (found) return found;
+      }
+      return undefined;
+    }
+    const direct = exactCodexMessage(value.item ?? value, marker, expectedText, notice);
+    if (direct) return { itemId: value.item?.id ?? direct.itemId,
+      clientUserMessageId: notice?.clientUserMessageId, ...(value.turnId ?? value.turn?.id ? { turnId: value.turnId ?? value.turn?.id } : {}) };
+    // Only containers that can hold thread items are walked. Content, text and tool
+    // payloads are deliberately not searched.
+    for (const key of ['data', 'items', 'turns', 'turn', 'item', 'message', 'thread',
+      'structuredContent']) {
+      if (!(key in value)) continue;
+      const found = findUserMessageMarker(value[key], marker, expectedText, notice, seen);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  function findCodexPayload(value, marker, expectedText, notice) {
+    for (const view of codexReadViews(value)) {
+      const found = findUserMessageMarker(view, marker, expectedText, notice);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  function codexThreadId(value) {
+    if (!value || typeof value !== 'object') return undefined;
+    const id = value.thread?.id ?? value.threadId ?? value.thread?.threadId
+      ?? value.structuredContent?.thread?.id ?? value.structuredContent?.threadId;
+    if (typeof id === 'string' && id) return id;
+    const text = Array.isArray(value.content)
+      ? value.content.find(part => typeof part?.text === 'string')?.text : undefined;
+    if (typeof text === 'string' && /^[\s]*[\[{]/.test(text)) {
+      try { return codexThreadId(JSON.parse(text)); } catch { /* not a JSON envelope */ }
+    }
+    return undefined;
+  }
+  async function findCodexNotice(owner, notice, marker, expectedText) {
+    const markers = [marker, ...(notice.readbackIds ?? []).map(id => `<!-- futureaide-control:${id} -->`)];
+    const findAny = value => {
+      for (const view of codexReadViews(value)) {
+        const claimed = codexThreadId(view);
+        if (claimed && claimed.toLowerCase() !== owner.threadId.toLowerCase()) return { wrongThread: true };
+        for (const entry of markers) {
+          const found = findUserMessageMarker(view, entry, expectedText, notice);
+          if (found) return found;
+        }
+      }
+      return undefined;
+    };
+    let summary;
+    const reportReceipt = expectedText !== undefined;
+    const monitor = receiptProcessIdentity();
+    const fallbackAppTools = async () => {
+      if (typeof codexOwnerCall !== 'function') return undefined;
+      const history = await codexOwnerCall(owner.threadId, 'read_thread', {
+        threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
+      });
+      const found = history?.isError ? undefined : findAny(history);
+      if (found?.wrongThread) return { wrongThread: true };
+      return found ? { delivered: true, complete: true, receipt: { via: 'app-tools', threadId: owner.threadId,
+        threadPageCount: 1, itemPageCount: 0, hitPage: 0, ...monitor, ...found } } : undefined;
+    };
+    // A summary or an immediate send response is not enough to prove a page receipt.
+    // Verify the exact original thread first when a native/app-tools metadata read exists.
+    try {
+      const metadata = await codexOwnerCall(owner.threadId, 'read_thread', {
+        threadId: owner.threadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 100,
+      });
+      const claimed = codexThreadId(metadata);
+      if (claimed && claimed.toLowerCase() !== owner.threadId.toLowerCase()) return { delivered: false, complete: false, wrongThread: true };
+    } catch { /* an unavailable metadata read is not proof of absence */ }
+    try {
+      summary = await readCodexOwnerTurns(owner.threadId, { limit: 30, itemsView: 'summary' }, { nativeRequest });
+    } catch (error) {
+      // A desktop without the native debug port still has its own thread read.
+      // It is scanned through the same userMessage-only matcher.
+      if (typeof codexOwnerCall !== 'function') throw error;
+      return await fallbackAppTools() ?? { delivered: false, complete: false };
+    }
+    const found = reportReceipt ? undefined : findAny(summary);
+    if (found?.wrongThread) return { delivered: false, complete: false, wrongThread: true };
+    if (found) return { delivered: true, complete: true, receipt: { via: 'native-summary', threadId: owner.threadId, ...monitor, ...found } };
+    // A native thread summary can be empty on a desktop that only exposes the
+    // app-tools read. Try that same-thread read before declaring a miss.
+    if (!(Array.isArray(summary?.data) && summary.data.length) && typeof codexOwnerCall === 'function') {
+      try {
+        const fallback = await fallbackAppTools();
+        if (fallback?.wrongThread) return { delivered: false, complete: false, wrongThread: true };
+        if (fallback) return fallback;
+      } catch { /* the native summary miss is still not proof of absence */ }
+    }
     const attempted = Date.parse(notice.attemptedAt ?? notice.createdAt ?? '');
     const turns = Array.isArray(summary.data) ? summary.data : [];
     const started = turns.map(turn => Number(turn.startedAt) * 1000).filter(Number.isFinite);
@@ -2384,19 +3203,47 @@ export function createScopedAgents(config, {
     const complete = (!summary.nextCursor || (Number.isFinite(attempted) && oldest !== undefined && attempted >= oldest))
       && candidates.length <= 5;
     let allItemsRead = true;
+    let itemPagesRead = 0;
     for (const turn of candidates.slice(0, 5)) {
       if (typeof turn.id !== 'string') continue;
       let cursor;
       let pages = 0;
       while (true) {
-        const page = await readCodexOwnerItems(owner.threadId, turn.id, { limit: 100,
-          ...(cursor ? { cursor } : {}) }, { nativeRequest });
-        if (hasMarker(page)) return { delivered: true, complete: true };
+        let page;
+        try {
+          page = await readCodexOwnerItems(owner.threadId, turn.id, { limit: 100,
+            ...(cursor ? { cursor } : {}) }, { nativeRequest });
+        } catch {
+          // The native item page is unavailable on this desktop; the same-thread
+          // app-tools read is the only permitted fallback.
+          const fallback = await fallbackAppTools();
+          if (fallback?.wrongThread) return { delivered: false, complete: false, wrongThread: true };
+          if (fallback) return fallback;
+          allItemsRead = false;
+          break;
+        }
+        pages += 1;
+        itemPagesRead += 1;
+        const hit = findAny(page);
+        if (hit?.wrongThread) return { delivered: false, complete: false, wrongThread: true };
+        if (hit) return { delivered: true, complete: true, receipt: { via: 'native-item-page',
+          threadId: owner.threadId, turnId: turn.id, threadPageCount: summary.pageCount ?? 1,
+          turnPageCount: summary.pageCount ?? 1, itemPageCount: pages, hitPage: pages, ...monitor, ...hit } };
         cursor = typeof page.nextCursor === 'string' ? page.nextCursor : undefined;
-        pages++;
         if (!cursor) break;
         if (pages >= 5) { allItemsRead = false; break; }
       }
+    }
+    // Older Desktop builds expose the persistent userMessage only in a native
+    // summary (items/list is empty even though the exact envelope is present).
+    // Only accept that already-read summary after every native item page was
+    // attempted, and only with the same exact-envelope matcher used above.
+    if (reportReceipt && allItemsRead && candidates.length <= 5 && !summary.truncated) {
+      const summaryHit = findAny(summary);
+      if (summaryHit?.wrongThread) return { delivered: false, complete: false, wrongThread: true };
+      if (summaryHit) return { delivered: true, complete: true, receipt: { via: 'native-summary',
+        source: 'native-summary', threadId: owner.threadId, threadPageCount: summary.pageCount ?? 1,
+        turnPageCount: summary.pageCount ?? 1, itemPageCount: itemPagesRead, hitPage: 0, ...monitor, ...summaryHit } };
     }
     return { delivered: false, complete: complete && allItemsRead };
   }
@@ -2445,6 +3292,7 @@ export function createScopedAgents(config, {
 
   async function deliver(record, notice, text, {
     persist = () => store.save(record), allowSend = true, submission = false, reportSummary = undefined,
+    treeDeadline = undefined,
   } = {}) {
     if (notice.state === 'delivered') return;
     if (notice.state === 'blocked') return;
@@ -2471,6 +3319,9 @@ export function createScopedAgents(config, {
     const sent = Boolean(notice.attemptedAt) || awaitingNoticeReceipt(notice);
     const owner = store.owner(record.ownerId);
     const claude = owner?.source === 'claude-desktop' || Boolean(owner?.nativeSessionId);
+    // Receipt tightening is a report rule. Questions and failure notices keep their
+    // established accepted-write behavior; only a report must prove its exact envelope.
+    const exactCodexReceipt = reportSummary !== undefined;
     // A notice written by the old reader may already be over thirty minutes old
     // when this build first sees it. Give that notice one versioned, paginated,
     // read-only scan of the transcript as it stood at this first sight. Evidence
@@ -2482,7 +3333,7 @@ export function createScopedAgents(config, {
     if (sent && attemptAge(notice) >= UNCONFIRMED_AFTER_MS && claudeRescanPending) {
       notice.id ??= uid('notice');
       let settled;
-      try { settled = await findClaudeNoticeReceipt(owner, notice); }
+      try { settled = await findClaudeNoticeReceipt(owner, notice, text); }
       catch {
         // The binding may fail before findClaudeReceipt can record a scan. At the
         // deadline an unreadable channel is no evidence, so settle it on the
@@ -2505,30 +3356,65 @@ export function createScopedAgents(config, {
       persist();
       return;
     }
-    // Waiting on a final's tree cannot disable the expiry rule. A successful
-    // tree proof clears this timer and sends it through the same notice path.
+    // Waiting on a final's tree cannot disable the expiry rule. The bounded release
+    // moment comes from the report's own persisted creation time, so a restarted
+    // monitor resumes the same deadline instead of starting a new countdown.
     if (!allowSend && !awaitingNoticeReceipt(notice)) {
+      const created = Date.parse(notice.createdAt ?? '');
+      const deadline = Number.isFinite(treeDeadline) ? treeDeadline
+        : Number.isFinite(created) ? created + TREE_RELEASE_MS : undefined;
       if (!notice.waitingForTree) {
         notice.waitingForTree = true;
-        notice.nextAttemptAt = Date.parse(notice.createdAt) + EXPIRE_UNSENT_AFTER_MS;
+        if (deadline !== undefined) {
+          notice.treeReleaseAt = new Date(deadline).toISOString();
+          notice.nextAttemptAt = deadline;
+        } else notice.nextAttemptAt = undefined;
+        persist();
+      } else {
+        // A row written by the six-hour build moves to the bounded deadline exactly
+        // once, from its original creation time. It is due at once in the roster
+        // projection, so this migration never waits six hours to happen.
+        let changed = false;
+        if (deadline !== undefined && notice.treeReleaseAt !== new Date(deadline).toISOString()) {
+          notice.treeReleaseAt = new Date(deadline).toISOString();
+          notice.nextAttemptAt = deadline;
+          changed = true;
+        }
+        if (Number.isFinite(deadline) && Date.now() >= deadline
+            && notice.nextAttemptAt !== deadline) {
+          // The caller is expected to release with a fresh observation before this
+          // point. Reaching here means it could not, so leave the row due for the
+          // next poll rather than hiding it behind an old backoff.
+          notice.nextAttemptAt = deadline;
+          changed = true;
+        }
+        if (changed) persist();
+      }
+      return;
+    }
+    notice.id ??= uid('notice');
+    if (isPullOwner(owner)) {
+      if (notice.state !== 'delivered') {
+        notice.state = 'pull_ready';
+        notice.readyAt ??= now();
+        delete notice.error;
+        delete notice.blockedAt;
+        delete notice.waitingForTree;
+        delete notice.nextAttemptAt;
         persist();
       }
       return;
     }
-    if (notice.nextAttemptAt && notice.nextAttemptAt > Date.now()) return;
-    notice.id ??= uid('notice');
-    notice.attempts = (notice.attempts ?? 0) + 1;
-    notice.nextAttemptAt = Date.now() + retryDelayMs(notice.attempts);
     const marker = `<!-- futureaide-control:${notice.id} -->`;
-    const markers = [marker, ...(notice.readbackIds ?? []).map(id => `<!-- futureaide-control:${id} -->`)];
-    const hasMarker = value => {
-      const content = JSON.stringify(value);
-      return markers.some(entry => content?.includes(entry));
-    };
     // These exact legacy failures happened before sendClaude opened a socket. They
     // can resume; other unknown outcomes stay read-only.
-    if (!submission && claude && notice.state === 'unknown' && claudeNeverWritten(notice)) notice.state = 'pending';
+    if (claude && notice.state === 'unknown' && claudeNeverWritten(notice)) notice.state = 'pending';
     if (awaitingNoticeReceipt(notice)) {
+      // One read-back per poll. The same notice can be visited by several delivery
+      // passes in one poll; a fresh generation is what allows the next poll to look
+      // again, without starting a second scan budget in the same pass.
+      if (notice.readbackGeneration === pollGeneration) return;
+      notice.readbackGeneration = pollGeneration;
       try {
         if (claude) {
           // The native receipt is the request id itself: our envelope uuid survives
@@ -2536,26 +3422,31 @@ export function createScopedAgents(config, {
           // so a long report's trailing marker is never reliable — deliveries are.
           // The scan starts at this notice's own cursor, so a long parent chat is
           // never rescanned and a page boundary simply continues on the next poll.
-          const settled = await findClaudeNoticeReceipt(owner, notice);
+          const settled = await findClaudeNoticeReceipt(owner, notice, text);
           Object.assign(notice, settled
             ? { state: 'delivered', deliveredAt: now(), recovered: true, receipt: settled, error: undefined }
             : { state: 'unknown' });
         } else if (typeof nativeRequest === 'function') {
-          const found = await findCodexNotice(owner, notice, hasMarker);
+          const found = await findCodexNotice(owner, notice, marker, exactCodexReceipt ? text : undefined);
           if (found.delivered) {
-            Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
+            Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, receipt: found.receipt, error: undefined });
           } else if (!submission && found.complete && Date.now() - (Date.parse(notice.attemptedAt ?? notice.createdAt ?? '') || Date.now()) >= CONFIRM_ABSENCE_AFTER_MS && !notice.resendAttempted) {
             // The whole relevant turn window was read and the marker is absent.
             // Re-send exactly once; this is no longer a blind write.
             Object.assign(notice, { state: 'pending', resendAttempted: true, nextAttemptAt: undefined, error: undefined });
           } else notice.state = 'unknown';
         } else {
-          // No debug port: the ordinary app-tools read remains the fallback.
+          // No debug port: the ordinary app-tools read remains the fallback, and it
+          // must still name an exact userMessage rather than any echoed text.
           const history = await codexOwnerCall(owner.threadId, 'read_thread', {
             threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
           });
-          if (!history?.isError && hasMarker(history)) {
-            Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true, error: undefined });
+          const found = history?.isError ? undefined
+            : findCodexPayload(history, marker, exactCodexReceipt ? text : undefined, notice);
+          if (found) {
+            Object.assign(notice, { state: 'delivered', deliveredAt: now(), recovered: true,
+              receipt: { via: 'app-tools', threadId: owner.threadId, threadPageCount: 1, itemPageCount: 0, hitPage: 0,
+                ...receiptProcessIdentity(), ...found }, error: undefined });
           } else notice.state = 'unknown';
         }
       } catch (error) {
@@ -2565,6 +3456,9 @@ export function createScopedAgents(config, {
       persist();
       return;
     }
+    if (notice.nextAttemptAt && notice.nextAttemptAt > Date.now()) return;
+    notice.attempts = (notice.attempts ?? 0) + 1;
+    notice.nextAttemptAt = Date.now() + retryDelayMs(notice.attempts);
     // A newly confirmed channel rejection must not rewrite an older ambiguous
     // delivery: the read-back branch above remains its only recovery path.
     if (record.callbackBlocked) { notice.state = 'blocked'; persist(); return; }
@@ -2626,23 +3520,68 @@ export function createScopedAgents(config, {
         else {
           // An accepted write is the only proof the session is there again, so the
           // absence ends here and any later one starts its own wait.
-          Object.assign(notice, { state: 'unknown', error: undefined });
+          Object.assign(notice, { state: 'unknown', error: undefined, readbackGeneration: pollGeneration });
           delete notice.callbackMissingSince;
         }
       } else {
         const result = await codexOwnerCall(owner.threadId, 'send_message_to_thread', { threadId: owner.threadId, prompt: `${text}\n\n${marker}` });
+        // A native/client identity is the strongest receipt. Keep it on the notice
+        // before any readback so a truncated page can still be matched safely.
+        if (typeof result?.clientUserMessageId === 'string') notice.clientUserMessageId = result.clientUserMessageId;
+        if (result?.notSent === true || result?.reschedule === true) {
+          Object.assign(notice, { state: 'pending', error: undefined, rescheduleReason: result.reason ?? 'not-sent' });
+          delete notice.clientUserMessageId;
+          delete notice.nextAttemptAt;
+          persist();
+          return;
+        }
         const unavailable = result?.isError && JSON.stringify(result).includes('direct app-server input is not allowed for multi-agent v2 sub-agents');
         if (unavailable) record.callbackBlocked = true;
-        Object.assign(notice, unavailable ? { state: 'blocked', error: { code: 'native-callback-unavailable' } } : result?.isError ? { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } }
-          : { state: 'delivered', deliveredAt: now(), error: undefined });
+        if (unavailable) Object.assign(notice, { state: 'blocked', error: { code: 'native-callback-unavailable' } });
+        else if (result?.isError) Object.assign(notice, { state: 'pending', error: { message: 'The desktop rejected this notice before acceptance.' } });
+        else {
+          // A successful RPC is not a receipt. A report must be read back from the
+          // persisted original-thread turn/item pages; an immediate send response or
+          // a summary that happens to contain the marker is not that page receipt.
+          let receipt;
+          if (exactCodexReceipt && typeof nativeRequest === 'function' && result?.via === 'native-rpc') {
+            const found = await findCodexNotice(owner, notice, marker, text);
+            if (found?.wrongThread) {
+              Object.assign(notice, { state: 'unknown', error: undefined, readbackGeneration: pollGeneration });
+            } else if (found?.delivered) {
+              receipt = found.receipt;
+            } else {
+              receipt = undefined;
+            }
+          } else {
+            receipt = findCodexPayload(result, marker, exactCodexReceipt ? text : undefined, notice);
+            if (!receipt) {
+              try {
+                const history = await codexOwnerCall(owner.threadId, 'read_thread', {
+                  threadId: owner.threadId, turnLimit: 30, includeOutputs: true, maxOutputCharsPerItem: 100000,
+                });
+                receipt = history?.isError ? undefined
+                  : findUserMessageMarker(history, marker, exactCodexReceipt ? text : undefined, notice);
+              } catch { /* an unreadable thread is not proof of absence */ }
+            }
+          }
+          if (receipt) Object.assign(notice, { state: 'delivered', deliveredAt: now(), receipt, error: undefined });
+          else Object.assign(notice, { state: 'unknown', error: undefined, readbackGeneration: pollGeneration });
+        }
       }
     } catch (error) {
       // sendClaude throws only before its write, and a session that cannot be found was
       // never written to, so a Claude notice that lands here can be sent again. A
       // Codex owner that disappeared with the profile is a terminal notice instead.
       if (!claude && terminalCodexOwnerError(error)) blockCodexNotice(record, notice, error);
-      else {
-        Object.assign(notice, { state: claude ? 'pending' : 'unknown', error: safeError(error) });
+      else if (!claude && (error?.notSent === true || error?.reschedule === true)) {
+        Object.assign(notice, { state: 'pending', error: undefined,
+          rescheduleReason: error.reason ?? error.code ?? 'not-sent' });
+        delete notice.clientUserMessageId;
+        delete notice.nextAttemptAt;
+      } else {
+        Object.assign(notice, { state: claude ? 'pending' : 'unknown', error: safeError(error),
+          ...(!claude ? { readbackGeneration: pollGeneration } : {}) });
         // A binding refreshed mid-send that finds no session is the same definite
         // absence the verify above reports, and nothing reached the session.
         if (claude && reportSummary !== undefined) {
@@ -2694,15 +3633,16 @@ export function createScopedAgents(config, {
    * Read one Claude notice's native receipt, refreshing a binding the session has
    * outgrown once. Used both by the normal read-back and the bounded upgrade scan.
    */
-  async function findClaudeNoticeReceipt(owner, notice) {
+  async function findClaudeNoticeReceipt(owner, notice, text) {
+    const expectedBodyHash = claudeInboxBodyHash(`${text}\n\n<!-- futureaide-control:${notice.id} -->`);
     let binding;
     try {
       binding = await claudeNoticeBinding(owner);
-      return await findClaudeReceipt(binding, notice, claudeReadEvents);
+      return await findClaudeReceipt(binding, notice, claudeReadEvents, expectedBodyHash);
     } catch (error) {
       if (!claudeBindingStale(error)) throw error;
       binding = await refreshClaudeBinding(owner);
-      return findClaudeReceipt(binding, notice, claudeReadEvents);
+      return findClaudeReceipt(binding, notice, claudeReadEvents, expectedBodyHash);
     }
   }
 
@@ -2713,6 +3653,7 @@ export function createScopedAgents(config, {
    * this the moment to replace a binding it has outgrown.
    */
   async function returnChannel(owner) {
+    if (isPullOwner(owner)) return { returnChannel: 'chat-verified' };
     if (!owner.nativeSessionId) return { returnChannel: 'chat-verified' };
     try {
       try { currentRecord(await claudeNoticeBinding(owner)); }
@@ -2932,9 +3873,11 @@ export function createScopedAgents(config, {
    */
   async function clearRecord(record, { autoClaimed = false, autoRetry = false } = {}) {
     requireWritableTarget(record);
+    const automatic = autoClaimed || autoRetry;
     record.state = 'cleaning'; record.closed = true;
-    if (autoClaimed || autoRetry) record.autoCleanupClosed = true;
+    if (automatic) record.autoCleanupClosed = true;
     if (!autoClaimed) store.save(record);
+    let checkingHost = false;
     try {
       for (const child of store.childrenOf(record.agentId)) {
         const current = store.get(child.agentId);
@@ -2949,13 +3892,48 @@ export function createScopedAgents(config, {
         }
       }
       if (record.lifetime === 'once' && record.parentAgentId) await keepChildSnapshot(record);
+      const capturedNativeState = isHeadlessCli(targetOf(record)) ? store.backendState(record.agentId) : undefined;
+      const resumeSessionId = targetOf(record) === 'codex-cli'
+        ? (capturedNativeState?.threadId ?? null)
+        : targetOf(record) === 'claude-cli'
+          ? (capturedNativeState?.started ? capturedNativeState?.sessionId ?? null : null)
+          : targetOf(record) === 'agy-cli'
+            ? (capturedNativeState?.started ? capturedNativeState?.conversationId ?? null : null)
+            : null;
+      const agentPathBeforeRemove = managedPath(record);
+      const rootOwnerBeforeRemove = rootOwnerIdForRecord(record);
       if (!record.nativeDestroyed) {
+        checkingHost = true;
         const backend = await checkHost(record);
+        checkingHost = false;
         const result = await backend.destroy();
         if (result.destroyed !== true) throw new Error(result.message ?? `${backend.labels?.host ?? targetOf(record)} has not confirmed complete session cleanup.`);
         if (result.nativeSessionRetained !== undefined) record.nativeSessionRetained = result.nativeSessionRetained;
         record.nativeDestroyed = true; store.save(record);
       }
+      if (record.workspaceMode === 'worktree' && record.worktreePath) {
+        const wtPath = path.resolve(record.worktreePath);
+        const repoRoot = path.resolve(record.rootWorkspace ?? config.workspace);
+        const worktreesRoot = path.join(repoRoot, '.work', 'worktrees');
+        const wtRel = path.relative(worktreesRoot, wtPath);
+        if (wtRel && !wtRel.startsWith('..') && !path.isAbsolute(wtRel)) {
+          const runtimeRoot = path.dirname(path.resolve(config.stateDirectory));
+          const otherInUse = await activeTaskUse(runtimeRoot, wtPath, []).catch(() => false);
+          // `record` itself is still in `agents` until `store.remove` below, so check whether
+          // any OTHER agent references `wtPath`.
+          const canonicalWt = wtPath.replaceAll('\\', '/').toLowerCase();
+          const otherAgentUses = otherInUse && store.list().some(other =>
+            other.agentId !== record.agentId
+            && JSON.stringify(other).replaceAll('\\\\', '/').toLowerCase().includes(canonicalWt));
+          if (!otherAgentUses) {
+            await execFileAsync('git', ['-C', repoRoot, 'worktree', 'remove', '--force', wtPath], { windowsHide: true }).catch(() => {});
+            await removeTree(wtPath, { recursive: true, force: true }).catch(() => {});
+            await execFileAsync('git', ['-C', repoRoot, 'worktree', 'prune'], { windowsHide: true }).catch(() => {});
+          }
+        }
+      }
+      const pendingBaseline = record.task?.taskId ? baselineWrites.get(record.task.taskId) : undefined;
+      if (pendingBaseline) await pendingBaseline;
       const directory = agentDirectory(record);
       const root = path.resolve(config.stateDirectory, 'scoped');
       const relative = path.relative(root, path.resolve(directory));
@@ -2969,17 +3947,40 @@ export function createScopedAgents(config, {
         if (!actualRelative || actualRelative.startsWith('..') || path.isAbsolute(actualRelative)) throw new Error('The state directory resolves outside its owned root.');
         await removeTree(directory, { recursive: true, force: true });
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (record.lifetime === 'once' && (autoClaimed || autoRetry)) {
+        store.saveAgentStub({
+          agentId: record.agentId,
+          rootOwnerId: rootOwnerBeforeRemove,
+          ownerId: record.ownerId,
+          name: record.name,
+          role: record.role ?? inferRoleFromName(record.name) ?? null,
+          agentPath: agentPathBeforeRemove,
+          parentAgentId: record.parentAgentId ?? null,
+          target: targetOf(record),
+          workspace: record.rootWorkspace ?? record.workspace ?? null,
+          resumeSessionId,
+          model: actualModelName(record.model) ?? actualModelName(record.modelPin) ?? null,
+          lastTaskSummary: record.task?.message ? compactText(record.task.message, 120) : null,
+        });
+      } else {
+        store.deleteAgentStub?.(record.agentId);
+      }
       store.remove(record, { deliveredReceipt: autoClaimed || autoRetry });
       forgetBackend(record);
       return { name: record.name, deleted: true, sessionDataRemoved: !record.nativeSessionRetained,
         ...(record.nativeSessionRetained !== undefined ? { nativeSessionRetained: record.nativeSessionRetained } : {}) };
     } catch (error) {
       const current = store.get(record.agentId);
+      const retries = current?.cleanupReadRetries ?? 0;
+      const retryBeforeDelete = automatic && targetOf(record) === 'codex-desktop'
+        && error.uncertain !== true && error.terminal !== true && isCodexTransientTimeout(error)
+        && (checkingHost || error.cleanupNotSent === true) && retries < CODEX_CLEANUP_READ_RETRIES;
       // An uncertain destroy is a write whose outcome is unknown, not a failed cleanup:
       // the host may already be finishing it. A busy or queued child makes the parent
       // wait the same way. Neither is reported as an error, or a queued cleanup would
       // be listed as failed.
-      if (current && (error.uncertain === true || error.code === 'agent-busy')) {
+      if (current && (retryBeforeDelete || error.uncertain === true || error.code === 'agent-busy')) {
+        if (retryBeforeDelete) current.cleanupReadRetries = retries + 1;
         current.state = 'cleaning'; current.closed = true; current.error = safeError(error); deferRetry(current); store.save(current);
         return { name: record.name, deleted: false, queued: true, state: 'cleaning' };
       }
@@ -3012,14 +4013,35 @@ export function createScopedAgents(config, {
       { agentId: child.agentId, taskId: child.task?.taskId, nodes });
   }
 
+  const exactReportText = (record, task, report, fallback) => {
+    const raw = typeof report?.id === 'string' ? report.id : undefined;
+    const id = raw?.startsWith('submission:') ? raw.slice('submission:'.length) : raw;
+    const key = task?.requestId ? store.taskKeyForRequest(record.ownerId, task.requestId) : undefined;
+    if (!key || !id) return fallback ?? report?.message;
+    const stored = store.storedReportBody(record.ownerId, key, id);
+    return stored && !stored.error && typeof stored.body === 'string' ? stored.body : fallback ?? report?.message;
+  };
+
   // Only persisted report_parent calls may wake the parent chat.
   async function deliverReports(record, { readOnDemand = false } = {}) {
     await drainSubmissions(record, { currentOnly: true, readOnDemand });
     let finalTerminal = true;
+    let changed = false;
     for (const report of record.task?.reports ?? []) {
       if (fromSubmission(report.id)) {
         if (report.final && !terminalNotice(report.delivery)) finalTerminal = false;
         continue;
+      }
+      if (report.sharedSubmission && !nativeReportOnly(record)) {
+        const exists = store.submissions(record.agentId, record.task?.taskId)
+          .some(item => item.id === report.sharedSubmission);
+        if (exists) {
+          if (report.final && !terminalNotice(report.delivery)) finalTerminal = false;
+          continue;
+        }
+        // A legacy report whose shared row was removed has no other sender; drop
+        // the stale alias and let its native notice settle (or expire) normally.
+        delete report.sharedSubmission;
       }
       // Prefer the report's own time. An old fixture/report without one may use the
       // task's start time (still a real time); a truly timeless old notice expires.
@@ -3029,13 +4051,30 @@ export function createScopedAgents(config, {
         await deliver(record, report.delivery, report.message);
         continue;
       }
-      if (report.final && !report.treeSettledConfirmed) { finalTerminal = false; continue; }
-      await deliver(record, report.delivery, `${hostLabel(record)}「${record.name}」${report.final ? '交付' : '汇报'}：\n${report.message}`,
-        { reportSummary: report.message });
+      if (report.final && !finalReportReady(report)) {
+        // A native report has no submission row to carry the wait. Its own notice
+        // gets the same bounded release moment, so the monitor wakes at the
+        // deadline instead of polling a settling tree every few hundred milliseconds.
+        const notice = report.delivery;
+        const deadline = finalReportDeadline(report, record.task);
+        if (!notice.waitingForTree) { notice.waitingForTree = true; changed = true; }
+        if (deadline !== undefined && notice.treeReleaseAt !== new Date(deadline).toISOString()) {
+          notice.treeReleaseAt = new Date(deadline).toISOString();
+          notice.nextAttemptAt = deadline;
+          changed = true;
+        }
+        finalTerminal = false;
+        continue;
+      }
+      const message = exactReportText(record, record.task, report, report.message);
+      if (report.message !== message) report.message = message;
+      await deliver(record, report.delivery, `${hostLabel(record)}「${record.name}」${report.final ? '交付' : '汇报'}：\n${message}${report.treeRelease ? '\n\n' + treeReleaseText(report.treeRelease) : ''}`,
+        { reportSummary: message });
       // An older non-final notice must never hold back the final report that
       // follows it. The final report itself still has to reach a terminal state.
       if (report.final && !terminalNotice(report.delivery)) finalTerminal = false;
     }
+    if (changed) store.save(record);
     return finalTerminal;
   }
 
@@ -3063,6 +4102,21 @@ export function createScopedAgents(config, {
    * so no report is ever written twice.
    */
   async function settleDelivery(record) {
+    // A shared submission row is the durable owner of a delivery attempt. Bring its
+    // current attempt clock into the task mirror before deciding whether the thirty-
+    // minute gate or a fresh read-back applies. A terminal projection is never
+    // rewritten by an older row.
+    for (const item of store.submissionWork(record.agentId, record.task?.taskId)) {
+      if (!item.delivery) continue;
+      const report = (record.task?.reports ?? []).find(entry => sameReportId(entry.id, item.id)
+        || entry.sharedSubmission === item.id);
+      if (report?.delivery && !['delivered', 'blocked'].includes(report.delivery.state)) {
+        for (const field of ['state', 'attemptedAt', 'nextAttemptAt', 'error', 'readbackIds',
+          'attempts', 'readbackGeneration']) {
+          if (field in item.delivery) report.delivery[field] = item.delivery[field];
+        }
+      }
+    }
     for (const report of record.task?.reports ?? []) {
       const notice = report.delivery;
       if (!fromSubmission(report.id) && awaitingNoticeReceipt(notice)) notice.nextAttemptAt = undefined;
@@ -3072,17 +4126,21 @@ export function createScopedAgents(config, {
     const task = record.task;
     const final = (task?.reports ?? []).find(report => report.final);
     // The same finish gate a poll uses, so a settled report closes its task once.
-    if (final?.treeSettledConfirmed && task.result
+    if (final && finalReportReady(final) && task.result
         && task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))) await finishDeliveredReport(record);
   }
 
   async function requireSettledSubmissions(record) {
     const taskId = record.task?.taskId;
-    const count = taskId ? store.submissionDebt(record.agentId, taskId) : 0;
-    if (!count) return;
+    // The shared submission gate is the original one: an unconfirmed write keeps
+    // its unknown occupation until its own thirty-minute limit or a terminal state.
+    // The tree-release path is separate and must not turn that into a generic debt
+    // shortcut that blocks a real in-flight report early.
+    const blocking = taskId ? store.submissionWork(record.agentId, taskId) : [];
+    if (!blocking.length) return;
     await ensureWorker(record, { wake: true, hasSubmission: true });
-    throw Object.assign(new Error(`上一轮还有 ${count} 条请示或回报未送达。请等投递确认或进入终态后重试。`),
-      { code: 'previous-delivery-pending', retryable: true, count });
+    throw Object.assign(new Error(`上一轮还有 ${blocking.length} 条请示或回报未送达。请等投递确认或进入终态后重试。`),
+      { code: 'previous-delivery-pending', retryable: true, count: blocking.length });
   }
 
   async function finishDeliveredReport(record) {
@@ -3101,6 +4159,22 @@ export function createScopedAgents(config, {
     task.finishedAt ??= now();
     const finalDelivered = task.reports.filter(report => report.final)
       .every(report => report.delivery.state === 'delivered');
+    // The release is not a tree proof. Only a real observation that still shows
+    // this owned tree settled may authorize automatic once cleanup, and that proof
+    // is persisted here before any cleanup claim.
+    let observedSettled = record.observation?.stale !== true && record.observation?.observationError === undefined
+      && treeSettled(record, record.observation ?? {});
+    if (!observedSettled && record.lifetime === 'once' && task.state === 'completed' && finalDelivered) {
+      try {
+        record.observation = await observe(record);
+        observedSettled = treeSettled(record, record.observation);
+      } catch (error) {
+        record.observation = { ...record.observation, stale: true, observationError: error.message };
+        observedSettled = false;
+      }
+    }
+    if (observedSettled && !task.treeSettledConfirmed) task.treeSettledConfirmed = true;
+    const realTreeSettled = task.treeSettledConfirmed === true && observedSettled;
     // A blocked final is a terminal delivery outcome, not a delivered report.
     // Keep the name, task body and notification for the parent; a persistent name
     // returns to idle so it can accept work, and a one-shot stays listed for delete.
@@ -3110,7 +4184,6 @@ export function createScopedAgents(config, {
       return afterTerminal(record);
     }
     if (record.lifetime === 'once' && task.state === 'completed' && finalDelivered) {
-      if (store.claimAutoCleanup(record)) return clearRecord(record, { autoClaimed: true });
       const hold = store.autoCleanupHold(record.agentId);
       if (hold.pending || hold.blocked) {
         record.state = hold.pending ? 'delivery_pending'
@@ -3119,19 +4192,29 @@ export function createScopedAgents(config, {
         store.save(record);
         return hold.pending ? publicResult(record) : afterTerminal(record);
       }
-      const latest = store.get(record.agentId);
-      if (latest?.task?.taskId === task.taskId && latest.task.cancelRequested) {
-        task.cancelRequested = true;
-        record.state = task.state = 'running';
-        store.save(record);
-        return publicResult(record);
-      }
       if (store.supplementSummary(record.agentId, task.taskId).blocked) {
         record.state = 'supplement_blocked';
         store.save(record);
         return publicResult(record);
       }
-      else return publicResult(latest ?? record);
+      if (realTreeSettled) {
+        if (store.claimAutoCleanup(record)) return clearRecord(record, { autoClaimed: true });
+        const latest = store.get(record.agentId);
+        if (latest?.task?.taskId === task.taskId && latest.task.cancelRequested) {
+          task.cancelRequested = true;
+          record.state = task.state = 'running';
+          store.save(record);
+          return publicResult(record);
+        }
+        return publicResult(latest ?? record);
+      }
+      // A once name whose final is delivered but whose owned tree still has a running
+      // child must keep its record and keep watching. The ordinary monitor sweep will
+      // call settleFinishedRound again; it must not claim cleanup or close the tree yet.
+      task.autoCleanupPending = true;
+      record.state = 'idle';
+      store.save(record);
+      return afterTerminal(record);
     }
     record.state = task.state === 'completed' ? 'idle' : task.state;
     store.save(record);
@@ -3149,24 +4232,61 @@ export function createScopedAgents(config, {
           || typeof incoming.message !== 'string' || !incoming.message.trim()
           || typeof incoming.final !== 'boolean') throw new Error('The bridge returned an invalid explicit report.');
       if (fromSubmission(incoming.id)) continue;
-      const previous = task.reports.find(report => report.id === incoming.id);
+      const previous = task.reports.find(report => sameReportId(report.id, incoming.id));
       if (previous) {
-        if (previous.message !== incoming.message || previous.final !== incoming.final) throw new Error('A persisted report identity changed.');
-      } else task.reports.push({ id: incoming.id, taskId: incoming.taskId, message: incoming.message,
-        final: incoming.final, createdAt: incoming.createdAt, delivery: { id: 'report-' + incoming.id, state: 'pending',
-          createdAt: incoming.createdAt ?? now() } });
+        if (previous.final !== incoming.final || (previous.message !== incoming.message
+            && !(typeof previous.message === 'string' && previous.message.startsWith(incoming.message)))) {
+          throw new Error('A persisted report identity changed.');
+        }
+        if (previous.message !== incoming.message) previous.message = incoming.message;
+        // A crash can leave the shared submission row without the task projection.
+        // Adopt the native raw id only before any delivery attempt; delivered and
+        // in-flight rows keep their exact existing identity.
+        if (previous.id !== incoming.id && fromSubmission(previous.id)
+            && !previous.delivery?.attemptedAt && previous.delivery?.state === 'pending') previous.id = incoming.id;
+      } else {
+        task.reports.push({ id: incoming.id, taskId: incoming.taskId, message: incoming.message,
+          final: incoming.final, createdAt: incoming.createdAt, delivery: { id: 'report-' + incoming.id, state: 'pending',
+            createdAt: incoming.createdAt } });
+        // The native DSH report UUID becomes the shared submission identity. Its body
+        // and delivery state are then the same facts the wait exit reads.
+        const added = task.reports.at(-1);
+        added.message = exactReportText(record, task, added, incoming.message);
+      }
+      const projected = task.reports.find(report => sameReportId(report.id, incoming.id));
+      // Never manufacture a second pending row for an already delivered/blocked
+      // report from a rollback-era roster. A fresh report or a pending projection
+      // gets exactly one shared row (INSERT OR IGNORE keeps it idempotent). A report
+      // with no original time keeps that absence instead of being stamped now.
+      const createdForRow = projected?.createdAt ?? (previous ? undefined : incoming.createdAt ?? task.startedAt);
+      if (!nativeReportOnly(record) && projected && createdForRow && !['delivered', 'blocked'].includes(projected.delivery?.state)
+          && (projected.delivery?.state === 'pending' || !projected.delivery?.attemptedAt)) {
+        store.enqueueSubmission({ id: bareReportId(incoming.id), ownerId: record.ownerId, agentId: record.agentId,
+          taskId: task.taskId, kind: 'report', message: projected.message, final: projected.final,
+          created: createdForRow });
+      }
     }
     const final = task.reports.find(report => report.final);
-    if (final && treeSettled(record, view) && !(view.questions ?? []).some(question => question.state === 'pending')) final.treeSettledConfirmed = true;
-    if (final && final.treeSettledConfirmed) {
-      task.result = { state: task.cancelRequested || task.state === 'cancelled' || rootSummary(view)?.state === 'cancelled' ? 'cancelled' : task.state === 'failed' || rootSummary(view)?.state === 'failed' ? 'failed' : 'completed',
-        reply: final.message, changes: attributedChanges(record, view), coverage: treeCoverage(record, view), tree: publicTree(record, view) };
+    if (final && !final.treeSettledConfirmed) releaseDueFinals(record, view);
+    if (final && view?.stale !== true && !view?.observationError && !view?.tree?.observationError
+        && treeSettled(record, view) && !(view.questions ?? []).some(question => question.state === 'pending')) final.treeSettledConfirmed = true;
+    if (final?.treeSettledConfirmed && final.delivery?.waitingForTree) {
+      // A tree that settled before its deadline releases the same queued notice.
+      delete final.delivery.waitingForTree;
+      delete final.delivery.nextAttemptAt;
+    }
+    if (final && finalReportReady(final)) {
+      const outcome = task.cancelRequested || task.state === 'cancelled' || rootSummary(view)?.state === 'cancelled' ? 'cancelled'
+        : task.state === 'failed' || rootSummary(view)?.state === 'failed' ? 'failed' : 'completed';
+      task.result = { state: outcome,
+        reply: final.message, changes: attributedChanges(record, view), coverage: treeCoverage(record, view),
+        tree: publicTree(record, view), ...(final.treeRelease ? { treeRelease: final.treeRelease } : {}) };
       task.state = task.result.state;
     }
     // Persist the terminal outcome before delivery can succeed or become ambiguous.
     store.save(record);
     const delivered = await deliverReports(record);
-    if (final && final.treeSettledConfirmed) {
+    if (final && finalReportReady(final)) {
       // Compared only after the tree settled and only once, because polls repeat this
       // block until delivery ends. The report never waits for git and a failed
       // comparison is coverage, not an error.
@@ -3578,7 +4698,7 @@ export function createScopedAgents(config, {
       // The entry's observation can go stale while the name lock waits. Re-read the
       // target's own state before a mode that only works while idle: a DSH queue and
       // a CLI steer must be refused, never written as the other mode.
-      if ((target === 'dsh' && mode === 'queue') || (target === 'claude-cli' && mode === 'steer')) {
+      if ((target === 'dsh' && mode === 'queue') || (isHeadlessCli(target) && mode === 'steer')) {
         const latest = await observe(record);
         if (latest.running === true) {
           saveSupplementReceipt(item.requestId, 'blocked', 'mode-unsupported',
@@ -3747,7 +4867,7 @@ export function createScopedAgents(config, {
         else saveSupplementReceipt(item.requestId, 'queued', null, { delivery: 'local-pending', mode: 'queue' });
         continue;
       }
-      if (target === 'claude-cli') {
+      if (isHeadlessCli(target)) {
         // A headless CLI turn owns its session until the process exits. Every ordinary
         // supplement waits between turns; an explicit steer was refused at the entry.
         if (scheduled.running === true) {
@@ -3875,23 +4995,29 @@ export function createScopedAgents(config, {
       store.setSupplement(item.requestId, 'blocked', reason);
     }
     if (task?.legacyAutomaticResult && !final) return publicResult(record);
-    if (final && !final.treeSettledConfirmed && !task.treeUnavailable) {
+    if (final && !finalReportReady(final) && !task.treeUnavailable) {
       let view;
       try {
         view = await observe(record);
       } catch (error) {
-        record.observation = { ...record.observation, stale: true };
+        record.observation = { ...record.observation, stale: true, observationError: error.message };
         if (targetOf(record) === 'codex-desktop' && error.code === MISSING_THREAD_CODE) {
           record.error = safeError(error);
           task.treeUnavailable = MISSING_THREAD_CODE;
           record.state = task.state = 'failed';
+        }
+        if (releaseDueFinals(record, record.observation, error.message)) {
+          store.save(record);
+          // The last readable tree may still be shown, but it is explicitly stale
+          // and unreadable; the release record carries that fact.
+          return finishReports(record, record.observation);
         }
         store.save(record);
       }
       if (view) return finishReports(record, view);
     }
     if (hasPendingDelivery(record)) await deliverReports(record);
-    if (final?.treeSettledConfirmed && task.result && task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))) {
+    if (finalReportReady(final) && task.result && task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))) {
       return finishDeliveredReport(record);
     }
     return task?.treeUnavailable ? publicResult(record) : afterTerminal(record);
@@ -4015,6 +5141,7 @@ export function createScopedAgents(config, {
   }
 
   async function pollLocked(record) {
+    pollGeneration += 1;
     if (readOnlyTarget(record)) return publicResult(record);
     if (record.state === 'cleaning') {
       const nextAttempt = Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0);
@@ -4067,7 +5194,17 @@ export function createScopedAgents(config, {
       const stopping = task?.cancelRequested && (!task.cancelVerified || task.cancelPending || !task.cancelTreeSettled);
       if (terminalRound(record) && !stopping) return await settleFinishedRound(record);
       if (!task?.cancelRequested && await expireStaleWork(record)) return await settleFinishedRound(record);
-      if (Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now() || firstDispatchDeferred(record)) return publicResult(record);
+      // The final's own persisted creation+120s is a delivery moment, independent of
+      // a business retry stamp. Check it before that stamp can defer the whole name.
+      const dueFinal = (task?.reports ?? []).find(report => report.final && !finalReportReady(report)
+        && treeReleaseDue(report, task));
+      if (dueFinal) {
+        releaseDueFinals(record, record.observation ?? {}, record.error?.message);
+        store.save(record);
+        return await finishReports(record, record.observation ?? {});
+      }
+      if (!hasWaitingTreeFinal(task)
+          && (Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now() || firstDispatchDeferred(record))) return publicResult(record);
       if (record.state === 'idle') {
         if (!hasPendingDelivery(record)) return publicResult(record);
         await deliverReports(record);
@@ -4105,9 +5242,13 @@ export function createScopedAgents(config, {
       if (hasSupplements) await drainSupplements(record);
       if (task?.reports?.length) {
         await deliverReports(record);
-        const final = task.reports.find(report => report.final && report.treeSettledConfirmed);
+        const final = task.reports.find(report => report.final && finalReportReady(report));
         if (final && task.result && task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))
             && (!task.cancelRequested || (task.cancelVerified && task.cancelTreeSettled))) {
+          if (isHeadlessCli(targetOf(record))) {
+            await observe(record).catch(() => {});
+            store.save(record);
+          }
           return finishDeliveredReport(record);
         }
       }
@@ -4140,7 +5281,7 @@ export function createScopedAgents(config, {
       if (task.cancelRequested || task.reports?.length || view.reports?.length
           || (view.questions ?? []).some(question => question.state === 'pending')) turnSnapshot = undefined;
       const reported = await finishReports(record, view);
-      if ((task.reports ?? []).some(report => report.final && report.treeSettledConfirmed)) return reported;
+      if ((task.reports ?? []).some(report => report.final && finalReportReady(report))) return reported;
       // The helper that asked is still working: its answer must not wait for that turn
       // to end, or for a later question, before it is written into the conversation.
       let answerDispatchedThisPoll;
@@ -4191,7 +5332,8 @@ export function createScopedAgents(config, {
       }
       // Every other target reads its answer as the next turn, once this one has ended.
       if (await dispatchAnswers(record, view)) return publicResult(record);
-      if (!treeSettled(record, view)) {
+      const finalReport = task.reports.find(report => report.final);
+      if (!treeSettled(record, view) && !finalReportReady(finalReport)) {
         waitForTree(record, view);
         return await finishReports(record, view);
       }
@@ -4199,7 +5341,8 @@ export function createScopedAgents(config, {
       const finalDispatch = task.dispatches.filter(dispatch => !dispatch.reminder).at(-1);
       const terminal = task.cancelRequested || rootSummary(view)?.state === 'cancelled' ? 'cancelled'
         : rootSummary(view)?.state === 'failed' || finalDispatch?.state === 'failed' ? 'failed'
-          : finalDispatch?.state === 'cancelled' ? 'cancelled' : undefined;
+          : finalDispatch?.state === 'cancelled' ? 'cancelled'
+            : finalReportReady(finalReport) ? (task.result?.state ?? 'completed') : undefined;
       // A turn that ends with the answer only in ordinary text leaves the caller with
       // nothing, so the agent is told once. The marker is persisted before the send:
       // a crash between the two sends nothing twice, and the reminder's own turn
@@ -4243,6 +5386,22 @@ export function createScopedAgents(config, {
           deferTransportRetry(record, error);
         } else deferRetry(record);
       }
+      // A final whose bounded release is already due is not held hostage by an
+      // unreadable tree. Release it from the last persisted observation, say that
+      // the read failed, and let the ordinary delivery path carry the report.
+      const released = record.task ? releaseDueFinals(record, record.observation ?? {}, error) : false;
+      if (released && record.task) {
+        const final = record.task.reports.find(report => report.final);
+        if (final && finalReportReady(final)) {
+          const outcome = record.task.cancelRequested || record.task.state === 'cancelled' ? 'cancelled'
+            : record.error?.terminal === true ? 'failed' : 'completed';
+          record.task.result ??= { state: outcome, reply: final.message,
+            changes: attributedChanges(record, record.observation), coverage: treeCoverage(record, record.observation),
+            tree: publicTree(record, record.observation), ...(final.treeRelease ? { treeRelease: final.treeRelease } : {}) };
+          record.task.state = record.task.result.state;
+          record.state = 'delivery_pending';
+        }
+      }
       forgetBackend(record);
       store.save(record);
       if (terminal && record.task && !store.get(record.agentId)?.task?.cancelRequested) {
@@ -4250,6 +5409,14 @@ export function createScopedAgents(config, {
         catch { /* the pending failure report is retried by the next scan */ }
       }
       if (missingThread) await drainSubmissions(record, { currentOnly: true });
+      if (released) {
+        try { await deliverReports(record); } catch { /* the next poll retries the same notice */ }
+        const final = record.task?.reports?.find(report => report.final);
+        if (final && finalReportReady(final)
+            && record.task.reports.filter(report => report.final).every(report => terminalNotice(report.delivery))) {
+          return finishDeliveredReport(record);
+        }
+      }
       return terminal ? afterTerminal(record) : publicResult(record);
     }
   }
@@ -4281,6 +5448,7 @@ export function createScopedAgents(config, {
       if (unexpected) throw unexpected.reason;
     },
     async status(extra) {
+      const retryDeadline = Date.now() + STATUS_RETRY_DEADLINE_MS;
       const status = { toolsLoaded: true, contextVerified: false, dshConnected: false, returnChannel: 'not-checked' };
       let owner;
       try {
@@ -4305,53 +5473,193 @@ export function createScopedAgents(config, {
         lifetime: 'once', target: 'codex-desktop', workspace: owner?.workspace ?? config.workspace,
         state: 'probing', createdAt: now(), updatedAt: now(), history: [] };
       const emptyCatalog = { models: [], defaultModel: null };
-      const probeAdapter = record => diagnoseTarget(record.target, { adapters: backendAdapters,
-        ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}), record, deps: adapterDeps(record) });
+      const probeAdapter = (record, probeOptions) => diagnoseTarget(record.target, { adapters: backendAdapters,
+        ...(backendAdapterLoader ? { adapterLoader: backendAdapterLoader } : {}), record, deps: adapterDeps(record), config, probeOptions });
+      const readCodexStatus = async () => {
+        const first = await probeAdapter(codexProbe);
+        const remaining = retryDeadline - Date.now();
+        if (!isCodexTransientTimeout(first.reason ?? first.modelError) || remaining < CODEX_READ_REPLY_BUDGET_MS) return first;
+        let timer;
+        try {
+          return await Promise.race([probeAdapter(codexProbe, { refreshTimeout: true }), new Promise(resolve => {
+            timer = setTimeout(() => resolve(first), remaining);
+          })]);
+        } finally { clearTimeout(timer); }
+      };
       // Locked to the host default, DSH offers callers that one model and nothing else.
       const dshChoices = summary => config.dshDefaultModelOnly !== true ? summary
         : { ...summary, models: summary.defaultModel ? [summary.defaultModel] : [], modelLocked: true };
-      const [dshModels, codexEntry, claudeEntry] = await Promise.all([
+      const [dshModels, codexEntry, codexCliEntry, claudeEntry, agyEntry] = await Promise.all([
         host ? readStatusModels(() => controlFactory(config, { client }).models()).then(dshChoices) : emptyCatalog,
-        probeAdapter(codexProbe),
+        readCodexStatus(),
+        probeAdapter({ ...codexProbe, target: 'codex-cli' }),
         probeAdapter({ ...codexProbe, target: 'claude-cli' }),
+        probeAdapter({ ...codexProbe, target: 'agy-cli' }),
       ]);
       status.backends = {
         dsh: { ...dshDiagnostics(host, status), ...dshModels },
         'codex-desktop': { ...emptyCatalog, ...codexEntry, ...(codexEntry.ready
           ? { ...codexToolsDiagnostics(await readCodexToolsStatus(codexProbe)), evidence: 'native-rpc' } : {}) },
+        'codex-cli': { ...emptyCatalog, ...codexCliEntry },
         'claude-cli': { ...emptyCatalog, ...claudeEntry },
+        'agy-cli': { ...emptyCatalog, ...agyEntry },
       };
       return status;
     },
-    async create({ name, lifetime, target, model, effort }, extra) {
-      assertName(name);
+    async create({ name, role, lifetime: rawLifetime, target: rawTarget, model: rawModel, effort: rawEffort, worktree, workspaceMode, workspace_mode, proxy, timeoutMinutes, timeoutMs, _revivedSessionId } = {}, extra) {
+      const normalizedTimeout = normalizeTurnTimeoutOptions({ timeoutMs, timeoutMinutes });
+      const callerHasModelRequest = hasModelRequest({ model: rawModel, effort: rawEffort });
+      const {
+        explicitRole,
+        target,
+        model,
+        effort,
+        lifetime,
+        autoFilledModel,
+      } = applyCallerDefaults({ role, target: rawTarget, model: rawModel, effort: rawEffort, lifetime: rawLifetime });
       if (!['once', 'persistent'].includes(lifetime)) throw new Error('lifetime must be once or persistent.');
+      const resolvedWorkspaceMode = workspaceMode ?? workspace_mode ?? (worktree === true ? 'worktree' : worktree === false ? 'inherit' : 'inherit');
+      if (!['inherit', 'worktree'].includes(resolvedWorkspaceMode)) {
+        throw Object.assign(new Error('workspaceMode must be "inherit" or "worktree".'), { code: 'invalid-workspace-mode' });
+      }
+      let normalizedProxyOverride;
+      if (proxy !== undefined && proxy !== null && proxy !== '') {
+        const proxyStr = typeof proxy === 'string' ? proxy.trim().toLowerCase() : '';
+        if (proxyStr !== 'faswitch' && proxyStr !== 'auto') {
+          normalizeProxySpec(proxy);
+          normalizedProxyOverride = typeof proxy === 'string' && /^\d{1,5}$/.test(proxy.trim())
+            ? Number.parseInt(proxy.trim(), 10)
+            : proxy;
+        }
+      }
       const backendTarget = normalizeTarget(target);
       const owner = await context(extra);
-      // A cross-application call: when the caller is itself a managed Codex child, the
-      // new name is its child and follows that owner tree. A verified Claude caller has
-      // no Codex thread to look up — it owns its names flat, so it is never asked for one.
-      const parent = trustedCaller(extra) ? undefined : store.agentForCodexThread(callingThread(extra), { includeAutoClosed: true });
-      const record = { agentId: uid('agent'), ownerId: owner.ownerId, sessionId: uid('session-codex'), name, lifetime,
-        target: backendTarget, workspace: owner.workspace, state: 'creating', createdAt: now(), updatedAt: now(), history: [],
-        ...(parent ? { parentAgentId: parent.agentId } : {}) };
-      await ensureTargetBackend(record);
-      {
-        // Resolve against the live target catalog before the name exists, so a typo
-        // creates nothing and a valid pin is part of the first durable record.
-        let preview;
-        try { preview = await resolveRequestedPin(record, { model, effort }); }
-        catch (error) { if (hasModelRequest({ model, effort })) throw error; }
-        if (preview) record.creationSelection = preview;
-        if (preview && model !== undefined && !dshDefaultOnly(record)) record.modelPin = nameModelPin(record, preview);
-        if (effort !== undefined) record.pendingEffort = effort;
+      const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+      const caller = effectiveTrustedCaller(extra);
+      const parentIdFromCaller = owner.callerAgentId ?? caller?.parentAgentId;
+      const parent = parentIdFromCaller
+        ? (store.get(parentIdFromCaller) ?? { agentId: parentIdFromCaller })
+        : (caller ? undefined : store.agentForCodexThread(callingThread(extra), { includeAutoClosed: true }));
+
+      let chosenName;
+      if ((name === undefined || (typeof name === 'string' && !name.trim())) && explicitRole) {
+        const teamMembers = visibleRecords(rootOwnerId).all;
+        const ownMembers = store.list(owner.ownerId);
+        const stubs = store.listAgentStubs(rootOwnerId);
+        const usedNames = new Set([
+          ...teamMembers.map(r => r.name),
+          ...ownMembers.map(r => r.name),
+          ...stubs.map(s => s.name),
+        ]);
+        let seq = 1;
+        while (usedNames.has(`${explicitRole}${seq}`)) seq += 1;
+        chosenName = assertName(`${explicitRole}${seq}`);
+      } else {
+        chosenName = assertName(name);
       }
-      store.insert(record, { requireOpenParent: Boolean(parent) });
+      const resolvedRole = explicitRole ?? inferRoleFromName(chosenName);
+      const agentId = uid('agent');
+      const baseWorkspace = owner.workspace ?? config.workspace;
+      let effectiveWorkspace = baseWorkspace;
+      let createdWorktreePath;
+      let createdWorktreeBaseHead;
+      if (resolvedWorkspaceMode === 'worktree') {
+        const shortId = agentId.replace(/^agent-/, '').slice(0, 8);
+        const safeSlug = chosenName.replace(/[^a-zA-Z0-9\u4e00-\u9fa5._-]+/g, '-').replace(/^-+|-+$/g, '') || 'agent';
+        const worktreesDir = path.join(baseWorkspace, '.work', 'worktrees');
+        createdWorktreePath = path.join(worktreesDir, `${safeSlug}-${shortId}`);
+        await mkdir(worktreesDir, { recursive: true });
+        await withWorktreeLock(baseWorkspace, async () => {
+          const { stdout: headOut } = await execFileAsync('git', ['-C', baseWorkspace, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true }).catch(() => ({ stdout: '' }));
+          createdWorktreeBaseHead = String(headOut ?? '').trim() || undefined;
+          await execFileAsync('git', ['-C', baseWorkspace, 'worktree', 'add', '--detach', createdWorktreePath], { windowsHide: true });
+        });
+        effectiveWorkspace = createdWorktreePath;
+      }
+
+      const rollbackWorktree = async () => {
+        if (!createdWorktreePath) return;
+        await withWorktreeLock(baseWorkspace, async () => {
+          await execFileAsync('git', ['-C', baseWorkspace, 'worktree', 'remove', '--force', createdWorktreePath], { windowsHide: true }).catch(() => {});
+          await removeTree(createdWorktreePath, { recursive: true, force: true }).catch(() => {});
+          await execFileAsync('git', ['-C', baseWorkspace, 'worktree', 'prune'], { windowsHide: true }).catch(() => {});
+        });
+      };
+
+      const record = {
+        agentId,
+        ownerId: owner.ownerId,
+        sessionId: uid('session-codex'),
+        name: chosenName,
+        ...(resolvedRole ? { role: resolvedRole } : {}),
+        lifetime,
+        target: backendTarget,
+        workspace: effectiveWorkspace,
+        ...(resolvedWorkspaceMode === 'worktree' ? {
+          workspaceMode: 'worktree',
+          worktreePath: createdWorktreePath,
+          rootWorkspace: baseWorkspace,
+          ...(createdWorktreeBaseHead ? { worktreeBaseHead: createdWorktreeBaseHead } : {}),
+        } : {}),
+        ...(normalizedProxyOverride !== undefined ? { proxyOverride: normalizedProxyOverride } : {}),
+        ...(normalizedTimeout.timeoutMs !== undefined ? { turnTimeoutMs: normalizedTimeout.timeoutMs } : {}),
+        ...(normalizedTimeout.timeoutMinutes !== undefined ? { turnTimeoutMinutes: normalizedTimeout.timeoutMinutes } : {}),
+        state: 'creating',
+        createdAt: now(),
+        updatedAt: now(),
+        history: [],
+        ...(parent ? { parentAgentId: parent.agentId } : {}),
+      };
+      const requireOpenParent = Boolean(parent && store.get(parent.agentId));
+      try {
+        await ensureTargetBackend(record);
+        {
+          // Resolve against the live target catalog before the name exists, so a typo
+          // creates nothing and a valid pin is part of the first durable record.
+          let preview;
+          let pinModel = model;
+          try {
+            preview = await resolveRequestedPin(record, { model, effort });
+          } catch (error) {
+            if (callerHasModelRequest) throw error;
+            if (autoFilledModel && error?.code === 'model-not-found') {
+              pinModel = undefined;
+              preview = await resolveRequestedPin(record, effort !== undefined ? { effort } : {}).catch(() => undefined);
+            } else if (autoFilledModel && error?.code === 'model-catalog-unavailable' && model) {
+              preview = {
+                provider: backendTarget === 'claude-cli' ? 'claude-cli' : backendTarget === 'agy-cli' ? 'antigravity' : 'openai',
+                model,
+                ...(effort ? { reasoningEffort: effort } : {}),
+                requestedEffort: effort ?? null,
+                effortSource: effort ? 'role-default' : null,
+                selectedEffort: effort ?? null,
+              };
+            }
+          }
+          if (preview) record.creationSelection = preview;
+          if (preview && pinModel !== undefined && !dshDefaultOnly(record)) record.modelPin = nameModelPin(record, preview);
+          if (effort !== undefined) record.pendingEffort = effort;
+        }
+        store.insert(record, { requireOpenParent });
+      } catch (error) {
+        await rollbackWorktree();
+        throw error;
+      }
       if (extra) extra[Symbol.for('futureaide.feedbackDispatchScope')] = { agentId: record.agentId, taskId: null };
       return store.locked(record.agentId, async () => {
         if (!store.get(record.agentId)) throw new Error('This subagent was removed while it was being created.');
         try {
           await prepare(record);
+          if (_revivedSessionId && isHeadlessCli(backendTarget)) {
+            const currentNative = store.backendState(record.agentId) ?? { seq: 0, requests: {}, answers: {}, answered: [] };
+            if (backendTarget === 'codex-cli') {
+              store.saveBackendState(record.agentId, { ...currentNative, threadId: _revivedSessionId, started: true });
+            } else if (backendTarget === 'claude-cli') {
+              store.saveBackendState(record.agentId, { ...currentNative, sessionId: _revivedSessionId, started: true });
+            } else if (backendTarget === 'agy-cli') {
+              store.saveBackendState(record.agentId, { ...currentNative, conversationId: _revivedSessionId, started: true });
+            }
+          }
           return { ...publicResult(record), created: true, modelRequestsStarted: 0,
             // A creation receipt reports the resolved pin even when the target has
             // no session-level selection API yet; list/wait still report only an
@@ -4363,8 +5671,9 @@ export function createScopedAgents(config, {
         }
       });
     },
-    async sendUnkeyed({ name, message, model, effort, mode }, extra) {
+    async sendUnkeyed({ name, message, model, effort, mode, timeoutMinutes, timeoutMs }, extra) {
       textMessage(message);
+      const normalizedTimeout = normalizeTurnTimeoutOptions({ timeoutMs, timeoutMinutes });
       const requestedMode = normalizeRequestedMode(mode);
       let request = { model, effort };
       let wantsSelection = hasModelRequest(request);
@@ -4381,7 +5690,7 @@ export function createScopedAgents(config, {
       const effectiveMode = (record, { answer = false, start = false } = {}) => {
         if (requestedMode) return requestedMode;
         if (answer || start) return 'steer';
-        return targetOf(record) === 'claude-cli' ? 'queue' : 'steer';
+        return isHeadlessCli(targetOf(record)) ? 'queue' : 'steer';
       };
       const queued = (record, pin, extraReceipt = {}) => ({
         name: record.name, accepted: false, queued: true, state: record.state,
@@ -4518,7 +5827,8 @@ export function createScopedAgents(config, {
             : 'Wait for this task’s submitted reports before reusing the name.');
         }
         if (record.state !== 'idle' && !stoppedTask && record.task?.reports?.some(report => report.final)) {
-          await requireSettledSubmissions(record);
+          // A final that is still waiting for its tree is still a sealed final. Its
+          // own pending submission must not mask the more specific final-report rule.
           throw new Error('The agent has submitted its final report; wait for delivery or explicitly delete the agent.');
         }
         const target = targetOf(record);
@@ -4542,6 +5852,11 @@ export function createScopedAgents(config, {
           return pin;
         };
         if (activeTask) {
+          if (normalizedTimeout.timeoutMs !== undefined || normalizedTimeout.timeoutMinutes !== undefined) {
+            if (normalizedTimeout.timeoutMs !== undefined) record.task.turnTimeoutMs = normalizedTimeout.timeoutMs;
+            if (normalizedTimeout.timeoutMinutes !== undefined) record.task.turnTimeoutMinutes = normalizedTimeout.timeoutMinutes;
+            store.save(record);
+          }
           // Before the first write there is no native root to read yet. An ordinary
           // supplement without a new selection is stored straight away; probing the
           // host here would turn a normal queue write into a failed send.
@@ -4576,7 +5891,7 @@ export function createScopedAgents(config, {
           if (target === 'dsh' && requestedMode === 'queue' && (view.running === true || pendingQuestion)) {
             return modeUnsupported(record, 'queue', ['steer']);
           }
-          if (target === 'claude-cli') {
+          if (isHeadlessCli(target)) {
             // An omitted mode or explicit steer given while a question is pending is
             // the answer, never a queued supplement: the caller is answering.
             if (pendingQuestion && requestedMode !== 'queue') {
@@ -4694,14 +6009,18 @@ export function createScopedAgents(config, {
         // The selected model is frozen with the task: a desktop first dispatch is
         // delayed through the worker queue and must not read a later pin change.
         const requestId = uid('request');
+        const archivedUsage = sumTwoUsages(record.historicalUsage, record.task?.usage);
         const next = { ...record, state: 'running', observation: undefined, error: undefined,
           nextAttemptAt: undefined, retryAttempts: 0, sleep: undefined,
+          ...(archivedUsage ? { historicalUsage: archivedUsage, usage: archivedUsage } : {}),
           ...(request.model !== undefined && !dshDefaultOnly(record) ? { modelPin: nameModelPin(record, pin) } : {}),
           pendingEffort: undefined,
           // A pin saved before the lock was turned on goes with the next task.
           ...(dshDefaultOnly(record) ? { modelPin: undefined } : {}),
           task: { taskId: uid('task'), requestId, message, mode: requestedMode ?? 'steer',
             state: 'starting', startedAt: now(), dispatches: [], answers: [],
+            ...(normalizedTimeout.timeoutMs !== undefined ? { turnTimeoutMs: normalizedTimeout.timeoutMs } : {}),
+            ...(normalizedTimeout.timeoutMinutes !== undefined ? { turnTimeoutMinutes: normalizedTimeout.timeoutMinutes } : {}),
             modelSelection: pin ? { ...pin } : null, ...(pendingSelection ? { pendingSelection } : {}), selectionExplicit: wantsSelection, finalReminder: 'armed' } };
         // A task assignment ends the previous round for good: its release attempt loses
         // its ticket here, so the host refuses it at the point where it would unsubscribe
@@ -4748,7 +6067,7 @@ export function createScopedAgents(config, {
       try { return await withName(extra, name, operation, { waitMs: 0 }); } catch (error) {
         if (enteredOperation || error.code !== 'agent-busy') throw error;
         const owner = await context(extra);
-        const record = requireWritableTarget(named(owner, name));
+        const record = requireWritableTarget(named(owner, name, extra));
         ignoreSelectionFor(record);
         const target = targetOf(record);
         const activeTask = record.task && !terminalRound(record) && ACTIVE.has(record.state);
@@ -4756,7 +6075,7 @@ export function createScopedAgents(config, {
         if (activeTask && target === 'dsh' && effectiveMode(record) === 'queue') {
           return modeUnsupported(record, 'queue', ['steer']);
         }
-        if (activeTask && target === 'claude-cli' && effectiveMode(record) === 'steer') {
+        if (activeTask && isHeadlessCli(target) && effectiveMode(record) === 'steer') {
           let view;
           try { view = await observe(record); } catch { view = undefined; }
           if (view?.running === true && !(view.questions ?? []).some(question => question.state === 'pending')) {
@@ -4813,13 +6132,91 @@ export function createScopedAgents(config, {
      * keeps its own application and lifetime, so a conflicting explicit value is
      * refused instead of quietly running the task on the wrong backend.
      */
-    async run({ name, message, lifetime, target, model, effort, mode } = {}, extra) {
+    async run({ tasks, name, role, message, lifetime: rawLifetime, target: rawTarget, model: rawModel, effort: rawEffort, mode, worktree, workspaceMode, workspace_mode, proxy, timeoutMinutes, timeoutMs } = {}, extra) {
+      if (tasks !== undefined) {
+        if (!Array.isArray(tasks) || tasks.length === 0) {
+          throw Object.assign(new Error('tasks must be a non-empty array of task items.'), { code: 'invalid-arguments' });
+        }
+        const owner = await context(extra);
+        const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+        const teamMembers = visibleRecords(rootOwnerId).all;
+        const ownMembers = store.list(owner.ownerId);
+        const stubs = store.listAgentStubs(rootOwnerId);
+        const usedNames = new Set([
+          ...teamMembers.map(r => r.name),
+          ...ownMembers.map(r => r.name),
+          ...stubs.map(s => s.name),
+        ]);
+        const prepared = tasks.map(item => {
+          if (!item || typeof item !== 'object') {
+            throw Object.assign(new Error('Each entry in tasks must be an object.'), { code: 'invalid-arguments' });
+          }
+          textMessage(item.message);
+          const itemRole = normalizeRole(item.role);
+          let assignedName;
+          if (typeof item.name === 'string' && item.name.trim()) {
+            assignedName = assertName(item.name);
+            usedNames.add(assignedName);
+          } else if (item.name !== undefined && item.name !== '') {
+            assignedName = assertName(item.name);
+            usedNames.add(assignedName);
+          } else if (itemRole) {
+            let seq = 1;
+            while (usedNames.has(`${itemRole}${seq}`)) seq += 1;
+            assignedName = assertName(`${itemRole}${seq}`);
+            usedNames.add(assignedName);
+          } else {
+            for (let attempt = 0; attempt < 20 && assignedName === undefined; attempt++) {
+              const candidate = `助手-${randomUUID().replaceAll('-', '').slice(0, 4)}`;
+              if (!usedNames.has(candidate)) assignedName = candidate;
+            }
+            if (!assignedName) throw new Error('Could not generate an unused subagent name; pass one explicitly.');
+            usedNames.add(assignedName);
+          }
+          const itemWorktree = item.worktree ?? worktree;
+          const itemWorkspaceMode = item.workspaceMode ?? item.workspace_mode
+            ?? (itemWorktree === true ? 'worktree' : itemWorktree === false ? 'inherit' : (workspaceMode ?? workspace_mode));
+          const itemProxy = item.proxy ?? proxy;
+          const itemTimeoutMinutes = item.timeoutMinutes ?? timeoutMinutes;
+          const itemTimeoutMs = item.timeoutMs ?? timeoutMs;
+          return {
+            name: assignedName,
+            ...(itemRole ? { role: itemRole } : {}),
+            message: item.message,
+            ...(item.lifetime !== undefined ? { lifetime: item.lifetime } : {}),
+            ...(item.target !== undefined ? { target: item.target } : {}),
+            ...(item.model !== undefined ? { model: item.model } : {}),
+            ...(item.effort !== undefined ? { effort: item.effort } : {}),
+            ...(item.mode !== undefined ? { mode: item.mode } : {}),
+            ...(itemWorkspaceMode !== undefined ? { workspaceMode: itemWorkspaceMode } : {}),
+            ...(itemProxy !== undefined ? { proxy: itemProxy } : {}),
+            ...(itemTimeoutMinutes !== undefined ? { timeoutMinutes: itemTimeoutMinutes } : {}),
+            ...(itemTimeoutMs !== undefined ? { timeoutMs: itemTimeoutMs } : {}),
+          };
+        });
+        const items = await Promise.all(prepared.map(spec => service.run(spec, extra)));
+        const taskKeys = items.map(entry => entry?.taskKey).filter(Boolean);
+        const wakeCmd = buildWakeCmd(owner, taskKeys, { batch: true });
+        return {
+          batch: true,
+          items,
+          taskKeys,
+          ...(wakeCmd ? { wakeCmd } : {}),
+        };
+      }
+
       textMessage(message);
       const requestedMode = normalizeRequestedMode(mode);
+      const {
+        explicitRole,
+        target,
+        lifetime: effectiveLifetime,
+      } = applyCallerDefaults({ role, target: rawTarget, model: rawModel, effort: rawEffort, lifetime: rawLifetime });
       const owner = await context(extra);
       const wanted = normalizeTarget(target);
-      const createdLifetime = lifetime ?? 'once';
+      const createdLifetime = effectiveLifetime ?? 'once';
       if (!['once', 'persistent'].includes(createdLifetime)) throw new Error('lifetime must be once or persistent.');
+      const effectiveWorkspaceMode = workspaceMode ?? workspace_mode ?? (worktree === true ? 'worktree' : worktree === false ? 'inherit' : undefined);
       const sent = result => ({ state: result.state, accepted: result.accepted === true,
         ...(result.requestId ? { requestId: result.requestId } : {}),
         ...(result.taskKey ? { taskKey: result.taskKey } : {}),
@@ -4832,7 +6229,8 @@ export function createScopedAgents(config, {
         ...(result.modelLocked ? { modelLocked: true } : {}),
         ...(result.queued !== undefined ? { queued: result.queued === true } : {}), ...(result.retrying ? { retrying: true } : {}),
         ...(result.callbackError ? { callbackError: result.callbackError } : {}), ...(result.error ? { error: result.error } : {}) });
-      const existing = name === undefined ? undefined : store.named(owner.ownerId, assertName(name));
+      const trimmedName = typeof name === 'string' && name.trim() ? assertName(name) : (name !== undefined && name !== '' ? assertName(name) : undefined);
+      const existing = trimmedName === undefined ? undefined : store.named(owner.ownerId, trimmedName);
       if (existing) {
         // send only says "closing, blocked or not ready"; a caller that picked this
         // name needs to know the name is on its way out rather than misbound.
@@ -4841,33 +6239,71 @@ export function createScopedAgents(config, {
             { code: 'name-closing' });
         }
         const boundTarget = targetOf(existing);
-        if (target !== undefined && wanted !== boundTarget) throw Object.assign(new Error(`The name “${existing.name}” is already bound to ${hostLabel(existing)}; it cannot run on ${TARGET_LABELS[wanted]}. Omit target to continue this name, or use another name.`), { code: 'target-conflict' });
-        if (lifetime !== undefined && lifetime !== existing.lifetime) throw Object.assign(new Error(`The name “${existing.name}” is already a ${existing.lifetime} subagent; omit lifetime, pass ${existing.lifetime}, or use another name.`), { code: 'lifetime-conflict' });
-        const result = await service.send({ name: existing.name, message, model, effort, mode: requestedMode }, extra);
-        return { name: existing.name, lifetime: existing.lifetime, ...(boundTarget !== 'dsh' ? { target: boundTarget } : {}), ...sent(result), reused: true };
+        const rawWanted = rawTarget !== undefined ? normalizeTarget(rawTarget) : undefined;
+        if (rawWanted !== undefined && rawWanted !== boundTarget) throw Object.assign(new Error(`The name “${existing.name}” is already bound to ${hostLabel(existing)}; it cannot run on ${TARGET_LABELS[rawWanted]}. Omit target to continue this name, or use another name.`), { code: 'target-conflict' });
+        if (rawLifetime !== undefined && rawLifetime !== existing.lifetime) throw Object.assign(new Error(`The name “${existing.name}” is already a ${existing.lifetime} subagent; omit lifetime, pass ${existing.lifetime}, or use another name.`), { code: 'lifetime-conflict' });
+        if (explicitRole && !existing.role) { existing.role = explicitRole; store.save(existing); }
+        const result = await service.send({ name: existing.name, message, model: rawModel, effort: rawEffort, mode: requestedMode, timeoutMinutes, timeoutMs }, extra);
+        const wakeCmd = buildWakeCmd(owner, result.taskKey);
+        return {
+          name: existing.name,
+          ...(existing.role ? { role: existing.role } : {}),
+          lifetime: existing.lifetime,
+          ...(boundTarget !== 'dsh' ? { target: boundTarget } : {}),
+          ...sent(result),
+          ...(wakeCmd ? { wakeCmd } : {}),
+          reused: true,
+        };
       }
-      let chosen = name === undefined ? undefined : assertName(name);
-      if (chosen === undefined) {
+      let chosen = trimmedName;
+      if (chosen === undefined && !explicitRole) {
         for (let attempt = 0; attempt < 5 && chosen === undefined; attempt++) {
           const candidate = `助手-${randomUUID().replaceAll('-', '').slice(0, 4)}`;
           if (!store.named(owner.ownerId, candidate)) chosen = candidate;
         }
         if (chosen === undefined) throw new Error('Could not generate an unused subagent name; pass one explicitly.');
       }
-      const created = await service.create({ name: chosen, lifetime: createdLifetime, target: wanted, model, effort }, extra);
+      const created = await service.create({
+        ...(chosen !== undefined ? { name: chosen } : {}),
+        ...(explicitRole ? { role: explicitRole } : {}),
+        ...(rawLifetime !== undefined ? { lifetime: rawLifetime } : (!explicitRole ? { lifetime: createdLifetime } : {})),
+        ...(rawTarget !== undefined ? { target: rawTarget } : (!explicitRole ? { target: wanted } : {})),
+        model: rawModel,
+        effort: rawEffort,
+        workspaceMode: effectiveWorkspaceMode,
+        proxy,
+        timeoutMinutes,
+        timeoutMs,
+      }, extra);
       // A failed creation keeps its own receipt: sending into a name that never
       // connected would report a delivery nobody is waiting for.
       if (created.created !== true || created.error) return created;
+      const finalName = created.name;
       try {
-        const result = await service.send({ name: chosen, message, model, effort, mode: requestedMode }, extra);
-        return { name: chosen, lifetime: createdLifetime, ...(wanted !== 'dsh' ? { target: wanted } : {}), ...sent(result), created: true };
+        const result = await service.send({ name: finalName, message, model: rawModel, effort: rawEffort, mode: requestedMode, timeoutMinutes, timeoutMs }, extra);
+        const wakeCmd = buildWakeCmd(owner, result.taskKey);
+        return {
+          name: finalName,
+          ...(created.role ? { role: created.role } : {}),
+          ...(created.workspaceMode ? { workspaceMode: created.workspaceMode } : {}),
+          lifetime: created.lifetime ?? createdLifetime,
+          ...(wanted !== 'dsh' ? { target: wanted } : {}),
+          ...sent(result),
+          ...(wakeCmd ? { wakeCmd } : {}),
+          created: true,
+        };
       } catch (error) {
         // The name exists now, so a thrown send would hide the name the caller must
         // use to continue; report the created name with the failure instead.
-        const current = store.named(owner.ownerId, chosen);
-        return { name: chosen, lifetime: createdLifetime, ...(wanted !== 'dsh' ? { target: wanted } : {}),
+        const current = store.named(owner.ownerId, finalName);
+        return {
+          name: finalName,
+          ...(current?.role ?? created.role ? { role: current?.role ?? created.role } : {}),
+          lifetime: created.lifetime ?? createdLifetime,
+          ...(wanted !== 'dsh' ? { target: wanted } : {}),
           created: true, state: current?.state ?? 'reconnecting', accepted: false,
-          actualModel: actualModelName(current?.model) ?? actualModelName(current?.modelPin), error: safeError(error) };
+          actualModel: actualModelName(current?.model) ?? actualModelName(current?.modelPin), error: safeError(error),
+        };
       }
     },
     async answer({ name, message }, extra) {
@@ -4878,42 +6314,254 @@ export function createScopedAgents(config, {
         return answerLocked(record, message, undefined, { modelSelection: selection, selectionExplicit: false });
       });
     },
-    async list(extra, { name: filterName, state: filterState } = {}) {
+    async list(extra, { scope = 'team', name: filterName, role: filterRole, state: filterState } = {}) {
+      if (!['team', 'agent', 'all'].includes(scope)) {
+        throw Object.assign(new Error('scope must be "team", "agent", or "all".'), { code: 'invalid-scope' });
+      }
       const owner = await context(extra);
-      // The filter runs over name/state metadata (the lifecycle index) before any
-      // record body, composed tree or worker is read. A name query deliberately
-      // bypasses the default active set so failed and cleaned names stay findable.
+      const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
       const wantedName = filterName === undefined ? undefined : assertName(filterName);
+      const wantedRole = normalizeRole(filterRole);
       if (filterState !== undefined && (typeof filterState !== 'string' || !filterState
           || filterState !== filterState.trim() || filterState.length > 64)) {
         throw new Error('Use a nonempty lifecycle state of at most 64 characters, without leading/trailing whitespace.');
       }
       const wantedState = filterState;
-      let selected = store.listNames(owner.ownerId);
-      if (wantedName !== undefined) selected = selected.filter(row => row.name === wantedName);
-      if (wantedState !== undefined) {
-        selected = selected.filter(row => wantedState === 'active'
-          ? !INACTIVE_STATES.has(row.state) : row.state === wantedState);
-      } else if (wantedName === undefined) {
-        selected = selected.filter(row => !INACTIVE_STATES.has(row.state));
+
+      const isStaleIdle = (record, nowMs = Date.now()) => {
+        if (!record || record.state !== 'idle') return false;
+        if ((record.observation?.questions ?? []).some(q => q.state === 'pending')) return false;
+        if ((record.task?.reports ?? []).some(r => !terminalNotice(r.delivery) && r.delivery?.state !== 'delivered')) return false;
+        if (store.submissionDebt(record.agentId) > 0) return false;
+        if (store.childrenOf(record.agentId).some(c => !c.closed && !INACTIVE_STATES.has(c.state))) return false;
+        const refTime = Date.parse(record.task?.finishedAt ?? record.updatedAt ?? record.createdAt ?? '');
+        return Number.isFinite(refTime) && nowMs - refTime > STALE_IDLE_MS;
+      };
+
+      const decorateRecord = (record, runningMonitor) => {
+        const base = publicResult(record);
+        const pathStr = managedPath(record);
+        const segments = pathStr.split('/');
+        const parentRec = record.parentAgentId ? store.get(record.parentAgentId) : undefined;
+        const resolvedRole = record.role ?? inferRoleFromName(record.name) ?? null;
+        const unabsorbed = readParentSubmissions(record);
+        const mergedQuestions = [...base.questions];
+        for (const q of unabsorbed.questions) {
+          if (!mergedQuestions.some(existing => existing.message === q.message)) {
+            mergedQuestions.push({ message: q.message });
+          }
+        }
+        return {
+          ...base,
+          role: resolvedRole,
+          agentPath: pathStr,
+          parentName: parentRec?.name ?? (segments.length > 1 ? segments.at(-2) : null),
+          parentAgentId: record.parentAgentId ?? null,
+          depth: segments.length - 1,
+          questions: mergedQuestions,
+          monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping')
+            : (runningMonitor ? 'running' : 'stopped'),
+          supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? ''),
+        };
+      };
+
+      if (scope === 'agent') {
+        if (wantedName === undefined) {
+          throw Object.assign(new Error('scope="agent" requires name.'), { code: 'name-required' });
+        }
+        const { all: teamAll } = visibleRecords(rootOwnerId);
+        const byPath = teamAll.filter(r => managedPath(r) === wantedName);
+        let chosenRecord = byPath[0];
+        if (!chosenRecord) {
+          const byShort = teamAll.filter(r => r.name === wantedName);
+          if (byShort.length === 1) chosenRecord = byShort[0];
+          else if (byShort.length > 1) {
+            const activeMatches = byShort.filter(r => !r.closed && !INACTIVE_STATES.has(r.state));
+            if (activeMatches.length === 1) chosenRecord = activeMatches[0];
+            else {
+              const paths = (activeMatches.length > 1 ? activeMatches : byShort).map(r => managedPath(r));
+              throw Object.assign(new Error(`“${wantedName}” matches multiple members: ${paths.join(', ')}. Specify the full path.`), { code: 'node-ambiguous', paths });
+            }
+          }
+        }
+        if (!chosenRecord) {
+          const stub = store.getAgentStub(rootOwnerId, wantedName);
+          if (stub) {
+            const stubDetail = {
+              name: stub.name,
+              role: stub.role ?? inferRoleFromName(stub.name) ?? null,
+              agentPath: stub.agentPath,
+              parentName: stub.agentPath.includes('/') ? stub.agentPath.split('/').at(-2) : null,
+              parentAgentId: stub.parentAgentId,
+              depth: stub.agentPath.split('/').length - 1,
+              target: stub.target,
+              lifetime: 'once',
+              state: 'archived_stub',
+              resumable: Boolean(stub.resumeSessionId),
+              actualModel: stub.model,
+              task: stub.lastTaskSummary ? { text: stub.lastTaskSummary, state: 'completed', finishedAt: stub.closedAt } : null,
+              questions: [],
+              changes: { count: 0, unconfirmed: 0, files: [] },
+              reports: { total: 0, pending: 0, latest: null, items: [] },
+              children: [],
+            };
+            return { scope: 'agent', ownerId: rootOwnerId, agent: stubDetail, items: [stubDetail], total: 1 };
+          }
+          throw Object.assign(new Error(`No subagent named “${wantedName}” exists in this team.`), { code: 'agent-not-found' });
+        }
+
+        const full = publicResult(chosenRecord, { fullResult: true });
+        const unabsorbed = readParentSubmissions(chosenRecord);
+        const openQuestions = [
+          ...(chosenRecord.observation?.questions ?? []).filter(q => q.state === 'pending').map(q => ({
+            id: q.id, message: q.message, state: 'pending', ...(q.createdAt ? { createdAt: q.createdAt } : {}),
+          })),
+        ];
+        for (const q of unabsorbed.questions) {
+          if (!openQuestions.some(existing => existing.id === q.id)) openQuestions.push(q);
+        }
+        const explicitReports = [...(chosenRecord.task?.reports ?? []).filter(r => !r.failure)];
+        for (const r of unabsorbed.reports) {
+          if (!explicitReports.some(existing => sameReportId(existing.id, r.id))) {
+            explicitReports.push({ id: r.id, message: r.message, final: r.final, createdAt: r.createdAt, delivery: { state: 'pull_ready' } });
+          }
+        }
+        const latestRep = explicitReports.at(-1);
+        const allChangedFiles = attributedChanges(chosenRecord, chosenRecord.observation ?? {});
+        const directChildren = store.childrenOf(chosenRecord.agentId).map(c => ({
+          name: c.name,
+          role: c.role ?? inferRoleFromName(c.name) ?? null,
+          agentPath: managedPath(c),
+          target: targetOf(c),
+          state: c.state,
+        }));
+        const running = !chosenRecord.sleep
+          && await monitorAlive(store, Date.now(), { idleSessionCleanup: config.idleSessionCleanup !== false });
+        const decorated = decorateRecord(chosenRecord, running);
+        const agentDetail = {
+          ...decorated,
+          task: chosenRecord.task ? {
+            text: chosenRecord.task.message,
+            message: chosenRecord.task.message,
+            state: chosenRecord.task.state,
+            startedAt: chosenRecord.task.startedAt,
+            ...(chosenRecord.task.finishedAt ? { finishedAt: chosenRecord.task.finishedAt } : {}),
+            ...(chosenRecord.task.usage ? { usage: chosenRecord.task.usage } : {}),
+          } : null,
+          questions: openQuestions,
+          changes: {
+            count: allChangedFiles.length,
+            unconfirmed: allChangedFiles.filter(f => f.attribution === 'unconfirmed').length,
+            files: allChangedFiles.map(fileSummary),
+            coverage: full.changes.coverage,
+          },
+          reports: {
+            total: explicitReports.length,
+            pending: explicitReports.filter(r => !terminalNotice(r.delivery)).length,
+            latest: latestRep ? {
+              id: latestRep.id,
+              message: latestRep.message,
+              summary: compactText(latestRep.message, 240),
+              final: latestRep.final === true,
+              delivery: latestRep.delivery?.state ?? 'pending',
+              ...(latestRep.createdAt ? { createdAt: latestRep.createdAt } : {}),
+            } : null,
+            items: explicitReports.map(r => ({
+              id: r.id,
+              message: r.message,
+              final: r.final === true,
+              delivery: r.delivery?.state ?? 'pending',
+              ...(r.createdAt ? { createdAt: r.createdAt } : {}),
+            })),
+          },
+          children: directChildren,
+        };
+        return { scope: 'agent', ownerId: rootOwnerId, agent: agentDetail, items: [agentDetail], total: 1 };
       }
-      const records = selected.map(row => store.get(row.id)).filter(Boolean);
-      // Own names only, each with its own composed tree; managed descendants appear
-      // inside that tree, never as extra entries in this chat's list.
+
+      if (scope === 'all') {
+        const nowMs = Date.now();
+        let allRecords = store.list();
+        if (wantedName !== undefined) {
+          allRecords = allRecords.filter(r => r.name === wantedName || managedPath(r) === wantedName);
+        }
+        if (wantedRole !== undefined) {
+          allRecords = allRecords.filter(r => (r.role ?? inferRoleFromName(r.name)) === wantedRole);
+        }
+        if (wantedState !== undefined) {
+          allRecords = allRecords.filter(r => wantedState === 'active'
+            ? !INACTIVE_STATES.has(r.state) : r.state === wantedState);
+        } else if (wantedName === undefined) {
+          allRecords = allRecords.filter(r => !r.closed && !INACTIVE_STATES.has(r.state) && !isStaleIdle(r, nowMs));
+        }
+        const running = allRecords.some(record => !record.sleep)
+          && await monitorAlive(store, nowMs, { idleSessionCleanup: config.idleSessionCleanup !== false });
+        const byRoot = new Map();
+        const allItems = [];
+        for (const record of allRecords) {
+          const teamOwnerId = rootOwnerIdForRecord(record);
+          const item = decorateRecord(record, running);
+          allItems.push(item);
+          let bucket = byRoot.get(teamOwnerId);
+          if (!bucket) {
+            bucket = [];
+            byRoot.set(teamOwnerId, bucket);
+          }
+          bucket.push(item);
+        }
+        const teams = [];
+        for (const [teamOwnerId, members] of byRoot.entries()) {
+          const teamOwner = store.owner(teamOwnerId);
+          const hasHierarchy = members.some(m => Boolean(m.parentAgentId) || m.depth > 0 || (m.tree?.nodes?.length ?? 0) > 1);
+          const pendingQuestions = members.reduce((sum, m) => sum + (m.questions?.length ?? 0), 0);
+          teams.push({
+            ownerId: teamOwnerId,
+            source: teamOwner?.source ?? 'unknown',
+            workspace: teamOwner?.workspace ?? store.get(members[0]?.agentId)?.workspace ?? null,
+            hasHierarchy,
+            memberCount: members.length,
+            pendingQuestions,
+            members,
+          });
+        }
+        return { scope: 'all', teams, groups: teams, items: allItems, total: allItems.length };
+      }
+
+      // Default: scope === 'team' — whole team tree under this root owner.
+      const { all: teamAll } = visibleRecords(rootOwnerId);
+      const seenIds = new Set(teamAll.map(r => r.agentId));
+      if (owner.ownerId !== rootOwnerId) {
+        for (const ownRec of store.list(owner.ownerId)) {
+          if (!seenIds.has(ownRec.agentId)) {
+            seenIds.add(ownRec.agentId);
+            teamAll.push(ownRec);
+          }
+        }
+      }
+      const nowMs = Date.now();
+      let selected = teamAll;
+      if (wantedName !== undefined) {
+        selected = selected.filter(r => r.name === wantedName || managedPath(r) === wantedName);
+      }
+      if (wantedRole !== undefined) {
+        selected = selected.filter(r => (r.role ?? inferRoleFromName(r.name)) === wantedRole);
+      }
+      if (wantedState !== undefined) {
+        selected = selected.filter(r => wantedState === 'active'
+          ? !INACTIVE_STATES.has(r.state) : r.state === wantedState);
+      } else if (wantedName === undefined) {
+        selected = selected.filter(r => !INACTIVE_STATES.has(r.state) && !isStaleIdle(r, nowMs));
+      }
+      const selectedIds = selected.map(r => r.agentId);
       let ensured;
       const ensure = () => ensured ??= ensureMonitor();
-      for (const record of records) await ensureWorker(record, { ensure });
-      // ensureWorker can persist a monitor-unavailable error (or wake a sleeping
-      // name) while starting the shared listener. Read the selected rows again so
-      // the first list answer carries that newer durable metadata instead of the
-      // snapshot taken before the listener was started.
-      const current = selected.map(row => store.get(row.id)).filter(Boolean);
+      for (const record of selected) await ensureWorker(record, { ensure });
+      const current = selectedIds.map(id => store.get(id)).filter(Boolean);
       const running = current.some(record => !record.sleep)
         && await monitorAlive(store, Date.now(), { idleSessionCleanup: config.idleSessionCleanup !== false });
-      return { items: current.map(record => ({ ...publicResult(record),
-        monitor: record.sleep ? (record.sleep.wakePending ? 'waking' : 'sleeping')
-          : (running ? 'running' : 'stopped'),
-        supplements: store.supplementSummary(record.agentId, record.task?.taskId ?? '') })), total: current.length };
+      const items = current.map(record => decorateRecord(record, running));
+      const hasHierarchy = teamAll.some(r => Boolean(r.parentAgentId) || (r.observation?.tree?.nodes?.length ?? 0) > 1);
+      return { scope: 'team', ownerId: rootOwnerId, hasHierarchy, items, total: items.length };
     },
     async changes({ name, task = 0 }, extra) {
       return withName(extra, name, async record => {
@@ -5002,7 +6650,7 @@ export function createScopedAgents(config, {
     },
     async cancel({ name }, extra) {
       const owner = await context(extra);
-      const record = requireWritableTarget(named(owner, name));
+      const record = requireWritableTarget(named(owner, name, extra));
       if (!record.task || record.closed) return { name, accepted: false, state: record.state };
       if (!store.requestCancel(record)) return { name, accepted: false, state: store.get(record.agentId)?.state ?? 'removed' };
       if (targetOf(record) !== 'dsh') {
@@ -5040,7 +6688,7 @@ export function createScopedAgents(config, {
     },
     async delete({ name }, extra) {
       const owner = await context(extra);
-      const record = requireWritableTarget(named(owner, name));
+      const record = requireWritableTarget(named(owner, name, extra));
       if (targetOf(record) === 'dsh') {
         const result = await withName(extra, name, current => clearRecord(current));
         if (result.queued) await ensureWorker(store.get(record.agentId), { wake: true });
@@ -5050,7 +6698,7 @@ export function createScopedAgents(config, {
       if (queued) await ensureWorker(store.get(record.agentId), { wake: true });
       const current = queued ? undefined : store.get(record.agentId);
       return { name, deleted: false, queued, state: queued ? 'cleaning' : current?.cleanupRosterTicket ? 'cleanup-claimed' : 'removed',
-        ...(targetOf(record) === 'claude-cli' ? { nativeHistoryPolicy: 'retain' } : {}) };
+        ...(isHeadlessCli(targetOf(record)) ? { nativeHistoryPolicy: 'retain' } : {}) };
     },
     /**
      * Explicit ask/report from a managed Codex Desktop child, called from that
@@ -5059,7 +6707,7 @@ export function createScopedAgents(config, {
      * the same task so the one state machine delivers it to the parent.
      */
     feedbackScope(tool, args, extra) {
-      const caller = trustedCaller(extra);
+      const caller = effectiveTrustedCaller(extra);
       if (tool === 'feedback' || tool === 'report_parent' || tool === 'ask_parent') {
         if (caller) return '';
         const bound = store.agentForCodexThread(callingThread(extra));
@@ -5067,13 +6715,15 @@ export function createScopedAgents(config, {
         return record ? [record.agentId, record.task?.taskId ?? ''].join(':') : '';
       }
       if (!args?.name) return '';
-      const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+      const callerKey = caller?.source === 'antigravity' ? (caller.conversationId ?? caller.nativeSessionId) : caller?.nativeSessionId;
+      const ownerId = caller ? ownerIdForSource(caller.source, callerKey) : ownerIdFor(callingThread(extra));
       const record = store.named(ownerId, args.name);
       return record ? [record.agentId, record.task?.taskId ?? ''].join(':') : 'unbound';
     },
     async submitCallerFeedback({ name, ...input }, extra, error, deadline) {
-      const caller = trustedCaller(extra);
-      const ownerId = caller ? ownerIdForSource(caller.source, caller.nativeSessionId) : ownerIdFor(callingThread(extra));
+      const caller = effectiveTrustedCaller(extra);
+      const callerKey = caller?.source === 'antigravity' ? (caller.conversationId ?? caller.nativeSessionId) : caller?.nativeSessionId;
+      const ownerId = caller ? ownerIdForSource(caller.source, callerKey) : ownerIdFor(callingThread(extra));
       const record = name ? store.named(ownerId, name) : null;
       return submitFeedback(input, {
         source: caller?.source ?? 'codex-desktop',
@@ -5111,17 +6761,25 @@ export function createScopedAgents(config, {
       await ensureWorker(record, { wake: true, hasSubmission: record?.task?.taskId === receipt.taskId });
       return receipt;
     },
-    async wait({ names, taskKeys, after, timeoutSeconds } = {}, extra) {
-      if (timeoutSeconds !== undefined && (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > 45)) throw new Error('Wait between 0 and 45 seconds.');
+    async wait({ names, taskKeys, after, timeoutSeconds, barrier = 'any', allowExtendedTimeout = false } = {}, extra) {
+      const maxTimeout = allowExtendedTimeout === true ? 86400 : 45;
+      if (timeoutSeconds !== undefined && (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0 || timeoutSeconds > maxTimeout)) {
+        throw new Error(allowExtendedTimeout === true ? `Wait between 0 and ${maxTimeout} seconds.` : 'Wait between 0 and 45 seconds.');
+      }
+      if (!['any', 'all'].includes(barrier)) {
+        throw Object.assign(new Error('barrier must be "any" or "all".'), { code: 'invalid-barrier' });
+      }
       if (names && taskKeys) throw new Error('Use names or taskKeys, not both.');
       const owner = await context(extra);
+      const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
       if (names) names.forEach(assertName);
       if (taskKeys && (!Array.isArray(taskKeys) || taskKeys.some(key => typeof key !== 'string'))) throw new Error('taskKeys must be an array of task keys.');
-      const available = taskKeys ? [] : store.list(owner.ownerId);
-      const selected = available.filter(record => !names || names.includes(record.name));
-      const notListed = new Set((names ?? []).filter(name => !available.some(record => record.name === name)));
+      const available = taskKeys ? [] : visibleRecords(rootOwnerId).all;
+      const matchesWaitName = (record, wanted) => record.name === wanted || managedPath(record) === wanted;
+      const selected = available.filter(record => !names || names.some(wanted => matchesWaitName(record, wanted)));
+      const notListed = new Set((names ?? []).filter(name => !available.some(record => matchesWaitName(record, name))));
       // Legacy name snapshots retain their old bounded state-query behaviour.
-      if (timeoutSeconds !== undefined && taskKeys === undefined && after === undefined) {
+      if (timeoutSeconds !== undefined && taskKeys === undefined && after === undefined && barrier === 'any' && !allowExtendedTimeout) {
         const selectedIds = selected.map(record => record.agentId);
         const deadline = Date.now() + timeoutSeconds * 1000;
         let items;
@@ -5130,7 +6788,11 @@ export function createScopedAgents(config, {
           for (const id of selectedIds) {
             const record = store.get(id);
             if (!record) { notListed.add(selected.find(item => item.agentId === id).name); continue; }
-            items.push(publicResult(record, { fullResult: true }));
+            const taskKey = record.task?.requestId
+              ? store.taskKeyForRequest(record.ownerId, record.task.requestId)
+                ?? store.saveTaskKey(record.ownerId, record.agentId, record.task.requestId, record.task.taskId)
+              : undefined;
+            items.push(waitItem(record, taskKey, storedBodyText(store, record, taskKey)));
           }
           if (!selectedIds.length || notListed.size || items.some(item => item.error ||
               ['awaiting_input', 'awaiting_report', 'cancelled', 'idle', 'delivery_pending', 'cleanup_failed', 'failed'].includes(item.state))) break;
@@ -5149,8 +6811,8 @@ export function createScopedAgents(config, {
           timedOut: Date.now() >= deadline && items.some(item => item.state === 'running') };
       }
       const keys = taskKeys ?? selected.filter(record => record.task?.requestId).map(record =>
-        store.taskKeyForRequest(owner.ownerId, record.task.requestId)
-        ?? store.saveTaskKey(owner.ownerId, record.agentId, record.task.requestId, record.task.taskId));
+        store.taskKeyForRequest(record.ownerId, record.task.requestId)
+        ?? store.saveTaskKey(record.ownerId, record.agentId, record.task.requestId, record.task.taskId));
       const selection = [...new Set(keys)].sort();
       const selectionHash = createHash('sha256').update(JSON.stringify([owner.ownerId, selection])).digest('base64url');
       const keyIndexes = new Map(selection.map((key, index) => [key, String(index)]));
@@ -5178,11 +6840,19 @@ export function createScopedAgents(config, {
         while (true) {
           if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
           if (waitsClosed) throw Object.assign(new Error('The service closed while waiting.'), { code: 'transport-lost' });
-          const events = [], items = [], initialPositions = new Map();
+          const events = [], items = [], initialPositions = new Map(), keySettled = new Map(), pullDeliveries = [];
           for (const key of selection) {
             const cursorIndex = keyIndexes.get(key);
             let mapping = store.resolveTaskKey(owner.ownerId, key);
+            if (!mapping) {
+              const cross = store.resolveTaskKeyAnyOwner(key);
+              const crossRec = cross ? store.get(cross.agentId) : undefined;
+              if (cross && crossRec && rootOwnerIdForRecord(crossRec) === rootOwnerId) {
+                mapping = cross;
+              }
+            }
             if (!mapping) throw Object.assign(new Error('Task receipt is unavailable for this owner.'), { code: 'task-receipt-unavailable' });
+            const effectiveKeyOwner = mapping.ownerId ?? owner.ownerId;
             if (mapping.receipt?.expired) throw Object.assign(new Error('Task receipt has expired.'), { code: 'task-receipt-expired' });
             if (mapping.failureReason) throw Object.assign(new Error('The dispatched input failed.'), { code: mapping.failureReason, requestId: mapping.requestId });
             const record = store.get(mapping.agentId);
@@ -5190,17 +6860,33 @@ export function createScopedAgents(config, {
             if (supplement?.status === 'blocked') throw Object.assign(new Error('The dispatched input failed.'), { code: supplement.reason ?? 'dispatch-failed', requestId: mapping.requestId });
             if (!mapping.taskId) {
               if (supplement?.status === 'accepted' && supplement.task) {
-                store.saveTaskKey(owner.ownerId, mapping.agentId, mapping.requestId, supplement.task);
-                mapping = store.resolveTaskKey(owner.ownerId, key);
+                store.saveTaskKey(effectiveKeyOwner, mapping.agentId, mapping.requestId, supplement.task);
+                mapping = store.resolveTaskKey(effectiveKeyOwner, key);
               }
             }
-            if (record && record.ownerId !== owner.ownerId) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
-            if (!record && !mapping.receipt) mapping = store.resolveTaskKey(owner.ownerId, key);
+            if (record && record.ownerId !== owner.ownerId && rootOwnerIdForRecord(record) !== rootOwnerId) {
+              throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
+            }
+            if (!record && !mapping.receipt) mapping = store.resolveTaskKey(effectiveKeyOwner, key);
             if (!mapping) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
             if (mapping.failureReason) throw Object.assign(new Error('The dispatched input failed.'), { code: mapping.failureReason, requestId: mapping.requestId });
-            if (mapping.receipt) { if (!positions[cursorIndex]?.delivered) events.push({ id: key + ':delivered:' + mapping.receipt.finalSubmissionId, taskKey: key, type: 'delivered', final: true, createdAt: mapping.receipt.deliveredAt }); continue; }
+            if (mapping.receipt) {
+              keySettled.set(key, true);
+              if (!positions[cursorIndex]?.delivered) {
+                const receiptBody = store.storedReportBody(effectiveKeyOwner, key, mapping.receipt.finalSubmissionId);
+                const receiptMsg = receiptBody && !receiptBody.error ? receiptBody.body : undefined;
+                events.push({ id: key + ':delivered:' + mapping.receipt.finalSubmissionId, taskKey: key, type: 'delivered', final: true, createdAt: mapping.receipt.deliveredAt,
+                  submissionId: mapping.receipt.finalSubmissionId,
+                  ...(receiptMsg !== undefined ? { message: compactText(receiptMsg, 4000), ...(receiptMsg.length > 4000 ? { truncated: true } : {}) } : {}),
+                  ...(mapping.receipt.release ? { tree: mapping.receipt.release } : {}),
+                  body: receiptBody && !receiptBody.error
+                    ? reportBodyReference({ taskKey: key, submissionId: mapping.receipt.finalSubmissionId, body: receiptBody.body })
+                    : undefined });
+              }
+              continue;
+            }
             if (!record) throw Object.assign(new Error('Task receipt is unavailable.'), { code: 'task-receipt-unavailable' });
-            if (!mapping.taskId) { items.push({ name: record.name, state: 'queued', task: null }); continue; }
+            if (!mapping.taskId) { keySettled.set(key, false); items.push({ name: record.name, state: 'queued', task: null }); continue; }
             const task = record.task?.taskId === mapping.taskId ? record.task : store.historyTask(mapping.agentId, mapping.taskId);
             if (!task) throw Object.assign(new Error('The original task is unavailable.'), { code: 'task-receipt-unavailable' });
             const answer = (task.answers ?? []).find(item => item.answerId === mapping.requestId);
@@ -5210,61 +6896,169 @@ export function createScopedAgents(config, {
               throw Object.assign(new Error('The dispatched task failed to send.'), { code: dispatch.failure?.code ?? dispatch.error?.code ?? 'dispatch-failed', requestId: mapping.requestId, detail: dispatch.failure ?? dispatch.error });
             }
             const taskRecord = task === record.task ? record : { ...record, task, state: task.state, observation: undefined, error: undefined };
-            items.push(publicResult(taskRecord));
+            items.push(waitItem(taskRecord, key, storedBodyText(store, taskRecord, key)));
             const baseline = mapping.baseline ?? { count: 0, reportCount: 0, nativeCount: 0 };
             const position = positions[cursorIndex] ?? { count: baseline.count ?? 0, reportCount: baseline.reportCount ?? 0, nativeCount: baseline.nativeCount ?? 0 };
             initialPositions.set(cursorIndex, position);
-            const submissions = store.submissionsInOrder(mapping.agentId, mapping.taskId, position.count);
+            const allTaskSubmissions = store.submissionsInOrder(mapping.agentId, mapping.taskId, 0);
+            const submissions = allTaskSubmissions.slice(position.count ?? 0);
+            const exactBody = id => {
+              const stored = store.storedReportBody(effectiveKeyOwner, key, id);
+              return stored && !stored.error ? stored.body : undefined;
+            };
+            const headlessReady = isHeadlessCli(targetOf(record))
+              && !store.childrenOf(record.agentId).some(child => !child.closed && ACTIVE.has(child.state));
             for (let index = 0; index < submissions.length; index++) {
               const submission = submissions[index];
-              events.push({ id: key + ':submission:' + submission.id, taskKey: key, name: record.name,
+              const bodyText = submission.kind === 'report' ? exactBody(submission.id) : undefined;
+              const message = bodyText ?? submission.message;
+              const reportForSubmission = (task.reports ?? []).find(report =>
+                sameReportId(report.id, submission.id) || report.sharedSubmission === submission.id);
+              const waitingForRelease = submission.final === true
+                && !['delivered', 'blocked', 'pull_ready'].includes(submission.delivery?.state)
+                && !headlessReady
+                && (!reportForSubmission || !finalReportReady(reportForSubmission));
+              const eventId = key + ':submission:' + submission.id;
+              const evt = { id: eventId, taskKey: key, name: record.name,
+                ...(record.role ? { role: record.role } : {}),
                 type: submission.kind === 'ask' ? 'question' : submission.final ? 'final' : 'report',
-                message: compactText(submission.message, 4000), ...(submission.message?.length > 4000 ? { truncated: true } : {}),
-                final: submission.final === true, createdAt: submission.created });
+                message: compactText(message, 4000),
+                ...(typeof message === 'string' && message.length > 4000 ? { truncated: true } : {}),
+                ...(submission.kind === 'ask'
+                  ? {}
+                  : { delivery: submission.delivery?.state ?? 'pending',
+                    ...(submission.delivery?.error ? { error: submission.delivery.error } : {}),
+                    ...((submission.delivery?.treeRelease ?? reportForSubmission?.delivery?.treeRelease)
+                      ? { tree: submission.delivery?.treeRelease ?? reportForSubmission.delivery.treeRelease } : {}),
+                    ...(bodyText !== undefined ? { body: reportBodyReference({ taskKey: key, submissionId: submission.id, body: bodyText }) } : {}),
+                    ...(waitingForRelease ? { pendingRelease: true, advance: false } : {}) }),
+                final: submission.final === true, createdAt: submission.created };
+              events.push(evt);
+              if (!waitingForRelease) {
+                pullDeliveries.push({ eventId, mapping, submissionId: submission.id, kind: submission.kind, final: submission.final === true });
+              }
             }
-            const reports = (task.reports ?? []).filter(report => !report.failure && !report.id?.startsWith('submission:'));
+            const reports = (task.reports ?? []).filter(report => !report.failure
+              && !report.id?.startsWith('submission:')
+              && (!report.sharedSubmission || nativeReportOnly(record)));
             for (let index = position.reportCount ?? 0; index < reports.length; index++) {
               const report = reports[index];
-              events.push({ id: key + ':report:' + (report.id ?? index), taskKey: key, name: record.name,
+              const submissionId = typeof report.id === 'string' ? report.id : undefined;
+              const bodyText = submissionId ? exactBody(submissionId) : undefined;
+              const message = bodyText ?? report.message;
+              const waitingForRelease = report.final === true && !headlessReady && !finalReportReady(report);
+              const eventId = key + ':report:' + (report.id ?? index);
+              events.push({ id: eventId, taskKey: key, name: record.name,
+                ...(record.role ? { role: record.role } : {}),
                 type: report.final ? 'final' : 'report', source: 'task-report',
-                message: compactText(report.message, 4000), ...(report.message?.length > 4000 ? { truncated: true } : {}),
+                message: compactText(message, 4000),
+                ...(typeof message === 'string' && message.length > 4000 ? { truncated: true } : {}),
+                delivery: report.delivery?.state ?? 'pending',
+                ...(report.delivery?.error ? { error: report.delivery.error } : {}),
+                ...(report.delivery?.treeRelease ? { tree: report.delivery.treeRelease } : {}),
+                ...(submissionId && bodyText !== undefined ? { body: reportBodyReference({ taskKey: key, submissionId, body: bodyText }) } : {}),
+                ...(waitingForRelease ? { pendingRelease: true, advance: false } : {}),
                 final: report.final === true, createdAt: report.createdAt });
+              if (!waitingForRelease && submissionId) {
+                pullDeliveries.push({ eventId, mapping, submissionId, kind: 'report', final: report.final === true, taskReport: true });
+              }
             }
             // Old rosters may have only the last observation; read it without a write.
             const nativeQuestions = task === record.task ? captureNativeQuestionHistory(taskRecord) : (task.nativeQuestions ?? []);
             for (let index = position.nativeCount ?? 0; index < nativeQuestions.length; index++) {
               const question = nativeQuestions[index];
               events.push({ id: key + ':native:' + question.id, taskKey: key, name: record.name,
+                ...(record.role ? { role: record.role } : {}),
                 type: 'question', source: 'native', message: compactText(question.message, 4000), createdAt: question.createdAt });
             }
             const state = task === record.task ? terminalRound(record) : (['completed', 'failed', 'cancelled'].includes(task?.state) ? task.state : undefined);
             if (state && !positions[cursorIndex]?.terminal) events.push({ id: key + ':terminal:' + state, taskKey: key, name: record.name, type: state, source: 'task', ...((task === record.task ? record.error ?? task.cancelError : task.error ?? task.cancelError) ? { reason: task === record.task ? record.error ?? task.cancelError : task.error ?? task.cancelError } : {}), createdAt: task?.finishedAt });
+
+            const hasFinalSubmission = allTaskSubmissions.some(s => s.kind === 'report' && s.final === true
+              && (headlessReady || ['delivered', 'blocked', 'pull_ready'].includes(s.delivery?.state)
+                || finalReportReady((task.reports ?? []).find(r => sameReportId(r.id, s.id) || r.sharedSubmission === s.id))));
+            const hasFinalTaskReport = reports.some(r => r.final === true && (headlessReady || finalReportReady(r)));
+            keySettled.set(key, Boolean(state || hasFinalSubmission || hasFinalTaskReport));
           }
+          let candidatePositions = { ...positions };
           const batch = []; let size = 0;
           for (const event of events) {
             const length = JSON.stringify(event).length;
             if (batch.length && size + length > 20000) break;
             const index = keyIndexes.get(event.taskKey);
-            const position = { ...(positions[index] ?? initialPositions.get(index) ?? { count: 0, reportCount: 0, nativeCount: 0 }) };
-            if (event.type === 'delivered') position.delivered = true;
-            else if (['completed', 'failed', 'cancelled'].includes(event.type)) position.terminal = true;
-            else if (event.source === 'native') position.nativeCount = (position.nativeCount ?? 0) + 1;
-            else if (event.source === 'task-report') position.reportCount = (position.reportCount ?? 0) + 1;
-            else position.count++;
-            const nextPositions = { ...positions, [index]: position };
+            const position = { ...(candidatePositions[index] ?? initialPositions.get(index) ?? { count: 0, reportCount: 0, nativeCount: 0 }) };
+            if (event.advance !== false) {
+              if (event.type === 'delivered') position.delivered = true;
+              else if (['completed', 'failed', 'cancelled'].includes(event.type)) position.terminal = true;
+              else if (event.source === 'native') position.nativeCount = (position.nativeCount ?? 0) + 1;
+              else if (event.source === 'task-report') position.reportCount = (position.reportCount ?? 0) + 1;
+              else position.count++;
+            }
+            const nextPositions = { ...candidatePositions, [index]: position };
             if (cursor(nextPositions).length > 20000 && batch.length) break;
             if (cursor(nextPositions).length > 20000) throw Object.assign(new Error('Wait cursor exceeds its size limit; select fewer tasks.'), { code: 'wait-cursor-limit' });
-            positions = nextPositions;
+            candidatePositions = nextPositions;
             batch.push(event); size += length;
           }
           const timedOut = Date.now() >= deadline;
-          if (batch.length || timedOut || notListed.size || !selection.length) return { items, notListed: [...notListed], events: batch, nextCursor: cursor(), reason: batch.length ? 'event' : notListed.size ? 'not-listed' : timedOut ? 'timeout' : 'empty', timedOut: timedOut && !batch.length };
+          const hasBarrierBreaker = events.some(e => e.type === 'question' || e.type === 'failed' || e.type === 'cancelled');
+          const allTasksSettled = selection.length > 0 && selection.every(k => keySettled.get(k) === true);
+          const barrierSatisfied = barrier === 'all'
+            ? (hasBarrierBreaker || allTasksSettled)
+            : batch.length > 0;
+          if (barrierSatisfied || timedOut || notListed.size || !selection.length) {
+            positions = candidatePositions;
+            if (batch.length && isPullOwner(owner)) {
+              const returnedIds = new Set(batch.filter(e => e.advance !== false).map(e => e.id));
+              acknowledgePulledDeliveries(owner, pullDeliveries.filter(d => returnedIds.has(d.eventId)), batch);
+            }
+            return {
+              items,
+              notListed: [...notListed],
+              events: batch,
+              nextCursor: cursor(),
+              reason: batch.length && (barrierSatisfied || barrier === 'any') ? 'event' : notListed.size ? 'not-listed' : timedOut ? 'timeout' : 'empty',
+              timedOut: timedOut && !barrierSatisfied,
+            };
+          }
           const current = pending;
           if (Number.isFinite(deadline)) timer = setTimeout(notify, Math.max(0, deadline - Date.now()));
           await current;
           clearTimeout(timer); timer = undefined;
         }
       } finally { clearTimeout(timer); signal?.removeEventListener('abort', notify); unsubscribe(); }
+    },
+    /**
+     * Explicit retrieval of one report body by owner + taskKey + submission ID.
+     * It is intentionally not folded into wait: a caller that wants the text asks
+     * for a page, and only this path can return the exact original characters.
+     */
+    async readReport({ taskKey, submissionId, offset = 0, limit = REPORT_BODY_PAGE_CHARS } = {}, extra) {
+      if (typeof taskKey !== 'string' || !taskKey) throw Object.assign(new Error('A task key is required.'), { code: 'invalid-task-key' });
+      if (typeof submissionId !== 'string' || !submissionId) throw Object.assign(new Error('A submission ID is required.'), { code: 'invalid-submission-id' });
+      const owner = await context(extra);
+      const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+      let effectiveOwnerId = owner.ownerId;
+      let stored = store.storedReportBody(effectiveOwnerId, taskKey, submissionId);
+      if (stored.error === 'task-receipt-unavailable') {
+        const cross = store.resolveTaskKeyAnyOwner(taskKey);
+        const crossRec = cross ? store.get(cross.agentId) : undefined;
+        if (cross && crossRec && rootOwnerIdForRecord(crossRec) === rootOwnerId) {
+          effectiveOwnerId = cross.ownerId;
+          stored = store.storedReportBody(effectiveOwnerId, taskKey, submissionId);
+        }
+      }
+      if (stored.error) throw Object.assign(new Error(stored.error === 'task-receipt-expired' || stored.error === 'report-body-expired'
+        ? 'The task receipt or its report body has expired.' : stored.error === 'task-receipt-unavailable'
+          ? 'Task receipt is unavailable for this owner.' : 'The report body is unavailable for this owner and task.'), { code: stored.error });
+      if (isPullOwner(owner)) {
+        const mapping = store.resolveTaskKey(effectiveOwnerId, taskKey);
+        if (mapping) {
+          acknowledgePulledDeliveries(owner, [{ mapping, submissionId: bareReportId(submissionId), kind: 'report' }], []);
+        }
+      }
+      const page = reportBodyPage(stored.body, { offset, limit });
+      return { taskKey, submissionId, ...page, created: stored.created, expires: stored.expires };
     },
     poll(agentId) {
       if (inflight.has(agentId)) return inflight.get(agentId);
@@ -5364,7 +7158,8 @@ export function createScopedAgents(config, {
           if (owesFastPoll(candidate)) fastPoll.add(agentId); else fastPoll.delete(agentId);
         }
         const candidateNextAt = Math.max(candidate?.nextAttemptAt ?? 0, candidate?.noticeNextAt ?? 0);
-        if (!hinted && !urgentPoll.has(agentId) && !force && candidateNextAt > Date.now()) continue;
+        if (!hinted && !urgentPoll.has(agentId) && !force && !hasWaitingTreeFinal(candidate)
+            && candidateNextAt > Date.now()) continue;
         // Large retained histories must not turn resolved-promise polls into a
         // single uninterrupted CPU burst that starves the shared HTTP listener.
         await yieldToIO();
@@ -5377,7 +7172,8 @@ export function createScopedAgents(config, {
         const urgent = urgentPoll.delete(record.agentId);
         if (!hinted && !urgent && !force && nextPollAt.get(record.agentId) > Date.now()) continue;
         if (!hasSubmission && firstDispatchDeferred(record)) continue;
-        if (!hinted && !urgent && !force && Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now()) continue;
+        if (!hinted && !urgent && !force && !hasWaitingTreeFinal(record)
+            && Math.max(record.nextAttemptAt ?? 0, record.transportNextAttemptAt ?? 0) > Date.now()) continue;
         let becameFast = false;
         const work = service.poll(record.agentId)
           // The record this poll was scheduled from is already stale: the poll is what
@@ -5413,10 +7209,1099 @@ export function createScopedAgents(config, {
       await Promise.allSettled([...monitorInflight.values(), ...inflight.values()]);
       // A release that is still in the air is not a poll, but shutting down with it
       // running would close the roster under it: wait it out here instead.
-      await Promise.allSettled([...releaseInflight.values()]);
+      await Promise.allSettled([...releaseInflight.values(), ...settlementInflight.values()]);
       // A baseline write survives the poll that started it; a shutdown that only waited
       // for polls could close the database with half a snapshot still being written.
       while (baselineWrites.size) await Promise.allSettled([...baselineWrites.values()]);
+    },
+    async flushSettlements() {
+      const keepAlive = setInterval(() => {}, 5000);
+      try {
+        while (settlementInflight.size) await Promise.allSettled([...settlementInflight.values()]);
+        while (baselineWrites.size) await Promise.allSettled([...baselineWrites.values()]);
+      } finally {
+        clearInterval(keepAlive);
+      }
+    },
+    notifyWait() {
+      wakeWaiters();
+    },
+    async handleCliSubmission({ agentId } = {}) {
+      if (agentId && !draining && !waitsClosed) {
+        try {
+          await store.locked(agentId, async () => {
+            const record = store.get(agentId);
+            if (record && !record.closed && record.task) {
+              await drainSubmissions(record, { currentOnly: true });
+            }
+          }, { waitMs: 40 });
+        } catch {
+          // Even when the agent lock is held by a running poll, the submission row is
+          // already durable in SQLite and wait() reads submissionsInOrder directly.
+        }
+      }
+      wakeWaiters();
+      if (agentId) announceWork(agentId);
+    },
+    async postBoard({ message, mentions, author: explicitAuthor } = {}, extra) {
+      textMessage(message);
+      const owner = await context(extra);
+      const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+      const callerAgent = owner.callerAgentId ? store.get(owner.callerAgentId) : undefined;
+      const author = callerAgent
+        ? managedPath(callerAgent)
+        : (typeof explicitAuthor === 'string' && explicitAuthor.trim() ? explicitAuthor.trim() : 'Boss');
+      const authorRole = callerAgent ? (callerAgent.role ?? inferRoleFromName(callerAgent.name) ?? null) : 'Boss';
+      const parsedMentions = extractBoardMentions(message, mentions);
+      const routed = [];
+
+      const { all: teamMembers } = visibleRecords(rootOwnerId);
+      for (const mention of parsedMentions) {
+        if (!mention || mention === author || mention === 'Boss' || mention === 'all') continue;
+        const activeMatch = teamMembers.find(r => !r.closed && managedPath(r) === mention)
+          ?? teamMembers.find(r => !r.closed && r.name === mention && !INACTIVE_STATES.has(r.state))
+          ?? teamMembers.find(r => !r.closed && r.name === mention);
+        const boardPrompt = `[团队黑板点名 · 来自 ${author}]\n${message}\n\n请针对点名你的问题查证并通过 report_parent(message, final=true)（如需请示则用 ask_parent）简要回复。`;
+        if (activeMatch) {
+          try {
+            const targetExtra = targetCallerExtraForOwner(activeMatch.ownerId, activeMatch);
+            const sent = await service.send({ name: activeMatch.name, message: boardPrompt }, targetExtra);
+            routed.push({
+              mention,
+              name: activeMatch.name,
+              agentPath: managedPath(activeMatch),
+              action: 'woken',
+              ...(sent?.taskKey ? { taskKey: sent.taskKey } : {}),
+            });
+          } catch (error) {
+            routed.push({
+              mention,
+              name: activeMatch.name,
+              agentPath: managedPath(activeMatch),
+              action: 'failed',
+              error: safeError(error),
+            });
+          }
+          continue;
+        }
+        const stub = store.getAgentStub(rootOwnerId, mention);
+        if (stub) {
+          try {
+            const stubExtra = targetCallerExtraForOwner(stub.ownerId, stub);
+            store.deleteAgentStub(stub.agentId);
+            const created = await service.create({
+              name: stub.name,
+              ...(stub.role ? { role: stub.role } : {}),
+              lifetime: 'once',
+              target: stub.target,
+              ...(stub.model ? { model: stub.model } : {}),
+              _revivedSessionId: stub.resumeSessionId ?? undefined,
+            }, stubExtra);
+            if (created.created === true && !created.error) {
+              const sent = await service.send({ name: stub.name, message: boardPrompt }, stubExtra);
+              routed.push({
+                mention,
+                name: stub.name,
+                agentPath: stub.agentPath,
+                action: 'revived',
+                resumedSession: Boolean(stub.resumeSessionId),
+                ...(sent?.taskKey ? { taskKey: sent.taskKey } : {}),
+              });
+            } else {
+              routed.push({
+                mention,
+                name: stub.name,
+                agentPath: stub.agentPath,
+                action: 'failed',
+                ...(created.error ? { error: created.error } : {}),
+              });
+            }
+          } catch (error) {
+            routed.push({
+              mention,
+              name: stub.name,
+              agentPath: stub.agentPath,
+              action: 'failed',
+              error: safeError(error),
+            });
+          }
+          continue;
+        }
+        routed.push({ mention, action: 'not-found' });
+      }
+
+      const saved = store.postBoardMessage({
+        rootOwnerId,
+        author,
+        authorRole,
+        authorAgentId: callerAgent?.agentId ?? null,
+        text: message,
+        mentions: parsedMentions,
+        routed,
+      });
+      wakeWaiters();
+      return { posted: true, message: saved, mentions: parsedMentions, routed };
+    },
+    async readBoard({ limit = 50, afterSeq = 0 } = {}, extra) {
+      const owner = await context(extra);
+      const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+      const { messages, latestSeq } = store.listBoardMessages(rootOwnerId, { limit, afterSeq });
+      return { rootOwnerId, messages, latestSeq };
+    },
+    async manageTeam({
+      action,
+      target,
+      parent,
+      reparentTo,
+      reparent_to,
+      keepChildren,
+      keep_children,
+      killTree,
+      kill_tree,
+      message,
+    } = {}, extra) {
+      const normalizedAction = typeof action === 'string' ? action.trim().toLowerCase() : '';
+      if (!['strays', 'adopt', 'kick', 'merge', 'reparent', 'resume', 'sweep'].includes(normalizedAction)) {
+        throw Object.assign(
+          new Error('action must be one of "adopt", "kick", "merge", "reparent", "resume", "strays", or "sweep".'),
+          { code: 'invalid-team-action' },
+        );
+      }
+      const owner = await context(extra);
+      const rootOwnerId = resolveTeamRootOwnerId(owner, extra);
+      const callerWorkspace = owner.workspace ?? config.workspace;
+      const normCallerWs = callerWorkspace ? pathKey(callerWorkspace) : null;
+      const STRAY_IDLE_MS = 30 * 60 * 1000;
+
+      const effectiveParent = parent !== undefined ? parent : (reparentTo !== undefined ? reparentTo : reparent_to);
+      const effectiveKeepChildren = (killTree === true || kill_tree === true)
+        ? false
+        : (keepChildren !== undefined
+          ? keepChildren !== false
+          : (keep_children !== undefined ? keep_children !== false : true));
+
+      const relocateMovedDirs = async movedList => {
+        const scopedRoot = path.resolve(config.stateDirectory, 'scoped');
+        for (const item of movedList ?? []) {
+          if (!item?.oldOwnerId || !item?.newOwnerId || item.oldOwnerId === item.newOwnerId) continue;
+          forgetBackend({ agentId: item.agentId });
+          const srcDir = path.join(scopedRoot, item.oldOwnerId, item.agentId);
+          const dstDir = path.join(scopedRoot, item.newOwnerId, item.agentId);
+          const hasSrc = await lstat(srcDir).then(s => s.isDirectory()).catch(() => false);
+          if (!hasSrc) continue;
+          await mkdir(path.dirname(dstDir), { recursive: true });
+          try {
+            await rename(srcDir, dstDir);
+          } catch {
+            await cp(srcDir, dstDir, { recursive: true, force: true }).catch(() => {});
+            await removeTree(srcDir, { recursive: true, force: true }).catch(() => {});
+          }
+        }
+      };
+
+      const scanStrays = (nowMs = Date.now()) => {
+        const allOpen = store.list().filter(r => r && !r.cleanupRosterTicket && !r.closed);
+        const byTeamRoot = new Map();
+        for (const rec of allOpen) {
+          const tRoot = rootOwnerIdForRecord(rec);
+          let arr = byTeamRoot.get(tRoot);
+          if (!arr) { arr = []; byTeamRoot.set(tRoot, arr); }
+          arr.push(rec);
+        }
+        const lostErrorCodes = new Set([
+          'calling-context-unavailable',
+          'codex-thread-not-found',
+          'claude-session-not-found',
+          'agy-conversation-not-found',
+          'host-ownership-mismatch',
+        ]);
+        const strays = [];
+        for (const rec of allOpen) {
+          const recRoot = rootOwnerIdForRecord(rec);
+          const parentRec = rec.parentAgentId ? store.get(rec.parentAgentId) : undefined;
+          const brokenParent = Boolean(
+            rec.parentAgentId
+            && (!parentRec || parentRec.closed || ['cleaning', 'cleanup_failed'].includes(parentRec.state)),
+          );
+          let staleForeignSession = false;
+          if (!brokenParent && recRoot !== rootOwnerId) {
+            const peers = byTeamRoot.get(recRoot) ?? [rec];
+            const anyRunning = peers.some(p => p.state === 'running' || p.state === 'creating');
+            if (!anyRunning) {
+              const ownerDoc = store.owner(recRoot);
+              const latestStamp = Math.max(
+                ...peers.map(p => Date.parse(p.updatedAt ?? p.createdAt ?? '') || 0),
+                Date.parse(ownerDoc?.createdAt ?? '') || 0,
+              );
+              const hasLostError = peers.some(p => lostErrorCodes.has(p.error?.code));
+              if (!ownerDoc || hasLostError || (latestStamp > 0 && nowMs - latestStamp >= STRAY_IDLE_MS)) {
+                staleForeignSession = true;
+              }
+            }
+          }
+          if (brokenParent || staleForeignSession) {
+            strays.push({
+              agentId: rec.agentId,
+              name: rec.name,
+              role: rec.role ?? inferRoleFromName(rec.name) ?? null,
+              agentPath: managedPath(rec),
+              ownerId: rec.ownerId,
+              rootOwnerId: recRoot,
+              parentAgentId: rec.parentAgentId ?? null,
+              target: targetOf(rec),
+              lifetime: rec.lifetime,
+              state: rec.state,
+              workspace: rec.rootWorkspace ?? rec.workspace ?? null,
+              strayReason: brokenParent ? 'broken-parent' : 'stale-session',
+              updatedAt: rec.updatedAt ?? rec.createdAt ?? null,
+            });
+          }
+        }
+        return strays;
+      };
+
+      const forcePurgeSingleRecord = async rec => {
+        if (!rec) return;
+        const fresh = store.get(rec.agentId) ?? rec;
+        try {
+          if (!readOnlyTarget(fresh) && !fresh.nativeDestroyed) {
+            const backend = await backendFor(fresh);
+            if (typeof backend.destroy === 'function') await backend.destroy().catch(() => {});
+            else if (typeof backend.cancel === 'function') await backend.cancel().catch(() => {});
+          }
+        } catch {}
+        const dir = agentDirectory(fresh);
+        await killProcessCage({ pids: [], turnDir: dir, sessionId: fresh.sessionId }).catch(() => {});
+        if (fresh.workspaceMode === 'worktree' && fresh.worktreePath) {
+          const wtPath = path.resolve(fresh.worktreePath);
+          const repoRoot = path.resolve(fresh.rootWorkspace ?? config.workspace);
+          const worktreesRoot = path.join(repoRoot, '.work', 'worktrees');
+          const wtRel = path.relative(worktreesRoot, wtPath);
+          if (wtRel && !wtRel.startsWith('..') && !path.isAbsolute(wtRel)) {
+            const canonicalWt = wtPath.replaceAll('\\', '/').toLowerCase();
+            const sharedWithSurvivor = store.list().some(other =>
+              other.agentId !== fresh.agentId
+              && !other.closed
+              && JSON.stringify(other).replaceAll('\\', '/').toLowerCase().includes(canonicalWt));
+            if (!sharedWithSurvivor) {
+              await withWorktreeLock(repoRoot, async () => {
+                await execFileAsync('git', ['-C', repoRoot, 'worktree', 'remove', '--force', wtPath], { windowsHide: true }).catch(() => {});
+                await removeTree(wtPath, { recursive: true, force: true }).catch(() => {});
+                await execFileAsync('git', ['-C', repoRoot, 'worktree', 'prune'], { windowsHide: true }).catch(() => {});
+              });
+            }
+          }
+        }
+        const scopedRoot = path.resolve(config.stateDirectory, 'scoped');
+        const rel = path.relative(scopedRoot, path.resolve(dir));
+        if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+          await removeTree(dir, { recursive: true, force: true }).catch(() => {});
+        }
+        store.deleteAgentStub?.(fresh.agentId);
+        try {
+          store.remove(fresh, { deliveredReceipt: false });
+        } catch {
+          store.db.prepare('DELETE FROM agents WHERE id=?').run(fresh.agentId);
+          store.touched(fresh.agentId);
+        }
+        forgetBackend(fresh);
+      };
+
+      const resolveOptionalParentRecord = parentSpec => {
+        if (parentSpec === undefined || parentSpec === null || parentSpec === '' || parentSpec === 'root' || parentSpec === 'Boss') {
+          return null;
+        }
+        return named(owner, String(parentSpec), extra);
+      };
+
+      if (normalizedAction === 'strays') {
+        const strays = scanStrays();
+        return { action: 'strays', ok: true, strays, total: strays.length };
+      }
+
+      if (normalizedAction === 'sweep') {
+        const strays = scanStrays().filter(item => item.state !== 'running' && item.state !== 'creating');
+        const strayIds = new Set(strays.map(s => s.agentId));
+        const depthOf = id => {
+          let depth = 0;
+          let cur = store.get(id);
+          const seen = new Set();
+          while (cur?.parentAgentId && !seen.has(cur.agentId)) {
+            seen.add(cur.agentId);
+            depth += 1;
+            cur = store.get(cur.parentAgentId);
+          }
+          return depth;
+        };
+        const orderedIds = [...strayIds].sort((a, b) => depthOf(b) - depthOf(a));
+        const sweptNames = [];
+        for (const id of orderedIds) {
+          const rec = store.get(id);
+          if (!rec || rec.state === 'running' || rec.state === 'creating') continue;
+          if (store.childrenOf(id).some(c => !strayIds.has(c.agentId))) {
+            for (const c of store.childrenOf(id)) {
+              if (!strayIds.has(c.agentId)) store.reparentAgent(c.agentId, rec.parentAgentId ?? null);
+            }
+          }
+          sweptNames.push(rec.name);
+          await forcePurgeSingleRecord(rec);
+        }
+        store.pruneExpiredTaskKeys();
+        wakeWaiters();
+        return { action: 'sweep', ok: true, sweptCount: sweptNames.length, sweptNames };
+      }
+
+      if (normalizedAction === 'adopt') {
+        const trimmedTarget = typeof target === 'string' ? target.trim() : '';
+        const resolvedParent = resolveOptionalParentRecord(effectiveParent);
+        if (!trimmedTarget || trimmedTarget === 'auto' || trimmedTarget === 'project') {
+          const allOpen = store.list().filter(r => r && !r.cleanupRosterTicket && !r.closed);
+          const byRoot = new Map();
+          for (const rec of allOpen) {
+            const tRoot = rootOwnerIdForRecord(rec);
+            if (tRoot === rootOwnerId) continue;
+            let arr = byRoot.get(tRoot);
+            if (!arr) { arr = []; byRoot.set(tRoot, arr); }
+            arr.push(rec);
+          }
+          const oldOwnersToAdopt = new Set();
+          const agentIdsToAdopt = [];
+          const allAdoptedTeamMembers = [];
+          const topRootAgents = [];
+          for (const [foreignRoot, members] of byRoot.entries()) {
+            const anyActivelyRunning = members.some(m => m.state === 'running' || m.state === 'creating');
+            if (anyActivelyRunning) continue;
+            const ownerDoc = store.owner(foreignRoot);
+            const wsCandidate = ownerDoc?.workspace ?? members[0]?.rootWorkspace ?? members[0]?.workspace;
+            if (normCallerWs && wsCandidate && pathKey(wsCandidate) !== normCallerWs) continue;
+            oldOwnersToAdopt.add(foreignRoot);
+            for (const m of members) {
+              allAdoptedTeamMembers.push(m);
+              const isRootMember = !m.parentAgentId || !members.some(p => p.agentId === m.parentAgentId);
+              if (isRootMember) {
+                topRootAgents.push(m.agentId);
+              }
+              if (isRootMember || m.ownerId === foreignRoot) {
+                oldOwnersToAdopt.add(m.ownerId);
+                agentIdsToAdopt.push(m.agentId);
+              }
+            }
+          }
+          for (const ownerDoc of store.listOwners()) {
+            if (!ownerDoc?.ownerId || ownerDoc.ownerId === rootOwnerId) continue;
+            if (normCallerWs && ownerDoc.workspace && pathKey(ownerDoc.workspace) !== normCallerWs) continue;
+            const liveInOwner = allOpen.filter(r => rootOwnerIdForRecord(r) === ownerDoc.ownerId);
+            if (liveInOwner.some(m => m.state === 'running' || m.state === 'creating')) continue;
+            oldOwnersToAdopt.add(ownerDoc.ownerId);
+          }
+          if (resolvedParent) {
+            for (const topId of topRootAgents) store.reparentAgent(topId, resolvedParent.agentId);
+          }
+          const { moved } = store.transferAgentsToOwner(agentIdsToAdopt, rootOwnerId);
+          await relocateMovedDirs(moved);
+          const assets = store.transferOwnerTeamAssets([...oldOwnersToAdopt], rootOwnerId);
+          const movedById = new Map(moved.map(item => [item.agentId, item.name]));
+          const adoptedNames = allAdoptedTeamMembers.map(m => movedById.get(m.agentId) ?? m.name);
+          wakeWaiters();
+          return {
+            action: 'adopt',
+            mode: 'project',
+            ok: true,
+            ownerId: rootOwnerId,
+            adoptedCount: adoptedNames.length,
+            adoptedNames,
+            transferredOwners: [...oldOwnersToAdopt],
+            boardMessagesTransferred: assets.boardMoved,
+            stubsTransferred: assets.stubsMoved,
+          };
+        }
+
+        // Adopt by explicit old ownerId
+        if (trimmedTarget.startsWith('owner-') && trimmedTarget !== rootOwnerId) {
+          const foreignMembers = store.list().filter(r => !r.closed && (r.ownerId === trimmedTarget || rootOwnerIdForRecord(r) === trimmedTarget));
+          if (foreignMembers.length > 0 || store.owner(trimmedTarget)) {
+            if (resolvedParent) {
+              for (const m of foreignMembers) {
+                if (!m.parentAgentId || !foreignMembers.some(p => p.agentId === m.parentAgentId)) {
+                  store.reparentAgent(m.agentId, resolvedParent.agentId);
+                }
+              }
+            }
+            const { moved } = store.transferAgentsToOwner(foreignMembers.map(m => m.agentId), rootOwnerId);
+            await relocateMovedDirs(moved);
+            const assets = store.transferOwnerTeamAssets([trimmedTarget], rootOwnerId);
+            wakeWaiters();
+            return {
+              action: 'adopt',
+              mode: 'owner',
+              ok: true,
+              ownerId: rootOwnerId,
+              adoptedCount: moved.length,
+              adoptedNames: moved.map(m => m.name),
+              boardMessagesTransferred: assets.boardMoved,
+              stubsTransferred: assets.stubsMoved,
+            };
+          }
+        }
+
+        // Adopt a specific live stray/foreign agent by agentId, path, or name
+        const allOpen = store.list().filter(r => r && !r.cleanupRosterTicket && !r.closed);
+        const candidateRecord = allOpen.find(r => r.agentId === trimmedTarget)
+          ?? allOpen.find(r => rootOwnerIdForRecord(r) !== rootOwnerId && (managedPath(r) === trimmedTarget || r.name === trimmedTarget))
+          ?? allOpen.find(r => (managedPath(r) === trimmedTarget || r.name === trimmedTarget) && Boolean(r.parentAgentId && !store.get(r.parentAgentId)));
+        if (candidateRecord) {
+          const subtree = [candidateRecord, ...store.descendantsOf([candidateRecord.agentId])];
+          const oldOwnerSet = new Set(subtree.map(r => r.ownerId));
+          store.reparentAgent(candidateRecord.agentId, resolvedParent ? resolvedParent.agentId : null);
+          const { moved } = store.transferAgentsToOwner(subtree.map(r => r.agentId), rootOwnerId);
+          await relocateMovedDirs(moved);
+          for (const oldOw of oldOwnerSet) {
+            if (oldOw !== rootOwnerId && store.list(oldOw).length === 0) {
+              store.transferOwnerTeamAssets([oldOw], rootOwnerId);
+            }
+          }
+          const adoptedRootName = moved.find(m => m.agentId === candidateRecord.agentId)?.name ?? candidateRecord.name;
+          let sent;
+          if (typeof message === 'string' && message.trim()) {
+            sent = await service.send({ name: managedPath(store.get(candidateRecord.agentId)), message: message.trim() }, extra);
+          }
+          wakeWaiters();
+          return {
+            action: 'adopt',
+            mode: 'agent',
+            ok: true,
+            name: adoptedRootName,
+            agentId: candidateRecord.agentId,
+            parentAgentId: resolvedParent?.agentId ?? null,
+            adoptedCount: moved.length,
+            adoptedNames: moved.map(m => m.name),
+            ...(sent?.taskKey ? { taskKey: sent.taskKey, wakeCmd: buildWakeCmd(owner, sent.taskKey) } : {}),
+          };
+        }
+
+        // Revive a finished veteran stub from team_agent_stubs
+        const stub = store.findAgentStubGlobal(trimmedTarget, rootOwnerId);
+        if (stub) {
+          store.deleteAgentStub(stub.agentId);
+          const createExtra = resolvedParent
+            ? {
+              [Symbol.for('futureaide.trustedCaller')]: {
+                source: 'managed-cli',
+                parentAgentId: resolvedParent.agentId,
+                ownerId: rootOwnerId,
+                workspace: callerWorkspace,
+              },
+            }
+            : extra;
+          const created = await service.create({
+            name: stub.name,
+            ...(stub.role ? { role: stub.role } : {}),
+            lifetime: 'persistent',
+            target: stub.target,
+            ...(stub.model ? { model: stub.model } : {}),
+            _revivedSessionId: stub.resumeSessionId ?? undefined,
+          }, createExtra);
+          let sent;
+          if (created.created === true && !created.error && typeof message === 'string' && message.trim()) {
+            sent = await service.send({ name: resolvedParent ? `${managedPath(resolvedParent)}/${created.name}` : created.name, message: message.trim() }, extra);
+          }
+          wakeWaiters();
+          return {
+            action: 'adopt',
+            mode: 'revived-stub',
+            ok: created.created === true && !created.error,
+            name: created.name,
+            revived: true,
+            resumedSession: Boolean(stub.resumeSessionId),
+            parentAgentId: resolvedParent?.agentId ?? null,
+            ...(sent?.taskKey ? { taskKey: sent.taskKey, wakeCmd: buildWakeCmd(owner, sent.taskKey) } : {}),
+            ...(created.error ? { error: created.error } : {}),
+          };
+        }
+
+        throw Object.assign(
+          new Error(`No adoptable team, stray subagent, or stub matched “${trimmedTarget}”.`),
+          { code: 'agent-not-found' },
+        );
+      }
+
+      if (normalizedAction === 'reparent') {
+        if (typeof target !== 'string' || !target.trim()) {
+          throw Object.assign(new Error('reparent requires target.'), { code: 'invalid-arguments' });
+        }
+        const record = named(owner, target.trim(), extra);
+        const resolvedParent = resolveOptionalParentRecord(effectiveParent);
+        const updated = store.reparentAgent(record.agentId, resolvedParent ? resolvedParent.agentId : null);
+        if (updated.ownerId !== rootOwnerId) {
+          const { moved } = store.transferAgentsToOwner([updated.agentId], rootOwnerId);
+          await relocateMovedDirs(moved);
+        }
+        const refreshed = store.get(record.agentId);
+        wakeWaiters();
+        return {
+          action: 'reparent',
+          ok: true,
+          name: refreshed.name,
+          agentId: refreshed.agentId,
+          parentAgentId: refreshed.parentAgentId ?? null,
+          parentName: refreshed.parentAgentId ? (store.get(refreshed.parentAgentId)?.name ?? null) : null,
+          agentPath: managedPath(refreshed),
+        };
+      }
+
+      if (normalizedAction === 'kick') {
+        if (typeof target !== 'string' || !target.trim()) {
+          throw Object.assign(new Error('kick requires target.'), { code: 'invalid-arguments' });
+        }
+        const trimmedTarget = target.trim();
+        let record;
+        try {
+          record = named(owner, trimmedTarget, extra);
+        } catch (err) {
+          if (err?.code !== 'agent-not-found') throw err;
+          record = store.list().find(r => r && (r.agentId === trimmedTarget || managedPath(r) === trimmedTarget || r.name === trimmedTarget));
+          if (!record) throw err;
+        }
+
+        if (effectiveKeepChildren) {
+          const explicitNewParent = effectiveParent !== undefined ? resolveOptionalParentRecord(effectiveParent) : undefined;
+          const promotedParentId = explicitNewParent !== undefined
+            ? (explicitNewParent ? explicitNewParent.agentId : null)
+            : (record.parentAgentId ?? null);
+          if (promotedParentId) {
+            const descendantsSet = new Set(store.descendantsOf([record.agentId]).map(d => d.agentId));
+            if (promotedParentId === record.agentId || descendantsSet.has(promotedParentId)) {
+              throw Object.assign(new Error('Cannot reparent surviving children under the kicked subagent or its own subtree.'), { code: 'reparent-cycle' });
+            }
+          }
+          const directChildren = store.childrenOf(record.agentId);
+          const survivingSubtree = [...directChildren, ...store.descendantsOf(directChildren.map(c => c.agentId))];
+          for (const child of directChildren) {
+            store.reparentAgent(child.agentId, promotedParentId);
+          }
+          if (survivingSubtree.length > 0) {
+            const { moved } = store.transferAgentsToOwner(survivingSubtree.map(s => s.agentId), rootOwnerId);
+            await relocateMovedDirs(moved);
+          }
+          const promotedChildren = directChildren.map(c => store.get(c.agentId)?.name ?? c.name);
+          await forcePurgeSingleRecord(record);
+          wakeWaiters();
+          return {
+            action: 'kick',
+            ok: true,
+            name: record.name,
+            agentId: record.agentId,
+            keepChildren: true,
+            newParentAgentId: promotedParentId,
+            promotedChildren,
+            removedNames: [record.name],
+          };
+        }
+
+        const descendants = store.descendantsOf([record.agentId]);
+        const removedNames = [...descendants.map(d => d.name), record.name];
+        for (const child of [...descendants].reverse()) {
+          await forcePurgeSingleRecord(child);
+        }
+        await forcePurgeSingleRecord(record);
+        wakeWaiters();
+        return {
+          action: 'kick',
+          ok: true,
+          name: record.name,
+          agentId: record.agentId,
+          keepChildren: false,
+          promotedChildren: [],
+          removedNames,
+        };
+      }
+
+      if (normalizedAction === 'merge') {
+        if (typeof target !== 'string' || !target.trim()) {
+          throw Object.assign(new Error('merge requires target.'), { code: 'invalid-arguments' });
+        }
+        const trimmedTarget = target.trim();
+        let record;
+        try {
+          record = named(owner, trimmedTarget, extra);
+        } catch (err) {
+          if (err?.code !== 'agent-not-found') throw err;
+          record = store.list().find(r => r && !r.closed && (r.agentId === trimmedTarget || managedPath(r) === trimmedTarget || r.name === trimmedTarget));
+          if (!record) throw err;
+        }
+        if (record.state === 'running' || record.state === 'creating') {
+          throw Object.assign(
+            new Error(`Subagent “${record.name}” is still ${record.state}; wait for it to finish or cancel it before merging its worktree.`),
+            { code: 'agent-running' },
+          );
+        }
+        if (!record.worktreePath) {
+          throw Object.assign(
+            new Error(`Subagent “${record.name}” has no isolated worktree to merge.`),
+            { code: 'worktree-not-found' },
+          );
+        }
+        const wtPath = path.resolve(record.worktreePath);
+        const repoRoot = path.resolve(record.rootWorkspace ?? callerWorkspace ?? config.workspace);
+        const wtExists = await lstat(wtPath).then(s => s.isDirectory()).catch(() => false);
+        if (!wtExists) {
+          throw Object.assign(
+            new Error(`Worktree directory no longer exists: ${wtPath}`),
+            { code: 'worktree-not-found' },
+          );
+        }
+
+        const parseNullPaths = raw => String(raw ?? '')
+          .split('\0')
+          .map(entry => entry.replaceAll('\\', '/').trim())
+          .filter(entry => entry && entry !== '.work' && !entry.startsWith('.work/'));
+
+        const mergeOutcome = await withWorktreeLock(repoRoot, async () => {
+          const { stdout: repoHeadOut } = await execFileAsync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true });
+          const { stdout: wtHeadOut } = await execFileAsync('git', ['-C', wtPath, 'rev-parse', 'HEAD'], { encoding: 'utf8', windowsHide: true });
+          const repoHead = repoHeadOut.trim();
+          const wtHead = wtHeadOut.trim();
+
+          let baseCommit = record.worktreeBaseHead;
+          if (baseCommit) {
+            const validBase = await execFileAsync('git', ['-C', wtPath, 'cat-file', '-e', `${baseCommit}^{commit}`], { windowsHide: true })
+              .then(() => true)
+              .catch(() => false);
+            if (!validBase) baseCommit = undefined;
+          }
+          if (!baseCommit) {
+            const { stdout: mbOut } = await execFileAsync('git', ['-C', wtPath, 'merge-base', repoHead, wtHead], { encoding: 'utf8', windowsHide: true })
+              .catch(() => ({ stdout: wtHead }));
+            baseCommit = mbOut.trim() || wtHead;
+          }
+
+          const [wtCommitted, wtStaged, wtUnstaged, wtUntracked] = await Promise.all([
+            execFileAsync('git', ['-C', wtPath, 'diff', '--name-only', '--no-renames', '-z', baseCommit, 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
+            execFileAsync('git', ['-C', wtPath, 'diff', '--cached', '--name-only', '--no-renames', '-z', 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
+            execFileAsync('git', ['-C', wtPath, 'diff', '--name-only', '--no-renames', '-z', 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
+            execFileAsync('git', ['-C', wtPath, 'ls-files', '--others', '--exclude-standard', '-z'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
+          ]);
+          const mergedFiles = [...new Set([...wtCommitted, ...wtStaged, ...wtUnstaged, ...wtUntracked])].sort();
+
+          if (mergedFiles.length > 0) {
+            const [mainStaged, mainUnstaged, mainUntracked] = await Promise.all([
+              execFileAsync('git', ['-C', repoRoot, 'diff', '--cached', '--name-only', '--no-renames', '-z', 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
+              execFileAsync('git', ['-C', repoRoot, 'diff', '--name-only', '--no-renames', '-z', 'HEAD'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
+              execFileAsync('git', ['-C', repoRoot, 'ls-files', '--others', '--exclude-standard', '-z'], { encoding: 'utf8', windowsHide: true }).then(r => parseNullPaths(r.stdout)),
+            ]);
+            const mainDirtySet = new Set([...mainStaged, ...mainUnstaged, ...mainUntracked]);
+            const conflictingFiles = mergedFiles.filter(f => mainDirtySet.has(f));
+            if (conflictingFiles.length > 0) {
+              throw Object.assign(
+                new Error(`Cannot merge worktree for “${record.name}”: main workspace has uncommitted changes on ${conflictingFiles.join(', ')}.`),
+                { code: 'worktree-merge-conflict', conflictingFiles },
+              );
+            }
+
+            await execFileAsync('git', ['-C', wtPath, 'add', '-A'], { windowsHide: true });
+            const { stdout: patchBuffer } = await execFileAsync(
+              'git',
+              ['-C', wtPath, 'diff', '--cached', '--binary', '--full-index', '--no-ext-diff', '--no-renames', baseCommit, '--', '.', ':(exclude).work'],
+              { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+            );
+
+            if (patchBuffer && patchBuffer.length > 0) {
+              const patchDir = agentDirectory(record);
+              await mkdir(patchDir, { recursive: true });
+              const patchFile = path.join(patchDir, `worktree-merge-${Date.now()}-${process.pid}.patch`);
+              await writeFile(patchFile, patchBuffer);
+              try {
+                const directOk = await execFileAsync('git', ['-C', repoRoot, 'apply', '--check', '--whitespace=nowarn', patchFile], { windowsHide: true })
+                  .then(() => true)
+                  .catch(() => false);
+                if (directOk) {
+                  await execFileAsync('git', ['-C', repoRoot, 'apply', '--whitespace=nowarn', patchFile], { windowsHide: true });
+                } else {
+                  const threeWayOk = await execFileAsync('git', ['-C', repoRoot, 'apply', '--check', '--3way', '--whitespace=nowarn', patchFile], { windowsHide: true })
+                    .then(() => true)
+                    .catch(() => false);
+                  if (!threeWayOk) {
+                    await execFileAsync('git', ['-C', wtPath, 'reset', '--mixed', wtHead], { windowsHide: true }).catch(() => {});
+                    throw Object.assign(
+                      new Error(`Cannot merge worktree for “${record.name}”: changes conflict with main workspace history.`),
+                      { code: 'worktree-merge-conflict', conflictingFiles: mergedFiles },
+                    );
+                  }
+                  await execFileAsync('git', ['-C', repoRoot, 'apply', '--3way', '--whitespace=nowarn', patchFile], { windowsHide: true });
+                }
+              } finally {
+                await rm(patchFile, { force: true }).catch(() => {});
+              }
+            }
+          }
+
+          const worktreesRoot = path.join(repoRoot, '.work', 'worktrees');
+          const wtRel = path.relative(worktreesRoot, wtPath);
+          let worktreeRemoved = false;
+          if (wtRel && !wtRel.startsWith('..') && !path.isAbsolute(wtRel)) {
+            const runtimeRoot = path.dirname(path.resolve(config.stateDirectory));
+            const anyInUse = await activeTaskUse(runtimeRoot, wtPath, []).catch(() => false);
+            const canonicalWt = wtPath.replaceAll('\\', '/').toLowerCase();
+            const sharedWithOther = anyInUse && store.list().some(other =>
+              other.agentId !== record.agentId
+              && !other.closed
+              && JSON.stringify(other).replaceAll('\\', '/').toLowerCase().includes(canonicalWt));
+            if (!sharedWithOther) {
+              await execFileAsync('git', ['-C', repoRoot, 'worktree', 'remove', '--force', wtPath], { windowsHide: true }).catch(() => {});
+              await removeTree(wtPath, { recursive: true, force: true }).catch(() => {});
+              await execFileAsync('git', ['-C', repoRoot, 'worktree', 'prune'], { windowsHide: true }).catch(() => {});
+              worktreeRemoved = !(await lstat(wtPath).then(() => true).catch(() => false));
+            }
+          }
+          return { mergedFiles, worktreeRemoved };
+        });
+
+        const fresh = store.get(record.agentId) ?? record;
+        const updated = {
+          ...fresh,
+          workspace: repoRoot,
+          workspaceMode: 'inherit',
+          updatedAt: now(),
+        };
+        delete updated.worktreePath;
+        delete updated.worktreeBaseHead;
+        store.db.prepare('UPDATE agents SET body=? WHERE id=?').run(JSON.stringify(updated), updated.agentId);
+        store.touched(updated.agentId);
+        forgetBackend(updated);
+        wakeWaiters();
+
+        const summary = mergeOutcome.mergedFiles.length
+          ? `Merged ${mergeOutcome.mergedFiles.length} file(s) from ${fresh.name} into main workspace and removed worktree.`
+          : `No file changes in ${fresh.name}'s worktree; removed temporary worktree.`;
+        return {
+          action: 'merge',
+          ok: true,
+          name: fresh.name,
+          mergedFiles: mergeOutcome.mergedFiles,
+          worktreeRemoved: mergeOutcome.worktreeRemoved,
+          summary,
+        };
+      }
+
+      // action === 'resume'
+      if (typeof target !== 'string' || !target.trim()) {
+        throw Object.assign(new Error('resume requires target.'), { code: 'invalid-arguments' });
+      }
+      const trimmedTarget = target.trim();
+      let record;
+      try {
+        record = named(owner, trimmedTarget, extra);
+      } catch (err) {
+        if (err?.code === 'agent-not-found') {
+          const stub = store.findAgentStubGlobal(trimmedTarget, rootOwnerId);
+          if (stub) {
+            const adopted = await service.manageTeam({
+              action: 'adopt',
+              target: trimmedTarget,
+              ...(effectiveParent !== undefined ? { parent: effectiveParent } : {}),
+            }, extra);
+            record = named(owner, adopted.name, extra);
+          } else {
+            throw err;
+          }
+        } else {
+          throw err;
+        }
+      }
+      requireWritableTarget(record);
+      const continuationMessage = typeof message === 'string' && message.trim()
+        ? message.trim()
+        : '请从中断处继续完成原定任务并调用 report_parent 汇报。';
+
+      const buildHandoffPrompt = async rec => {
+        const archived = store.historyFor(rec.agentId);
+        const latestTask = rec.task ?? archived.at(-1);
+        const originalTaskText = latestTask?.message ? compactText(latestTask.message, 1500) : '（未找到原任务描述）';
+        let changedList = attributedChanges(rec, rec.observation ?? {});
+        if (!changedList.length) {
+          const liveDiff = await workspaceDiff(rec).catch(() => null);
+          if (liveDiff?.changes?.length) changedList = liveDiff.changes;
+        }
+        const filesSummary = changedList.length
+          ? changedList.slice(0, 20).map(f => `- ${f.operation ?? 'modified'}: ${f.path}`).join('\n')
+          : '（未检测到已改文件）';
+
+        const timeline = [];
+        if (latestTask?.taskId) {
+          for (const sub of store.submissionsInOrder(rec.agentId, latestTask.taskId, 0)) {
+            timeline.push({
+              at: sub.created ?? '',
+              line: `- [${sub.kind === 'ask' ? '提问' : (sub.final ? '终报' : '进展')}] ${compactText(sub.message, 300)}`,
+            });
+          }
+        }
+        for (const rep of latestTask?.reports ?? []) {
+          if (!rep.failure && rep.message && !String(rep.id ?? '').startsWith('submission:')) {
+            timeline.push({
+              at: rep.createdAt ?? '',
+              line: `- [${rep.final ? '终报' : '进展'}] ${compactText(rep.message, 300)}`,
+            });
+          }
+        }
+        for (const ans of latestTask?.answers ?? []) {
+          if (ans.message) {
+            timeline.push({
+              at: ans.created ?? '',
+              line: `- [上级答复] ${compactText(ans.message, 300)}`,
+            });
+          }
+        }
+        timeline.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+        const recentThree = timeline.slice(-3).map(t => t.line);
+        const progressSummary = recentThree.length ? recentThree.join('\n') : '（暂无历史汇报或问答）';
+
+        return [
+          '[跨账号无缝交接续跑]',
+          '1. 原定任务：',
+          originalTaskText,
+          '',
+          '2. 工作区已改文件摘要：',
+          filesSummary,
+          '',
+          '3. 最近进展与问答（最近 3 条）：',
+          progressSummary,
+          '',
+          '4. 本轮续跑要求：',
+          continuationMessage,
+        ].join('\n');
+      };
+
+      const resetStoppedRecordForNextTurn = rec => {
+        const fresh = store.get(rec.agentId) ?? rec;
+        if (fresh.task) {
+          const snap = {
+            ...fresh.task,
+            ...(publicResult(fresh).error ? { error: publicResult(fresh).error } : {}),
+            changes: attributedChanges(fresh, fresh.observation ?? {}),
+            coverage: treeCoverage(fresh, fresh.observation ?? {}),
+            tree: publicTree(fresh, fresh.observation ?? {}),
+          };
+          store.appendHistory(fresh.agentId, snap);
+          if (fresh.task.taskId) {
+            store.blockQueued(fresh.agentId, fresh.task.taskId, 'resumed-in-new-round');
+            for (const sub of store.submissionWork(fresh.agentId, fresh.task.taskId)) {
+              store.saveSubmissionDelivery(sub.id, { state: 'delivered', deliveredAt: now() }, { expected: sub.deliveryVersion });
+            }
+          }
+        }
+        const archivedUsage = sumTwoUsages(fresh.historicalUsage, fresh.task?.usage);
+        const cleaned = {
+          ...fresh,
+          state: 'idle',
+          closed: false,
+          error: undefined,
+          sleep: undefined,
+          nextAttemptAt: undefined,
+          retryAttempts: 0,
+          task: undefined,
+          ...(archivedUsage ? { historicalUsage: archivedUsage, usage: archivedUsage } : {}),
+          updatedAt: now(),
+        };
+        delete cleaned.autoCleanupClosed;
+        store.db.prepare('UPDATE agents SET body=? WHERE id=?').run(JSON.stringify(cleaned), cleaned.agentId);
+        store.touched(cleaned.agentId);
+        return store.get(cleaned.agentId);
+      };
+
+      const mismatchCodes = new Set([
+        'host-ownership-mismatch',
+        'codex-thread-not-found',
+        'claude-session-not-found',
+        'agy-conversation-not-found',
+        'session-not-found',
+        'thread-not-found',
+        'account-switched',
+      ]);
+
+      // Stop stuck active process if currently running before resuming
+      if (record.state === 'running' || record.state === 'creating') {
+        try {
+          const b = await backendFor(record);
+          await b.cancel?.();
+        } catch {}
+        record = store.get(record.agentId) ?? record;
+      }
+
+      let needsHandoff = mismatchCodes.has(record.error?.code) || mismatchCodes.has(record.task?.treeUnavailable);
+      const targetBackend = targetOf(record);
+      let currentRoute = null;
+      if (isHeadlessCli(targetBackend)) {
+        currentRoute = await resolveManagedCliRoute(targetBackend, cliConfigForRecord(record)).catch(() => null);
+        const nativeState = store.backendState(record.agentId);
+        const priorProfile = record.profileId ?? record.host?.profileId ?? nativeState?.profileId ?? null;
+        if (priorProfile && currentRoute?.profileId && priorProfile !== currentRoute.profileId) {
+          needsHandoff = true;
+        }
+        if (!needsHandoff && targetBackend === 'codex-cli' && nativeState?.codexHome && currentRoute?.codexHome
+            && pathKey(nativeState.codexHome) !== pathKey(currentRoute.codexHome)) {
+          needsHandoff = true;
+        }
+      }
+      if (!needsHandoff) {
+        try {
+          await checkHost(record);
+        } catch (err) {
+          if (mismatchCodes.has(err?.code)) needsHandoff = true;
+          else throw err;
+        }
+      }
+
+      const executeAccountHandoff = async recBeforeReset => {
+        const handoffPrompt = await buildHandoffPrompt(recBeforeReset);
+        let cleaned = resetStoppedRecordForNextTurn(recBeforeReset);
+        store.deleteBackendState(cleaned.agentId);
+        forgetBackend(cleaned);
+        cleaned = {
+          ...cleaned,
+          sessionId: uid('session-codex'),
+          created: false,
+          host: undefined,
+          ...(currentRoute?.profileId ? { profileId: currentRoute.profileId } : { profileId: undefined }),
+          updatedAt: now(),
+        };
+        store.db.prepare('UPDATE agents SET body=? WHERE id=?').run(JSON.stringify(cleaned), cleaned.agentId);
+        store.touched(cleaned.agentId);
+        const freshRec = store.get(cleaned.agentId);
+        await prepare(freshRec);
+        if (currentRoute?.profileId || currentRoute?.codexHome) {
+          const ns = store.backendState(freshRec.agentId) ?? { seq: 0, requests: {}, answers: {}, answered: [] };
+          store.saveBackendState(freshRec.agentId, {
+            ...ns,
+            ...(currentRoute.profileId ? { profileId: currentRoute.profileId } : {}),
+            ...(currentRoute.codexHome ? { codexHome: currentRoute.codexHome } : {}),
+          });
+        }
+        const addr = managedPath(store.get(freshRec.agentId));
+        const sent = await service.send({ name: addr, message: handoffPrompt }, extra);
+        const wakeCmd = buildWakeCmd(owner, sent.taskKey);
+        return {
+          action: 'resume',
+          ok: true,
+          name: freshRec.name,
+          agentPath: addr,
+          mode: 'handoff-new-account',
+          taskKey: sent.taskKey,
+          ...(wakeCmd ? { wakeCmd } : {}),
+        };
+      };
+
+      if (needsHandoff) {
+        return executeAccountHandoff(record);
+      }
+
+      // Attempt native session resume first; if native session is unreachable on the active account, fall back to handoff!
+      const snapshotBeforeNative = structuredClone(record);
+      if (terminalRound(record) || record.state === 'running' || record.state === 'reconnecting' || record.error) {
+        record = resetStoppedRecordForNextTurn(record);
+      }
+      if (!record.created) {
+        await prepare(record);
+      }
+      try {
+        const addr = managedPath(record);
+        const sent = await service.send({ name: addr, message: continuationMessage }, extra);
+        if (sent?.error && mismatchCodes.has(sent.error.code)) {
+          return executeAccountHandoff(snapshotBeforeNative);
+        }
+        // Trigger one immediate poll on headless CLI so synchronous session/account errors surface immediately if mocked
+        if (isHeadlessCli(targetBackend)) {
+          await service.poll(record.agentId).catch(() => {});
+          const postPoll = store.get(record.agentId);
+          const lastDisp = postPoll?.task?.dispatches?.at(-1);
+          const errCode = postPoll?.error?.code ?? lastDisp?.failure?.code ?? lastDisp?.error?.code;
+          if (errCode && mismatchCodes.has(errCode)) {
+            return executeAccountHandoff(snapshotBeforeNative);
+          }
+        }
+        const wakeCmd = buildWakeCmd(owner, sent.taskKey);
+        return {
+          action: 'resume',
+          ok: true,
+          name: record.name,
+          agentPath: addr,
+          mode: 'native-resume',
+          taskKey: sent.taskKey,
+          ...(wakeCmd ? { wakeCmd } : {}),
+        };
+      } catch (err) {
+        if (mismatchCodes.has(err?.code)) {
+          return executeAccountHandoff(snapshotBeforeNative);
+        }
+        throw err;
+      }
+    },
+    async manageCliProxy({ action = 'status', target = 'all', proxy } = {}) {
+      if (!['status', 'bind'].includes(action)) {
+        throw Object.assign(new Error('action must be "status" or "bind".'), { code: 'invalid-proxy-action' });
+      }
+      if (!['codex-cli', 'claude-cli', 'agy-cli', 'all'].includes(target)) {
+        throw Object.assign(new Error('target must be "codex-cli", "claude-cli", "agy-cli", or "all".'), { code: 'invalid-proxy-target' });
+      }
+      const targets = target === 'all' ? ['codex-cli', 'claude-cli', 'agy-cli'] : [target];
+      if (action === 'bind') {
+        if (proxy === undefined || proxy === null || String(proxy).trim() === '') {
+          throw Object.assign(new Error('proxy value is required for action="bind".'), { code: 'invalid-proxy-config' });
+        }
+        const trimmed = typeof proxy === 'string' ? proxy.trim() : '';
+        const resetToFaswitch = typeof proxy === 'string' && ['faswitch', 'auto'].includes(trimmed.toLowerCase());
+        const normalizedValue = resetToFaswitch
+          ? undefined
+          : (typeof proxy === 'string' && /^\d{1,5}$/.test(trimmed) ? Number.parseInt(trimmed, 10) : proxy);
+        if (!resetToFaswitch) normalizeProxySpec(normalizedValue);
+        await updateCliRoutes(config, { targets, value: normalizedValue, resetToFaswitch });
+      }
+      const routes = await Promise.all(targets.map(async t => {
+        const route = await resolveManagedCliRoute(t, config);
+        const effectiveMode = route.source === 'manual'
+          ? (route.mode === 'direct' ? 'direct' : 'manual')
+          : (route.source === 'faswitch' ? 'faswitch' : route.mode === 'direct' ? 'direct' : 'inherit');
+        return {
+          target: t,
+          ok: route.ok === true,
+          effectiveMode,
+          source: route.source ?? 'inherit',
+          mode: route.mode ?? null,
+          port: route.port ?? null,
+          proxyUrl: route.proxyUrl ?? null,
+          profileName: route.profileName ?? null,
+          profileId: route.profileId ?? null,
+          proxyReachable: route.proxyReachable ?? null,
+          ...(route.configuredVia ? { configuredVia: route.configuredVia } : {}),
+          ...(!route.ok && route.code ? { code: route.code } : {}),
+          ...(route.error ? { error: route.error } : {}),
+        };
+      }));
+      const failed = routes.find(r => !r.ok);
+      return {
+        ok: !failed,
+        action,
+        target,
+        routes,
+        ...(failed ? {
+          error: {
+            code: failed.code ?? 'proxy-unavailable',
+            message: failed.error ?? `Proxy check failed for ${failed.target}.`,
+          },
+        } : {}),
+      };
+    },
+    async gc({ onceRetentionMs = config.onceTerminalRetentionMs, idleRetentionMs = config.agentIdleRetentionMs, nowMs = Date.now() } = {}) {
+      if (config.agentAutoCleanup === false) return { enabled: false, removed: [] };
+      const removed = store.gcStaleAgents({ onceRetentionMs, idleRetentionMs, nowMs });
+      const scopedRoot = path.resolve(config.stateDirectory, 'scoped');
+      for (const entry of removed) {
+        const dir = path.join(scopedRoot, entry.ownerId, entry.agentId);
+        const rel = path.relative(scopedRoot, path.resolve(dir));
+        if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) {
+          await removeTree(dir, { recursive: true, force: true }).catch(() => {});
+        }
+      }
+      return { enabled: true, removed };
     },
     async ensureIdleMonitor() {
       const records = typeof store.listWorkerCandidates === 'function' ? store.listWorkerCandidates() : store.list();
@@ -5465,6 +8350,175 @@ export function createScopedAgents(config, {
   };
 
   const pendingIn = view => (view?.questions ?? []).filter(question => question.state === 'pending');
+
+  function targetCallerExtraForOwner(targetOwnerId, targetRecordOrStub) {
+    const trustedSym = Symbol.for('futureaide.trustedCaller');
+    const targetOwner = store.owner(targetOwnerId);
+    if (targetRecordOrStub?.parentAgentId) {
+      return {
+        [trustedSym]: {
+          source: 'managed-cli',
+          parentAgentId: targetRecordOrStub.parentAgentId,
+          ownerId: targetOwnerId,
+          workspace: targetRecordOrStub.workspace ?? targetOwner?.workspace ?? config.workspace,
+        },
+      };
+    }
+    if (targetOwner?.source === 'antigravity') {
+      return {
+        [trustedSym]: {
+          source: 'antigravity',
+          conversationId: targetOwner.conversationId,
+          workspace: targetOwner.workspace,
+        },
+      };
+    }
+    if (targetOwner?.source === 'claude-desktop') {
+      return {
+        [trustedSym]: {
+          source: 'claude-desktop',
+          nativeSessionId: targetOwner.nativeSessionId,
+          workspace: targetOwner.workspace,
+        },
+      };
+    }
+    if (targetOwner?.source === 'codex-desktop' && targetOwner.threadId) {
+      return { _meta: { threadId: targetOwner.threadId } };
+    }
+    return {
+      [trustedSym]: {
+        source: 'managed-cli',
+        ownerId: targetOwnerId,
+        workspace: targetRecordOrStub?.workspace ?? targetOwner?.workspace ?? config.workspace,
+      },
+    };
+  }
+
+  function schedulePullSettlement(agentId) {
+    if (!agentId || draining || waitsClosed) return;
+    const prior = settlementInflight.get(agentId);
+    const work = (prior ? prior.catch(() => {}) : Promise.resolve()).then(async () => {
+      const delays = [0, 40, 120, 300, 800];
+      for (const ms of delays) {
+        if (waitsClosed || (ms > 0 && draining)) return;
+        if (ms > 0) {
+          await new Promise(resolve => {
+            const t = setTimeout(resolve, ms);
+            t.unref?.();
+          });
+        }
+        if (waitsClosed || (ms > 0 && draining)) return;
+        let current;
+        try { current = store.get(agentId); } catch { return; }
+        if (!current || current.closed) return;
+        try {
+          await store.locked(agentId, async () => {
+            if (waitsClosed) return;
+            const fresh = store.get(agentId);
+            if (!fresh || fresh.closed || !fresh.task) return;
+            if (isHeadlessCli(targetOf(fresh))) {
+              await observe(fresh).catch(() => {});
+              store.save(fresh);
+            }
+            await settleDelivery(fresh);
+          }, { waitMs: 60 });
+        } catch {}
+        if (waitsClosed) return;
+        let after;
+        try { after = store.get(agentId); } catch { return; }
+        if (!after) return;
+        const hasDeliveredFinal = (after.task?.reports ?? []).some(r => r.final && r.delivery?.state === 'delivered');
+        if (!(after.lifetime === 'once' && hasDeliveredFinal)) return;
+      }
+    }).finally(() => {
+      if (settlementInflight.get(agentId) === work) settlementInflight.delete(agentId);
+    });
+    settlementInflight.set(agentId, work);
+  }
+
+  function acknowledgePulledDeliveries(_owner, deliveries, batch) {
+    if (!deliveries.length) return;
+    const deliveredAt = now();
+    const agentsToSettle = new Set();
+    for (const item of deliveries) {
+      const { mapping, submissionId, kind, final, eventId } = item;
+      if (!mapping?.agentId || !submissionId) continue;
+      if (eventId && Array.isArray(batch)) {
+        const matchedEvt = batch.find(e => e.id === eventId);
+        if (matchedEvt && 'delivery' in matchedEvt) {
+          matchedEvt.delivery = 'delivered';
+          delete matchedEvt.error;
+        }
+      }
+      const workRows = store.submissionWork(mapping.agentId, mapping.taskId);
+      const subRow = workRows.find(r => r.id === submissionId);
+      if (subRow && subRow.delivery?.state !== 'delivered') {
+        store.saveSubmissionDelivery(submissionId, {
+          ...subRow.delivery,
+          id: subRow.delivery?.id ?? submissionNoticeId(submissionId),
+          state: 'delivered',
+          deliveredAt,
+          error: undefined,
+        }, { expected: subRow.deliveryVersion });
+      }
+      const record = store.get(mapping.agentId);
+      if (record && !record.closed && record.task?.taskId === mapping.taskId) {
+        const pendingSubs = store.submissions(mapping.agentId, mapping.taskId, true);
+        if (pendingSubs.length) absorbSubmissions(record, pendingSubs);
+        let mutated = false;
+        if (kind === 'ask') {
+          const ref = submissionRef(submissionId);
+          record.task.questionNotices ??= {};
+          const qNotice = record.task.questionNotices[ref] ?? { id: submissionNoticeId(submissionId), createdAt: deliveredAt };
+          if (qNotice.state !== 'delivered') {
+            record.task.questionNotices[ref] = { ...qNotice, state: 'delivered', deliveredAt, error: undefined };
+            mutated = true;
+          }
+        } else {
+          record.task.reports ??= [];
+          let rep = record.task.reports.find(r => sameReportId(r.id, submissionId) || r.sharedSubmission === submissionId);
+          if (!rep && subRow) {
+            rep = {
+              id: submissionRef(submissionId),
+              taskId: mapping.taskId,
+              message: subRow.message,
+              final: subRow.final === true,
+              createdAt: subRow.created,
+              sharedSubmission: submissionId,
+              delivery: { id: submissionNoticeId(submissionId), state: 'delivered', createdAt: subRow.created, deliveredAt },
+            };
+            record.task.reports.push(rep);
+            mutated = true;
+          } else if (rep && rep.delivery?.state !== 'delivered') {
+            rep.delivery = { ...(rep.delivery ?? {}), state: 'delivered', deliveredAt, error: undefined };
+            mutated = true;
+          }
+          if ((final || rep?.final) && rep) {
+            const noActiveChildren = !store.childrenOf(record.agentId).some(c => !c.closed && ACTIVE.has(c.state));
+            if (isHeadlessCli(targetOf(record)) && noActiveChildren) {
+              rep.treeSettledConfirmed = true;
+              record.task.result ??= {
+                state: 'completed',
+                reply: rep.message,
+                changes: attributedChanges(record, record.observation ?? {}),
+                coverage: treeCoverage(record, record.observation ?? {}),
+                tree: publicTree(record, record.observation ?? {}),
+              };
+              record.task.state = 'completed';
+              mutated = true;
+            }
+          }
+        }
+        if (mutated) {
+          try { store.save(record); } catch {}
+        }
+        agentsToSettle.add(mapping.agentId);
+      }
+    }
+    for (const agentId of agentsToSettle) {
+      schedulePullSettlement(agentId);
+    }
+  }
 
   /**
    * The receipt for an answer whose question was consumed before it could be sent.

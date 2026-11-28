@@ -3,16 +3,19 @@ import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { claudeCallbackReminderMs } from './claude-report-reminder.mjs';
+import { normalizeProxySpec } from './cli-proxy.mjs';
+import { replaceStateFile } from './replace-state-file.mjs';
+import { randomBytes } from 'node:crypto';
 
 export const defaultConfigPath = () => path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'futureaide-control', 'config.json');
 
-const configPath = filename => path.resolve(filename || process.env.DSH_CONTROL_CONFIG || process.env.FUTUREAIDE_CONTROL_CONFIG || defaultConfigPath());
+const configPath = filename => path.resolve(filename || process.env.FUTUREAIDE_CONFIG || process.env.DSH_CONTROL_CONFIG || process.env.FUTUREAIDE_CONTROL_CONFIG || defaultConfigPath());
 const transportFields = ['dataRoot', 'dshDataRoot', 'target', 'baseUrl', 'instanceFile', 'preferredInstanceFile', 'timeoutMs', 'hostBridgeFile', 'managedStateDirectory', 'reportPort'];
 // Behaviour switches a named profile may set for itself. They are deliberately not
 // transport fields: creating a profile copies only the connection, and a profile that
 // says nothing inherits the base configuration.
 const cleanupDefaults = {
-  agentAutoCleanup: false,
+  agentAutoCleanup: true,
   codexAutoCleanup: true,
   onceTerminalRetentionMs: 86400000,
   agentIdleRetentionMs: 43200000,
@@ -20,7 +23,46 @@ const cleanupDefaults = {
   agentCleanupIntervalMs: 900000,
   cleanupGraceMs: 86400000,
 };
-const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs', 'dshDefaultModelOnly', ...Object.keys(cleanupDefaults), 'defaultEffort', 'modelDefaultEfforts'];
+const cliRouteFields = ['faswitchHome', 'cliRoutes', 'codexCliPath', 'agyCliPath', 'codexCliProxy', 'codexCliProxyPort', 'claudeCliProxy', 'claudeCliProxyPort', 'agyCliProxy', 'agyCliProxyPort', 'antigravityProxy', 'antigravityProxyPort', 'requireProxy', 'autoWakeFaswitch'];
+const behaviorFields = ['idleSessionCleanup', 'teamBoard', 'claudeCallbackReminderMs', 'dshDefaultModelOnly', 'disabledTargets', 'antigravityCallerTokenFile', 'antigravityColdStartMonitor', 'turnTimeoutMinutes', 'turnTimeoutMs', ...cliRouteFields, ...Object.keys(cleanupDefaults), 'defaultEffort', 'modelDefaultEfforts'];
+
+export function normalizeDisabledTargets(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error('disabledTargets must be an array of non-empty strings.');
+  const normalized = [];
+  const seen = new Set();
+  for (const entry of value) {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      throw new Error('disabledTargets must be an array of non-empty strings.');
+    }
+    const item = entry.trim().toLowerCase();
+    if (!seen.has(item)) {
+      seen.add(item);
+      normalized.push(item);
+    }
+  }
+  return normalized;
+}
+
+function validateOptionalPath(value, field) {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`${field} must be a non-empty string path.`);
+  }
+  return value.trim();
+}
+
+function validateCliRoutes(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('cliRoutes must be an object mapping target names to a port, proxy URL, "direct", or route object.');
+  }
+  for (const [key, entry] of Object.entries(value)) {
+    if (!key.trim()) throw new Error('cliRoutes contains an empty target key.');
+    if (entry !== undefined && entry !== null) normalizeProxySpec(entry);
+  }
+  return value;
+}
 
 function cleanupSettings(base, overrides = {}) {
   const result = { ...cleanupDefaults, ...pick(base, Object.keys(cleanupDefaults)), ...pick(overrides, Object.keys(cleanupDefaults)) };
@@ -50,6 +92,24 @@ function dshConfig(value) {
   if (value.idleSessionCleanup !== undefined && typeof value.idleSessionCleanup !== 'boolean') throw new Error('idleSessionCleanup must be true or false.');
   if (value.teamBoard !== undefined && typeof value.teamBoard !== 'boolean') throw new Error('teamBoard must be true or false.');
   if (value.dshDefaultModelOnly !== undefined && typeof value.dshDefaultModelOnly !== 'boolean') throw new Error('dshDefaultModelOnly must be true or false.');
+  if (value.antigravityColdStartMonitor !== undefined && typeof value.antigravityColdStartMonitor !== 'boolean') throw new Error('antigravityColdStartMonitor must be true or false.');
+  if (value.disabledTargets !== undefined) normalizeDisabledTargets(value.disabledTargets);
+  if (value.antigravityCallerTokenFile !== undefined) validateOptionalPath(value.antigravityCallerTokenFile, 'antigravityCallerTokenFile');
+  if (value.faswitchHome !== undefined) validateOptionalPath(value.faswitchHome, 'faswitchHome');
+  if (value.codexCliPath !== undefined) validateOptionalPath(value.codexCliPath, 'codexCliPath');
+  if (value.agyCliPath !== undefined) validateOptionalPath(value.agyCliPath, 'agyCliPath');
+  if (value.turnTimeoutMinutes !== undefined && (typeof value.turnTimeoutMinutes !== 'number' || !Number.isFinite(value.turnTimeoutMinutes) || value.turnTimeoutMinutes <= 0)) {
+    throw new Error('turnTimeoutMinutes must be a positive finite number.');
+  }
+  if (value.turnTimeoutMs !== undefined && (typeof value.turnTimeoutMs !== 'number' || !Number.isFinite(value.turnTimeoutMs) || value.turnTimeoutMs <= 0)) {
+    throw new Error('turnTimeoutMs must be a positive finite number.');
+  }
+  if (value.cliRoutes !== undefined) validateCliRoutes(value.cliRoutes);
+  if (value.requireProxy !== undefined && typeof value.requireProxy !== 'boolean') throw new Error('requireProxy must be true or false.');
+  if (value.autoWakeFaswitch !== undefined && typeof value.autoWakeFaswitch !== 'boolean') throw new Error('autoWakeFaswitch must be true or false.');
+  for (const field of ['codexCliProxy', 'codexCliProxyPort', 'claudeCliProxy', 'claudeCliProxyPort', 'agyCliProxy', 'agyCliProxyPort', 'antigravityProxy', 'antigravityProxyPort']) {
+    if (value[field] !== undefined) normalizeProxySpec(value[field]);
+  }
   // A wait that is not a whole number of milliseconds cannot be scheduled; 0 is allowed
   // and means the first definite absence is enough.
   if (value.claudeCallbackReminderMs !== undefined) claudeCallbackReminderMs(value.claudeCallbackReminderMs);
@@ -60,6 +120,7 @@ function dshConfig(value) {
 /** Defaults on for unsubscribe, EOF shutdown, cold reads and monitor recovery.
  * Cancelled-round rejection and inbox delivery apply at either setting. */
 const idleSessionCleanup = (value, fallback = true) => typeof value === 'boolean' ? value : fallback;
+const antigravityColdStartMonitor = (value, fallback = true) => typeof value === 'boolean' ? value : fallback;
 
 /**
  * The team board is a viewer, not a feature of the monitor: it stays off unless the
@@ -150,6 +211,8 @@ export async function loadConfig(filename, profile) {
   filename = configPath(filename);
   if (profile !== undefined) validateProfileName(profile);
   const supplied = dshConfig(await readConfiguration(filename, { optional: true }));
+  const envCallerTokenFile = typeof process.env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE === 'string' && process.env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE.trim()
+    ? process.env.FUTUREAIDE_ANTIGRAVITY_CALLER_TOKEN_FILE.trim() : undefined;
   if (profile !== undefined) {
     const profileFile = path.join(await profileDirectory(filename), `${profile}.json`);
     try {
@@ -160,10 +223,15 @@ export async function loadConfig(filename, profile) {
     const selectedValue = validateProfile(await readConfiguration(profileFile));
     const selected = dshConfig({ ...selectedValue,
       dshDataRoot: selectedValue.dshDataRoot ?? selectedValue.dataRoot ?? supplied.dshDataRoot });
+    const antigravityCallerTokenFile = envCallerTokenFile
+      ?? validateOptionalPath(selected.antigravityCallerTokenFile ?? supplied.antigravityCallerTokenFile, 'antigravityCallerTokenFile');
+    const mergedCliRoutes = (supplied.cliRoutes || selected.cliRoutes)
+      ? { ...(supplied.cliRoutes ?? {}), ...(selected.cliRoutes ?? {}) } : undefined;
     return {
       hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
-      ...pick(supplied, transportFields),
+      ...pick(supplied, [...transportFields, ...cliRouteFields]),
       ...selected,
+      ...(mergedCliRoutes ? { cliRoutes: mergedCliRoutes } : {}),
       ...cleanupSettings(supplied, selectedValue), profile,
       // A selected profile overrides the base value it inherits; the switch is on by
       // default so an older configuration keeps releasing.
@@ -172,6 +240,10 @@ export async function loadConfig(filename, profile) {
       claudeCallbackReminderMs: claudeCallbackReminderMs(selected.claudeCallbackReminderMs,
         claudeCallbackReminderMs(supplied.claudeCallbackReminderMs)),
       dshDefaultModelOnly: dshDefaultModelOnly(selected.dshDefaultModelOnly, dshDefaultModelOnly(supplied.dshDefaultModelOnly)),
+      disabledTargets: normalizeDisabledTargets(selected.disabledTargets ?? supplied.disabledTargets),
+      antigravityColdStartMonitor: antigravityColdStartMonitor(selected.antigravityColdStartMonitor,
+        antigravityColdStartMonitor(supplied.antigravityColdStartMonitor)),
+      ...(antigravityCallerTokenFile !== undefined ? { antigravityCallerTokenFile } : {}),
       defaultEffort: selected.defaultEffort ?? supplied.defaultEffort ?? 'max',
       modelDefaultEfforts: mergeEfforts(FACTORY_MODEL_DEFAULT_EFFORTS, supplied.modelDefaultEfforts, selected.modelDefaultEfforts),
       stateDirectory: path.join(path.dirname(filename), 'state', 'profiles', profile),
@@ -179,6 +251,8 @@ export async function loadConfig(filename, profile) {
       configFile: filename,
     };
   }
+  const antigravityCallerTokenFile = envCallerTokenFile
+    ?? validateOptionalPath(supplied.antigravityCallerTokenFile, 'antigravityCallerTokenFile');
   return {
     hostBridgeFile: path.join(path.dirname(filename), 'host-bridge.json'),
     workspace: process.cwd(),
@@ -188,6 +262,9 @@ export async function loadConfig(filename, profile) {
     teamBoard: teamBoard(supplied.teamBoard),
     claudeCallbackReminderMs: claudeCallbackReminderMs(supplied.claudeCallbackReminderMs),
     dshDefaultModelOnly: dshDefaultModelOnly(supplied.dshDefaultModelOnly),
+    disabledTargets: normalizeDisabledTargets(supplied.disabledTargets),
+    antigravityColdStartMonitor: antigravityColdStartMonitor(supplied.antigravityColdStartMonitor),
+    ...(antigravityCallerTokenFile !== undefined ? { antigravityCallerTokenFile } : {}),
     defaultEffort: supplied.defaultEffort ?? 'max',
     modelDefaultEfforts: mergeEfforts(FACTORY_MODEL_DEFAULT_EFFORTS, supplied.modelDefaultEfforts),
     stateDirectory: path.join(path.dirname(filename), 'state'),
@@ -253,4 +330,54 @@ export function requireWorkspace(candidate, workspace) {
   if (typeof candidate !== 'string' || candidate.length === 0) return false;
   const relative = path.relative(path.resolve(workspace), path.resolve(candidate));
   return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+const LEGACY_PROXY_KEYS = {
+  'codex-cli': ['codexCliProxy', 'codexCliProxyPort'],
+  'claude-cli': ['claudeCliProxy', 'claudeCliProxyPort'],
+  'agy-cli': ['agyCliProxy', 'agyCliProxyPort'],
+  antigravity: ['antigravityProxy', 'antigravityProxyPort'],
+};
+
+/**
+ * Atomically persist CLI route bindings into `config.configFile` and synchronize
+ * the in-memory `config` object. Passing `resetToFaswitch: true` removes manual
+ * overrides so resolution resumes following FAswitch automatically.
+ */
+export async function updateCliRoutes(config, { targets = [], value, resetToFaswitch = false } = {}) {
+  const filename = configPath(config?.configFile);
+  const raw = await readConfiguration(filename, { optional: true });
+  const nextRoutes = raw.cliRoutes && typeof raw.cliRoutes === 'object' && !Array.isArray(raw.cliRoutes)
+    ? { ...raw.cliRoutes }
+    : {};
+  for (const target of targets) {
+    if (resetToFaswitch) {
+      delete nextRoutes[target];
+      for (const legacyKey of LEGACY_PROXY_KEYS[target] ?? []) {
+        delete raw[legacyKey];
+        if (config && typeof config === 'object') delete config[legacyKey];
+      }
+    } else {
+      normalizeProxySpec(value);
+      nextRoutes[target] = value;
+      for (const legacyKey of LEGACY_PROXY_KEYS[target] ?? []) {
+        delete raw[legacyKey];
+        if (config && typeof config === 'object') delete config[legacyKey];
+      }
+    }
+  }
+  if (Object.keys(nextRoutes).length > 0) {
+    raw.cliRoutes = nextRoutes;
+  } else {
+    delete raw.cliRoutes;
+  }
+  await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
+  const temp = `${filename}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  await writeFile(temp, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
+  await replaceStateFile(temp, filename);
+  if (config && typeof config === 'object') {
+    if (Object.keys(nextRoutes).length > 0) config.cliRoutes = { ...nextRoutes };
+    else delete config.cliRoutes;
+  }
+  return nextRoutes;
 }

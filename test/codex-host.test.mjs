@@ -8,20 +8,7 @@ import {
   createCodexHost, emptyProjection, projectCodexTurns, readDefaultModel, readCodexMcpRegistration, markerLine,
   sharedCodexCatalog, codexDeliverySelection,
 } from '../src/codex-host.mjs';
-import { createCodexBackend } from '../src/codex-backend.mjs';
-import { createCodexNativeRpc } from '../src/codex-ipc.mjs';
 import { liveThread, livePage, liveTurn } from './live-thread-fixture.mjs';
-import { resolveDispatchSelection } from '../src/model-selection.mjs';
-
-test('missing Codex capabilities remain unknown; an empty supported list sends no effort', () => {
-  const entry = { id: 'm', model: 'wire-m', isDefault: true, defaultReasoningEffort: 'low' };
-  const unknown = sharedCodexCatalog([entry]);
-  assert.throws(() => resolveDispatchSelection(unknown), { code: 'effort-capability-unknown' });
-  const fixed = sharedCodexCatalog([{ ...entry, supportedReasoningEfforts: [] }]);
-  const selected = resolveDispatchSelection(fixed);
-  assert.equal(selected.selectedEffort, null);
-  assert.deepEqual(codexDeliverySelection(fixed, selected), { modelId: 'm', model: 'wire-m' });
-});
 
 const directory = () => fileURLToPath(new URL(`../clean/validation/codex/${randomUUID()}/`, import.meta.url));
 
@@ -158,67 +145,52 @@ test('status uses one real read RPC and keeps each default-model read live', asy
 });
 
 test('a missing debug port is reported with the FAswitch instruction', async () => {
-  const transport = { transportGeneration: 2, transportFaultSequence: 1,
-    transportAttemptId: 'probe-attempt', transportStale: false };
   const host = createCodexHost({ nativeRequest: async () => {
     throw Object.assign(new Error('Exactly one running Codex main renderer must be available.'),
-      { code: 'codex-native-rpc-unavailable', ...transport });
+      { code: 'codex-native-rpc-unavailable', discoveryReason: 'no-match' });
   } });
-  await assert.rejects(host.probe(), { code: 'codex-native-rpc-unavailable',
-    message: /Open Codex from FAswitch/, ...transport });
+  await assert.rejects(host.probe(), error => error.code === 'codex-native-rpc-unavailable'
+    && /Open Codex from FAswitch/.test(error.message));
 });
 
-test('a confirmed transport recovery rechecks backend readiness once and leaves another transport cached', {
-  timeout: 4000,
-}, async () => {
-  const discoveryGate = Promise.withResolvers();
-  let discoveries = 0, reads = 0, otherReads = 0;
-  class Socket extends EventTarget {
-    constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
-    send(frame) {
-      reads++;
-      const { id } = JSON.parse(frame);
-      const data = JSON.stringify({ id, result: { result: { value: { data: [] } } } });
-      queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data })));
-    }
-    close() { this.dispatchEvent(new Event('close')); }
+test('Codex cleanup marks a timed-out preflight and leaves an in-flight delete unconfirmed', async () => {
+  const request = { nativeSessionId: 'thread-1', ownedNodeIds: ['thread-1'], workspace: 'D:/work/p' };
+  const timeout = Object.assign(new Error('Native Desktop response timed out.'), { code: 'codex-native-rpc-response-timeout' });
+  for (const phase of ['children', 'admission', 'delete', 'verify']) {
+    const writes = [];
+    const host = createCodexHost({ nativeRequest: async (method, params) => {
+      if (method === 'thread/read') {
+        if (phase === 'verify' && writes.length) throw timeout;
+        return { thread: liveThread({ id: 'thread-1', cwd: 'D:/work/p' }) };
+      }
+      if (method === 'thread/list') {
+        if (phase === 'children') throw timeout;
+        return { data: [] };
+      }
+      if (method === 'thread/delete') {
+        if (phase === 'admission') throw Object.assign(new Error(timeout.message), { code: timeout.code, notSent: true });
+        writes.push(params.threadId);
+        if (phase === 'delete') throw timeout;
+        return {};
+      }
+      throw new Error(`unexpected ${method}`);
+    } });
+    const beforeWrite = phase === 'children' || phase === 'admission';
+    await assert.rejects(host.destroy(request), error => error.code === timeout.code
+      && Boolean(error.cleanupNotSent) === beforeWrite);
+    assert.deepEqual(writes, beforeWrite ? [] : ['thread-1']);
+    assert.equal(timeout.cleanupNotSent, undefined, 'the underlying transport error can be shared');
   }
-  const rpc = createCodexNativeRpc({ WebSocketImpl: Socket, discover: async () => {
-    if (++discoveries === 1) throw Object.assign(new Error('fixture unavailable'),
-      { code: 'codex-native-rpc-unavailable' });
-    await discoveryGate.promise;
-    return { webSocketUrl: 'memory:isolated' };
+});
+
+test('a slow renderer lookup reports the timeout without suggesting a relaunch', async () => {
+  const host = createCodexHost({ nativeRequest: async () => {
+    throw Object.assign(new Error('Desktop renderer discovery timed out.'),
+      { code: 'codex-native-rpc-unavailable', discoveryReason: 'timeout' });
   } });
-  const backend = await createCodexBackend({}, { hostOptions: { nativeRequest: rpc.request,
-    readRecoveredFaultSequence: () => rpc.recoveredFaultSequence } });
-  const other = await createCodexBackend({}, { hostOptions: { nativeRequest: async () => {
-    otherReads++;
-    throw Object.assign(new Error('other fixture unavailable'),
-      { code: 'codex-native-rpc-unavailable', transportFaultSequence: 1 });
-  } } });
-  const recovered = Promise.withResolvers();
-  const unsubscribe = rpc.subscribeRecovery(recovered.resolve);
-  const unavailable = { code: 'codex-native-rpc-unavailable' };
-  try {
-    await Promise.all([assert.rejects(backend.probe(), unavailable), assert.rejects(backend.probe(), unavailable),
-      assert.rejects(other.probe(), unavailable)]);
-    await assert.rejects(backend.probe(), unavailable);
-    assert.equal(discoveries, 1);
-    discoveryGate.resolve();
-    assert.equal((await recovered.promise).faultSequence, 1);
-    assert.equal(reads, 1, 'only the transport recovery probe has read');
-    const results = await Promise.all([backend.probe(), backend.probe()]);
-    assert.equal(results[0].identity.application, 'codex-desktop');
-    assert.equal(reads, 2, 'both callers share one fresh capability read');
-    await backend.probe();
-    assert.equal(reads, 2, 'successful readiness stays cached');
-    await assert.rejects(other.probe(), unavailable);
-    assert.equal(otherReads, 1, 'another transport with the same fault sequence keeps its failed cache');
-  } finally {
-    unsubscribe();
-    discoveryGate.resolve();
-    rpc.close();
-  }
+  await assert.rejects(host.probe(), {
+    code: 'codex-native-rpc-unavailable', discoveryReason: 'timeout', message: 'Desktop renderer discovery timed out.',
+  });
 });
 
 test('schema-shaped turns project marker, messages and file changes incrementally', () => {

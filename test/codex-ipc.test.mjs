@@ -61,12 +61,12 @@ function scriptedRequest(handler) {
   return { calls, request: async (method, params) => { calls.push({ method, params }); return handler(method, params); } };
 }
 
-test('an application rejection does not close another in-flight request', async () => {
-  let socket;
+function socketFixture({ autoOpen = true, ...options } = {}) {
+  const sockets = [];
   class FakeWebSocket {
     constructor() {
-      socket = this; this.handlers = new Map(); this.sent = [];
-      queueMicrotask(() => this.emit('open'));
+      sockets.push(this); this.handlers = new Map(); this.sent = []; this.closed = false;
+      if (autoOpen) queueMicrotask(() => this.emit('open'));
     }
     addEventListener(type, callback, options) {
       const list = this.handlers.get(type) ?? [];
@@ -78,22 +78,123 @@ test('an application rejection does not close another in-flight request', async 
       for (const entry of list) entry.callback(event);
     }
     send(raw) { this.sent.push(JSON.parse(raw)); }
-    close() { this.emit('close'); }
+    close() { this.closed = true; this.emit('close'); }
     respond(index, payload) {
       const frame = this.sent[index];
       this.emit('message', { data: JSON.stringify({ id: frame.id, ...payload }) });
     }
   }
   const rpc = createCodexNativeRpc({ discover: async () => ({ webSocketUrl: 'ws://fixture' }),
-    WebSocketImpl: FakeWebSocket, idleMs: 10000 });
+    WebSocketImpl: FakeWebSocket, idleMs: 10000, measure: null, ...options });
+  return { rpc, sockets };
+}
+
+const nextTurn = () => new Promise(resolve => setImmediate(resolve));
+const replyValue = value => ({ result: { result: { value } } });
+
+test('an application rejection does not close another in-flight request', async () => {
+  const { rpc, sockets } = socketFixture();
   const rejected = rpc.request('thread/read', { threadId: 'missing' });
   const concurrent = rpc.request('thread/list', { limit: 1 });
-  await new Promise(resolve => setImmediate(resolve));
+  await nextTurn();
+  const [socket] = sockets;
   socket.respond(0, { result: { exceptionDetails: { exception: { description: 'thread not found' } } } });
-  socket.respond(1, { result: { result: { value: { data: [] } } } });
+  socket.respond(1, replyValue({ data: [] }));
   await assert.rejects(rejected, { code: 'codex-native-rpc-rejected' });
   assert.deepEqual(await concurrent, { data: [] }, 'the concurrent request survives the application rejection');
   await rpc.close();
+});
+
+test('failed discovery is retried only when an RPC client has another request', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let discoveries = 0;
+  const { rpc, sockets } = socketFixture({ discover: async () => {
+    if (++discoveries === 1) throw Object.assign(new Error('Desktop unavailable'), { code: 'codex-native-rpc-unavailable' });
+    return { webSocketUrl: 'ws://fixture' };
+  } });
+  t.after(() => rpc.close());
+  await assert.rejects(rpc.request('thread/list', { limit: 1 }), { code: 'codex-native-rpc-unavailable' });
+  t.mock.timers.tick(2000);
+  await nextTurn();
+  assert.equal(discoveries, 1);
+
+  const read = rpc.request('thread/read', { threadId: 'available' });
+  await nextTurn();
+  assert.equal(discoveries, 2);
+  sockets[0].respond(0, replyValue({ thread: { id: 'available' } }));
+  assert.deepEqual(await read, { thread: { id: 'available' } });
+});
+
+test('monitor recovery can probe when only persisted transport work remains', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const recovered = [];
+  const { rpc, sockets } = socketFixture({ onRecovery: event => recovered.push(event) });
+  t.after(() => rpc.close());
+  rpc.ensureProbe();
+  t.mock.timers.tick(0);
+  await nextTurn();
+  assert.equal(sockets[0].sent.length, 1);
+  sockets[0].respond(0, replyValue({ data: [] }));
+  await nextTurn();
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].faultSequence, rpc.recoveredFaultSequence);
+});
+
+test('a failed short probe leaves the reader connected and keeps a write waiting for verification', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { rpc, sockets } = socketFixture({ probeTimeoutMs: 20 });
+  t.after(() => rpc.close());
+  const first = rpc.request('thread/list', { limit: 1 });
+  await nextTurn();
+  sockets[0].respond(0, replyValue({ data: [] }));
+  await first;
+  sockets[0].close();
+
+  const read = rpc.request('thread/read', { threadId: 'pending' });
+  const write = rpc.request('turn/start', { threadId: 'pending' });
+  read.catch(() => {});
+  write.catch(() => {});
+  await nextTurn();
+  const [, socket] = sockets;
+  assert.equal(socket.sent.length, 1);
+  t.mock.timers.tick(0);
+  await nextTurn();
+  assert.equal(socket.sent.length, 2);
+
+  t.mock.timers.tick(20);
+  await nextTurn();
+  assert.equal(socket.closed, false);
+  socket.respond(0, replyValue({ thread: { id: 'pending' } }));
+  assert.deepEqual(await read, { thread: { id: 'pending' } });
+  assert.equal(socket.sent.length, 2);
+
+  t.mock.timers.tick(500);
+  await nextTurn();
+  assert.equal(socket.sent.length, 3);
+  socket.respond(2, replyValue({ data: [] }));
+  await nextTurn();
+  assert.equal(socket.sent.length, 4);
+  socket.respond(3, replyValue({ turn: { id: 'written' } }));
+  assert.deepEqual(await write, { turn: { id: 'written' } });
+});
+
+test('a read joining a recovery connection keeps its normal handshake deadline', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { rpc, sockets } = socketFixture({ autoOpen: false, probeTimeoutMs: 20 });
+  t.after(() => rpc.close());
+  rpc.ensureProbe();
+  t.mock.timers.tick(0);
+  await nextTurn();
+
+  const read = rpc.request('thread/read', { threadId: 'pending' });
+  const [socket] = sockets;
+  t.mock.timers.tick(20);
+  await nextTurn();
+  assert.equal(socket.closed, false);
+  socket.emit('open');
+  await nextTurn();
+  socket.respond(0, replyValue({ thread: { id: 'pending' } }));
+  assert.deepEqual(await read, { thread: { id: 'pending' } });
 });
 
 test('an idle thread gets turn/start with no model, effort or permission fields', async () => {

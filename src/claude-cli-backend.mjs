@@ -5,11 +5,52 @@ import * as cliRunner from './claude-cli-runner.mjs';
 
 const coverage = { source: 'claude-cli', complete: false,
   note: 'File attribution uses the shared before/after workspace comparison.' };
+export const CLI_STALLED_THRESHOLD_SECONDS = 180;
 const fail = (code, message, extra) => Object.assign(new Error(message), { code, ...extra });
+
+function sumUsageList(items) {
+  const valid = items.filter(item => item && typeof item === 'object');
+  if (!valid.length) return undefined;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedTokens = 0;
+  let totalTokens = 0;
+  let durationSec = 0;
+  for (const u of valid) {
+    inputTokens += Number(u.inputTokens) || 0;
+    outputTokens += Number(u.outputTokens) || 0;
+    cachedTokens += Number(u.cachedTokens) || 0;
+    totalTokens += Number(u.totalTokens) || 0;
+    durationSec += Number(u.durationSec) || 0;
+  }
+  return {
+    inputTokens: Math.round(inputTokens),
+    outputTokens: Math.round(outputTokens),
+    cachedTokens: Math.round(cachedTokens),
+    totalTokens: Math.round(totalTokens),
+    durationSec: Math.round(durationSec * 100) / 100,
+  };
+}
+
+function formatRunningActivity(native, nowMs = Date.now()) {
+  const refIso = native?.lastEventAt ?? native?.updatedAt ?? native?.startedAt;
+  const parsedMs = typeof refIso === 'string' && refIso ? Date.parse(refIso) : NaN;
+  const hasTimestamp = Number.isFinite(parsedMs);
+  const hasStep = typeof native?.lastStep === 'string' && native.lastStep.trim().length > 0;
+  if (!hasTimestamp && !hasStep) return { stalled: false, activity: 'running' };
+  const step = hasStep ? native.lastStep.trim() : '运行中';
+  if (!hasTimestamp) return { stalled: false, activity: step };
+  const silentSec = Math.max(0, Math.floor((nowMs - parsedMs) / 1000));
+  if (silentSec >= CLI_STALLED_THRESHOLD_SECONDS) {
+    return { stalled: true, silentSeconds: silentSec, activity: `⚠ 已静默 ${silentSec}s · ${step}` };
+  }
+  return { stalled: false, silentSeconds: silentSec, activity: `${silentSec}s前 · ${step}` };
+}
 
 export function createClaudeCliBackend(record, deps = {}) {
   const load = deps.load ?? (() => record);
   const runner = deps.runner ?? cliRunner;
+  const nowFn = deps.now ?? (() => Date.now());
   const state = () => ({ seq: 0, requests: {}, answers: {}, answered: [], ...deps.readNativeState?.() });
   const save = value => {
     if (!deps.writeNativeState) throw fail('claude-state-unavailable', 'The shared native-state store is required.');
@@ -70,6 +111,10 @@ export function createClaudeCliBackend(record, deps = {}) {
         ...(native.inputUuid ? { inputUuid: native.inputUuid } : {}),
         ...(native.effortAdjustment ? { effortAdjustment: native.effortAdjustment } : {}) };
       value.modelEvidence = request.modelEvidence;
+      changed = true;
+    }
+    if (native.usage && JSON.stringify(native.usage) !== JSON.stringify(request.usage)) {
+      request.usage = { ...native.usage };
       changed = true;
     }
     if (native.model && (native.model !== value.currentModel?.model
@@ -143,14 +188,26 @@ export function createClaudeCliBackend(record, deps = {}) {
       const running = native?.state === 'running';
       const current = load();
       const status = running ? 'running' : 'idle';
-      const last = Object.values(value.requests).filter(r => r.taskId === current.task?.taskId).at(-1);
+      const liveActivity = running ? formatRunningActivity(native, nowFn()) : { stalled: false, activity: 'idle' };
+      const allRequests = Object.values(value.requests);
+      const taskRequests = allRequests.filter(r => r.taskId === current.task?.taskId);
+      const last = taskRequests.at(-1);
       const failed = last?.terminal?.failure;
-      return { sessionId: current.sessionId, taskId: current.task?.taskId, running, throughSeq: value.seq,
-        currentModel: value.currentModel, modelEvidence: value.modelEvidence, modelSelectionObserved: false, changes: [], coverage,
+      const taskUsage = sumUsageList(taskRequests.map(r => r.usage));
+      const agentUsage = sumUsageList(allRequests.map(r => r.usage));
+      return { sessionId: current.sessionId, taskId: current.task?.taskId, running,
+        stalled: liveActivity.stalled, activity: liveActivity.activity,
+        ...(liveActivity.silentSeconds !== undefined ? { silentSeconds: liveActivity.silentSeconds } : {}),
+        throughSeq: value.seq,
+        currentModel: value.currentModel, modelEvidence: value.modelEvidence, modelSelectionObserved: false,
+        ...(taskUsage ? { usage: taskUsage } : {}),
+        ...(agentUsage ? { agentUsage } : {}),
+        changes: [], coverage,
         ...await submissions(value), tree: { settled: !running, running,
           ...(failed ? { rootSummary: { ready: true, state: 'failed', reply: failed.message } } : {}),
           nodes: [{ sessionId: current.sessionId, parentSessionId: null, name: current.name, status,
-            activity: status, changes: [], coverage }] } };
+            activity: liveActivity.activity, ...(liveActivity.stalled ? { stalled: true } : {}),
+            changes: [], coverage }] } };
     },
     async history({ targetSessionId, maxMessages = 20, requestId } = {}) {
       const current = load();
@@ -182,7 +239,7 @@ export function createClaudeCliBackend(record, deps = {}) {
       const result = { consumedQuestionIds: ids, continuation: 'Parent answer:\n' + message + '\nContinue the same task.' };
       value.answers[answerId] = result; save(value); return result;
     },
-    async deliver({ requestId, message, model, explicitModel, writeBlockReason }) {
+    async deliver({ requestId, message, model, explicitModel, timeoutMs, timeoutMinutes, writeBlockReason }) {
       if (!message?.trim() || !requestId || (explicitModel === true && !model?.model) || (model && !model.model)) {
         throw fail('invalid-dispatch', 'A request id, message and consistent model selection are required.', { terminal: true });
       }
@@ -214,10 +271,14 @@ export function createClaudeCliBackend(record, deps = {}) {
       const request = { messageHash: hash, taskId: load().task?.taskId, afterSeq: value.seq, model, status: 'unknown' };
       value.requests[requestId] = request; value.active = requestId; save(value);
       try {
-        const result = await runner.startClaudeTurn({ cli, directory: dir, workspace: load().workspace, name: load().name,
+        const current = load();
+        const result = await runner.startClaudeTurn({ cli, directory: dir, workspace: current.workspace, name: current.name,
           sessionId: value.sessionId, resume: value.started === true, message, model: model?.model,
-          effort: model?.reasoningEffort, mcpConfig, stagedControl: true,
-          ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) });
+          effort: model?.reasoningEffort, mcpConfig, config: deps.config, stagedControl: true,
+          timeoutMs: timeoutMs ?? current.task?.turnTimeoutMs ?? current.turnTimeoutMs,
+          timeoutMinutes: timeoutMinutes ?? current.task?.turnTimeoutMinutes ?? current.turnTimeoutMinutes,
+          ...(typeof writeBlockReason === 'function' ? { writeBlockReason } : {}) },
+          deps.resolveRoute ? { resolveRoute: deps.resolveRoute } : undefined);
         if (result?.accepted !== true && !result?.duplicate) throw fail('claude-cli-start-refused', 'The CLI worker refused the turn.', { terminal: true });
       } catch (error) {
         request.status = error.terminal ? 'rejected' : error.retryable || error.retryableRead ? 'retryable' : 'unknown';

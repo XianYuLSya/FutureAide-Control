@@ -4,12 +4,32 @@ import test from 'node:test';
 
 const read = relative => readFile(new URL(relative, import.meta.url), 'utf8');
 
-test('the default skill uses named subagents and keeps legacy dispatch in its reference', async () => {
+test('the default skill documents slim V2.1 subagent tools without DSH bloat and keeps legacy dispatch in its reference', async () => {
   const skill = await read('../skills/futureaide-control/SKILL.md');
-  for (const tool of ['create_agent', 'send_agent', 'answer_agent', 'list_agents', 'wait_agents', 'agent_changes', 'inspect_agent', 'cancel_agent', 'delete_agent', 'status']) {
+  for (const tool of [
+    'run_agent',
+    'create_agent',
+    'send_agent',
+    'answer_agent',
+    'list_agents',
+    'wait_agents',
+    'board_post',
+    'board_read',
+    'team',
+    'cli_proxy',
+    'agent_changes',
+    'inspect_agent',
+    'cancel_agent',
+    'delete_agent',
+    'status',
+  ]) {
     assert.ok(skill.includes('futureaide_' + tool), `Missing guidance for ${tool}`);
   }
   assert.doesNotMatch(skill, /futureaide_spawn_agent|codex_thread_id/);
+  assert.doesNotMatch(skill, /\bDSH\b|target:\s*"dsh"/i, 'obsolete DSH instructions must be removed from SKILL.md');
+  for (const v23Keyword of ['agy-cli', 'timeout_minutes', 'merge', '18s · 14.2k tok']) {
+    assert.ok(skill.includes(v23Keyword), `SKILL.md is missing V2.3 guidance for ${v23Keyword}`);
+  }
   assert.match(skill, /references\/legacy-workflows\.md/);
   const legacy = await read('../skills/futureaide-control/references/legacy-workflows.md');
   assert.match(legacy, /futureaide_spawn_agent/);
@@ -23,13 +43,11 @@ test('the skill and README explain busy-time mode and delivery by target', async
     assert.ok(skill.includes(word), `skill is missing ${word}`);
   }
   assert.match(skill, /explicit `queue` never answers/i);
-  assert.match(skill, /DSH refuses explicit `queue` while busy/i);
   assert.match(skill, /Claude CLI refuses explicit `steer` while busy/i);
   const readme = await read('../README.md');
   for (const word of ['mode', 'mode-unsupported', 'supportedModes', 'delivery', 'accepted-route-unknown', 'inputs']) {
     assert.ok(readme.includes(word), `README is missing ${word}`);
   }
-  assert.match(readme, /DSH.*supportedModes/s);
   assert.match(readme, /Claude CLI.*supportedModes/s);
 });
 

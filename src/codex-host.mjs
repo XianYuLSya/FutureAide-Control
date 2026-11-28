@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { codexDomainForThread } from './codex-domain.mjs';
+import { codexCleanupPreflightError, isCodexTransientTimeout } from './agent-backend.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
@@ -476,23 +477,25 @@ export function createCodexHost(options = {}) {
     const { status } = await releaseCodexThreadNative(threadId, { request: exchange });
     return { status: UNSUBSCRIBE_ACCEPTED.has(status) ? status : 'unverified' };
   };
-  function capabilityProbe(key) {
+  function capabilityProbe(key, refreshTimeout = false) {
     const cached = probes.get(key);
-    if (cached && cached.expires > Date.now()) return cached;
+    if (cached && cached.expires > Date.now() && !(refreshTimeout && cached.timedOut)) return cached;
     const entry = { expires: Infinity };
     entry.promise = nativeRequest('thread/list', { limit: 1, useStateDbOnly: true }).then(result => {
       if (!Array.isArray(result?.data)) throw fail('codex-native-rpc-invalid-response', 'Codex returned no thread list.');
       entry.expires = Date.now() + (options.probeCacheMs ?? 30000);
       return { nativeAvailable: true };
     }).catch(error => {
+      entry.timedOut = isCodexTransientTimeout(error);
       entry.expires = Date.now() + 5000;
       return { nativeAvailable: false, reason: error };
     });
     probes.set(key, entry);
     return entry;
   }
-  async function probeCapabilities() {
+  async function probeCapabilities(refreshTimeout) {
     const key = JSON.stringify([home, options.workspace ?? process.cwd()]);
+    if (refreshTimeout) return capabilityProbe(key, true).promise;
     let retriedFault = 0;
     while (true) {
       const entry = capabilityProbe(key);
@@ -505,11 +508,12 @@ export function createCodexHost(options = {}) {
     }
   }
   return {
-    async probe() {
-      const { nativeAvailable, reason } = await probeCapabilities();
+    async probe({ refreshTimeout = false } = {}) {
+      const { nativeAvailable, reason } = await probeCapabilities(refreshTimeout);
       if (!nativeAvailable) {
         const code = reason?.code ?? 'codex-native-rpc-unavailable';
-        const message = code === 'codex-native-rpc-unavailable' || code === 'codex-native-rpc-timeout'
+        const missingRenderer = code === 'codex-native-rpc-unavailable' && reason?.discoveryReason === 'no-match';
+        const message = missingRenderer
           ? 'Codex Desktop is not reachable over its local debug port. Open Codex from FAswitch, then retry.'
             + (reason?.message ? ` (${reason.message})` : '')
           : reason?.message ?? 'The Codex Desktop readiness read failed.';
@@ -1029,7 +1033,7 @@ export function createCodexHost(options = {}) {
       try { root = await readCodexThreadNative(nativeSessionId, { request: nativeRequest }); }
       catch (error) {
         if (error.code === 'codex-thread-not-found') return { destroyed: true };
-        throw error;
+        throw codexCleanupPreflightError(error);
       }
       // The roster binding plus the thread's cwd are the ownership evidence. The
       // old thread_source/agent_created_thread marker is gone from this path.
@@ -1047,7 +1051,8 @@ export function createCodexHost(options = {}) {
         for (const child of children) if (typeof child?.id === 'string') await visit(child.id);
         rows.push(id); // descendants before root; a partial failure retains the root binding
       };
-      await visit(nativeSessionId);
+      try { await visit(nativeSessionId); }
+      catch (error) { throw codexCleanupPreflightError(error); }
       if (ownedNodeIds.some(id => !visited.has(id))) {
         throw fail('codex-delete-owner-mismatch', 'An owned node is no longer a native descendant.');
       }
@@ -1055,8 +1060,11 @@ export function createCodexHost(options = {}) {
         try { await readCodexThreadNative(id, { request: nativeRequest }); return true; }
         catch (error) { if (error.code === 'codex-thread-not-found') return false; throw error; }
       };
-      for (const id of rows) {
-        await nativeRequest('thread/delete', { threadId: id });
+      for (const [index, id] of rows.entries()) {
+        try { await nativeRequest('thread/delete', { threadId: id }); }
+        catch (error) {
+          throw index === 0 && error.notSent === true ? codexCleanupPreflightError(error) : error;
+        }
         if (await exists(id)) return { destroyed: false, message: 'Native deletion did not remove the thread record.' };
       }
       return { destroyed: true };

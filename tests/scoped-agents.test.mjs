@@ -10,8 +10,6 @@ import { FINAL_REPORT_REMINDER } from '../src/report-contract.mjs';
 import { monitorSpawn } from '../src/shared-monitor.mjs';
 import { RosterStore } from '../src/roster-store.mjs';
 import { ownerIdFor } from '../src/calling-context.mjs';
-import { createAuthority, openAuthority } from '../src/cleanup-authority.mjs';
-import { readRosterTree, claimRosterTree, recordRosterStep, completeRosterTicket } from '../src/cleanup-roster-transaction.mjs';
 
 const workspace = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const A = '11111111-1111-4111-8111-111111111111';
@@ -21,11 +19,11 @@ const extra = threadId => ({ _meta: { threadId } });
 const stopMonitor = store => store.db.prepare('DELETE FROM leases WHERE key IN (?,?)').run('idle-monitor', 'idle-monitor:ready');
 
 async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, beforeNotice, beforeModels, captureFiles,
-  callCodex: callCodexOverride, store: injectedStore, config: extraConfig = {}, reportedEffort, reportedDelivery } = {}) {
+  callCodex: callCodexOverride, config: extraConfig = {} } = {}) {
   const base = path.join(workspace, 'clean', 'scoped-tests');
   await mkdir(base, { recursive: true });
   const stateDirectory = await mkdtemp(path.join(base, 'run-'));
-  const store = injectedStore ?? new RosterStore(':memory:');
+  const store = new RosterStore(':memory:');
   const sessions = new Map();
   const sends = [], notices = [], removed = [], workers = [], reads = [], cancellations = [], beginnings = [], historyRequests = [];
   let offline = false, notificationMode = 'ok', statusCalls = 0, catalogCalls = 0, cursorCalls = 0;
@@ -34,7 +32,7 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
   const selections = [];
   const api = {
     async connectionIdentity() { if (offline) throw new Error('DSH offline'); return { application: 'dsh', dataRoot: path.join(stateDirectory, 'native') }; },
-    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy', 'managedPromptV2', 'managedPromptReceipt'] }; },
+    async hostStatus() { return { treeProtocol: 1, reportProtocol: 1, methods: ['managedCreate', 'managedBeginTask', 'managedStatus', 'managedHistory', 'managedAnswer', 'managedCancel', 'managedDestroy'] }; },
     async managedCreate(input) {
       if (!sessions.has(input.sessionId)) sessions.set(input.sessionId, { ...input, model: { provider: 'fixture', model: 'test' }, running: false, seq: 0, questions: [], changes: [], turns: new Map() });
       return { ...sessions.get(input.sessionId), modelRequestsStarted: 0 };
@@ -76,21 +74,8 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
       s.answers ??= new Map();
       if (s.answers.has(input.answerId)) return s.answers.get(input.answerId);
       const pending = s.questions.filter(question => question.state === 'pending');
-      // The real bridge is given the question identity the caller saw and refuses
-      // to consume any other question. The fixture must enforce the same contract,
-      // otherwise a wrong caller would still pass here.
-      if (Array.isArray(input.questionIds) && input.questionIds.length) {
-        const live = new Set(pending.map(question => question.id));
-        if (!input.questionIds.every(id => live.has(id))) {
-          return { accepted: false, notSent: true, consumedQuestionIds: [],
-            pendingQuestionIds: pending.map(question => question.id),
-            pendingQuestions: pending.map(question => question.message) };
-        }
-      }
-      const answering = Array.isArray(input.questionIds) && input.questionIds.length
-        ? pending.filter(question => input.questionIds.includes(question.id)) : pending;
-      answering.forEach(question => { question.state = 'answered'; });
-      const result = { consumedQuestionIds: answering.map(question => question.id), continuation: `Answer: ${input.message}` };
+      pending.forEach(question => { question.state = 'answered'; });
+      const result = { consumedQuestionIds: pending.map(question => question.id), continuation: `Answer: ${input.message}` };
       s.answers.set(input.answerId, result);
       return result;
     },
@@ -128,11 +113,10 @@ async function fixture({ startSharedMonitor, monitorFailureGraceMs, beforeSend, 
       if (beforeSend) await beforeSend(input);
       const s = sessions.get(input.sessionId);
       const afterSeq = s.seq;
-      const delivery = s.running ? 'current-turn' : 'new-turn';
       s.running = true; s.seq += 1;
       s.turns.set(input.requestId, { afterSeq, state: 'running' });
       sends.push(input);
-      return { accepted: true, delivery: reportedDelivery === null ? null : delivery, afterSeq, actualEffort: reportedEffort === null ? null : s.model.reasoningEffort ?? null, actualEffortSource: reportedEffort === null ? null : 'host-readback', ...(reportedEffort === null ? { actualModel: null } : {}) };
+      return { accepted: true, afterSeq };
     },
     async wait(input) {
       const s = sessions.get(input.sessionId);
@@ -195,7 +179,7 @@ test('default model follows live host for new tasks, supplements and answers wit
   const f = await fixture();
   try {
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    assert.equal(f.catalogCalls(), 1, 'empty creation previews the current model');
+    assert.equal(f.catalogCalls(), 0, 'empty creation does not fetch the model catalog');
     const newModel = { provider: 'new-route', model: 'new-model', reasoningEffort: 'max' };
     const record = f.record(); record.model = newModel; f.store.save(record);
     f.defaultModel(newModel);
@@ -208,9 +192,9 @@ test('default model follows live host for new tasks, supplements and answers wit
     await f.service.send({ name: 'artist', message: 'switch back' }, extra(A));
     f.defaultModel(newModel);
     await f.service.send({ name: 'artist', message: 'switch again' }, extra(A));
-    assert.equal(f.selections.length, 1, 'active supplements keep the running selection');
-    assert.equal(new Set(f.selections.map(item => item.requestId)).size, 1);
-    assert.equal(f.catalogCalls(), 5);
+    assert.equal(f.selections.length, 3);
+    assert.equal(new Set(f.selections.map(item => item.requestId)).size, 3, 'each input owns its model receipt');
+    assert.equal(f.catalogCalls(), 4);
     assert.equal(f.cursorCalls(), 0, 'begin/status observations supply the cursor');
     f.finish();
     const session = f.sessions.get(record.sessionId);
@@ -219,7 +203,7 @@ test('default model follows live host for new tasks, supplements and answers wit
     f.defaultModel({ provider: 'fixture', model: 'test' });
     await f.service.answer({ name: 'artist', message: 'yes' }, extra(A));
     await f.service.poll(record.agentId);
-    assert.equal(f.selections.length, 2);
+    assert.equal(f.selections.length, 4);
     assert.equal(f.sends.at(-1).message, 'Answer: yes');
     assert.equal(f.record().task.dispatches.at(-1).kind, 'answer');
     assert.equal(f.cursorCalls(), 0);
@@ -259,7 +243,7 @@ test('model failure is visible in list wait and inspect, notifies once and clear
     assert.equal(failed.state, 'failed');
     assert.deepEqual(failed.error, { source: 'model', code: 'no_healthy_account', httpStatus: 503,
       message: 'The model gateway has no healthy account available.' });
-    assert.deepEqual((await f.service.list(extra(A), { state: 'failed' })).items[0].error, failed.error);
+    assert.deepEqual((await f.service.list(extra(A))).items[0].error, failed.error);
     assert.deepEqual((await f.service.wait({ names: ['artist'] }, extra(A))).items[0].error, failed.error);
     assert.deepEqual((await f.service.inspect({ name: 'artist' }, extra(A))).error, failed.error);
     assert.equal(f.record().error, undefined, 'successful observation does not replace model failure with a connection error');
@@ -300,7 +284,7 @@ test('model failure backfill uses only the inspected original request and does n
     assert.equal(inspection.error.code, 'no_healthy_account');
     assert.equal(f.historyRequests.length, 1);
     assert.equal(f.reads.length, 1);
-    assert.deepEqual((await f.service.list(extra(A), { state: 'failed' })).items[0].error, inspection.error);
+    assert.deepEqual((await f.service.list(extra(A))).items[0].error, inspection.error);
 
     await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
     const next = f.record();
@@ -708,28 +692,8 @@ test('one-shot asks directly, resumes once, and clears only after confirmed resu
   f.service.close();
 });
 
-for (const enabled of [false,true]) test(`delivered once retains original immediate cleanup with C and switch ${enabled}`, async () => {
-  const f=await fixture({config:{agentAutoCleanup:enabled}});
-  try {
-    await f.service.create({name:'artist',lifetime:'once'},extra(A));
-    await f.service.send({name:'artist',message:'one'},extra(A));
-    const record=f.record();
-    const config={stateDirectory:f.stateDirectory,configFile:path.join(f.stateDirectory,'config.json')};
-    await writeFile(config.configFile,'{}');
-    const key=JSON.stringify(['roster','managed-agent',path.resolve(f.stateDirectory),record.agentId]);
-    const authorityId=await createAuthority(config,false,'test-manifest',[{key,decision:'C',fingerprint:'test'}]);
-    const authority=await openAuthority(config,false,{write:true,binding:authorityId});
-    try { if(enabled) authority.toggle(true); assert.equal(authority.lookup(key).decision,'C'); }
-    finally {authority.close();}
-    await writeFile(path.join(f.stateDirectory,'cleanup-binding.json'),JSON.stringify({approval:'test',ids:{local:authorityId}}));
-    f.finish(); f.report(); await f.service.poll(record.agentId);
-    assert.equal(f.record(),undefined);
-    assert.ok(f.removed.includes(record.sessionId));
-  } finally {f.service.close();}
-});
-
 test('persistent agents reuse one session and retain earlier task changes', async () => {
-  const f = await fixture({ captureFiles: async () => ({ available: true, workspace, files: {} }) });
+  const f = await fixture();
   await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
   const id = f.record().sessionId;
   await f.service.send({ name: 'artist', message: 'first' }, extra(A));
@@ -1166,7 +1130,6 @@ test('tree inspection and file attribution follow only this root lineage without
       f.sessions.set(id, { sessionId: id, turns: new Map([['native-turn', { afterSeq: 0, state: 'ended', endSeq: 2,
         messages: [{ seq: 1, text }] }]]) });
     }
-    const readsBeforeInspection = f.reads.length;
     const changes = await f.service.changes({ name: 'artist' }, extra(A));
     assert.deepEqual(changes.changes.map(item => item.agentPath), [['artist'], ['artist', 'designer'], ['artist', 'designer', 'reviewer']]);
     const list = await f.service.list(extra(A));
@@ -1177,7 +1140,7 @@ test('tree inspection and file attribution follow only this root lineage without
     assert.equal(inspected.tree.nodes[2].messages[0].text, 'Grandchild review');
     const visible = JSON.stringify([list, changes, inspected]);
     for (const hidden of ['native-child', 'native-grandchild', foreign.sessionId, 'foreign-secret.md', 'foreign chat']) assert.ok(!visible.includes(hidden));
-    assert.ok(!f.reads.slice(readsBeforeInspection).includes(foreign.sessionId));
+    assert.ok(!f.reads.includes(foreign.sessionId));
     assert.equal((await f.service.list(extra(B))).items[0].tree.nodes.length, 0);
   } finally { f.service.close(); }
 });
@@ -1617,7 +1580,7 @@ test('send returns a compact receipt for a rich active task and preserves errors
   ];
   f.store.save(record);
   const result = await f.service.send({ name: 'artist', message: 'private supplement' }, extra(A));
-  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualEffort', 'actualEffortSource', 'actualModel', 'callbackError', 'delivery', 'effortSource', 'mode', 'name', 'queued', 'requestId', 'requestedEffort', 'selectedEffort', 'state', 'taskKey']);
+  assert.deepEqual(Object.keys(result).sort(), ['accepted', 'actualModel', 'callbackError', 'delivery', 'mode', 'name', 'queued', 'requestId', 'state']);
   assert.equal(result.accepted, true);
   assert.equal(result.callbackError.code, 'native-callback-unavailable');
   assert.doesNotMatch(JSON.stringify(result), /private|deep child|coverage/);
@@ -2005,46 +1968,46 @@ test('create resolves a model substring and keeps it across sends, effort change
     assert.equal(created.actualModel, 'alpha-pro');
     assert.equal(f.sends.length, 0, 'creation starts no model turn');
     assert.deepEqual(f.record().modelPin,
-      { provider: 'fixture', model: 'alpha-pro' });
+      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
     assert.deepEqual(f.selections.map(item => [item.model, item.reasoningEffort, item.sessionOnly]),
-      [['alpha-pro', 'max', true]], 'an explicit DSH pin is session-only');
+      [['alpha-pro', 'low', true]], 'an explicit DSH pin is session-only');
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'alpha-pro');
 
     const first = await f.service.send({ name: 'artist', message: 'go' }, extra(A));
     assert.equal(first.actualModel, 'alpha-pro');
-    assert.equal(f.selections.at(-1).reasoningEffort, 'max');
-    assert.equal(f.record().task.modelSelection.reasoningEffort, 'max');
+    assert.equal(f.selections.length, 1, 'the same live selection is not selected again');
+    assert.deepEqual(f.record().task.modelSelection,
+      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
 
     const second = await f.service.send({ name: 'artist', message: 'more', effort: 'max' }, extra(A));
     assert.equal(second.actualModel, 'alpha-pro');
     assert.deepEqual(f.record().modelPin,
-      { provider: 'fixture', model: 'alpha-pro' });
+      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'max' });
     const lastSelection = f.selections.at(-1);
     assert.equal(lastSelection.provider, 'fixture');
     assert.equal(lastSelection.model, 'alpha-pro');
     assert.equal(lastSelection.reasoningEffort, 'max');
     assert.equal(lastSelection.sessionOnly, true);
-    assert.match(lastSelection.requestId, /-model(?:-\d+)?$/);
+    assert.equal(lastSelection.requestId.endsWith('-model'), true);
     assert.equal(f.record().task.dispatches.at(-1).model.reasoningEffort, 'max');
   } finally { f.service.close(); }
 });
 
-test('effort alone uses the host default without pinning the model', async () => {
+test('effort alone without a pin is refused without touching the name or sending', async () => {
   const f = await fixture();
   try {
     f.catalog(MULTI_MODEL_CATALOG);
     await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'work', effort: 'high' }, extra(A));
-    assert.equal(receipt.actualModel, 'base');
-    assert.equal(receipt.actualEffort, 'high');
+    await assert.rejects(f.service.send({ name: 'artist', message: 'work', effort: 'high' }, extra(A)),
+      error => error.code === 'model-required-for-effort' && /host default/.test(error.message));
     assert.equal(f.record().modelPin, undefined);
-    assert.equal(f.sends.length, 1);
+    assert.equal(f.sends.length, 0);
   } finally { f.service.close(); }
 });
 
 const LOCKED = { config: { dshDefaultModelOnly: true } };
 
-test('locked to the DSH default, a caller model is ignored and effort is adapted', async () => {
+test('locked to the DSH default, a caller model and effort never select anything', async () => {
   const f = await fixture(LOCKED);
   try {
     f.catalog(MULTI_MODEL_CATALOG);
@@ -2057,13 +2020,13 @@ test('locked to the DSH default, a caller model is ignored and effort is adapted
     assert.equal(sent.accepted, true);
     assert.equal(sent.actualModel, 'base', 'the task runs on the host default');
     assert.equal(f.record().modelPin, undefined);
-    assert.equal(f.record().task.dispatches.at(-1).model.explicitFields.model, false);
-    assert.equal(f.selections.some(item => item.model !== 'base'), false);
-    assert.equal(sent.actualEffort, 'high');
+    assert.notEqual(f.record().task.dispatches.at(-1).explicitModel, true);
+    assert.equal(f.selections.some(item => item.sessionOnly === true || item.model !== 'base'), false,
+      'only the host default was ever selected');
   } finally { f.service.close(); }
 });
 
-test('locked to the DSH default, an unsupported requested effort is adapted', async () => {
+test('locked to the DSH default, an effort alone is ignored instead of refused', async () => {
   const f = await fixture(LOCKED);
   try {
     f.catalog(MULTI_MODEL_CATALOG);
@@ -2141,7 +2104,7 @@ test('a busy lock freezes the current pin for queued input and a later pin chang
     assert.equal(newer.queued, true);
     assert.equal(newer.actualModel, 'beta-mini', 'the queued receipt reports this input’s resolved full ID');
     assert.deepEqual(f.record().modelPin,
-      { provider: 'fixture', model: 'beta-mini' });
+      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
     assert.equal((await f.service.list(extra(A))).items[0].actualModel, 'alpha-pro',
       'list keeps the observed model separate from the queued new pin');
     assert.equal(f.store.supplements(record.agentId).length, 2);
@@ -2170,8 +2133,8 @@ test('a pending question freezes the answer selection before its continuation di
     assert.equal(answered.answered, true);
     assert.equal(answered.actualModel, 'beta-mini');
     const answer = f.record().task.answers[0];
-    assert.equal(answer.modelSelection.model, 'beta-mini');
-    assert.equal(answer.modelSelection.reasoningEffort, 'medium');
+    assert.deepEqual(answer.modelSelection,
+      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
     // The continuation waits for the live turn to end; a later pin change must not
     // rewrite the answer intent already accepted.
     f.finish();
@@ -2180,8 +2143,8 @@ test('a pending question freezes the answer selection before its continuation di
     f.store.save(later);
     await f.service.poll(record.agentId);
     const dispatch = f.record().task.dispatches.find(item => item.kind === 'answer');
-    assert.equal(dispatch.model.model, 'beta-mini');
-    assert.equal(dispatch.model.reasoningEffort, 'medium');
+    assert.deepEqual(dispatch.model,
+      { provider: 'fixture', model: 'beta-mini', reasoningEffort: 'medium' });
   } finally { f.service.close(); }
 });
 
@@ -2195,8 +2158,8 @@ test('a reminder keeps the name’s explicit selection', async () => {
     await f.service.poll(f.record().agentId);
     const reminder = f.record().task.dispatches.find(item => item.reminder === true);
     assert.ok(reminder);
-    assert.equal(reminder.model.model, 'alpha-pro');
-    assert.equal(reminder.model.reasoningEffort, 'max');
+    assert.deepEqual(reminder.model,
+      { provider: 'fixture', model: 'alpha-pro', reasoningEffort: 'low' });
   } finally { f.service.close(); }
 });
 
@@ -2215,1001 +2178,5 @@ test('a reminder that did arrive keeps the task running while the model works', 
     const working = await f.service.poll(record.agentId);
     assert.equal(working.state, 'running', 'the reminder turn is work in progress, not a finished task');
     assert.equal(f.record().task.state, 'running');
-  } finally { f.service.close(); }
-});
-test('created run failure follows its generated name and never a replacement round', async () => {
-  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
-  const { McpServer } = await import('@modelcontextprotocol/sdk/server/mcp.js');
-  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
-  const { registerScopedTools } = await import('../src/mcp-server.mjs');
-  const { pendingFeedback } = await import('../src/feedback-inbox.mjs');
-  const f = await fixture(); const original = f.api.hostStatus; let probes = 0;
-  f.api.hostStatus = async () => { if (++probes > 1) throw Object.assign(new Error('fixture probe'), {code:'host-probe-failed'}); return original(); };
-  const server = new McpServer({name:'feedback-test',version:'1'}); registerScopedTools(server,{service:f.service});
-  const client = new Client({name:'feedback-test',version:'1'}); const [a,b] = InMemoryTransport.createLinkedPair(); await server.connect(b); await client.connect(a);
-  try {
-    const run = JSON.parse((await client.callTool({name:'futureaide_run_agent',arguments:{message:'x'},_meta:{threadId:A}})).content[0].text);
-    assert.equal(run.created,true); assert.equal(run.error.code,'host-probe-failed');
-    const first = JSON.parse((await client.callTool({name:'futureaide_feedback',arguments:{name:run.name,kind:'problem',message:'creation dispatch failed'},_meta:{threadId:A}})).content[0].text);
-    assert.equal(first.saved,true);
-    let rows = pendingFeedback(path.join(f.stateDirectory,'config.json')).flatMap(x=>x.occurrences);
-    assert.equal(rows.find(x=>x.message==='creation dispatch failed').error.code,'host-probe-failed');
-    const record = f.record(run.name); record.task = {taskId:'replacement-task',startedAt:new Date().toISOString(),dispatches:[],reports:[]}; f.store.save(record);
-    await client.callTool({name:'futureaide_feedback',arguments:{name:run.name,kind:'problem',message:'new round'},_meta:{threadId:A}});
-    rows = pendingFeedback(path.join(f.stateDirectory,'config.json')).flatMap(x=>x.occurrences);
-    assert.equal(rows.find(x=>x.message==='new round').error,null);
-  } finally { await client.close(); await server.close(); f.service.close(); }
-});
-
-test('task-key wait replays reports, isolates owners and respects cursors and cancellation', async () => {
-  const f = await fixture();
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
-    assert.ok(sent.taskKey);
-    const r = f.record();
-    const controller = new AbortController();
-    const pending = f.service.wait({ taskKeys: [sent.taskKey] }, { ...extra(A), signal: controller.signal });
-    f.store.enqueueSubmission({ id: 'wait-stage', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId,
-      kind: 'report', message: 'stage ready', final: false });
-    const first = await pending;
-    assert.equal(first.events[0].type, 'report');
-    assert.equal(first.events[0].message, 'stage ready');
-    const replay = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.equal(replay.events[0].id, first.events[0].id);
-    const next = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
-    assert.equal(next.events.length, 0);
-    f.store.enqueueSubmission({ id: 'wait-skew', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId,
-      kind: 'report', message: 'later insert', created: '2000-01-01T00:00:00.000Z' });
-    const skew = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
-    assert.equal(skew.events[0].message, 'later insert');
-    await assert.rejects(f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(B)), { code: 'task-receipt-unavailable' });
-    const cancel = new AbortController();
-    const blocked = f.service.wait({ taskKeys: [sent.taskKey], after: skew.nextCursor }, { ...extra(A), signal: cancel.signal });
-    cancel.abort();
-    await assert.rejects(blocked, { name: 'AbortError' });
-  } finally { f.service.close(); }
-});
-
-
-test('task-key wait reads the original archived round after a new round', async () => {
-  const f = await fixture();
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'old', lifetime: 'persistent' }, extra(A));
-    const previous = f.record();
-    previous.state = 'failed'; previous.task.state = 'failed';
-    previous.task.error = { code: 'old-failure' };
-    f.store.save(previous);
-    const replacement = { ...previous, state: 'running', error: undefined,
-      task: { taskId: 'new-task', requestId: 'new-request', message: 'new', state: 'running', dispatches: [] } };
-    assert.equal(f.store.replaceTask(replacement, previous, { ...previous.task }), true);
-    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.equal(result.items[0].task.text, 'old');
-    assert.equal(result.events[0].type, 'failed');
-    assert.equal(result.events[0].reason.code, 'old-failure');
-  } finally { f.service.close(); }
-});
-
-
-test('task-key wait returns native questions and task reports once', async () => {
-  const f = await fixture();
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
-    const record = f.record();
-    record.task.reports = [{ id: 'native-report', message: 'checkpoint', final: false, delivery: { state: 'pending' } }];
-    record.observation = { questions: [{ id: 'native-question', state: 'pending', message: 'Which option?' }] };
-    f.store.save(record);
-    const first = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.deepEqual(first.events.map(event => event.type), ['report', 'question']);
-    const next = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
-    assert.equal(next.events.length, 0);
-  } finally { f.service.close(); }
-});
-
-
-test('native question cursor does not repeat survivors and pages without loss', async () => {
-  const f = await fixture();
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
-    const r = f.record();
-    r.observation = { questions: Array.from({ length: 6 }, (_, i) => ({ id: 'q' + i, state: 'pending', message: String(i).repeat(4000) })) };
-    f.store.save(r);
-    const first = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.ok(first.events.length < 6);
-    const second = await f.service.wait({ taskKeys: [sent.taskKey], after: first.nextCursor, timeoutSeconds: 0 }, extra(A));
-    assert.equal(first.events.length + second.events.length, 6);
-    const current = f.record(); current.observation.questions = [current.observation.questions[0]]; f.store.save(current);
-    const third = await f.service.wait({ taskKeys: [sent.taskKey], after: second.nextCursor, timeoutSeconds: 0 }, extra(A));
-    assert.equal(third.events.length, 0);
-  } finally { f.service.close(); }
-});
-
-test('supplement key begins after existing reports and does not duplicate submissions', async () => {
-  const f = await fixture();
-  try {
-    await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
-    const r = f.record();
-    f.store.enqueueSubmission({ id: 'old', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId, kind: 'report', message: 'old' });
-    const sent = await f.service.send({ name: 'artist', message: 'continue' }, extra(A));
-    f.store.enqueueSubmission({ id: 'new', ownerId: r.ownerId, agentId: r.agentId, taskId: r.task.taskId, kind: 'report', message: 'new' });
-    const latest = f.record(); latest.task.reports = [{ id: 'submission:new', message: 'new', final: false, delivery: { state: 'pending' } }]; f.store.save(latest);
-    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.deepEqual(result.events.map(event => event.message), ['new']);
-  } finally { f.service.close(); }
-});
-
-for (const automatic of [true, false]) test(`${automatic ? 'automatic' : 'manual'} tree cleanup handles child receipt`, async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'artist', lifetime: automatic ? 'once' : 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'parent' }, extra(A));
-    await f.service.create({ name: 'child', lifetime: 'persistent' }, extra(A));
-    const parent = f.record(), child = f.record('child');
-    child.parentAgentId = parent.agentId;
-    child.task = { taskId: 'child-task', state: 'completed', reports: [{ id: 'submission:child-final', final: true, delivery: { state: 'delivered' } }], dispatches: [] };
-    child.observation = { tree: { settled: true, running: false }, questions: [] };
-    f.store.save(child);
-    const key = f.store.saveTaskKey(child.ownerId, child.agentId, 'child-request', 'child-task');
-    if (automatic) {
-      const ready = f.store.get(parent.agentId);
-      ready.task.reports = [{ id: 'parent-final', final: true, delivery: { state: 'delivered' } }];
-      f.store.save(ready);
-      assert.equal(f.store.claimAutoCleanup(ready), true);
-      await f.service.poll(parent.agentId);
-    }
-    else await f.service.delete({ name: 'artist' }, extra(A));
-    assert.equal(f.store.get(child.agentId), undefined, JSON.stringify(f.store.get(parent.agentId)));
-    const mapping = f.store.resolveTaskKey(child.ownerId, key);
-    if (automatic) assert.equal(mapping.receipt.finalSubmissionId, 'child-final');
-    else assert.equal(mapping, null);
-  } finally { f.service.close(); }
-});
-
-test('public delete retry after a busy automatic cleanup retains the confirmed receipt', async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
-    const sent = await f.service.send({ name: 'artist', message: 'work' }, extra(A));
-    const parent = f.record();
-    parent.task.reports = [{ id: 'submission:busy-final', final: true, delivery: { state: 'delivered' } }]; f.store.save(parent);
-    assert.equal(f.store.claimAutoCleanup(parent), true);
-    const prepare = f.store.db.prepare.bind(f.store.db);
-    f.store.db.prepare = sql => /wal_checkpoint/i.test(sql) ? { get: () => ({ busy: 1 }) } : prepare(sql);
-    try { await f.service.poll(parent.agentId); } finally { f.store.db.prepare = prepare; }
-    assert.equal(f.record().state, 'cleanup_failed');
-    await f.service.delete({ name: 'artist' }, extra(A));
-    assert.equal(f.store.resolveTaskKey(parent.ownerId, sent.taskKey).receipt.finalSubmissionId, 'busy-final');
-  } finally { f.service.close(); }
-});
-
-test('automatic child cleanup retries an uncertain destroy with its original source', async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'once' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'parent' }, extra(A));
-    await f.service.create({ name: 'child', lifetime: 'persistent' }, extra(A));
-    const parent = f.record(), child = f.record('child'); child.parentAgentId = parent.agentId;
-    child.task = { taskId: 'child-task', state: 'completed', reports: [{ id: 'child-final', final: true, delivery: { state: 'delivered' } }], dispatches: [] };
-    f.store.save(child);
-    const key = f.store.saveTaskKey(child.ownerId, child.agentId, 'child-request', 'child-task');
-    parent.task.reports = [{ id: 'parent-final', final: true, delivery: { state: 'delivered' } }]; f.store.save(parent);
-    assert.equal(f.store.claimAutoCleanup(parent), true);
-    const destroy = f.api.managedDestroy; let failed = false;
-    f.api.managedDestroy = async input => {
-      if (!failed && input.sessionId === child.sessionId) { failed = true; throw Object.assign(new Error('unknown'), { uncertain: true }); }
-      return destroy(input);
-    };
-    await f.service.poll(parent.agentId);
-    const retry = f.store.get(child.agentId);
-    assert.equal(retry.autoCleanupClosed, true);
-    retry.nextAttemptAt = 0; f.store.save(retry);
-    await f.service.poll(child.agentId);
-    assert.equal(f.store.resolveTaskKey(child.ownerId, key).receipt.finalSubmissionId, 'child-final');
-  } finally { f.service.close(); }
-});
-
-test('cleanup ticket preserves the old wait receipt across same-name replacement', async () => {
-  const dir = await mkdtemp(path.join(workspace, 'clean', 'scoped-tests', 'ticket-wait-'));
-  const file = path.join(dir, 'roster.sqlite');
-  const store = new RosterStore(file); const f = await fixture({ store });
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'old', lifetime: 'once' }, extra(A));
-    const old = f.record();
-    old.task.reports = [{ id: 'submission:ticket-final', final: true, message: 'private', delivery: { state: 'delivered' } }];
-    store.save(old);
-    const tree = readRosterTree(file, old.agentId);
-    claimRosterTree(file, { rootId: old.agentId, fingerprint: tree.fingerprint, ticketId: 'ticket-wait' });
-    recordRosterStep(file, 'ticket-wait', old.agentId, 'native-complete', { removed: true });
-    recordRosterStep(file, 'ticket-wait', old.agentId, 'private-complete', { removed: true });
-    completeRosterTicket(file, 'ticket-wait');
-    const replacement = await f.service.run({ name: 'artist', message: 'new', lifetime: 'persistent' }, extra(A));
-    const oldWait = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    const newWait = await f.service.wait({ taskKeys: [replacement.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.notEqual(replacement.taskKey, sent.taskKey);
-    assert.equal(oldWait.events[0].type, 'delivered');
-    assert.equal(oldWait.events[0].id, `${sent.taskKey}:delivered:ticket-final`);
-    assert.equal(newWait.events.some(event => event.type === 'delivered'), false);
-  } finally { f.service.close(); }
-});
-
-test('send returns its original key without rechecking a reused name', async () => {
-  const f = await fixture();
-  try {
-    await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
-    const send = f.service.sendUnkeyed; let originalAgent;
-    f.service.sendUnkeyed = async (...args) => {
-      const result = await send(...args); const old = f.record(); originalAgent = old.agentId;
-      old.task.reports = [{ id: 'submission:cleanup-final', final: true, message: 'done', delivery: { state: 'delivered' } }];
-      f.store.save(old); f.store.remove(old, { deliveredReceipt: true });
-      f.store.insert({ ...old, agentId: 'replacement-agent', sessionId: 'replacement-session',
-        task: { taskId: 'replacement-task', requestId: 'replacement-request', state: 'running', reports: [] } });
-      return result;
-    };
-    const sent = await f.service.send({ name: 'artist', message: 'next' }, extra(A));
-    const mapping = f.store.resolveTaskKey(ownerIdFor(A), sent.taskKey);
-    assert.equal(mapping.requestId, sent.requestId);
-    assert.equal(mapping.agentId, originalAgent);
-    assert.equal(mapping.receipt.finalSubmissionId, 'cleanup-final');
-  } finally { f.service.close(); }
-});
-
-test('wait rechecks the receipt when cleanup commits between mapping and record reads', async () => {
-  const f = await fixture();
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
-    const r = f.record(); r.task.reports = [{ id: 'submission:done', final: true, message: 'done', delivery: { state: 'delivered' } }]; f.store.save(r);
-    const get = f.store.get.bind(f.store); let fired = false;
-    f.store.get = id => { if (!fired && id === r.agentId) { fired = true; f.store.remove(r, { deliveredReceipt: true }); return undefined; } return get(id); };
-    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.equal(result.events[0].type, 'delivered');
-  } finally { f.service.close(); }
-});
-
-
-test('wait surfaces the requested blocked supplement and undelivered answer', async () => {
-  const f = await fixture();
-  try {
-    await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
-    const accepted = await f.service.send({ name: 'artist', message: 'accepted' }, extra(A));
-    assert.equal(f.store.supplement(accepted.requestId).status, 'accepted');
-    assert.equal(f.store.setSupplement(accepted.requestId, 'blocked', 'dispatch-expired'), false);
-    assert.equal(f.store.supplement(accepted.requestId).status, 'accepted');
-    await f.service.wait({ taskKeys: [accepted.taskKey], timeoutSeconds: 0 }, extra(A));
-    const current = f.record(); let release;
-    const held = f.store.locked(current.agentId, () => new Promise(resolve => { release = resolve; }));
-    await new Promise(resolve => setImmediate(resolve));
-    let sent;
-    try { sent = await f.service.send({ name: 'artist', message: 'next' }, extra(A)); }
-    finally { release(); await held; }
-    assert.equal(f.store.supplement(sent.requestId).status, 'queued');
-    f.store.db.prepare('UPDATE supplements SET created=? WHERE requestId=?').run('2020-01-01T00:00:00.000Z', sent.requestId);
-    await f.service.poll(current.agentId);
-    assert.equal(f.store.supplement(sent.requestId).reason, 'dispatch-expired');
-    await assert.rejects(f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A)), error => error.code === 'dispatch-expired' && error.requestId === sent.requestId);
-    const r = f.record(); r.task.answers = [{ answerId: 'bad-answer', message: 'x', undelivered: 'final-submitted' }];
-    assert.equal(f.store.saveAnswerWithTaskKey(r, 'bad-answer'), true);
-    const key = f.store.taskKeyForRequest(r.ownerId, 'bad-answer');
-    await assert.rejects(f.service.wait({ taskKeys: [key], timeoutSeconds: 0 }, extra(A)), error => error.code === 'final-submitted' && error.requestId === 'bad-answer');
-  } finally { f.service.close(); }
-});
-
-
-test('task-key wait reads under a concurrent WAL writer lock', async () => {
-  const { DatabaseSync } = await import('node:sqlite');
-  const dir = await mkdtemp(path.join(workspace, 'clean', 'scoped-tests', 'wal-'));
-  const file = path.join(dir, 'roster.sqlite');
-  const store = new RosterStore(file); const f = await fixture({ store });
-  const writer = new DatabaseSync(file);
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'work', lifetime: 'persistent' }, extra(A));
-    store.db.exec('PRAGMA busy_timeout=50'); writer.exec('BEGIN IMMEDIATE');
-    const result = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.equal(result.reason, 'timeout');
-    writer.exec('ROLLBACK');
-  } finally { writer.close(); f.service.close(); }
-});
-
-
-test('old task key keeps the original terminal reason after poll and a new send', async () => {
-  const f = await fixture();
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
-    f.finish(); const r = f.record(), session = f.sessions.get(r.sessionId);
-    Object.assign(session.turns.get(r.task.dispatches[0].requestId), { messages: [], completionReason: { kind: 'error', error: { code: 'SERVER', message: '503: {"code":"no_healthy_account"}' } } });
-    const failed = await f.service.poll(r.agentId);
-    assert.equal(failed.state, 'failed');
-    await f.service.send({ name: 'artist', message: 'new task' }, extra(A));
-    const old = await f.service.wait({ taskKeys: [sent.taskKey], timeoutSeconds: 0 }, extra(A));
-    assert.equal(old.events.find(event => event.type === 'failed')?.reason?.code, 'no_healthy_account');
-  } finally { f.service.close(); }
-});
-
-
-test('native questions survive disappearance, pagination beyond 128 and task archive', async () => {
-  const f = await fixture();
-  try {
-    const sent = await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
-    let old = f.record();
-    old.observation = { questions: Array.from({ length: 129 }, (_, i) => ({ id: 'historical-' + i, state: 'pending', message: 'question ' + i + ' ' + 'x'.repeat(3900) })) };
-    f.store.save(old);
-    old = f.record(); old.observation = { questions: [] }; old.state = 'failed'; old.task.state = 'failed'; f.store.save(old);
-    const next = { ...old, state: 'running', task: { taskId: 'next-round', requestId: 'next-request', message: 'next', state: 'running', reports: [] } };
-    assert.equal(f.store.replaceTask(next, old, { ...old.task }), true);
-    let after, all = [];
-    do {
-      const result = await f.service.wait({ taskKeys: [sent.taskKey], ...(after ? { after } : {}), timeoutSeconds: 0 }, extra(A));
-      all.push(...result.events.filter(event => event.type === 'question'));
-      after = result.nextCursor;
-      assert.ok(after.length < 1500);
-      if (!result.events.length) break;
-    } while (true);
-    assert.equal(all.length, 129);
-    assert.equal(new Set(all.map(event => event.id)).size, 129);
-    assert.match(all[0].message, /^question 0 /);
-    assert.match(all[128].message, /^question 128 /);
-  } finally { f.service.close(); }
-});
-
-
-test('unselected wait returns a report with 161 selected tasks and a compact cursor', async () => {
-  const f = await fixture();
-  try {
-    await f.service.run({ name: 'artist', message: 'first', lifetime: 'persistent' }, extra(A));
-    const root = f.record();
-    for (let i = 0; i < 160; i++) {
-      const record = { ...root, agentId: 'many-agent-' + i, name: 'many-' + i, sessionId: 'many-session-' + i,
-        task: { taskId: 'many-task-' + i, requestId: 'many-request-' + i, message: 'work', state: 'running', reports: [] } };
-      f.store.insert(record);
-    }
-    f.store.enqueueSubmission({ id: 'many-report', ownerId: root.ownerId, agentId: root.agentId, taskId: root.task.taskId, kind: 'report', message: 'only report' });
-    const result = await f.service.wait({}, extra(A));
-    assert.equal(result.events.length, 1);
-    assert.equal(result.events[0].message, 'only report');
-    assert.ok(result.nextCursor.length < 500);
-    const replay = await f.service.wait({ after: result.nextCursor, timeoutSeconds: 0 }, extra(A));
-    assert.equal(replay.events.length, 0);
-  } finally { f.service.close(); }
-});
-
-test('dispatch freezes default effort and confirms DSH receipt', async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
-    assert.equal(receipt.selectedEffort, 'high');
-    assert.equal(receipt.actualEffort, 'high');
-    const dispatch = f.record().task.dispatches[0];
-    assert.equal(dispatch.model.explicitFields.effort, true);
-    assert.equal(dispatch.model.explicitFields.model, false);
-    assert.equal(dispatch.model.requestedEffort, 'high');
-    assert.equal(f.selections.at(-1).reasoningEffort, 'high');
-  } finally { f.service.close(); }
-});
-test('create effort is consumed once and later inputs use the current default', async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent', effort: 'high' }, extra(A));
-    const first = await f.service.send({ name: 'artist', message: 'first' }, extra(A));
-    assert.equal(first.requestedEffort, 'high');
-    assert.equal(first.actualEffort, 'high');
-    const second = await f.service.send({ name: 'artist', message: 'second' }, extra(A));
-    assert.equal(second.requestedEffort, 'max');
-    assert.equal(second.actualEffort, 'high', 'steer stays on the active turn');
-    assert.equal(f.record().modelPin, undefined);
-  } finally { f.service.close(); }
-});
-test('DSH model lock retains the requested effort on the host default', async () => {
-  const f = await fixture({ config: { dshDefaultModelOnly: true } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'first', model: 'other', effort: 'high' }, extra(A));
-    assert.equal(receipt.actualModel, 'test');
-    assert.equal(receipt.actualEffort, 'high');
-    assert.equal(f.selections.at(-1).model, 'test');
-    assert.equal(f.selections.at(-1).reasoningEffort, 'high');
-    assert.equal(f.record().modelPin, undefined);
-  } finally { f.service.close(); }
-});
-test('locked DSH reselects a changed provider only after confirmed pre-write failure', async () => {
-  let attempts = 0;
-  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
-    if (attempts++ === 0) throw Object.assign(new Error('host default changed'), { code: 'managed-model-changed', notSent: true, retryableRead: true });
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const first = await f.service.send({ name: 'artist', message: 'only once', effort: 'high' }, extra(A));
-    const requestId = first.requestId;
-    assert.equal(f.sends.length, 0);
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    const saved = f.record(); saved.task.dispatches[0].nextAttemptAt = 0; f.store.save(saved);
-    await f.service.poll(saved.agentId);
-    assert.equal(f.sends.length, 1);
-    assert.equal(f.sends[0].requestId, requestId);
-    assert.deepEqual(f.selections.map(s => [s.provider, s.model, s.reasoningEffort]),
-      [['fixture', 'test', 'high'], ['new-route', 'test', 'high']]);
-    assert.notEqual(f.selections[0].requestId, f.selections[1].requestId);
-    assert.equal(f.record().task.dispatches[0].modelReselection.after.provider, 'new-route');
-  } finally { f.service.close(); }
-});
-test('locked DSH with an unknown write never reselects or resends after default change', async () => {
-  let attempts = 0;
-  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
-    attempts++; throw Object.assign(new Error('write acknowledgement lost'), { uncertain: true });
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const first = await f.service.send({ name: 'artist', message: 'unknown write', effort: 'high' }, extra(A));
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    await f.service.poll(f.record().agentId);
-    await f.service.poll(f.record().agentId);
-    assert.equal(attempts, 1);
-    assert.equal(f.selections.length, 1);
-    assert.equal(f.record().task.dispatches[0].requestId, first.requestId);
-    assert.equal(f.record().task.dispatches[0].state, 'unknown');
-  } finally { f.service.close(); }
-});
-test('create previews the default effort without claiming it is actual', async () => {
-  const f = await fixture();
-  try {
-    const preview = await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    assert.equal(preview.requestedEffort, 'max');
-    assert.equal(preview.selectedEffort, 'max');
-    assert.equal(preview.actualEffort, null);
-    assert.equal(f.sends.length, 0);
-  } finally { f.service.close(); }
-});
-test('locked DSH accepted request stays on original receipt after default change', async () => {
-  const f = await fixture({ config: { dshDefaultModelOnly: true } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const first = await f.service.send({ name: 'artist', message: 'accepted once', effort: 'high' }, extra(A));
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    await f.service.poll(f.record().agentId);
-    assert.equal(f.sends.length, 1);
-    assert.equal(f.selections.length, 1);
-    const dispatch = f.record().task.dispatches[0];
-    assert.equal(dispatch.requestId, first.requestId);
-    assert.equal(dispatch.actualEffort, 'high');
-    assert.equal(dispatch.model.provider, 'fixture');
-  } finally { f.service.close(); }
-});
-test('a locked DSH supplement with uncertain write is never resent after default changes', async () => {
-  let attempts = 0;
-  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
-    if (++attempts === 2) throw Object.assign(new Error('lost supplement receipt'), { uncertain: true });
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'uncertain supplement', effort: 'high' }, extra(A));
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    await f.service.poll(f.record().agentId);
-    await f.service.poll(f.record().agentId);
-    assert.equal(attempts, 2);
-    assert.equal(f.sends.length, 1);
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === receipt.requestId);
-    assert.equal(dispatch.state, 'unknown');
-    assert.equal(dispatch.delivery, 'unknown');
-  } finally { f.service.close(); }
-});
-test('locked DSH steers on the new host default after its provider changes', async () => {
-  let lockedProvider = 'fixture';
-  const attempts = [];
-  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async input => {
-    attempts.push({ requestId: input.requestId, provider: input.selection?.provider, effort: input.selection?.reasoningEffort });
-    if (input.selection?.provider !== lockedProvider) throw Object.assign(new Error('host rejects stale locked provider'),
-      { code: 'managed-model-changed', notSent: true, retryableRead: true });
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const first = await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
-    assert.equal(first.actualEffort, 'high');
-    const adjustment = await f.service.send({ name: 'artist', message: 'adjust', effort: 'max' }, extra(A));
-    assert.equal(adjustment.actualEffort, 'max');
-    lockedProvider = 'new-route';
-    f.defaultModel({ provider: lockedProvider, model: 'test' });
-    const next = await f.service.send({ name: 'artist', message: 'new provider', effort: 'max' }, extra(A));
-    assert.equal(next.accepted, true);
-    assert.equal(next.actualEffort, 'max');
-    assert.deepEqual(attempts.map(item => [item.provider, item.effort]),
-      [['fixture', 'high'], ['fixture', 'max'], ['new-route', 'max']]);
-    assert.equal(f.sends.filter(item => item.requestId === next.requestId).length, 1);
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === next.requestId);
-    assert.equal(dispatch.model.provider, 'new-route');
-    assert.equal(dispatch.deliveryModel, undefined, 'a stale live selection cannot override the newly locked model');
-    assert.equal(f.selections.at(-1).provider, 'new-route');
-  } finally { f.service.close(); }
-});
-test('locked DSH reselects A then B then A with fresh selection steps and one business input', async () => {
-  let attempts = 0;
-  const f = await fixture({ config: { dshDefaultModelOnly: true }, beforeSend: async () => {
-    if (++attempts <= 2) throw Object.assign(new Error('default changed before write'), { notSent: true, retryableRead: true });
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'only once', effort: 'high' }, extra(A));
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    let record = f.record(); record.task.dispatches[0].nextAttemptAt = 0; f.store.save(record);
-    await f.service.poll(record.agentId);
-    f.defaultModel({ provider: 'fixture', model: 'test' });
-    record = f.record(); record.task.dispatches[0].nextAttemptAt = 0; f.store.save(record);
-    await f.service.poll(record.agentId);
-    assert.deepEqual(f.selections.map(item => item.provider), ['fixture', 'new-route', 'fixture']);
-    assert.equal(new Set(f.selections.map(item => item.requestId)).size, 3);
-    assert.equal(f.sends.length, 1);
-    assert.equal(f.sends[0].requestId, receipt.requestId);
-  } finally { f.service.close(); }
-});
-test('DSH steer keeps active high while freezing max as the next-start choice', async () => {
-  const f = await fixture({ config: { dshDefaultModelOnly: true } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'start', effort: 'high' }, extra(A));
-    const steer = await f.service.send({ name: 'artist', message: 'continue' }, extra(A));
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === steer.requestId);
-    assert.equal(dispatch.model.requestedEffort, 'max');
-    assert.equal(dispatch.model.reasoningEffort, 'max');
-    assert.equal(dispatch.deliveryModel.reasoningEffort, 'high');
-    assert.equal(steer.actualEffort, 'high');
-    assert.equal(f.selections.length, 1, 'no session selection changed during the active turn');
-  } finally { f.service.close(); }
-});
-
-test('DSH accepted receipt with unknown actual effort never falls back to selected effort', async () => {
-  const f = await fixture({ reportedEffort: null });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'accepted with missing effort', effort: 'high' }, extra(A));
-    assert.equal(receipt.accepted, true);
-    assert.equal(receipt.selectedEffort, 'high');
-    assert.equal(receipt.actualEffort, null);
-    assert.equal(receipt.actualEffortSource, null);
-    assert.equal(receipt.actualModel, null);
-    const item = (await f.service.list(extra(A))).items[0];
-    assert.equal(item.actualEffort, null);
-    assert.equal(item.actualModel, null);
-  } finally { f.service.close(); }
-});
-test('unlocked DSH effort-only steer resolves against the active provider and keeps the new default for start', async () => {
-  const f = await fixture();
-  const catalog = provider => ({ default: { provider, model: 'test' }, routableProviders: ['fixture', 'new-route'],
-    groups: [
-      { id: 'fixture', models: [{ id: 'test', reasoningEfforts: ['high', 'xhigh'] }] },
-      { id: 'new-route', models: [{ id: 'test', reasoningEfforts: ['high', 'max'] }] },
-    ] });
-  try {
-    f.catalog(catalog('fixture'));
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const first = await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
-    assert.equal(first.actualEffort, 'high');
-    f.catalog(catalog('new-route'));
-    const second = await f.service.send({ name: 'artist', message: 'adjust current', effort: 'max' }, extra(A));
-    assert.equal(second.accepted, true);
-    assert.equal(second.requestedEffort, 'max');
-    assert.equal(second.selectedEffort, 'xhigh');
-    assert.equal(second.actualEffort, 'xhigh');
-    assert.equal(second.effortAdjustment.reason, 'nearest-supported-effort');
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === second.requestId);
-    assert.deepEqual([dispatch.model.provider, dispatch.model.selectedEffort], ['new-route', 'max']);
-    assert.deepEqual([dispatch.deliveryModel.provider, dispatch.deliveryModel.reasoningEffort], ['fixture', 'xhigh']);
-    assert.deepEqual([f.selections.at(-1).provider, f.selections.at(-1).reasoningEffort], ['fixture', 'xhigh']);
-    assert.equal(f.sends.filter(item => item.requestId === second.requestId).length, 1);
-    const view = (await f.service.list(extra(A))).items[0];
-    assert.equal(view.selectedEffort, 'xhigh');
-    assert.equal(view.actualEffort, 'xhigh');
-    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === second.requestId);
-    assert.equal(row.selectedEffort, 'xhigh');
-    assert.equal(row.actualEffort, 'xhigh');
-  } finally { f.service.close(); }
-});
-test('locked DSH receipt reflects reselected provider capability after default changes before delivery', async () => {
-  let catalogCalls = 0, f;
-  const catalog = provider => ({ default: { provider, model: 'test' }, routableProviders: ['fixture', 'new-route'],
-    groups: [
-      { id: 'fixture', models: [{ id: 'test', reasoningEfforts: ['high', 'max'] }] },
-      { id: 'new-route', models: [{ id: 'test', reasoningEfforts: ['medium'] }] },
-    ] });
-  f = await fixture({ config: { dshDefaultModelOnly: true }, beforeModels: () => {
-    if (++catalogCalls === 5) f.catalog(catalog('new-route'));
-  } });
-  try {
-    f.catalog(catalog('fixture'));
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'initial', effort: 'high' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'switch', effort: 'max' }, extra(A));
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === receipt.requestId);
-    assert.equal(receipt.accepted, true);
-    assert.deepEqual([receipt.requestedEffort, receipt.selectedEffort, receipt.actualEffort], ['max', 'medium', 'medium']);
-    assert.equal(receipt.effortAdjustment.reason, 'nearest-supported-effort');
-    assert.deepEqual([dispatch.model.provider, dispatch.model.selectedEffort], ['new-route', 'medium']);
-    assert.equal(f.sends.filter(item => item.requestId === receipt.requestId).length, 1);
-    const list = (await f.service.list(extra(A))).items[0];
-    assert.deepEqual([list.selectedEffort, list.actualEffort], ['medium', 'medium']);
-    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === receipt.requestId);
-    assert.deepEqual([row.selectedEffort, row.actualEffort], ['medium', 'medium']);
-  } finally { f.service.close(); }
-});
-test('DSH steer rejected before write after A ends starts the frozen B selection once', async () => {
-  let f, attempts = 0;
-  const offered = [];
-  f = await fixture({ beforeSend: async input => {
-    if (input.message !== 'after boundary') return;
-    offered.push({ requestId: input.requestId, selection: input.selection, startSelection: input.startSelection,
-      expectedTurn: input.expectedTurn, mode: input.mode });
-    if (attempts++ === 0) {
-      f.sessions.get(f.record().sessionId).running = false;
-      throw Object.assign(new Error('A ended before write'), { code: 'managed-turn-ended', notSent: true, retryableRead: true });
-    }
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const first = await f.service.send({ name: 'artist', message: 'start A', effort: 'high' }, extra(A));
-    assert.equal(first.delivery, 'new-turn');
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    const pending = await f.service.send({ name: 'artist', message: 'after boundary' }, extra(A));
-    assert.equal(f.sends.length, 1, 'the bridge refused before the business write');
-    assert.equal(offered[0].selection.reasoningEffort, 'high');
-    assert.deepEqual([offered[0].startSelection.provider, offered[0].startSelection.reasoningEffort], ['new-route', 'max']);
-    assert.ok(Number.isSafeInteger(offered[0].expectedTurn.throughSeq));
-    const record = f.record(); const saved = record.task.dispatches.find(item => item.requestId === pending.requestId);
-    saved.nextAttemptAt = 0; f.store.save(record);
-    await f.service.poll(record.agentId);
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === pending.requestId);
-    assert.equal(offered.length, 2);
-    assert.equal(offered[1].requestId, pending.requestId);
-    assert.deepEqual([offered[1].selection.provider, offered[1].selection.reasoningEffort], ['new-route', 'max']);
-    assert.equal(offered[1].expectedTurn, undefined);
-    assert.equal(f.sends.filter(input => input.requestId === pending.requestId).length, 1);
-    assert.equal(dispatch.delivery, 'new-turn');
-    assert.equal(dispatch.actualEffort, 'max');
-    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, 'new-turn');
-    assert.equal((await f.service.wait({ names: ['artist'], timeoutSeconds: 0 }, extra(A))).items[0].inputDelivery, 'new-turn');
-    const inspected = await f.service.inspect({ name: 'artist' }, extra(A));
-    assert.equal(inspected.inputDelivery, 'new-turn');
-    assert.equal(inspected.inputs.find(input => input.requestId === pending.requestId).delivery, 'new-turn');
-  } finally { f.service.close(); }
-});
-test('DSH accepted receipt with unknown route never reports an inferred delivery', async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    // Simulate a bridge that confirms acceptance but cannot recover its route.
-    const original = f.controlFactory;
-    // The fixture opts out of route evidence at the control response boundary.
-    f.api.managedPromptReceipt = async () => ({ status: 'unknown' });
-    assert.equal(typeof original, 'function');
-    const receipt = await f.service.send({ name: 'artist', message: 'normal' }, extra(A));
-    assert.equal(receipt.delivery, 'new-turn');
-    // Historical accepted receipt without delivery must not borrow its intent.
-    const record = f.record();
-    const dispatch = record.task.dispatches[0];
-    dispatch.accepted = false; dispatch.state = 'unknown'; dispatch.delivery = 'unknown';
-    const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
-    await mkdir(directory, { recursive: true });
-    const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, dispatch.requestId])).digest('hex');
-    await writeFile(path.join(directory, key + '.json'), JSON.stringify({ status: 'accepted', result: { actualEffort: 'max', delivery: null } }));
-    f.store.save(record);
-    await f.service.poll(record.agentId);
-    const recovered = f.record().task.dispatches[0];
-    assert.equal(recovered.accepted, true);
-    assert.equal(recovered.delivery, null);
-    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, undefined);
-    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === dispatch.requestId);
-    assert.equal(row.delivery, null);
-  } finally { f.service.close(); }
-});
-
-test('DSH lost acknowledgement recovers actual route without resending the input', async () => {
-  let f, attempts = 0;
-  f = await fixture({ beforeSend: async input => {
-    if (input.message !== 'lost steer') return;
-    attempts++;
-    const record = f.record();
-    const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
-    await mkdir(directory, { recursive: true });
-    const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, input.requestId])).digest('hex');
-    await writeFile(path.join(directory, key + '.json'), JSON.stringify({ status: 'unknown', instance: await f.api.connectionIdentity() }));
-    f.sends.push(input); // The native fixture recorded the one successful write.
-    throw Object.assign(new Error('acknowledgement lost'), { uncertain: true });
-  } });
-  f.api.managedPromptReceipt = async () => ({ status: 'accepted', delivery: 'current-turn',
-    selected: { provider: 'fixture', model: 'test', reasoningEffort: 'high' } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'start', effort: 'high' }, extra(A));
-    const pending = await f.service.send({ name: 'artist', message: 'lost steer' }, extra(A));
-    await f.service.poll(f.record().agentId);
-    await f.service.poll(f.record().agentId);
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === pending.requestId);
-    assert.equal(attempts, 1);
-    assert.equal(f.sends.filter(item => item.requestId === pending.requestId).length, 1);
-    assert.equal(dispatch.accepted, true);
-    assert.equal(dispatch.delivery, 'current-turn');
-    assert.equal(dispatch.actualEffort, 'high');
-    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, 'current-turn');
-    const inspect = await f.service.inspect({ name: 'artist' }, extra(A));
-    assert.equal(inspect.inputs.find(item => item.requestId === pending.requestId).delivery, 'current-turn');
-  } finally { f.service.close(); }
-});
-
-test('DSH accepted response explicitly lacking a route stays null in send, list and inspect', async () => {
-  const f = await fixture({ reportedDelivery: null });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    const first = await f.service.send({ name: 'artist', message: 'first', effort: 'high' }, extra(A));
-    assert.equal(first.accepted, true);
-    assert.equal(first.delivery, null);
-    const second = await f.service.send({ name: 'artist', message: 'second' }, extra(A));
-    assert.equal(second.accepted, true);
-    assert.equal(second.delivery, null);
-    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, undefined);
-    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === second.requestId);
-    assert.equal(row.delivery, null);
-  } finally { f.service.close(); }
-});
-test('DSH changed activity is re-observed and the native boundary chooses the current turn', async () => {
-  let f, attempts = 0;
-  const offered = [];
-  f = await fixture({ beforeSend: async input => {
-    if (input.message !== 'new activity') return;
-    offered.push({ selection: input.selection, startSelection: input.startSelection, expectedTurn: input.expectedTurn });
-    if (attempts++ === 0) {
-      const session = f.sessions.get(f.record().sessionId);
-      session.running = true; session.seq += 2;
-      session.model = { provider: 'new-route', model: 'test', reasoningEffort: 'max' };
-      throw Object.assign(new Error('turn changed before write'), { code: 'managed-turn-changed', notSent: true, retryableRead: true });
-    }
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'start A', effort: 'high' }, extra(A));
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    const pending = await f.service.send({ name: 'artist', message: 'new activity' }, extra(A));
-    const record = f.record(); const saved = record.task.dispatches.find(item => item.requestId === pending.requestId);
-    saved.nextAttemptAt = 0; f.store.save(record);
-    await f.service.poll(record.agentId);
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === pending.requestId);
-    assert.equal(attempts, 2);
-    assert.equal(f.sends.filter(input => input.requestId === pending.requestId).length, 1);
-    assert.equal(offered[0].selection.provider, 'fixture');
-    assert.equal(offered[1].selection.provider, 'new-route');
-    assert.ok(offered[1].expectedTurn.throughSeq > offered[0].expectedTurn.throughSeq);
-    assert.equal(dispatch.delivery, 'current-turn');
-    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, 'current-turn');
-  } finally { f.service.close(); }
-});
-test('DSH recovery of a persisted pre-write refusal uses the frozen start selection', async () => {
-  let f, attempts = 0;
-  const offered = [];
-  f = await fixture({ beforeSend: async input => {
-    if (input.message !== 'recover refusal') return;
-    offered.push(input);
-    if (attempts++ === 0) {
-      const record = f.record(); f.sessions.get(record.sessionId).running = false;
-      const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
-      await mkdir(directory, { recursive: true });
-      const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, input.requestId])).digest('hex');
-      await writeFile(path.join(directory, key + '.json'), JSON.stringify({ status: 'retryable', code: 'managed-turn-ended', notSent: true }));
-      throw Object.assign(new Error('worker stopped after bridge refusal'), { uncertain: true });
-    }
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'start A', effort: 'high' }, extra(A));
-    f.defaultModel({ provider: 'new-route', model: 'test' });
-    const pending = await f.service.send({ name: 'artist', message: 'recover refusal' }, extra(A));
-    const record = f.record();
-    assert.equal(record.task.dispatches.find(item => item.requestId === pending.requestId).state, 'unknown');
-    await f.service.poll(record.agentId);
-    const dispatch = f.record().task.dispatches.find(item => item.requestId === pending.requestId);
-    assert.equal(attempts, 2);
-    assert.equal(f.sends.filter(input => input.requestId === pending.requestId).length, 1);
-    assert.deepEqual([offered[1].selection.provider, offered[1].selection.reasoningEffort], ['new-route', 'max']);
-    assert.equal(offered[1].expectedTurn, undefined);
-    assert.equal(dispatch.delivery, 'new-turn');
-  } finally { f.service.close(); }
-});
-test('DSH reports a native new turn when the bridge safely writes after A ended', async () => {
-  let f;
-  f = await fixture({ beforeSend: input => {
-    if (input.message === 'same selection after A') f.sessions.get(f.record().sessionId).running = false;
-  } });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'start A', effort: 'high' }, extra(A));
-    const receipt = await f.service.send({ name: 'artist', message: 'same selection after A', effort: 'high' }, extra(A));
-    assert.equal(receipt.accepted, true);
-    assert.equal(receipt.mode, 'steer');
-    assert.equal(receipt.delivery, 'new-turn');
-    assert.equal(receipt.actualEffort, 'high');
-    assert.equal((await f.service.list(extra(A))).items[0].inputDelivery, 'new-turn');
-    const inspect = await f.service.inspect({ name: 'artist' }, extra(A));
-    assert.equal(inspect.inputs.find(item => item.requestId === receipt.requestId).delivery, 'new-turn');
-    assert.equal(f.sends.filter(item => item.requestId === receipt.requestId).length, 1);
-  } finally { f.service.close(); }
-});
-test('expired DSH input recovers an accepted null route and model without guessing', async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'original' }, extra(A));
-    const record = f.record(); const dispatch = record.task.dispatches[0];
-    record.task.startedAt = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
-    dispatch.accepted = false; dispatch.state = 'unknown'; dispatch.delivery = 'local-pending';
-    const directory = path.join(f.stateDirectory, 'scoped', record.ownerId, record.agentId, 'requests');
-    await mkdir(directory, { recursive: true });
-    const key = createHash('sha256').update(JSON.stringify(['send', record.sessionId, dispatch.requestId])).digest('hex');
-    await writeFile(path.join(directory, key + '.json'), JSON.stringify({ status: 'accepted', result: {
-      delivery: null, actualModel: null, actualEffort: null } }));
-    f.store.save(record);
-    await f.service.poll(record.agentId);
-    const recovered = f.record().task.dispatches[0];
-    assert.equal(recovered.accepted, true);
-    assert.equal(recovered.delivery, null);
-    assert.equal(recovered.actualModel, null);
-    assert.equal(f.sends.length, 1);
-    const row = (await f.service.inspect({ name: 'artist' }, extra(A))).inputs.find(item => item.requestId === dispatch.requestId);
-    assert.equal(row.accepted, true);
-    assert.equal(row.queued, false);
-    assert.equal(row.delivery, null);
-    assert.equal(row.status, 'accepted');
-  } finally { f.service.close(); }
-});
-
-test('DSH run preserves a confirmed acceptance with unknown delivery as null', async () => {
-  const f = await fixture({ reportedDelivery: null });
-  try {
-    const result = await f.service.run({ name: 'artist', lifetime: 'persistent', message: 'work' }, extra(A));
-    assert.equal(result.accepted, true);
-    assert.equal(Object.hasOwn(result, 'delivery'), true);
-    assert.equal(result.delivery, null);
-  } finally { f.service.close(); }
-});
-
-
-test('an answer for a consumed question is a no-send receipt, not the old error', async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'ask me first' }, extra(A));
-    const record = f.record();
-    const session = f.sessions.get(record.sessionId);
-
-    // The caller saw q1; by the time it answers, q1 is gone and q2 is pending.
-    record.observation = { ...(record.observation ?? {}), questions: [{ id: 'q1', message: 'Which one?', state: 'pending' }] };
-    f.store.save(record);
-    session.questions = [{ id: 'q2', message: 'A different one?', state: 'pending' }];
-    const changed = await f.service.answer({ name: 'artist', message: 'old answer' }, extra(A));
-    assert.equal(changed.answered, false);
-    assert.equal(changed.delivered, false);
-    assert.equal(changed.reason, 'question-changed');
-    assert.deepEqual(changed.pendingQuestions, ['A different one?']);
-    assert.equal(session.questions[0].state, 'pending', 'the new question is not consumed by the old answer');
-    assert.equal(f.sends.filter(item => item.message.includes('old answer')).length, 0, 'nothing was sent');
-
-    // The caller saw q2; it is consumed before the answer reaches a backend.
-    const fresh = f.record();
-    fresh.observation = { ...(fresh.observation ?? {}), questions: [{ id: 'q2', message: 'A different one?', state: 'pending' }] };
-    f.store.save(fresh);
-    session.questions = [];
-    const consumed = await f.service.answer({ name: 'artist', message: 'answer after consume' }, extra(A));
-    assert.equal(consumed.answered, false);
-    assert.equal(consumed.delivered, false);
-    assert.equal(consumed.reason, 'question-not-pending');
-    assert.deepEqual(consumed.pendingQuestions, []);
-    assert.equal(f.sends.filter(item => item.message.includes('answer after consume')).length, 0);
-    assert.equal(f.record().task.answers?.length ?? 0, 0, 'no answer intent was recorded');
-
-    // The same race one layer deeper: the preflight sees q3, but the native answer
-    // call finds it consumed. That is a settled no-send too, even though the backend
-    // returns no consumed ids.
-    const race = f.record();
-    race.observation = { ...(race.observation ?? {}), questions: [{ id: 'q3', message: 'Which third?', state: 'pending' }] };
-    f.store.save(race);
-    session.questions = [{ id: 'q3', message: 'Which third?', state: 'pending' }];
-    const nativeAnswer = f.api.managedAnswer;
-    f.api.managedAnswer = async () => { session.questions = []; return { consumedQuestionIds: [] }; };
-    try {
-      const raced = await f.service.answer({ name: 'artist', message: 'raced answer' }, extra(A));
-      assert.equal(raced.answered, false);
-      assert.equal(raced.reason, 'question-not-pending');
-      assert.deepEqual(raced.pendingQuestions, [], 'the consumed question is not reported as still pending');
-      assert.equal(f.sends.filter(item => item.message.includes('raced answer')).length, 0);
-    } finally { f.api.managedAnswer = nativeAnswer; }
-
-    // The preflight sees q4 and the bridge is asked for q4, but q4 is replaced by
-    // q5 before the bridge's own atomic check. The replacement must stay pending
-    // and must never receive the old answer text.
-    const replacedRecord = f.record();
-    replacedRecord.observation = { ...(replacedRecord.observation ?? {}),
-      questions: [{ id: 'q4', message: 'Which fourth?', state: 'pending' }] };
-    f.store.save(replacedRecord);
-    session.questions = [{ id: 'q4', message: 'Which fourth?', state: 'pending' }];
-    let bridgeQuestionIds;
-    const nativeAnswerReplaced = f.api.managedAnswer;
-    f.api.managedAnswer = async input => {
-      bridgeQuestionIds = input.questionIds;
-      session.questions = [{ id: 'q5', message: 'A replacement?', state: 'pending' }];
-      return nativeAnswerReplaced(input);
-    };
-    try {
-      const replaced = await f.service.answer({ name: 'artist', message: 'fourth answer' }, extra(A));
-      assert.deepEqual(bridgeQuestionIds, ['q4'], 'the bridge receives the question the caller saw');
-      assert.equal(replaced.answered, false);
-      assert.equal(replaced.delivered, false);
-      assert.equal(replaced.reason, 'question-changed');
-      assert.deepEqual(replaced.pendingQuestions, ['A replacement?']);
-      assert.equal(session.questions[0].state, 'pending', 'the replacement is not consumed');
-      assert.equal(f.sends.filter(item => item.message.includes('fourth answer')).length, 0);
-    } finally { f.api.managedAnswer = nativeAnswerReplaced; }
-
-    // The same identity check with no question left: an explicit no-send with no
-    // pending question at all, not the old native error.
-    const goneRecord = f.record();
-    goneRecord.observation = { ...(goneRecord.observation ?? {}),
-      questions: [{ id: 'q6', message: 'Which sixth?', state: 'pending' }] };
-    f.store.save(goneRecord);
-    session.questions = [{ id: 'q6', message: 'Which sixth?', state: 'pending' }];
-    const nativeAnswerGone = f.api.managedAnswer;
-    f.api.managedAnswer = async input => {
-      assert.deepEqual(input.questionIds, ['q6']);
-      session.questions = [];
-      return nativeAnswerGone(input);
-    };
-    try {
-      const gone = await f.service.answer({ name: 'artist', message: 'sixth answer' }, extra(A));
-      assert.equal(gone.answered, false);
-      assert.equal(gone.reason, 'question-not-pending');
-      assert.deepEqual(gone.pendingQuestions, []);
-      assert.equal(f.sends.filter(item => item.message.includes('sixth answer')).length, 0);
-    } finally { f.api.managedAnswer = nativeAnswerGone; }
-  } finally { f.service.close(); }
-});
-
-test('list defaults to active names and finds inactive ones by name or state within the caller', async () => {
-  const f = await fixture();
-  try {
-    await f.service.create({ name: 'active', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'active', message: 'work' }, extra(A));
-    const at = new Date().toISOString();
-    f.store.insert({ agentId: `agent-${'a'.repeat(32)}`, ownerId: ownerIdFor(A), sessionId: 'session-failed',
-      name: 'failed-one', lifetime: 'persistent', target: 'dsh', workspace, created: true, state: 'failed',
-      createdAt: at, updatedAt: at, history: [] });
-    f.store.insert({ agentId: `agent-${'b'.repeat(32)}`, ownerId: ownerIdFor(A), sessionId: 'session-cleanup',
-      name: 'cleanup-one', lifetime: 'persistent', target: 'dsh', workspace, created: true, state: 'cleanup_failed',
-      closed: true, createdAt: at, updatedAt: at, history: [] });
-
-    const defaults = await f.service.list(extra(A));
-    assert.deepEqual(defaults.items.map(item => item.name), ['active']);
-    assert.equal(defaults.total, 1);
-    const byName = await f.service.list(extra(A), { name: 'failed-one' });
-    assert.deepEqual(byName.items.map(item => [item.name, item.state]), [['failed-one', 'failed']]);
-    const byState = await f.service.list(extra(A), { state: 'cleanup_failed' });
-    assert.deepEqual(byState.items.map(item => [item.name, item.state]), [['cleanup-one', 'cleanup_failed']]);
-    const activeOnly = await f.service.list(extra(A), { state: 'active' });
-    assert.deepEqual(activeOnly.items.map(item => item.name), ['active']);
-    const both = await f.service.list(extra(A), { name: 'failed-one', state: 'failed' });
-    assert.equal(both.items.length, 1);
-    const mismatch = await f.service.list(extra(A), { name: 'failed-one', state: 'cleanup_failed' });
-    assert.equal(mismatch.items.length, 0);
-    assert.equal((await f.service.list(extra(B))).items.length, 0, 'another caller never sees these names');
-  } finally { f.service.close(); }
-});
-
-test('list carries a monitor-unavailable error recorded while starting its first listener', async () => {
-  let ready = true;
-  const f = await fixture({ startSharedMonitor: async () => ready, monitorFailureGraceMs: 60000 });
-  try {
-    await f.service.create({ name: 'artist', lifetime: 'persistent' }, extra(A));
-    await f.service.send({ name: 'artist', message: 'work' }, extra(A));
-    const record = f.record();
-    // A running name with no earlier error: this list call is the first one that
-    // starts the listener, and that listener is now unavailable.
-    record.state = 'running'; record.task.state = 'running'; record.error = undefined;
-    f.store.save(record);
-    ready = false;
-    const listed = await f.service.list(extra(A));
-    assert.equal(listed.items[0].error?.code, 'monitor-unavailable',
-      'the first list answer reflects the durable error written while it started the listener');
-    assert.equal(f.record().error.code, 'monitor-unavailable');
   } finally { f.service.close(); }
 });

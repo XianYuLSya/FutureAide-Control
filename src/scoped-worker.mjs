@@ -22,13 +22,13 @@
 import path from 'node:path';
 import { loadConfig } from './config.mjs';
 import { createScopedAgents } from './scoped-agents.mjs';
-import { subscribeCodexRecovery, ensureCodexRecoveryProbe } from './codex-ipc.mjs';
+import { subscribeCodexRecovery, ensureCodexRecoveryProbe, requestCodexNative } from './codex-ipc.mjs';
 import { scopedManagement } from './mcp-server.mjs';
 import { backgroundBatch, pollSleeping, scanSleeping } from './idle-monitor.mjs';
 import { createDirectoryWatchers, createWakeQueue, ensureSharedMonitor, monitorDirectories, monitorSelfHeld, monitorWaitMs,
   recordMonitorPid, renewMonitorPid, throttledSignal, waitForCommit, wakeHintName, planMonitorRound, MONITOR_LEASE, MONITOR_PROCESS_LEASE,
   MONITOR_READY_LEASE } from './shared-monitor.mjs';
-import { closeReportService, ensureReportService, reportPort, rosterIdentity } from './report-endpoint.mjs';
+import { closeReportService, ensureReportService, isReportServiceListening, reportPort, rosterIdentity } from './report-endpoint.mjs';
 import { processStartTime } from './claude-caller-identity.mjs';
 
 const MIN_ROUND_MS = 250;      // never poll faster than this
@@ -57,6 +57,9 @@ const hints = createWakeQueue({ sweepRequestMs: SWEEP_REQUEST_MS });
 // that second wakes it when the second ends instead of being dropped.
 const pollSignal = throttledSignal(signal, { intervalMs: POLL_SIGNAL_MS });
 const service = createScopedAgents(config, {
+  // The production monitor uses the same native request object as the MCP path;
+  // without this explicit binding the receipt reader silently selected app-tools.
+  nativeRequest: requestCodexNative,
   // This process IS the shared listener. Its own work paths — waking a sleeping name,
   // parking one, a first dispatch — ask "is a listener running?", and the honest answer
   // for that question about oneself is known without asking the OS: a process that holds
@@ -84,6 +87,7 @@ const service = createScopedAgents(config, {
 subscribeCodexRecovery(event => { service.transportRecovered(event).catch(error => { process.stderr.write(`[futureaide-monitor] recovery: ${error?.stack ?? error}\n`); }); });
 
 let wake, heartbeat, running = true, signalled = false, lastDelivery = 0, identity;
+let reportAttempt, reportReady = false, reportRetryAt = 0, reportProblem;
 let idleSince, lastVersion = store.dataVersion(), rounds = 0, lastSweepAt = 0;
 // Measurement aid only: FUTUREAIDE_MONITOR_TRACE=1 prints one line per round so a
 // test or a manual run can count rounds without reading the database.
@@ -173,11 +177,20 @@ try {
       process.stderr.write(`[futureaide-monitor] team board not mounted: ${error?.code ?? error?.message ?? 'unknown'}\n`);
     }
   }
-  const reports = await ensureReportService({ store, port: reportPort(config),
-    management: scopedManagement({ service }), ...(board ? { board } : {}), log: message => trace(`report: ${message}`) });
-  if (reports.ready !== true) {
-    trace(`tool service not ready: ${reports.reason?.code ?? 'unknown'} roster=${rosterIdentity(store).slice(0, 12)}`);
-    process.stderr.write(`[futureaide-monitor] tool service not ready: ${reports.reason?.code ?? 'unknown'}\n`);
+  const port = reportPort(config);
+  const reportOptions = { store, port, management: scopedManagement({ service }), ...(board ? { board } : {}),
+    onCliSubmission: async payload => {
+      await service.handleCliSubmission?.(payload);
+      if (payload?.agentId && hints.queued(payload.agentId)) signal();
+    },
+    runtimeDir: config.stateDirectory,
+    ...(config.antigravityCallerTokenFile ? { antigravityCallerTokenFile: config.antigravityCallerTokenFile } : {}),
+    canStart: () => ownsLease() && store.leaseHeld(MONITOR_READY_LEASE, holder), log: message => trace(`report: ${message}`) };
+  function reportNotReady(code) {
+    if (reportProblem === code) return;
+    reportProblem = code;
+    trace(`tool service not ready: ${code} roster=${rosterIdentity(store).slice(0, 12)}`);
+    process.stderr.write(`[futureaide-monitor] tool service not ready: ${code}\n`);
   }
   // A killed predecessor leaves a readiness lease behind; it cannot belong to any
   // running listener once this process owns the holder lease.
@@ -199,6 +212,18 @@ try {
   // expired still stops the loop on the next read.
   while (running && store.leaseHeld(MONITOR_LEASE, holder)) {
     if (!store.leaseHeld(MONITOR_READY_LEASE, holder)) break;
+    // An older monitor can still own the port while its requests finish. Keep
+    // retrying in the background until this worker has a healthy listener of its own.
+    if (!reportAttempt && Date.now() >= reportRetryAt && (!reportReady || !isReportServiceListening(port))) {
+      reportRetryAt = Date.now() + SWEEP_MS;
+      reportAttempt = ensureReportService(reportOptions).then(status => {
+        reportReady = status.ready && status.hosting === 'this-process';
+        if (reportReady) reportProblem = undefined;
+        else reportNotReady(status.reason?.code ?? 'report-service-another-process');
+      }).catch(error => reportNotReady(error?.code ?? 'report-service-unavailable')).finally(() => {
+        reportAttempt = undefined;
+      });
+    }
     const cleanupWaiting = cleanup?.tick() === true;
     const roundStarted = Date.now();
     const { taken, only, sweepDue } = planMonitorRound(hints, service, lastSweepAt, { sweepMs: SWEEP_MS });
@@ -280,6 +305,7 @@ try {
   pollSignal.close();
   clearInterval(heartbeat);
   watchers.close();
+  await reportAttempt;
   await closeReportService();
   store.releaseLease(MONITOR_READY_LEASE, holder);
   if (identity !== undefined) store.releaseLease(MONITOR_PROCESS_LEASE, `${holder}:${process.pid}:${identity}`);

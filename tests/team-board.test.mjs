@@ -32,7 +32,7 @@ function fixture() {
   // Claude owner without a session title: the board must fall back to the folder name.
   store.saveOwner({ ownerId: 'owner-a', workspace: 'D:\\Work\\media', source: 'claude-desktop', createdAt: recent });
   // Codex owner whose thread owns a name in another chat (the lead-nesting rule).
-  store.saveOwner({ ownerId: 'owner-b', workspace: 'D:\\Work\\xiayuls_workflow', source: 'codex-desktop',
+  store.saveOwner({ ownerId: 'owner-b', workspace: 'D:\\Work\\demo-workspace', source: 'codex-desktop',
     threadId: 'thread-lead', createdAt: recent });
   store.insert(record({ agentId: 'agent-lead', ownerId: 'owner-b', name: '团队长', state: 'running',
     observation: { tree: { nodes: [{}, {}] } } }));

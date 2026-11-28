@@ -1,19 +1,17 @@
 # 更新记录
 
-## 0.5.21 — 2026-11-24 · 断连自动接回，等回包不轮询，插话和排队分得清
+## 2.3.0 (2026-11-28) · 三端三极全无头军团、隔离分支一键合入与实时 Token 账单
 
-升级后重启监工 `scoped-worker` 才生效。升级时已开着的 Claude Desktop 会话，要重连 FutureAide Control 插件或新开一个会话：升级前启动的桥做长等待会返回 MCP `-32001 Request timed out`。已经派出的单保留原回执，重连后凭原 `taskKey` 查回包，不要重派。
+本版完成从早期桌面单点桥接到 **Antigravity / Codex / Claude 三端主对话 × `codex-cli` / `claude-cli` / `agy-cli` 三极无头 CLI 军团** 的完整架构升级（早期 DSH 目标正式退居底层历史兼容）：
 
-- **Codex 断连后自动接回。** 插件和 Codex 的连接断开后，监工自己接回。Codex 主页面换了新连接时，只读查询先改用新连接，派单这类写入要等新连接核实后才放行。修正了探针超时把只读查询全部挡在页面前的问题。
-- **补充可以选插话还是排队。** `send`、`run` 新增 `mode`：`steer` 插进正在跑的这一轮，`queue` 等这一轮结束，作为下一轮的开头。回执的 `delivery` 写明去向：`current-turn`、`after-current`、`new-turn`，或只存在本地的 `local-pending`。DSH 不接受显式 `queue`，Claude CLI 不接受显式 `steer`，这时返回 `mode-unsupported`，什么也不保存。带着名字原有模型的补充不再被误判成“运行中换模型”。
-- **等回包不用轮询。** 派单后用 `futureaide_wait_agents({taskKeys:[taskKey]})` 等一次，等到报告、提问或结束事件就返回，不用传 `timeout_seconds`。处理完一件再等下一件时，把上次的 `nextCursor` 作为 `after` 传入。Claude 会话实测一次等待 197.8 秒收到最终回报，纯空等的请求从 1 次降到 0 次。Codex 调用方单次等待受宿主 60 秒上限，超时后任务照跑，最终回报照常送达。
-- **反馈通道。** 调用方用 `futureaide_feedback`、受管助手用 `feedback` 报告插件的问题，记在本机收件箱。同一问题按编号累计次数，附带版本、目标、名字、调用方、时间和出错的工具。整理用 `feedback-pending`、`feedback-organize`、`feedback-todos`，用法见技能说明。
-- **派单时选思考强度。** `run`、`create`、`send` 可传 `effort`。不传时依次取 `modelDefaultEfforts`（出厂只有 GPT-6.2-Astra 是 high）和 `defaultEffort`（出厂 max），再就近取模型支持的档位。名字上显式选过的强度会带到之后的 `send`、`answer` 和排队起的新一轮。回执的 `actualEffort` 报实际生效的档位。
-- 回答时按问题身份核对：问题已被处理或换了，回执返回 `answered:false`、原因和当前待答的问题，不再报错，也不发送。
-- 报告照常送达时，不再报 `codex-report-not-ready`。
-- `futureaide_list_agents` 默认只列活跃的名字。传 `name` 可读单个名字（包括已结束的），传 `state` 按状态筛选。
-
-已知问题：`futureaide_wait_agents` 读到的最终回报，可能又作为普通通知送来一次；很长的正文在等待结果里可能被截断，以通知为准。
+- **三足鼎立全无头互调（新增 `agy-cli`）**：在无头 `codex-cli`、`claude-cli` 基础上正式接入无头反重力后端 `agy-cli`（另保留按需附着 `codex-desktop` 原生 RPC），Antigravity、Codex、Claude 三端主对话均可按同一套工具跨模型家族自由混编调度。
+- **2 参数极简派单、批量并发与 `timeout_minutes` 护栏**：`futureaide_run_agent` 与 `futureaide_create_agent` 支持只传 `role` + `message`，自动读取 `~/.config/work-workflow/团队配置.md` 选定后端、模型与强度并自动排号（如 `后端1`、`后端2`）；支持 `tasks: [...]` 单次并发派发最多 20 名成员，并新增可选 `timeout_minutes`（1–240 分钟）单次执行限时保护。
+- **Git `worktree` 独立分支与 `merge` 一键合入拆树**：并行派单支持 `worktree: true` 自动分配独立 Git 工作树防文件踩踏；`futureaide_team` 新增 `action: "merge"`，验收后一键将成员 `worktree` 改动合回主工作区并清理临时工作树，精简视图直接回显 `mergedFiles` 与 `summary`。
+- **`<50ms` 极薄回调桥 + `futureaide-wait` 零打扰唤醒**：无头 CLI 提问（`ask_parent`）与终报（`report_parent`）经本地极薄回调桥 `<50ms` 入库，派单回执返回合并 `wakeCmd`（`futureaide-wait`），支持 `barrier: "all" | "any"` 零轮询阻塞等待与内联正文直读。
+- **Win32 Job Object 内核进程笼 + 自动 GC**：无头 CLI 子进程树统一纳入 Windows Job Object 内核级进程笼，取消、超时或宿主退出时连根终止后台孙进程，实现 **0 孤儿进程残留**；一次性成员交付终报后自动清场。
+- **团队会议室黑板 `@` 跨级直问与记忆复活**：新增 `futureaide_board_post` / `futureaide_board_read`，支持 `@后端1`、`@团队长1/后端2` 跨层级点名唤醒或按原会话记忆原地复活对表；`send` / `answer` / `cancel` / `delete` 全面支持最长 160 字符跨级路径直控。
+- **`futureaide_team` 全生命周期统管**：集中提供整队接班收编（`adopt`）、撤将留兵或整树强停（`kick`）、跨级调岗（`reparent`）、FAswitch 切号/中断免报错断点续跑（`resume`）、无主散人巡检与清扫（`strays` / `sweep`）及隔离分支合入（`merge`）。
+- **三极 CLI 端口代理硬锁 + 实时 Token 账单与卡顿黄灯**：`futureaide_cli_proxy` 扩展支持 `codex-cli`、`claude-cli`、`agy-cli`、`all` 端口绑定与 FAswitch 档案防跑偏强校验（Fail-Closed TCP 探活）；极简视图新增紧凑耗时与 Token 账单格式化（如 `"18s · 14.2k tok"`，无用量时零多余字段）、剔除无意义 `"running"` 复读并标出静默超时 `stalled: true` 预警。
 
 ## 0.5.20 — 2026-11-18 · Claude CLI 中断和补充消息
 

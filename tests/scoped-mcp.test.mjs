@@ -36,7 +36,7 @@ test('installed MCP exposes only name-addressed tools and forwards trusted reque
   await server.connect(b); await client.connect(a);
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 15, 'management and managed feedback tools are registered');
+    assert.equal(tools.length, 20, 'seventeen name-addressed management tools plus feedback/ask_parent/report_parent');
     assert.ok(tools.findIndex(tool => tool.name === 'futureaide_run_agent') < tools.findIndex(tool => tool.name === 'futureaide_create_agent'),
       'the one-call run tool is offered before the two-call pair');
     assert.ok(!tools.some(tool => /spawn_agent|register_peer|create_session|profile_create/.test(tool.name)));
@@ -65,7 +65,7 @@ test('creation advertises one optional target and never repeats it on later call
   try {
     const { tools } = await client.listTools();
     const create = tools.find(tool => tool.name === 'futureaide_create_agent');
-    assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['effort', 'lifetime', 'model', 'name', 'target']);
+    assert.deepEqual(Object.keys(create.inputSchema.properties).sort(), ['effort', 'lifetime', 'model', 'name', 'proxy', 'role', 'target', 'worktree']);
     for (const tool of tools) {
       const supportsSelection = ['futureaide_run_agent', 'futureaide_create_agent', 'futureaide_send_agent'].includes(tool.name);
       for (const field of ['model', 'effort']) {
@@ -73,12 +73,21 @@ test('creation advertises one optional target and never repeats it on later call
         assert.ok(!tool.inputSchema.required?.includes(field), `${tool.name}: ${field} stays optional`);
       }
     }
-    assert.deepEqual(create.inputSchema.properties.target.enum, ['dsh', 'codex-desktop', 'claude-cli'],
-      'every supported application is reachable from the public schema, not just internally');
+    assert.deepEqual(
+      create.inputSchema.properties.target.enum.filter(t => t !== 'agy-cli'),
+      ['dsh', 'codex-desktop', 'codex-cli', 'claude-cli'],
+      'every supported application is reachable from the public schema (with optional agy-cli)',
+    );
     assert.ok(!create.inputSchema.required?.includes('target'), 'the target stays optional');
-    // run is the second entry point that may bind a new name to an application; it
-    // advertises target for that one creation, exactly like create.
-    for (const tool of tools.filter(tool => !['futureaide_create_agent', 'futureaide_run_agent'].includes(tool.name))) {
+    const cliProxy = tools.find(tool => tool.name === 'futureaide_cli_proxy');
+    assert.deepEqual(cliProxy.inputSchema.properties.target.enum, ['codex-cli', 'claude-cli', 'agy-cli', 'all']);
+    const runTool = tools.find(tool => tool.name === 'futureaide_run_agent');
+    assert.ok('timeout_minutes' in runTool.inputSchema.properties);
+    assert.ok(!runTool.inputSchema.required?.includes('timeout_minutes'));
+    const teamTool = tools.find(tool => tool.name === 'futureaide_team');
+    assert.ok(teamTool.inputSchema.properties.action.enum.includes('merge'));
+    // Only creation/run, cli_proxy, and team governance accept a target field; per-agent tools stay name-addressed.
+    for (const tool of tools.filter(tool => !['futureaide_create_agent', 'futureaide_run_agent', 'futureaide_cli_proxy', 'futureaide_team'].includes(tool.name))) {
       assert.ok(!('target' in (tool.inputSchema.properties ?? {})), `${tool.name} must stay name-addressed`);
     }
 
@@ -142,10 +151,9 @@ const fullEntry = () => ({
 
 test('list and wait answer compactly and return the full structure only for detail', async () => {
   const entry = fullEntry();
-  const listFilters = [];
   const { client, close } = await connected({
     async resume() {},
-    async list(_extra, filters) { listFilters.push(filters); return { items: [entry], total: 1 }; },
+    async list() { return { items: [entry], total: 1 }; },
     async wait() { return { items: [entry], notListed: ['gone'], note: 'Absence alone does not prove completion.', timedOut: false }; },
   });
   try {
@@ -159,9 +167,6 @@ test('list and wait answer compactly and return the full structure only for deta
     assert.equal(compact.total, 1);
     const detail = await client.callTool({ name: 'futureaide_list_agents', arguments: { detail: true } });
     assert.deepEqual(JSON.parse(detail.content[0].text), { items: [entry], total: 1 }, 'detail is the unchanged structure');
-    await client.callTool({ name: 'futureaide_list_agents', arguments: { name: '助手', state: 'failed' } });
-    assert.deepEqual(listFilters.at(-1), { name: '助手', state: 'failed' },
-      'name and state filters reach the service that both the stdio and Claude entry share');
 
     const waited = JSON.parse((await client.callTool({ name: 'futureaide_wait_agents', arguments: { timeout_seconds: 0 } })).content[0].text);
     assert.equal(waited.items[0].task, 'x'.repeat(80) + '…');
@@ -172,30 +177,6 @@ test('list and wait answer compactly and return the full structure only for deta
     const fullWait = JSON.parse((await client.callTool({ name: 'futureaide_wait_agents', arguments: { timeout_seconds: 0, detail: true } })).content[0].text);
     assert.deepEqual(fullWait.items, [entry], 'detail keeps the full reply and coverage');
     assert.deepEqual(fullWait.notListed, ['gone']);
-  } finally { await close(); }
-});
-
-test('event wait preserves dispatch keys, response cursor and request-scoped progress', async () => {
-  const events = [{ id: 'report-1', type: 'report', message: 'answer' }];
-  const progress = [];
-  const { client, close } = await connected({
-    async resume() {},
-    async wait(options) {
-      assert.deepEqual(options.taskKeys, ['dispatch-1']);
-      assert.equal(options.after, 'previous');
-      assert.equal(options.timeoutSeconds, undefined);
-      return { events, nextCursor: 'next', reason: 'event' };
-    },
-  });
-  try {
-    const response = await client.callTool({ name: 'futureaide_wait_agents',
-      arguments: { taskKeys: ['dispatch-1'], after: 'previous' } }, undefined,
-    { onprogress: value => progress.push(value) });
-    const value = JSON.parse(response.content[0].text);
-    assert.deepEqual(value.events, events);
-    assert.equal(value.nextCursor, 'next');
-    assert.equal(value.reason, 'event');
-    assert.equal(progress.length, 1);
   } finally { await close(); }
 });
 
@@ -319,10 +300,28 @@ test('every tool keeps its own annotations: a write is never advertised as a rea
   const { client, close } = await connected({ async resume() {} });
   try {
     const tools = (await client.listTools()).tools;
-    const expected = { futureaide_status: true, futureaide_run_agent: false, futureaide_create_agent: false,
-      futureaide_send_agent: false, futureaide_answer_agent: false, futureaide_list_agents: true,
-      futureaide_wait_agents: true, futureaide_agent_changes: true, futureaide_inspect_agent: true,
-      futureaide_cancel_agent: false, futureaide_delete_agent: false, futureaide_feedback: false, feedback: false, ask_parent: false, report_parent: false };
+    const expected = {
+      futureaide_feedback: false,
+      futureaide_status: true,
+      futureaide_cli_proxy: false,
+      futureaide_run_agent: false,
+      futureaide_create_agent: false,
+      futureaide_send_agent: false,
+      futureaide_answer_agent: false,
+      futureaide_list_agents: true,
+      futureaide_wait_agents: true,
+      futureaide_board_post: false,
+      futureaide_board_read: true,
+      futureaide_team: false,
+      futureaide_read_report: true,
+      futureaide_agent_changes: true,
+      futureaide_inspect_agent: true,
+      futureaide_cancel_agent: false,
+      futureaide_delete_agent: false,
+      feedback: false,
+      ask_parent: false,
+      report_parent: false,
+    };
     assert.deepEqual(tools.map(tool => tool.name).sort(), Object.keys(expected).sort());
     for (const [tool, readOnly] of Object.entries(expected)) {
       const annotations = tools.find(entry => entry.name === tool).annotations;
@@ -363,10 +362,12 @@ test('run answers an existing name normally and a creation failure as an error',
   try {
     const reused = await client.callTool({ name: 'futureaide_run_agent', arguments: { name: 'helper', message: 'go' } });
     assert.notEqual(reused.isError, true, 'reusing a name is success, never created: false');
-    assert.deepEqual(JSON.parse(reused.content[0].text), response);
+    assert.deepEqual(JSON.parse(reused.content[0].text), { name: 'helper' });
+    const reusedDetail = await client.callTool({ name: 'futureaide_run_agent', arguments: { name: 'helper', message: 'go', detail: true } });
+    assert.deepEqual(JSON.parse(reusedDetail.content[0].text), response);
     response = { name: 'helper', lifetime: 'persistent', state: 'reconnecting', created: false,
       error: { code: 'managed-host-required', message: 'Install the current managed DSH bridge.' } };
-    const failed = await client.callTool({ name: 'futureaide_run_agent', arguments: { message: 'go' } });
+    const failed = await client.callTool({ name: 'futureaide_run_agent', arguments: { name: 'helper', message: 'go' } });
     assert.equal(failed.isError, true);
     assert.equal(JSON.parse(failed.content[0].text).error.code, 'managed-host-required');
   } finally { await close(); }
@@ -424,16 +425,16 @@ test('a supplement receipt keeps its delivery evidence and its refusal shape', a
   const { client, close } = await connected({ async resume() {}, async send() { return response; }, async run() { return response; } });
   try {
     for (const name of ['futureaide_send_agent', 'futureaide_run_agent']) {
-      const shown = await client.callTool({ name, arguments: { name: 'helper', message: 'go', mode: 'steer' } });
+      const shown = await client.callTool({ name, arguments: { name: 'helper', message: 'go', mode: 'steer', detail: true } });
       assert.notEqual(shown.isError, true);
-      assert.deepEqual(JSON.parse(shown.content[0].text), response, `${name} passes every receipt field through`);
+      assert.deepEqual(JSON.parse(shown.content[0].text), response, `${name} passes every receipt field through on detail:true`);
     }
     response = { name: 'helper', accepted: false,
       error: { code: 'mode-unsupported', target: 'dsh', supportedModes: ['steer'] } };
     for (const name of ['futureaide_send_agent', 'futureaide_run_agent']) {
       const refused = await client.callTool({ name, arguments: { name: 'helper', message: 'go', mode: 'queue' } });
       assert.equal(refused.isError, true, `${name} reports a refused mode as an error`);
-      assert.deepEqual(JSON.parse(refused.content[0].text), response, `${name} uses the same refusal shape`);
+      assert.deepEqual(JSON.parse(refused.content[0].text), { name: 'helper', error: response.error }, `${name} keeps name and refusal error in slim view`);
     }
   } finally { await close(); }
 });

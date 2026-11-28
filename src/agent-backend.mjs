@@ -85,7 +85,7 @@ import { historyMessages, modelTurnError } from './control.mjs';
 import { dispatchBoundary } from './dispatch.mjs';
 import { modelCatalogSummary } from './model-selection.mjs';
 
-export const TARGETS = Object.freeze(['dsh', 'codex-desktop', 'claude-cli']);
+export const TARGETS = Object.freeze(['dsh', 'codex-desktop', 'codex-cli', 'claude-cli', 'agy-cli']);
 export const DEFAULT_TARGET = 'dsh';
 // A target an older build offered and this one no longer does. Roster records that
 // carry it are read-only history: nothing can be created on it, and no local work is
@@ -110,6 +110,10 @@ export const invalidTarget = value => fail('invalid-target',
   `target must be one of ${TARGETS.join(' / ')}; received ${JSON.stringify(value)}.`);
 export const removedTarget = target => fail('backend-not-ready',
   `The ${target} target was removed from this build: it drove the user's own application window by simulating the mouse, keyboard and clipboard. This record is read-only and no local work is attempted for it; create a subagent on ${TARGETS.join(' / ')} instead.`);
+export const isTargetDisabled = (target, config) =>
+  Array.isArray(config?.disabledTargets) && config.disabledTargets.includes(String(target ?? '').trim().toLowerCase());
+export const targetDisabled = target => fail('target-disabled',
+  `The ${target} target is disabled in this installation's configuration (disabledTargets).`);
 
 export function normalizeTarget(value) {
   if (value === undefined || value === null) return DEFAULT_TARGET;
@@ -124,7 +128,7 @@ export function targetOf(record) {
 
 // Display name of the application behind a target, used in user-facing text.
 // DSH keeps its historical wording; a removed target falls back to its own id.
-export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'codex-desktop': 'Codex Desktop', 'claude-cli': 'Claude CLI' });
+export const TARGET_LABELS = Object.freeze({ dsh: 'DSH', 'codex-desktop': 'Codex Desktop', 'codex-cli': 'Codex CLI', 'claude-cli': 'Claude CLI', 'agy-cli': 'Antigravity CLI' });
 export function hostLabel(record) {
   const target = targetOf(record);
   return TARGET_LABELS[target] ?? target;
@@ -132,6 +136,18 @@ export function hostLabel(record) {
 
 const reason = error => ({ code: error?.code ?? 'operation-failed', message: String(error?.message ?? error).slice(0, 400),
   ...(error?.discoveryReason ? { discoveryReason: error.discoveryReason } : {}) });
+
+/** An explicit timeout, distinct from a missing renderer, rejection or unverified identity. */
+export function isCodexTransientTimeout(error) {
+  return error?.code === 'codex-native-rpc-timeout' || error?.code === 'codex-native-rpc-response-timeout'
+    || (error?.code === 'codex-native-rpc-unavailable' && error.discoveryReason === 'timeout');
+}
+
+/** Tag a timeout only at a boundary that proves no native cleanup write was sent. */
+export function codexCleanupPreflightError(error) {
+  if (!isCodexTransientTimeout(error) || error.uncertain === true || error.terminal === true) return error;
+  return Object.assign(new Error(error.message, { cause: error }), error, { cleanupNotSent: true });
+}
 
 // Catalog reads are diagnostic: an unavailable catalog must not hide the
 // registration evidence or substitute a default from the other application.
@@ -149,8 +165,12 @@ export async function readStatusModels(readCatalog) {
  * @param {object} options Injected adapters, a probe record, and the adapter's
  * private request directory. Probe must not write anything.
  */
-export async function diagnoseTarget(target, { adapters = {}, record = {}, requestDirectory = () => '', deps = {}, adapterLoader = adapterFactory } = {}) {
+export async function diagnoseTarget(target, { adapters = {}, record = {}, requestDirectory = () => '', deps = {}, adapterLoader = adapterFactory,
+  config, probeOptions } = {}) {
   const wanted = normalizeTarget(target);
+  if (isTargetDisabled(wanted, config ?? deps?.config)) {
+    return { ready: false, present: true, disabled: true, reason: reason(targetDisabled(wanted)) };
+  }
   let factory;
   try { factory = await adapterLoader(wanted, adapters); }
   catch (error) { return { ready: false, present: true, reason: reason(error) }; }
@@ -161,15 +181,18 @@ export async function diagnoseTarget(target, { adapters = {}, record = {}, reque
   const missing = BACKEND_METHODS.filter(method => typeof backend?.[method] !== 'function');
   if (missing.length) return { ready: false, present: true, reason: reason(backendNotReady(wanted, missing)) };
   let probe;
-  try { probe = await backend.probe(); }
+  try { probe = await backend.probe(probeOptions); }
   catch (error) {
-    // Claude's CLI catalog is available before login. Preserve both the IDs
-    // and the actual reason a turn cannot start.
+    // CLI catalogs are available locally before login or proxy startup. Preserve both
+    // the IDs, any resolved route summary, and the actual reason a turn cannot start.
     return { ready: false, present: true, reason: reason(error),
-      ...(wanted === 'claude-cli' ? await readStatusModels(() => backend.models()) : {}) };
+      ...(error?.route ? { route: error.route } : {}),
+      ...(wanted === 'claude-cli' || wanted === 'codex-cli' || wanted === 'agy-cli' ? await readStatusModels(() => backend.models()) : {}) };
   }
   const capabilities = { methods: probe?.methods ?? [], treeProtocol: probe?.treeProtocol ?? null,
-    reportProtocol: probe?.reportProtocol ?? null, ...await readStatusModels(() => backend.models()) };
+    reportProtocol: probe?.reportProtocol ?? null,
+    ...(probe?.route ? { route: probe.route } : {}),
+    ...await readStatusModels(() => backend.models()) };
   if (capabilities.treeProtocol !== 1) return { ready: false, present: true, ...capabilities,
     reason: { code: 'tree-protocol-required', message: `The ${wanted} adapter has not completed its task-tree protocol. No subagent can be created on it yet.` } };
   if (capabilities.reportProtocol !== 1) return { ready: false, present: true, ...capabilities,
@@ -188,7 +211,9 @@ async function adapterFactory(target, adapters = {}) {
   if (typeof adapters?.[target] === 'function') return adapters[target];
   const entry = {
     'codex-desktop': ['./codex-backend.mjs', 'createCodexBackend'],
+    'codex-cli': ['./codex-cli-backend.mjs', 'createCodexCliBackend'],
     'claude-cli': ['./claude-cli-backend.mjs', 'createClaudeCliBackend'],
+    'agy-cli': ['./agy-cli-backend.mjs', 'createAgyCliBackend'],
   }[target];
   if (!entry) return undefined;
   const moduleUrl = new URL(entry[0], import.meta.url);
@@ -210,10 +235,11 @@ async function adapterFactory(target, adapters = {}) {
  * @param {object} options Target, injected adapters, and the DSH client/control
  * factories already resolved by the caller.
  */
-export async function resolveBackend(record, { target, adapters = {}, dsh, load = () => record, deps = {}, adapterLoader = adapterFactory } = {}) {
+export async function resolveBackend(record, { target, adapters = {}, dsh, load = () => record, deps = {}, adapterLoader = adapterFactory, config } = {}) {
   const requested = target ?? record?.target;
   if (REMOVED_TARGETS.includes(requested)) throw removedTarget(requested);
   const wanted = normalizeTarget(requested);
+  if (isTargetDisabled(wanted, config ?? deps?.config)) throw targetDisabled(wanted);
   if (wanted === DEFAULT_TARGET) {
     if (!dsh) throw backendNotReady(DEFAULT_TARGET);
     return assertBackend(createDshBackend({ ...dsh, load }), DEFAULT_TARGET);

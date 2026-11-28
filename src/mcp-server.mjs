@@ -13,7 +13,19 @@ import { TRUSTED_CALLER, trustedCaller, callingThread } from './calling-context.
 import { feedbackRecordError, submitFeedback } from './feedback-client.mjs';
 import { monitorAlive } from './shared-monitor.mjs';
 import { exitWhenInputCloses, stdioWaitSignal } from './stdio-exit.mjs';
-import { compactChanges, compactCreate, compactInspect, compactList, compactStatus, compactWait } from './tool-view.mjs';
+import {
+  compactAnswer,
+  compactBoardPost,
+  compactChanges,
+  compactCreate,
+  compactInspect,
+  compactList,
+  compactRun,
+  compactSend,
+  compactStatus,
+  compactTeamManage,
+  compactWait,
+} from './tool-view.mjs';
 import { CODEX_ASK_PARENT_INSTRUCTION, FINAL_REPORT_CONTRACT, QUESTION_CONTRACT } from './report-contract.mjs';
 import { TARGETS } from './agent-backend.mjs';
 import { RosterStore, isCancelledRound } from './roster-store.mjs';
@@ -31,7 +43,7 @@ const dispatchScope = Symbol.for('futureaide.feedbackDispatchScope');
 
 function errorScope(extra, name) {
   const caller = trustedCaller(extra);
-  const identity = caller ? caller.source + ':' + caller.nativeSessionId : 'codex:' + callingThread(extra);
+  const identity = caller ? caller.source + ':' + (caller.conversationId ?? caller.nativeSessionId) : 'codex:' + callingThread(extra);
   return identity + ':' + (name ?? '') + ':' + (extra.feedbackScope ?? '');
 }
 
@@ -60,21 +72,125 @@ function applyDispatchScope(extra) {
   const binding = extra[dispatchScope];
   if (binding) extra.feedbackScope = [binding.agentId, binding.taskId ?? ''].join(':');
 }
-const name = z.string().min(1).max(80).describe('Subagent name in this chat. Names in other chats are unrelated.');
-const message = z.string().min(1).max(100000).describe('Task, update, or answer text. Pass it directly; do not create a communication file.');
+const name = z.string().min(1).max(80).describe('Subagent name in this chat (e.g. "后端1", "团队长1").');
+const agentPathName = z.string().min(1).max(160).describe('Subagent name or cross-level team path (e.g. "后端1" or "团队长1/后端1").');
+const role = z.string().min(1).max(40).optional().describe('Role label (e.g. "后端", "前端", "团队长", "调查员"). Auto-numbers name (后端1, 后端2) and applies 团队配置.md defaults.');
+const worktree = z.boolean().optional().describe('Create an isolated git worktree when true (default false shares the current project folder).');
+const timeoutMinutes = z.number().int().min(1).max(240).optional().describe('Optional execution timeout in minutes (1–240).');
+const cliProxySpec = z.union([z.number().int(), z.string()]).optional().describe('Optional CLI proxy override: port (e.g. 7890), proxy URL, "faswitch", or "direct".');
+const message = z.string().min(1).max(100000).describe('Task, supplement, or answer text passed directly.');
 const modelOptions = {
-  model: z.string().min(1).optional().describe('Model ID or substring, case-insensitive. An exact ID wins, then the first match in the target catalog. The resolved model stays with this name for later sends, answers and reminders. See futureaide_status for available IDs.'),
-  effort: z.string().min(1).optional().describe('Optional with or without model. New turns use modelDefaultEfforts (GPT-6.2-Astra: high) then defaultEffort (factory: max). The nearest supported level wins, lower on ties. actualEffort reports the confirmed level.'),
+  model: z.string().min(1).optional().describe('Model ID or case-insensitive substring (see futureaide_status). Omit to use role or backend default.'),
+  effort: z.string().min(1).optional().describe('Reasoning effort (e.g. "high", "xhigh", "max"). Omit to use role or model default.'),
 };
-const detail = z.boolean().optional().describe('Return the complete service structure instead of the compact default. It is much longer, so ask for it only when an omitted field is needed.');
-const listName = z.string().min(1).max(80).optional()
-  .describe('Return only this name, even when it is inactive (failed, cancelled, cleanup_failed or finished). Names in other chats are unrelated.');
+const detail = z.boolean().optional().describe('Return the uncompacted service structure when true (default false).');
+const listScope = z.enum(['team', 'agent', 'all']).optional()
+  .describe('View scope: "team" (default, current team hierarchy), "agent" (single member details), or "all" (all active teams).');
+const listRole = z.string().min(1).max(40).optional()
+  .describe('Filter members by role label (e.g. "后端", "前端", "团队长").');
+const listName = z.string().min(1).max(160).optional()
+  .describe('Filter to one member name or team path (e.g. "团队长1/后端1"), including inactive records.');
 const listState = z.string().min(1).max(64).optional()
-  .describe('Return only names in this exact lifecycle state: creating, running, awaiting_input, awaiting_report, reconnecting, delivery_pending, cleaning, cleanup_failed, idle, failed, cancelled or supplement_blocked. active means the default active set.');
-// Omitted and explicit steer are different requests: a target keeps its own
-// native default only when the caller says nothing. The targets disagree about
-// that default, so the field never fills in a value on the caller's behalf.
-const mode = z.enum(['steer', 'queue']).optional().describe('Where this input goes when the name is already working. Omit it to keep the target’s native default: an active Codex or DSH turn receives the text on its next step, while Claude CLI holds it for the next turn of the same session. steer asks for the active turn. queue asks to wait for the current turn to end and then start the next turn with this input alone; a queued input never joins the current turn. A target that cannot honor the requested mode returns mode-unsupported with its target and supportedModes and stores nothing. With no turn running, both modes simply start a turn.');
+  .describe('Filter by lifecycle state (default "active"; or "running", "awaiting_input", "idle", "failed", "cancelled", etc.).');
+const waitBarrier = z.enum(['any', 'all']).optional()
+  .describe('Wake barrier: "any" (default, first event) or "all" (all tasks settled, waking immediately on any question or failure).');
+const boardMessage = z.string().min(1).max(4000)
+  .describe('Message to post to the team board; @后端1 or @团队长1/后端2 wakes or revives mentioned members.');
+const mode = z.enum(['steer', 'queue']).optional()
+  .describe('Busy-time input mode: omit for target default, "steer" for active turn, or "queue" for next turn (unsupported modes return mode-unsupported with supportedModes).');
+const runTaskItem = z.object({
+  name: name.optional(),
+  role,
+  message,
+  model: modelOptions.model,
+  effort: modelOptions.effort,
+  target: z.enum(TARGETS).optional(),
+  lifetime: z.enum(['once', 'persistent']).optional(),
+  worktree,
+  timeout_minutes: timeoutMinutes,
+  proxy: cliProxySpec,
+});
+const runTasks = z.array(runTaskItem).min(1).max(20).optional()
+  .describe('Batch dispatch: 1–20 subagent tasks to launch in parallel with one merged wakeCmd.');
+
+function requireNameOrRole(args) {
+  const hasName = typeof args?.name === 'string' && args.name.trim().length > 0;
+  const hasRole = typeof args?.role === 'string' && args.role.trim().length > 0;
+  if (!hasName && !hasRole) {
+    throw Object.assign(
+      new Error('Provide at least one of name or role (for example role: "后端" to auto-number as 后端1, 后端2).'),
+      { code: 'invalid-arguments' },
+    );
+  }
+}
+
+function forwardCreationArgs({ detail: _detail, worktree: wt, workspace_mode, timeout_minutes, tasks, ...rest }) {
+  const mapped = {
+    ...rest,
+    ...(wt !== undefined
+      ? { worktree: wt, workspaceMode: wt ? 'worktree' : 'inherit' }
+      : (workspace_mode !== undefined ? { workspaceMode: workspace_mode } : {})),
+    ...(timeout_minutes !== undefined ? { timeoutMinutes: timeout_minutes } : {}),
+  };
+  if (Array.isArray(tasks)) {
+    mapped.tasks = tasks.map(({ worktree: itemWt, timeout_minutes: itemTimeout, ...itemRest }) => ({
+      ...itemRest,
+      ...(itemWt !== undefined
+        ? { worktree: itemWt, workspaceMode: itemWt ? 'worktree' : 'inherit' }
+        : {}),
+      ...(itemTimeout !== undefined ? { timeoutMinutes: itemTimeout } : {}),
+    }));
+  }
+  return mapped;
+}
+
+async function runSingleOrBatch(service, args, extra) {
+  if (Array.isArray(args.tasks)) {
+    for (const item of args.tasks) {
+      requireNameOrRole({ name: item.name ?? args.name, role: item.role ?? args.role });
+    }
+    const forwarded = forwardCreationArgs(args);
+    try {
+      return await service.run(forwarded, extra);
+    } catch (error) {
+      if (forwarded.message || !/1–100000 characters is required/.test(String(error?.message ?? ''))) {
+        throw error;
+      }
+      const items = [];
+      const errors = [];
+      for (const item of forwarded.tasks) {
+        try {
+          const single = await service.run({
+            ...(forwarded.role ? { role: forwarded.role } : {}),
+            ...(forwarded.model ? { model: forwarded.model } : {}),
+            ...(forwarded.effort ? { effort: forwarded.effort } : {}),
+            ...(forwarded.target ? { target: forwarded.target } : {}),
+            ...(forwarded.lifetime ? { lifetime: forwarded.lifetime } : {}),
+            ...(forwarded.worktree !== undefined ? { worktree: forwarded.worktree, workspaceMode: forwarded.workspaceMode } : {}),
+            ...(forwarded.timeoutMinutes !== undefined ? { timeoutMinutes: forwarded.timeoutMinutes } : {}),
+            ...(forwarded.proxy !== undefined ? { proxy: forwarded.proxy } : {}),
+            ...item,
+          }, extra);
+          items.push(single);
+          if (single?.error) errors.push({ name: single.name, error: single.error });
+        } catch (itemErr) {
+          const errObj = { code: itemErr?.code ?? 'operation-failed', message: itemErr?.message ?? String(itemErr) };
+          items.push({ ...(item.name ? { name: item.name } : {}), ...(item.role ? { role: item.role } : {}), error: errObj });
+          errors.push(errObj);
+        }
+      }
+      return { batch: true, items, ...(errors.length ? { errors } : {}) };
+    }
+  }
+  if (typeof args?.message !== 'string' || !args.message.trim()) {
+    throw Object.assign(
+      new Error('Provide message for single dispatch, or tasks for batch dispatch.'),
+      { code: 'invalid-arguments' },
+    );
+  }
+  requireNameOrRole(args);
+  return service.run(forwardCreationArgs(args), extra);
+}
 
 // Compact views are small by construction; this keeps boundedOutput's guarantee that
 // one answer can never exceed the transport-sized limit, without paying for indentation.
@@ -83,7 +199,13 @@ const mode = z.enum(['steer', 'queue']).optional().describe('Where this input go
 const COMPACT_MAXIMUM = 40000;
 
 async function waitForAgents(service, args, extra) {
-  const options = { names: args.names, taskKeys: args.taskKeys, after: args.after, timeoutSeconds: args.timeout_seconds };
+  const options = {
+    names: args.names,
+    taskKeys: args.taskKeys,
+    after: args.after,
+    timeoutSeconds: args.timeout_seconds,
+    ...(args.barrier !== undefined ? { barrier: args.barrier } : {}),
+  };
   const token = extra?._meta?.progressToken;
   if (args.timeout_seconds !== undefined || token == null || !extra.sendNotification) return service.wait(options, extra);
 
@@ -179,10 +301,14 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
       // A view may also shape the detail answer (inspect's node filter lives there),
       // so both paths receive the arguments.
       const text = view === compactWait && result.nextCursor
-        ? compactOutput(args.detail === true ? result : compactWait(result), () => ({
-          ...compactWait(result), items: [], itemCount: result.items?.length ?? 0,
-          note: 'The roster details exceeded the output budget. Events and the cursor are included.',
-        }))
+        ? compactOutput(args.detail === true ? result : compactWait(result), () => {
+          const slim = compactWait(result);
+          return {
+            ...slim,
+            ...(Array.isArray(slim.items) ? { items: [], itemCount: result.items?.length ?? 0 } : {}),
+            note: 'The roster details exceeded the output budget. Events and the cursor are included.',
+          };
+        })
         : view === undefined ? boundedOutput(result)
         : args?.detail === true
           ? (view.detail ? boundedOutput(view.detail(result, args)) : boundedOutput(result))
@@ -205,7 +331,7 @@ function toolRegistrar(server, { service, extraFor = extra => extra, diagnostics
 }
 
 /**
- * The eleven name-addressed management tools, registered on any MCP server that has a
+ * The thirteen name-addressed management tools, registered on any MCP server that has a
  * service and can supply a trusted caller context: the stdio server for this chat and
  * the loopback report service for a verified Claude caller. The Codex-side
  * ask_parent/report_parent are registered by the stdio server alone, so a surface that
@@ -219,39 +345,111 @@ export function registerScopedTools(server, options = {}) {
   // own annotations, or a host might auto-approve a write as a read.
   const registerView = (tool, description, inputSchema, action, view) =>
     register(tool, description, inputSchema, action, true, false, view);
-  register('futureaide_feedback', 'Record a plugin problem or friction in the local feedback inbox. Use ask_parent for decisions and report_parent for deliverables.', { ...feedbackSchema, name: name.optional() }, (s, a, e) => s.submitCallerFeedback(a, e, recentError(e, a.name), e.feedbackDeadline));
-  registerView('futureaide_status', 'Check this chat context and target readiness. Each backend lists its available model IDs in catalog order and its defaultModel. An unavailable backend or catalog includes the reason. Pass detail: true for the full diagnostics.', { detail }, (s, _a, e) => s.status(e), compactStatus);
-  register('futureaide_run_agent', 'Start a subagent’s work in one call: create the name if it does not exist, then send the task; an existing name simply receives the message. Use model to select the model for the name and effort to select the level for this input. The receipt gives the resolved ID as actualModel. Omit name to have one generated. Results return to this chat through the subagent’s own ask_parent questions and report_parent reports, so do not poll; accepted or queued is a receipt, not completion. lifetime is once (the default) or persistent, and target picks the application for a new name: dsh (the default), codex-desktop or claude-cli. An existing name keeps its own target and lifetime; a conflicting explicit value is refused rather than running on another application. mode applies to an existing working name: omit it for the target’s native behavior, steer to insert into its active turn, or queue to start the next turn after the current one ends. A new name starts its first turn either way. DSH refuses explicit queue while busy; Claude CLI refuses explicit steer while busy. An explicit mode the target cannot honor returns mode-unsupported with target and supportedModes, and stores nothing. A supplement receipt carries requestId, mode, delivery and, once proven, turnId or afterTurnId; accepted alone never proves which turn received it. A new name whose first send fails still returns created:true with that name and its error: the name exists, so call list before deciding whether to send again, and never rename and rerun the task. queued:true means locally saved — do not resend; retrying:true means the original request awaits background recovery, so the caller need not resend; unknown means inspect the original receipt and recipient before deciding whether a retry is safe.', {
-    name: name.optional(), message, ...modelOptions, lifetime: z.enum(['once', 'persistent']).optional()
-      .describe('Lifetime for a new name. Defaults to once. An existing name keeps its own lifetime and a conflicting explicit value is refused.'),
+  register('futureaide_feedback', 'Record a plugin bug ("problem") or usability issue ("friction") in the local feedback inbox.', { ...feedbackSchema, name: name.optional() }, (s, a, e) => s.submitCallerFeedback(a, e, recentError(e, a.name), e.feedbackDeadline));
+  registerView('futureaide_status', 'Check caller verification, backend readiness, active proxy routes, and available model IDs.', { detail }, (s, _a, e) => s.status(e), compactStatus);
+  register('futureaide_cli_proxy', 'Inspect ("status") or bind ("bind") proxy routes for headless codex-cli / claude-cli / agy-cli backends (port, URL, "faswitch", or "direct").', {
+    action: z.enum(['status', 'bind']).optional().describe('Operation: "status" (default) or "bind".'),
+    target: z.enum(['codex-cli', 'claude-cli', 'agy-cli', 'all']).optional().describe('Target CLI backend: "codex-cli", "claude-cli", "agy-cli", or "all" (default).'),
+    proxy: cliProxySpec,
+  }, (s, a, e) => s.manageCliProxy({
+    action: a.action ?? 'status',
+    target: a.target ?? 'all',
+    ...(a.proxy !== undefined ? { proxy: a.proxy } : {}),
+  }, e));
+  register('futureaide_run_agent', 'Create (if new) and dispatch subagents in one call: pass role or name with message, or pass tasks: [...] to launch up to 20 subagents in parallel. Role defaults resolve from 团队配置.md; set worktree: true for an isolated git worktree, and run wakeCmd in background to wait without polling. For an active name, mode ("steer" | "queue") controls busy delivery (unsupported modes return mode-unsupported with supportedModes).', {
+    name: name.optional(),
+    role,
+    message: message.optional(),
+    tasks: runTasks,
+    worktree,
+    timeout_minutes: timeoutMinutes,
+    proxy: cliProxySpec,
+    ...modelOptions,
+    lifetime: z.enum(['once', 'persistent']).optional()
+      .describe('Session lifetime: "once" (default, auto-cleans after final report) or "persistent" (reusable across tasks).'),
     target: z.enum(TARGETS).optional()
-      .describe('Execution target bound to a new name. Defaults to dsh. An existing name keeps its own target and a conflicting explicit value is refused; it never falls back to another backend.'),
+      .describe('Execution backend for a new name (e.g. "codex-cli", "claude-cli", "agy-cli", "codex-desktop"). Omit to use role default or codex-cli.'),
     mode,
-  }, (s, a, e) => s.run(a, e));
-  register('futureaide_create_agent', 'Reserve a name in the current project. Optionally select its model and reasoning effort before its first input. The receipt gives the resolved ID as actualModel. target picks the application that runs it, once, at creation: dsh (the default), codex-desktop or claude-cli; every later call addresses the subagent by name only. A target whose adapter is not installed is refused instead of substituting DSH. once cleans up the managed name after an explicitly submitted final report is delivered and the tree settles. Claude CLI retains its native conversation history; ordinary replies do not complete a task. persistent keeps its context until explicitly deleted.', {
-    name, ...modelOptions, lifetime: z.enum(['once', 'persistent']),
-    target: z.enum(TARGETS).optional().describe('Execution target bound to this name. Defaults to dsh. A target that is unavailable here fails explicitly; it never falls back to another backend.'),
-  }, (s, a, e) => s.create(a, e), false, false, compactCreate);
-  register('futureaide_send_agent', 'Assign work or supplement a named subagent. You can select its model and effort here. To switch a running Codex turn, wait until it ends and send the new selection. mode decides a busy name: omit it for the target’s native default, steer to insert into the active turn, or queue to wait for the current turn to end and then start the next turn with this input alone. DSH reads a supplement on the model’s next step and refuses explicit queue, even when a question is pending; Claude CLI has no native steer and refuses explicit steer. A refused mode returns mode-unsupported with target and supportedModes, and nothing is stored. When no turn is running, both modes start a turn. A waiting subagent treats an ordinary send as its answer; explicit queue never answers a pending question. Supplement receipts carry requestId, mode, delivery and, once proven, turnId or afterTurnId; accepted alone never proves which turn received it. Managed dispatch and monitoring read only the session this name is bound to (DSH, Codex Desktop or Claude CLI), not the full session list. queued:true means locally saved; do not resend. retrying:true means the original request awaits background recovery; the caller need not resend. unknown means inspect the original receipt and recipient before any retry; never blindly repeat. accepted:true means the target accepted the request, not that work is complete. Use list for queue status or changes/inspect for details. Only explicit questions and reports return to this chat; ordinary replies and idle trees never notify it.', { name, message, ...modelOptions, mode }, (s, a, e) => s.send(a, e));
-  register('futureaide_answer_agent', 'Answer the named subagent’s pending question directly. The plugin continues its original task once; no exchange ID, command, or text file is needed. Only an actually pending question is answered: if it was already consumed, or a different question is pending now, the receipt is answered:false, delivered:false with reason question-not-pending or question-changed and the current pendingQuestions, and nothing is sent. Use futureaide_send_agent only if you still want to add that text as an ordinary supplement.', { name, message }, (s, a, e) => s.answer(a, e));
-  registerView('futureaide_list_agents', 'Show only this chat’s subagents: name, state, lifetime, actualModel, current task, pending questions, the latest report, the changed-file count and a team roster. By default it lists active names only; pass name to read one name even when it is inactive, or state to list one exact lifecycle state such as failed, cancelled, cleanup_failed or idle (state: "active" is the default set). Filters run on lightweight name/state metadata before any record or tree is read, and never cross chats. A name that has descendants answers with team: one line per member carrying its relative path, state, activity while running and file count, capped at 30 rows and summarised by {more:n} beyond that. The default view is compact; coverage, timestamps, per-node details and the full result text are omitted. The file count includes unconfirmed paths and is paired with their own total, so the two are never added together. Pass detail: true for the complete structure when those fields are needed. Deep history is unnecessary for ordinary supervision.', { name: listName, state: listState, detail }, (s, a, e) => s.list(e, { name: a.name, state: a.state }), compactList);
-  registerView('futureaide_wait_agents', 'After dispatch, wait once using the taskKeys from run/send. Omit timeout_seconds to wait for a report, question or terminal state. Use nextCursor as after when waiting for the next event. An explicit 0 takes a snapshot and 1–45 bounds the query. Entries include actualModel and actualEffort. Codex has a configured 60-second tool budget that progress cannot extend. Claude interactive main sessions may background a call after two minutes. A host timeout or disconnect leaves the original task and its delivery intact. Do not poll or dispatch again.', {
-    names: z.array(name).min(1).max(50).optional(),
-    taskKeys: z.array(z.string().min(1).max(512)).min(1).max(50).optional().describe('Copy taskKey from each original dispatch receipt.'),
-    after: z.string().min(1).optional().describe('Copy nextCursor from the preceding event for the same selection.'),
-    timeout_seconds: z.number().int().min(0).max(45).optional(), detail,
+    detail,
+  }, (s, a, e) => runSingleOrBatch(s, a, e), false, false, compactRun);
+  register('futureaide_create_agent', 'Reserve a named or role-numbered subagent without starting a turn. Supports role defaults from 团队配置.md, target ("codex-cli" | "claude-cli" | "agy-cli" | "codex-desktop"), model/effort, worktree isolation, and proxy binding.', {
+    name: name.optional(),
+    role,
+    worktree,
+    proxy: cliProxySpec,
+    ...modelOptions,
+    lifetime: z.enum(['once', 'persistent']),
+    target: z.enum(TARGETS).optional()
+      .describe('Execution backend bound to this name (e.g. "codex-cli", "claude-cli", "agy-cli", "codex-desktop").'),
+  }, (s, a, e) => {
+    requireNameOrRole(a);
+    return s.create(forwardCreationArgs(a), e);
+  }, false, false, compactCreate);
+  register('futureaide_send_agent', 'Send a new task or supplement to an existing subagent by name or team path (e.g. "团队长1/后端1"), optionally updating model or effort. Omit mode for target default, pass "steer" for the active turn, or "queue" for the next turn (unsupported modes return mode-unsupported with supportedModes).', { name: agentPathName, message, ...modelOptions, mode, detail }, (s, a, e) => s.send({ name: a.name, message: a.message, ...(a.model !== undefined ? { model: a.model } : {}), ...(a.effort !== undefined ? { effort: a.effort } : {}), ...(a.mode !== undefined ? { mode: a.mode } : {}) }, e), false, false, compactSend);
+  register('futureaide_answer_agent', 'Answer a subagent’s pending ask_parent question by name or team path (e.g. "团队长1/后端1") so its current task continues.', { name: agentPathName, message, detail }, (s, a, e) => s.answer({ name: a.name, message: a.message }, e), false, false, compactAnswer);
+  registerView('futureaide_list_agents', 'List subagents concisely in three scopes: "team" (current team hierarchy, live activity, and stalled warnings), "agent" (single member questions, report, and changed files), or "all" (all active teams grouped by caller).', {
+    scope: listScope, name: listName, role: listRole, state: listState, detail,
+  }, (s, a, e) => s.list(e, {
+    ...(a.scope !== undefined ? { scope: a.scope } : {}),
+    ...(a.name !== undefined ? { name: a.name } : {}),
+    ...(a.role !== undefined ? { role: a.role } : {}),
+    ...(a.state !== undefined ? { state: a.state } : {}),
+  }), compactList);
+  registerView('futureaide_wait_agents', 'Wait for subagent questions, reports, or completion using taskKeys (or names). Returns inline event messages directly; pass barrier: "all" to wait for parallel tasks together (wakes immediately on any question or failure).', {
+    names: z.array(agentPathName).min(1).max(50).optional(),
+    taskKeys: z.array(z.string().min(1).max(512)).min(1).max(50).optional().describe('Copy taskKey from each dispatch receipt.'),
+    after: z.string().min(1).optional().describe('Copy nextCursor from the preceding wait call for the same selection.'),
+    barrier: waitBarrier,
+    timeout_seconds: z.number().int().min(0).max(45).optional(),
+    detail,
   }, (service, args, extra) => waitForAgents(service, args, options.inputSignal ? {
     ...extra, signal: AbortSignal.any([extra.signal, options.inputSignal].filter(Boolean)),
   } : extra), compactWait);
-  registerView('futureaide_agent_changes', 'Read observed file changes across a named subagent’s tree, attributed by agentPath, without reading conversations. Each path keeps only its operation, plus agentPath below the root and attribution when a before/after comparison found it; pass detail: true for the complete entries, including any before/after content. Coverage is stated as one sentence, and unconfirmed paths are called out. task=0 selects the current/latest task; 1 selects the preceding task, and its task text is kept so the answer says which task it is.', {
-    name, task: z.number().int().min(0).optional(), detail,
+  register('futureaide_board_post', 'Post to the team meeting board; @后端1 or @团队长1/后端2 mentions wake or revive the target member to reply.', {
+    message: boardMessage,
+    detail,
+  }, (s, a, e) => s.postBoard({ message: a.message }, e), false, false, compactBoardPost);
+  registerView('futureaide_board_read', 'Read recent messages from the team meeting board.', {
+    limit: z.number().int().min(1).max(100).optional().describe('Maximum board messages to return (1–100).'),
+    after_seq: z.number().int().min(0).optional().describe('Return only messages with seq greater than after_seq.'),
+  }, (s, a, e) => s.readBoard({
+    ...(a.limit !== undefined ? { limit: a.limit } : {}),
+    ...(a.after_seq !== undefined ? { afterSeq: a.after_seq } : {}),
+  }, e));
+  register('futureaide_team', 'Govern team membership and recovery: "adopt" (take over same-project old team or stray agent), "kick" (remove member; default keep_children: true promotes children), "reparent" (move under parent or null for root), "resume" (continue interrupted/switched-account work), "strays" (list unclaimed agents), "sweep" (clean idle strays), or "merge" (merge member worktree back and remove it).', {
+    action: z.enum(['adopt', 'kick', 'reparent', 'resume', 'strays', 'sweep', 'merge'])
+      .describe('Governance action: "adopt", "kick", "reparent", "resume", "strays", "sweep", or "merge".'),
+    target: z.string().min(1).max(160).optional()
+      .describe('Target member name, team path (e.g. "团队长1/后端1"), or "auto" for adopt.'),
+    parent: z.string().max(160).nullable().optional()
+      .describe('New parent name/path for reparent or adopt, or null to attach directly under Boss.'),
+    keep_children: z.boolean().optional()
+      .describe('For kick: true (default) promotes children to upper parent; false terminates the entire subtree.'),
+    message: z.string().min(1).max(20000).optional()
+      .describe('Optional continuation or handoff prompt (for resume/adopt).'),
+    detail,
+  }, (s, a, e) => s.manageTeam({
+    action: a.action,
+    target: a.target,
+    parent: a.parent,
+    keepChildren: a.keep_children,
+    message: a.message,
+  }, e), false, false, compactTeamManage);
+  registerView('futureaide_read_report', 'Read paginated raw report text by task_key and submission_ref when an exact unclipped page is needed.', {
+    task_key: z.string().min(1).max(512).describe('Task key from the dispatch receipt.'),
+    submission_ref: z.string().min(1).max(512).describe('Submission ID for the report.'),
+    offset: z.number().int().min(0).optional().describe('UTF-16 character offset; omit for first page or copy nextOffset.'),
+    limit: z.number().int().min(1).max(20000).optional().describe('Maximum characters per page (default 8000).'),
+  }, (s, a, e) => s.readReport({ taskKey: a.task_key, submissionId: a.submission_ref, offset: a.offset, limit: a.limit }, e));
+  registerView('futureaide_agent_changes', 'List observed file changes across a subagent’s tree (task=0 for latest, 1+ for earlier tasks).', {
+    name: agentPathName, task: z.number().int().min(0).optional(), detail,
   }, (s, a, e) => s.changes(a, e), compactChanges);
-  registerView('futureaide_inspect_agent', 'Inspect a named subagent and its descendants’ conversations, tools, and task history when deeper supervision is needed. Each tree node carries its own messages once; message text longer than 4000 characters is truncated and marked truncated: true. Pass node to read one member only: the team path a list shows (for example "design/frontend", or "subagent#2" when two members share a name) or a member name; a path wins and a shortened path with "…" is matched by its prefix. A name that fits several nodes is refused with the paths that work. Every other node keeps its name and status. Pass detail: true for the complete service structure, which this tool does not clip; node still filters it.', {
-    name, max_messages: z.number().int().min(1).max(100).optional(), detail,
-    node: z.string().min(1).max(200).optional().describe('Read only this tree node: its name or its team path from list. Other nodes are returned as name and status.'),
+  registerView('futureaide_inspect_agent', 'Inspect conversation messages, input receipts, and task history for a subagent or one tree node.', {
+    name: agentPathName, max_messages: z.number().int().min(1).max(100).optional(), detail,
+    node: z.string().min(1).max(200).optional().describe('Read only this tree node by name or team path from list.'),
   }, (s, a, e) => s.inspect({ name: a.name, maxMessages: a.max_messages ?? 20 }, e), compactInspect);
-  register('futureaide_cancel_agent', 'Request priority cancellation of this named subagent and its descendants without waiting for ordinary polling. An accepted request remains cancelling until the stopped tree is verified. Preserve context and submitted reports; cancellation does not delete session data.', { name }, (s, a, e) => s.cancel(a, e), false, true);
-  register('futureaide_delete_agent', 'Close the named subagent and its owned descendant tree, removing private plugin records and managed DSH or Codex session data. Claude CLI keeps its native conversation history. Project files and delivered results remain. The name leaves this chat’s list only after cleanup succeeds.', { name }, (s, a, e) => s.delete(a, e), false, true);
+  register('futureaide_cancel_agent', 'Cancel the active task and descendants of a named or path-addressed subagent while preserving session context.', { name: agentPathName }, (s, a, e) => s.cancel(a, e), false, true);
+  register('futureaide_delete_agent', 'Close and remove a named or path-addressed subagent and its owned descendants while keeping project files.', { name: agentPathName }, (s, a, e) => s.delete(a, e), false, true);
   return server;
 }
 
@@ -261,8 +459,8 @@ export function registerScopedTools(server, options = {}) {
  * use the same settings.
  */
 export function makeScopedServer({ configPath, scopedFactory = createScopedAgents, diagnostics,
-  configReady, inputSignal } = {}) {
-  const server = new McpServer({ name: 'futureaide-control', version: '0.5.20' });
+  configReady, inputSignal, env = process.env } = {}) {
+  const server = new McpServer({ name: 'futureaide-control', version: '2.3.0' });
   let servicePromise;
   const service = () => servicePromise ??= (configReady ?? loadConfig(configPath)).then(async config => {
     const value = scopedFactory(config);
@@ -285,8 +483,28 @@ export function makeScopedServer({ configPath, scopedFactory = createScopedAgent
     monitorHealth.unref();
     return value;
   });
-  registerScopedTools(server, { service, diagnostics, inputSignal });
-  registerParentTools(server, { service, diagnostics });
+  const isManagedCli = env?.FUTUREAIDE_MANAGED_CLI === '1';
+  const managedExtraFor = isManagedCli
+    ? extra => ({
+      ...extra,
+      [TRUSTED_CALLER]: {
+        source: 'managed-cli',
+        nativeSessionId: env.FUTUREAIDE_PARENT_AGENT_ID || 'managed-cli',
+        parentAgentId: env.FUTUREAIDE_PARENT_AGENT_ID,
+        ownerId: env.FUTUREAIDE_CALLER_OWNER_ID,
+        workspace: env.FUTUREAIDE_CALLER_WORKSPACE,
+      },
+    })
+    : undefined;
+  registerScopedTools(server, {
+    service,
+    diagnostics,
+    inputSignal,
+    ...(managedExtraFor ? { extraFor: managedExtraFor } : {}),
+  });
+  if (!isManagedCli) {
+    registerParentTools(server, { service, diagnostics });
+  }
   // Restore the shared listener on connection even before the first tool call.
   void service().catch(() => {});
   return server;
@@ -306,13 +524,29 @@ function registerParentTools(server, options) {
 }
 
 /**
- * The trusted caller context a verified Claude session becomes. The report surface
- * resolves the TCP peer itself and hands the answer here through its hook; nothing
- * in it ever comes from a tool argument.
+ * The trusted caller context a verified Claude or Antigravity session becomes.
+ * The report surface resolves the transport identity itself and hands the answer
+ * here through its hook; nothing in it ever comes from a tool argument.
  */
 export async function claudeTrustedCaller({ trusted, caller, extra } = {}) {
   const value = (typeof trusted === 'function' ? await trusted(extra) : undefined)
     ?? (typeof caller === 'function' ? await caller(extra) : undefined);
+  if (value?.source === 'antigravity') {
+    const conversationId = value.conversationId ?? value.nativeSessionId ?? value.sessionId;
+    const workspace = value.workspace ?? value.cwd;
+    if (typeof conversationId !== 'string' || !conversationId.trim()) {
+      throw Object.assign(new Error('The calling Antigravity session could not be verified.'),
+        { code: 'calling-context-unavailable' });
+    }
+    const normalizedId = conversationId.trim();
+    return {
+      source: 'antigravity',
+      conversationId: normalizedId,
+      nativeSessionId: normalizedId,
+      ...(typeof workspace === 'string' && workspace ? { workspace } : {}),
+      ...(value.label ? { label: value.label } : {}),
+    };
+  }
   const nativeSessionId = value?.nativeSessionId ?? value?.sessionId ?? value?.session;
   const workspace = value?.workspace ?? value?.cwd;
   if (typeof nativeSessionId !== 'string' || !nativeSessionId || typeof workspace !== 'string' || !workspace) {
@@ -492,26 +726,27 @@ export function makeServer(control, { configPath, controlFactory = createControl
  * is shared by every stdio entry point: see src/stdio-exit.mjs.
  */
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  if (process.argv[2] === '--claude-cli-reports') {
-    // This server belongs to a single claude -p process. The runner sets the
-    // route in its MCP config, outside the prompt and tool argument schemas.
+  if (process.argv[2] === '--claude-cli-reports' || process.argv[2] === '--codex-cli-reports') {
+    const cliTarget = process.argv[2] === '--codex-cli-reports' ? 'codex-cli' : 'claude-cli';
+    // This server belongs to a single headless CLI process (claude -p or codex exec).
+    // The runner sets the route in its MCP config, outside the prompt and tool argument schemas.
     const [roster, agentId, taskId, requestId, fifth, sixth] = process.argv.slice(3);
     // Older dispatches supplied only the cleanup flag in the fifth slot.
     const configFile = fifth === '--no-idle-session-cleanup' ? undefined : fifth;
     const mode = fifth === '--no-idle-session-cleanup' ? fifth : sixth;
-    if (!roster || !agentId || !taskId || !requestId) throw new Error('Missing managed Claude CLI dispatch.');
+    if (!roster || !agentId || !taskId || !requestId) throw new Error(`Missing managed ${cliTarget} dispatch.`);
     const store = new RosterStore(roster);
     const server = new McpServer({ name: 'futureaide', version: '1.0.0' });
     registerParentTools(server, {
       extraFor: extra => ({
         ...extra,
-        [TRUSTED_CALLER]: { source: 'claude-cli', nativeSessionId: agentId + ':' + taskId + ':' + requestId },
+        [TRUSTED_CALLER]: { source: cliTarget, nativeSessionId: agentId + ':' + taskId + ':' + requestId },
       }),
       service: {
-        submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId }),
+        submitToParent: payload => store.submitParentMessage(agentId, payload, { taskId, requestId, target: cliTarget }),
         submitManagedFeedback: (input, _extra, error, deadline) => {
           const record = store.get(agentId);
-          if (!record || record.closed || record.target !== 'claude-cli' || record.task?.taskId !== taskId
+          if (!record || record.closed || record.target !== cliTarget || record.task?.taskId !== taskId
               || record.task?.dispatches?.at(-1)?.requestId !== requestId || ['idle', 'failed'].includes(record.state)
               || isCancelledRound(record) || record.task.reports?.some(report => report.final)
               || store.submissions(agentId, taskId).some(report => report.final)) {
@@ -519,9 +754,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
               { code: 'submission-not-owned' });
           }
           return submitFeedback(input, {
-            source: 'claude-cli',
+            source: cliTarget,
             caller: store.owner(record.ownerId)?.source ?? null,
-            target: 'claude-cli',
+            target: cliTarget,
             name: record.name ?? null,
             error: feedbackRecordError(record, error),
           }, { configFile, deadline });

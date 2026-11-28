@@ -98,9 +98,9 @@ test('Claude caller reaches DSH through the real worker surface with model and e
     { provider: 'dsh-fixture', model: 'astra-4', reasoningEffort: 'max' },
     'the target session actually holds the selected full model and effort');
 
-  const promptCalls = dsh.calls().filter(call => call.method === 'managedPromptV2');
+  const promptCalls = dsh.calls().filter(call => call.method === 'session/prompt');
   assert.equal(promptCalls.length, 1);
-  assert.ok(methods(dsh.calls()).indexOf('managedSelectModel') < methods(dsh.calls()).indexOf('managedPromptV2'),
+  assert.ok(methods(dsh.calls()).indexOf('managedSelectModel') < methods(dsh.calls()).indexOf('session/prompt'),
     'the session is selected before the first prompt');
 
   const listed = await callTool(mcp.client, 'futureaide_list_agents', {});
@@ -117,7 +117,7 @@ test('Claude caller reaches DSH through the real worker surface with model and e
   assert.equal(followup.value.actualModel, 'astra-4');
   assert.equal(dsh.calls().filter(call => call.method === 'managedSelectModel').length, 2,
     'a later send without model/effort reuses the pin');
-  await until(() => dsh.calls().filter(call => call.method === 'managedPromptV2').length === 2,
+  await until(() => dsh.calls().filter(call => call.method === 'session/prompt').length === 2,
     { timeoutMs: 5000, message: 'the second DSH prompt' });
 
   // run is the one-call entry. A substring resolves in catalog order and the

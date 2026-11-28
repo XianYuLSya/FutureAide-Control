@@ -22,9 +22,14 @@ import { homedir, hostname } from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { isProcessAlive, queryWin32ProcessInfo } from './process-cage.mjs';
 
 const exec = promisify(execFile);
 const PROMPT_TIMEOUT_MS = 15000;
+const LIVE_PROCESS_CACHE_TTL_MS = 60000;
+const MAX_PROCESS_CACHE_ENTRIES = 1024;
+const liveProcessCache = new Map();
+const inflightProcessQueries = new Map();
 
 export const SESSION_ID_PATTERN = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
 
@@ -46,23 +51,123 @@ async function runPowerShell(script) {
   return stdout.trim();
 }
 
+function setCachedProcessInfo(pid, info) {
+  if (!info || (!info.startTime && !info.parentPid)) return;
+  if (liveProcessCache.size >= MAX_PROCESS_CACHE_ENTRIES && !liveProcessCache.has(pid)) {
+    const oldest = liveProcessCache.keys().next().value;
+    if (oldest !== undefined) liveProcessCache.delete(oldest);
+  }
+  liveProcessCache.set(pid, { ...info, at: Date.now() });
+}
+
+function getCachedProcessInfo(pid) {
+  const cached = liveProcessCache.get(pid);
+  if (!cached) return null;
+  if (Date.now() - cached.at >= LIVE_PROCESS_CACHE_TTL_MS) {
+    liveProcessCache.delete(pid);
+    return null;
+  }
+  return cached;
+}
+
+async function inspectLiveProcess(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  if (!isProcessAlive(pid)) {
+    liveProcessCache.delete(pid);
+    return null;
+  }
+  const hit = getCachedProcessInfo(pid);
+  if (hit) return hit;
+
+  let pending = inflightProcessQueries.get(pid);
+  if (!pending) {
+    pending = (async () => {
+      if (process.platform === 'win32') {
+        const fast = await queryWin32ProcessInfo(pid);
+        if (fast && fast.startTime) {
+          const entry = {
+            startTime: fast.startTime,
+            parentPid: fast.parentPid ?? (pid === process.pid && Number.isSafeInteger(process.ppid) && process.ppid > 0 ? process.ppid : null),
+          };
+          setCachedProcessInfo(pid, entry);
+          return entry;
+        }
+        // Fallback when Win32 helper is unavailable: combine StartTime + ParentProcessId in one call.
+        try {
+          const script = [
+            `$p = Get-Process -Id ${pid} -ErrorAction Stop`,
+            `$c = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction SilentlyContinue`,
+            `$ppid = if ($c -and $c.ParentProcessId) { $c.ParentProcessId.ToString() } else { "" }`,
+            `"$($p.StartTime.ToFileTimeUtc().ToString())" + [char]9 + $ppid`,
+          ].join('; ');
+          const raw = await runPowerShell(script);
+          const tab = raw.indexOf('\t');
+          const st = (tab >= 0 ? raw.slice(0, tab) : raw).trim();
+          const ppidVal = tab >= 0 ? Number.parseInt(raw.slice(tab + 1).trim(), 10) : NaN;
+          if (/^\d+$/.test(st)) {
+            const entry = {
+              startTime: st,
+              parentPid: Number.isSafeInteger(ppidVal) && ppidVal > 0 ? ppidVal : null,
+            };
+            setCachedProcessInfo(pid, entry);
+            return entry;
+          }
+        } catch {
+          return null;
+        }
+        return null;
+      }
+
+      // Non-Windows fallback for cross-platform safety.
+      try {
+        const { stdout } = await exec('ps', ['-o', 'ppid=,lstart=', '-p', String(pid)], {
+          encoding: 'utf8',
+          timeout: PROMPT_TIMEOUT_MS,
+        });
+        const trimmed = stdout.trim();
+        const match = /^(\d+)\s+(.+)$/.exec(trimmed);
+        if (!match) return null;
+        const ppidVal = Number.parseInt(match[1], 10);
+        const ms = Date.parse(match[2]);
+        const startTime = Number.isFinite(ms) ? String(BigInt(ms) * 10000n + 116444736000000000n) : null;
+        const entry = {
+          startTime,
+          parentPid: Number.isSafeInteger(ppidVal) && ppidVal > 0 ? ppidVal : null,
+        };
+        setCachedProcessInfo(pid, entry);
+        return entry;
+      } catch {
+        return null;
+      }
+    })();
+    inflightProcessQueries.set(pid, pending);
+  }
+
+  try {
+    return await pending;
+  } finally {
+    inflightProcessQueries.delete(pid);
+  }
+}
+
 /** Live process start time in the same units the session record uses, or null. */
 export async function processStartTime(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  try {
-    const value = await runPowerShell(`(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToFileTimeUtc().ToString()`);
-    return /^\d+$/.test(value) ? value : null;
-  } catch { return null; }
+  const info = await inspectLiveProcess(pid);
+  return info && typeof info.startTime === 'string' && /^\d+$/.test(info.startTime) ? info.startTime : null;
 }
 
 /** Parent PID of a live process, or null when it cannot be read. */
 export async function parentProcessId(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
-  try {
-    const value = await runPowerShell(`(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction Stop).ParentProcessId.ToString()`);
-    const parsed = Number.parseInt(value, 10);
-    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
-  } catch { return null; }
+  if (!isProcessAlive(pid)) {
+    liveProcessCache.delete(pid);
+    return null;
+  }
+  if (pid === process.pid && Number.isSafeInteger(process.ppid) && process.ppid > 0) {
+    return process.ppid;
+  }
+  const info = await inspectLiveProcess(pid);
+  return info && Number.isSafeInteger(info.parentPid) && info.parentPid > 0 ? info.parentPid : null;
 }
 
 /**
